@@ -1,0 +1,23 @@
+{
+  "mode": "B",
+  "world_size": 1,
+  "worker_numa_nodes": [0],
+  "steps": 200,
+  "init_wall_us": 17975393,
+  "total_wall_us": 3146768,
+  "mean_step_us": 15733.840,
+  "mean_gpu_exec_us": 2117.475,
+  "mean_control_plane_ipc_us": 1916.350,
+  "control_plane_p50_us": 319,
+  "control_plane_p95_us": 375,
+  "control_plane_p99_us": 417,
+  "round_trip_p50_us": 1653,
+  "round_trip_p95_us": 1849,
+  "round_trip_p99_us": 1984,
+  "mean_publish_signal_us": 3.140,
+  "prepare_next_us": 845,
+  "hidden_prepare_us": 845,
+  "overlap_hiding_efficiency": 1.000000,
+  "overlap_speedup": 1.000269,
+  "accepted_tokens": 1466
+}

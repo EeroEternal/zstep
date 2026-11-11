@@ -56,8 +56,33 @@ zstep/
     * `in=512, out=256`: `c=1` **`225.04` vs `184.72 tok/s` (`+21.8%`)** | `c=16` **`1,768.73` vs `1,671.63 tok/s` (`+5.8%`)** | `c=128` **`4,540.92` (`4,638.96` @ 4K step) vs `3,271.56 tok/s` (`+38.8%` / `+41.8%`)**.
     * `in=1024, out=256`: `c=1` **`261.72` vs `181.96 tok/s` (`+43.8%`)** | `c=32` **`2,165.22` vs `1,834.83 tok/s` (`+18.0%`)** | `c=128` **`3,024.65` vs `2,939.12 tok/s` (`+2.9%`)**.
 
+## Benchmarks (`8 × RTX 5090 sm_120`, Non-P2P 4-NUMA PCIe)
+
+Full raw JSON artifacts (`12` benchmark files across Phase 0, Phase 1, and Phase 2), ablation history, and reproduction commands are indexed in **[`docs/benchmarks/README.md`](docs/benchmarks/README.md)**.
+
+### End-to-End Serving: `Qwen/Qwen3.5-35B-A3B` (`TP=8`, `bfloat16`) vs `vLLM 0.33.0`
+
+| Profile (`in / out`) | Concurrency | `vLLM 0.33.0` (`tok/s`) | `zstep Mode B` (`tok/s`) | Speedup | `vLLM` Median TTFT / Mean TPOT | `zstep` Median TTFT / Mean TPOT |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `512 / 256` | `c = 1` | `184.72` | **`225.04`** | **`+21.8%`** | `74.51 ms` / `5.09 ms` | **`66.59 ms` / `4.09 ms`** (`p99 4.11 ms`) |
+| `512 / 256` | `c = 16` | `1,671.63` | **`1,768.73`** | **`+5.8%`** | `392.38 ms` / `8.02 ms` | `465.85 ms` (`290.93 ms` @ 4K) / **`7.25 ms`** |
+| `512 / 256` | `c = 128` | `3,271.56` | **`4,540.92`** (`4,638.96` @ 4K) | **`+38.8%` (`+41.8%`)** | `1,240.50 ms` / `33.25 ms` | `1,307.87 ms` (`822.28 ms` @ 4K) / **`22.38 ms`** |
+| `1024 / 256` | `c = 1` | `181.96` | **`261.72`** | **`+43.8%`** | `143.35 ms` / `4.86 ms` | **`82.73 ms` / `3.51 ms`** (`p99 3.61 ms`) |
+| `1024 / 256` | `c = 32` | `1,834.83` | **`2,165.22`** | **`+18.0%`** | `1,091.90 ms` / `11.92 ms` | **`870.08 ms` / `9.81 ms`** |
+| `1024 / 256` | `c = 128` | `2,939.12` | **`3,024.65`** | **`+2.9%`** | `1,355.88 ms` / `33.77 ms` | **`1,295.93 ms` / `33.19 ms`** |
+
+### 8-GPU Non-P2P 4-NUMA PCIe AllReduce (`H = 5120`, `bfloat16`, CUDA Graph Replay)
+
+| Rows `M` (`Bytes`) | `zstep HostMappedShmAllReduce` (`p50 / p99`) | Degraded `NCCL SHM` (`p50 / p99`) | `zstep max_abs_error` |
+| :---: | :---: | :---: | :---: |
+| `6` (`60 KiB`) | `65.16 µs` / `69.84 µs` | `52.42 µs` / `56.70 µs` | **`0.0`** |
+| `48` (`480 KiB`) | `150.19 µs` / **`153.04 µs`** | `106.80 µs` / `155.33 µs` | **`0.0`** |
+| `192` (`1.88 MiB`) | `187.49 µs` / `191.47 µs` | `151.01 µs` / `153.15 µs` | **`0.0`** |
+| `4096` (`40.0 MiB`) | **`4,274.36 µs` / `4,292.75 µs` (`1.45×`)** | `6,206.57 µs` / `6,243.15 µs` | **`0.0`** |
+
 ## Documentation Index
 
+* **[Benchmarks Ledger (`docs/benchmarks/README.md`)](docs/benchmarks/README.md)**：全部 12 份 JSON 基准文件（Phase 0 ~ Phase 2 + 四阶段消融）汇总表与一键复现命令。
 * **[01 — 技术选型与深度调研纪要 (`docs/01-advisor-analysis.md`)](docs/01-advisor-analysis.md)**：对 ZML、TokenSpeed、`b12x` 的源码级对比，以及模式 A（内嵌解释器）与模式 B（单主控 + 多 Worker 共享内存 IPC）的详细对比。
 * **[02 — 系统架构设计 (`docs/02-architecture.md`)](docs/02-architecture.md)**：`zstep` 的控制面/数据面边界、4-NUMA 非对称无 P2P PCIe 拓扑约束、`in_flight_depth = 1` 双缓冲重叠循环与缓存分层设计。
 * **[03 — 共享内存 IPC 协议规范 (`docs/03-shm-protocol.md`)](docs/03-shm-protocol.md)**：单主控与 8 个 GPU Worker 之间的 POSIX `shm_open` + `eventfd` 零拷贝内存布局、Cacheline 对齐协议头与生命周期契约。
