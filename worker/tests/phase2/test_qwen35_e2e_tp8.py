@@ -65,8 +65,10 @@ def test_qwen35_35b_a3b_mode_b_tp8_greedy_parity() -> None:
     reference_path = repo_root / "docs/benchmarks/phase2_vllm_greedy_reference.json"
     report_path = repo_root / "docs/benchmarks/phase2_greedy_parity_report.json"
     reference = json.loads(reference_path.read_text(encoding="utf-8"))
-    assert len(reference["cases"]) == 4
+    assert len(reference["cases"]) == 5
     assert 65 <= len(reference["cases"][3]["prompt_token_ids"]) <= 72
+    assert reference["cases"][4]["name"] == "prime_squares_table"
+    assert reference["cases"][4]["max_tokens"] == 128
     shm_name = f"zstep_qwen35_e2e_{os.getpid()}"
 
     cmd = [
@@ -114,9 +116,17 @@ def test_qwen35_35b_a3b_mode_b_tp8_greedy_parity() -> None:
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert re.fullmatch(r"[0-9a-f]{40}", report["git_sha"])
     assert report["max_prefill_chunk"] == 24
-    assert len(report["cases"]) == 4
+    assert len(report["cases"]) == 5
     assert report["cases"][1]["total_tokens"] == 128
     assert len(report["cases"][1]["single_generated_token_ids"]) == 128
+    assert report["cases"][4]["total_tokens"] == 128
+    prime_tokens = report["cases"][4]["single_generated_token_ids"]
+    assert len({tuple(prime_tokens[i : i + 16]) for i in range(len(prime_tokens) - 15)}) == (
+        len(prime_tokens) - 15
+    )
+    assert report["cases"][4]["single_match"]["all_matched"] is True
+    assert report["cases"][4]["batched_match"]["all_matched"] is True
+    assert report["cases"][4]["chunked_match"]["all_matched"] is True
     assert report["batched_vs_single_exact_match"] == all(
         case["batched_generated_token_ids"] == case["single_generated_token_ids"]
         for case in report["cases"]
@@ -126,8 +136,8 @@ def test_qwen35_35b_a3b_mode_b_tp8_greedy_parity() -> None:
         for case in report["cases"]
     )
     assert report["unchunked_schedule"]["prefill_steps"] == 1
-    assert report["unchunked_schedule"]["max_active_sequences"] == 4
-    assert report["chunked_schedule"]["max_active_sequences"] == 4
+    assert report["unchunked_schedule"]["max_active_sequences"] == 5
+    assert report["chunked_schedule"]["max_active_sequences"] == 5
     assert report["chunked_schedule"]["prefill_steps"] >= 3
     assert report["chunked_schedule"]["decode_steps_with_partial_prefill"] >= 1
 
@@ -144,6 +154,25 @@ def test_qwen35_35b_a3b_mode_b_tp8_greedy_parity() -> None:
                     assert actual_stats[key] == pytest.approx(value)
                 else:
                     assert actual_stats[key] == value
+            assert actual_stats["mean_top1_minus_top2_margin"] >= 0.0
+            assert actual_stats["min_top1_minus_top2_margin"] >= 0.0
+            if not actual_stats["all_matched"]:
+                diag = actual_stats["first_mismatch_diagnostics"]
+                assert diag is not None
+                assert diag["prefix_identical_at_step"] is True
+                assert diag["vllm_top2"] is not None
+                # When the prefix is still identical to vLLM (`single` mode, or `batched`/`chunked`
+                # if it has not diverged earlier from `single`), any BF16 argmax flip must be a
+                # razor-thin near-tie (`margin < 0.25`), never a confident logit mismatch.
+                if mode == "single":
+                    assert diag["vllm_top2"]["top1_minus_top2_margin"] < 0.25
+                    assert diag["zstep_top2"]["top1_minus_top2_margin"] < 0.25
+        for pair_key in ("single_vs_batched_first_mismatch", "batched_vs_chunked_first_mismatch"):
+            pair_diag = report_case[pair_key]
+            if pair_diag is not None:
+                assert pair_diag["prefix_identical_at_step"] is True
+                assert pair_diag["left_top2"]["top1_minus_top2_margin"] < 0.25
+                assert pair_diag["right_top2"]["top1_minus_top2_margin"] < 0.25
 
     backward_expected = reference["cases"][0]["expected_greedy_token_ids"][:16]
     assert report["cases"][0]["single_generated_token_ids"][:16] == backward_expected

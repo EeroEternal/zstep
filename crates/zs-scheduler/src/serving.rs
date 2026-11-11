@@ -124,11 +124,25 @@ pub struct BenchmarkTierSpec {
 
 pub const BENCHMARK_RANDOM_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
+/// Per-step greedy Top-2 logit diagnostics gathered across all TP ranks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StepTop2Logits {
+    pub top1_token: i32,
+    pub top1_logit: f32,
+    pub top2_token: i32,
+    pub top2_logit: f32,
+    pub top1_minus_top2_margin: f32,
+}
+
+/// Generated token IDs paired with per-step Top-2 logit diagnostics for a batch of prompts.
+pub type GreedyTop2Batch = (Vec<Vec<i32>>, Vec<Vec<StepTop2Logits>>);
+
 /// Per-tier continuous-batching throughput and latency metrics for one repeat.
 #[derive(Debug, Clone)]
 pub struct BenchmarkTierResult {
     pub label: String,
     pub repeat: usize,
+    pub seed: u64,
     pub concurrency: usize,
     pub num_prompts: usize,
     pub input_len: usize,
@@ -159,6 +173,7 @@ impl BenchmarkTierResult {
                 "    {{\n",
                 "      \"label\": {},\n",
                 "      \"repeat\": {},\n",
+                "      \"seed\": {},\n",
                 "      \"concurrency\": {},\n",
                 "      \"num_prompts\": {},\n",
                 "      \"input_len\": {},\n",
@@ -184,6 +199,7 @@ impl BenchmarkTierResult {
             ),
             json_string(&self.label),
             self.repeat,
+            self.seed,
             self.concurrency,
             self.num_prompts,
             self.input_len,
@@ -543,6 +559,7 @@ struct ActiveSequence {
     current_seq_len: usize,
     last_token: i32,
     generated_tokens: Vec<i32>,
+    generated_top2: Vec<StepTop2Logits>,
     target_output_len: usize,
     permit_time: Instant,
     submit_time: Instant,
@@ -668,6 +685,25 @@ impl ModeBServingEngine {
         prompts: &[Vec<i32>],
         target_output_lengths: &[usize],
     ) -> Result<Vec<Vec<i32>>> {
+        self.generate_greedy_internal(prompts, target_output_lengths, false)
+            .map(|(tokens, _)| tokens)
+    }
+
+    /// Generate exact greedy completions along with per-step global Top-2 logit diagnostics.
+    pub fn generate_greedy_with_top2(
+        &mut self,
+        prompts: &[Vec<i32>],
+        target_output_lengths: &[usize],
+    ) -> Result<GreedyTop2Batch> {
+        self.generate_greedy_internal(prompts, target_output_lengths, true)
+    }
+
+    fn generate_greedy_internal(
+        &mut self,
+        prompts: &[Vec<i32>],
+        target_output_lengths: &[usize],
+        record_top2: bool,
+    ) -> Result<GreedyTop2Batch> {
         if prompts.len() != target_output_lengths.len() {
             return Err(ModeBError::Protocol(format!(
                 "prompt count {} differs from output length count {}",
@@ -681,8 +717,13 @@ impl ModeBServingEngine {
             ));
         }
         let mut completed = vec![Vec::new(); prompts.len()];
+        let mut completed_top2 = if record_top2 {
+            vec![Vec::new(); prompts.len()]
+        } else {
+            Vec::new()
+        };
         if prompts.is_empty() {
-            return Ok(completed);
+            return Ok((completed, completed_top2));
         }
         self.last_generation_schedule = GenerationScheduleStats::default();
         let now = Instant::now();
@@ -711,6 +752,11 @@ impl ModeBServingEngine {
             &mut waiting,
             &mut raw_prompts,
             &mut completed,
+            if record_top2 {
+                Some(&mut completed_top2)
+            } else {
+                None
+            },
             &mut ttfts,
             &mut submit_ttfts,
             &mut tpots,
@@ -718,11 +764,20 @@ impl ModeBServingEngine {
             &mut steps,
             &mut overlapped,
         )?;
-        Ok(completed)
+        Ok((completed, completed_top2))
     }
 
-    /// Execute one continuous-batching benchmark tier with semaphore `spec.concurrency`.
+    /// Execute one continuous-batching benchmark tier with default seed `BENCHMARK_RANDOM_SEED`.
     pub fn run_benchmark_tier(&mut self, spec: &BenchmarkTierSpec) -> Result<BenchmarkTierResult> {
+        self.run_benchmark_tier_with_seed(spec, BENCHMARK_RANDOM_SEED)
+    }
+
+    /// Execute one continuous-batching benchmark tier with semaphore `spec.concurrency` and explicit `seed`.
+    pub fn run_benchmark_tier_with_seed(
+        &mut self,
+        spec: &BenchmarkTierSpec,
+        seed: u64,
+    ) -> Result<BenchmarkTierResult> {
         if spec.concurrency == 0
             || spec.num_prompts == 0
             || spec.input_len == 0
@@ -732,7 +787,8 @@ impl ModeBServingEngine {
                 "benchmark tier dimensions must all be positive".to_owned(),
             ));
         }
-        let all_prompts = build_deterministic_random_prompts(spec.num_prompts, spec.input_len);
+        let all_prompts =
+            build_deterministic_random_prompts_seeded(spec.num_prompts, spec.input_len, seed);
         let initial_admit = spec.concurrency.min(spec.num_prompts);
 
         let mut completed = vec![Vec::new(); spec.num_prompts];
@@ -767,6 +823,7 @@ impl ModeBServingEngine {
             &mut waiting_permitted,
             &mut unpermitted_pool,
             &mut completed,
+            None,
             &mut ttfts_us,
             &mut submit_ttfts_us,
             &mut tpots_us,
@@ -782,6 +839,7 @@ impl ModeBServingEngine {
         Ok(BenchmarkTierResult {
             label: spec.label.clone(),
             repeat: 0,
+            seed,
             concurrency: spec.concurrency,
             num_prompts: spec.num_prompts,
             input_len: spec.input_len,
@@ -813,6 +871,7 @@ impl ModeBServingEngine {
         waiting_permitted: &mut VecDeque<PendingRequest>,
         unpermitted_pool: &mut VecDeque<(usize, Vec<i32>, usize, Instant)>,
         completed: &mut [Vec<i32>],
+        mut completed_top2: Option<&mut [Vec<StepTop2Logits>]>,
         ttfts_us: &mut Vec<u64>,
         submit_ttfts_us: &mut Vec<u64>,
         tpots_us: &mut Vec<u64>,
@@ -926,8 +985,8 @@ impl ModeBServingEngine {
             self.coordinator.wait_step_completed(step_id)?;
             let now = Instant::now();
 
-            // Harvest accepted tokens from rank 0's ResultSlot
-            let emitted: Vec<(u32, i32)> = {
+            // Harvest accepted tokens and Top-2 logits from rank 0's ResultSlot
+            let emitted: Vec<(u32, i32, i32, u32, u32)> = {
                 let result = self.coordinator.result_slot(step_id)?;
                 if result.completed_step_id()? != step_id {
                     return Err(ModeBError::Protocol(format!(
@@ -944,11 +1003,20 @@ impl ModeBServingEngine {
                 let outputs = result.outputs()?;
                 outputs[..header.num_seq_results as usize]
                     .iter()
-                    .map(|o| (o.req_slot, o.accepted_tokens[0]))
+                    .map(|o| {
+                        (
+                            o.req_slot,
+                            o.accepted_tokens[0],
+                            o.accepted_tokens[1],
+                            o.accepted_logprobs_bits[0],
+                            o.accepted_logprobs_bits[1],
+                        )
+                    })
                     .collect()
             };
 
-            for (req_slot, tok) in emitted {
+            let collect_top2 = completed_top2.is_some();
+            for (req_slot, tok, tok2, lp1_bits, lp2_bits) in emitted {
                 let idx = *slot_to_active.get(req_slot as usize).unwrap_or(&usize::MAX);
                 if idx < active.len() {
                     let seq = &mut active[idx];
@@ -965,6 +1033,17 @@ impl ModeBServingEngine {
                     seq.last_token_time = Some(now);
                     seq.last_token = tok;
                     seq.generated_tokens.push(tok);
+                    if collect_top2 {
+                        let top1_logit = f32::from_bits(lp1_bits);
+                        let top2_logit = f32::from_bits(lp2_bits);
+                        seq.generated_top2.push(StepTop2Logits {
+                            top1_token: tok,
+                            top1_logit,
+                            top2_token: tok2,
+                            top2_logit,
+                            top1_minus_top2_margin: top1_logit - top2_logit,
+                        });
+                    }
                 }
             }
 
@@ -1007,6 +1086,9 @@ impl ModeBServingEngine {
                         tpots_us.push(span_us / denom);
                     }
                     completed[finished.request_id] = finished.generated_tokens;
+                    if let Some(top2_out) = completed_top2.as_deref_mut() {
+                        top2_out[finished.request_id] = finished.generated_top2;
+                    }
                     drop(finished.kv_leases);
                     drop(finished.slot_lease);
 
@@ -1117,6 +1199,7 @@ impl ModeBServingEngine {
                 current_seq_len: 0,
                 last_token,
                 generated_tokens: Vec::with_capacity(req.target_output_len),
+                generated_top2: Vec::new(),
                 target_output_len: req.target_output_len,
                 permit_time: req.permit_time,
                 submit_time: req.submit_time,
@@ -1349,14 +1432,38 @@ fn should_schedule_prefill(
         .is_some_and(|req| req.permit_time.elapsed().as_millis() >= 25)
 }
 
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
 /// Generate `num_prompts` deterministic pseudo-random token sequences in `[256, 65536)`
-/// (avoiding EOS/control token IDs and avoiding artificial prefix-cache collisions).
+/// using the default [`BENCHMARK_RANDOM_SEED`].
 pub fn build_deterministic_random_prompts(num_prompts: usize, input_len: usize) -> Vec<Vec<i32>> {
+    build_deterministic_random_prompts_seeded(num_prompts, input_len, BENCHMARK_RANDOM_SEED)
+}
+
+/// Generate `num_prompts` deterministic pseudo-random token sequences in `[256, 65536)`
+/// parameterized by `seed` so each `(round, tier)` receives fresh uncached prompts.
+pub fn build_deterministic_random_prompts_seeded(
+    num_prompts: usize,
+    input_len: usize,
+    seed: u64,
+) -> Vec<Vec<i32>> {
     let mut prompts = Vec::with_capacity(num_prompts);
-    let mut state: u64 = BENCHMARK_RANDOM_SEED;
+    let mut state: u64 = splitmix64(seed);
     for p in 0..num_prompts {
         let mut row = Vec::with_capacity(input_len);
-        state ^= (p as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        let prompt_mix = splitmix64(
+            seed.wrapping_add(
+                (p as u64)
+                    .wrapping_add(1)
+                    .wrapping_mul(0xBF58_476D_1CE4_E5B9),
+            ),
+        );
+        state = state.rotate_left(17) ^ prompt_mix;
         for _ in 0..input_len {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
@@ -1432,6 +1539,7 @@ mod tests {
                 current_seq_len: 0,
                 last_token: 42,
                 generated_tokens: Vec::new(),
+                generated_top2: Vec::new(),
                 target_output_len: 10,
                 permit_time: Instant::now(),
                 submit_time: Instant::now(),
@@ -1526,6 +1634,7 @@ mod tests {
             .map(|repeat| BenchmarkTierResult {
                 label: "tier".to_owned(),
                 repeat,
+                seed: BENCHMARK_RANDOM_SEED + repeat as u64,
                 concurrency: 4,
                 num_prompts: 12,
                 input_len: 512,
@@ -1570,6 +1679,15 @@ mod tests {
         for p in &prompts {
             assert_eq!(p.len(), 64);
             assert!(p.iter().all(|&tok| (256..65_256).contains(&tok)));
+        }
+
+        let round0 = build_deterministic_random_prompts_seeded(8, 64, BENCHMARK_RANDOM_SEED);
+        let round1 =
+            build_deterministic_random_prompts_seeded(8, 64, BENCHMARK_RANDOM_SEED + 1_000);
+        let round0_again = build_deterministic_random_prompts_seeded(8, 64, BENCHMARK_RANDOM_SEED);
+        assert_eq!(round0, round0_again);
+        for (p0, p1) in round0.iter().zip(&round1) {
+            assert_ne!(p0, p1);
         }
     }
 }

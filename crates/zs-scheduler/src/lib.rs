@@ -29,8 +29,9 @@ mod serving;
 pub use mode_b::{ModeBConfig, ModeBCoordinator, ModeBError, ModeBMetrics, WorkerLaunchConfig};
 pub use serving::{
     AggregateMetric, BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierResult,
-    BenchmarkTierSpec, GenerationScheduleStats, ModeBServingEngine, ServingBenchmarkReport,
-    SlotLease, SlotPool, TierAggregateStats, build_deterministic_random_prompts,
+    BenchmarkTierSpec, GenerationScheduleStats, GreedyTop2Batch, ModeBServingEngine,
+    ServingBenchmarkReport, SlotLease, SlotPool, StepTop2Logits, TierAggregateStats,
+    build_deterministic_random_prompts, build_deterministic_random_prompts_seeded,
 };
 
 /// Select the smallest captured CUDA Graph bucket `>= active_rows`, or `0` (eager)

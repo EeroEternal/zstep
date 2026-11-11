@@ -25,8 +25,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use zs_scheduler::{
     BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierSpec, GenerationScheduleStats,
-    ModeBConfig, ModeBCoordinator, ModeBServingEngine, ServingBenchmarkReport, TierAggregateStats,
-    WorkerLaunchConfig,
+    ModeBConfig, ModeBCoordinator, ModeBServingEngine, ServingBenchmarkReport, StepTop2Logits,
+    TierAggregateStats, WorkerLaunchConfig,
 };
 use zs_wire::ShmGeometry;
 
@@ -37,11 +37,63 @@ struct GreedyReference {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+struct VllmTop2Step {
+    top1_token: i32,
+    top1_logprob: f64,
+    top2_token: i32,
+    top2_logprob: f64,
+    top1_minus_top2_margin: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct GreedyReferenceCase {
     name: String,
     prompt_token_ids: Vec<i32>,
     max_tokens: usize,
     expected_greedy_token_ids: Vec<i32>,
+    #[serde(default)]
+    top2_steps: Vec<VllmTop2Step>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ZstepTop2StepReport {
+    top1_token: i32,
+    top1_logit: f32,
+    top2_token: i32,
+    top2_logit: f32,
+    top1_minus_top2_margin: f32,
+}
+
+impl From<StepTop2Logits> for ZstepTop2StepReport {
+    fn from(step: StepTop2Logits) -> Self {
+        Self {
+            top1_token: step.top1_token,
+            top1_logit: step.top1_logit,
+            top2_token: step.top2_token,
+            top2_logit: step.top2_logit,
+            top1_minus_top2_margin: step.top1_minus_top2_margin,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FirstMismatchDiagnostics {
+    token_index: usize,
+    prefix_identical_at_step: bool,
+    expected_token: i32,
+    generated_token: i32,
+    vllm_top2: Option<VllmTop2Step>,
+    zstep_top2: ZstepTop2StepReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ModePairMismatchDiagnostics {
+    token_index: usize,
+    prefix_identical_at_step: bool,
+    left_mode: String,
+    right_mode: String,
+    left_top2: ZstepTop2StepReport,
+    right_top2: ZstepTop2StepReport,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,6 +104,9 @@ struct GreedyMatchReport {
     exact_token_match_rate: f64,
     all_matched: bool,
     first_mismatch_token_index: Option<usize>,
+    mean_top1_minus_top2_margin: f64,
+    min_top1_minus_top2_margin: f64,
+    first_mismatch_diagnostics: Option<FirstMismatchDiagnostics>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,6 +125,8 @@ struct GreedyCaseParityReport {
     single_match: GreedyMatchReport,
     batched_match: GreedyMatchReport,
     chunked_match: GreedyMatchReport,
+    single_vs_batched_first_mismatch: Option<ModePairMismatchDiagnostics>,
+    batched_vs_chunked_first_mismatch: Option<ModePairMismatchDiagnostics>,
 }
 
 #[derive(Debug, Serialize)]
@@ -237,7 +294,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn greedy_match(expected: &[i32], generated: &[i32]) -> GreedyMatchReport {
+fn greedy_match(
+    expected: &[i32],
+    vllm_top2: &[VllmTop2Step],
+    generated: &[i32],
+    zstep_top2: &[StepTop2Logits],
+) -> GreedyMatchReport {
     let first_mismatch = expected
         .iter()
         .zip(generated)
@@ -248,6 +310,32 @@ fn greedy_match(expected: &[i32], generated: &[i32]) -> GreedyMatchReport {
         .zip(generated)
         .filter(|(expected_token, generated_token)| expected_token == generated_token)
         .count();
+    let (mean_margin, min_margin) = if zstep_top2.is_empty() {
+        (0.0, 0.0)
+    } else {
+        let sum: f64 = zstep_top2
+            .iter()
+            .map(|step| f64::from(step.top1_minus_top2_margin))
+            .sum();
+        let min = zstep_top2
+            .iter()
+            .map(|step| f64::from(step.top1_minus_top2_margin))
+            .fold(f64::INFINITY, f64::min);
+        (sum / zstep_top2.len() as f64, min)
+    };
+    let first_mismatch_diagnostics = first_mismatch.and_then(|idx| {
+        zstep_top2
+            .get(idx)
+            .copied()
+            .map(|z_step| FirstMismatchDiagnostics {
+                token_index: idx,
+                prefix_identical_at_step: true,
+                expected_token: expected[idx],
+                generated_token: generated[idx],
+                vllm_top2: vllm_top2.get(idx).cloned(),
+                zstep_top2: ZstepTop2StepReport::from(z_step),
+            })
+    });
     GreedyMatchReport {
         exact_prefix_match_tokens,
         total_tokens: expected.len(),
@@ -255,7 +343,34 @@ fn greedy_match(expected: &[i32], generated: &[i32]) -> GreedyMatchReport {
         exact_token_match_rate: exact_token_matches as f64 / expected.len() as f64,
         all_matched: exact_prefix_match_tokens == expected.len(),
         first_mismatch_token_index: first_mismatch,
+        mean_top1_minus_top2_margin: mean_margin,
+        min_top1_minus_top2_margin: min_margin,
+        first_mismatch_diagnostics,
     }
+}
+
+fn mode_pair_mismatch(
+    left_mode: &str,
+    left_tokens: &[i32],
+    left_top2: &[StepTop2Logits],
+    right_mode: &str,
+    right_tokens: &[i32],
+    right_top2: &[StepTop2Logits],
+) -> Option<ModePairMismatchDiagnostics> {
+    let idx = left_tokens
+        .iter()
+        .zip(right_tokens)
+        .position(|(a, b)| a != b)?;
+    let left_step = *left_top2.get(idx)?;
+    let right_step = *right_top2.get(idx)?;
+    Some(ModePairMismatchDiagnostics {
+        token_index: idx,
+        prefix_identical_at_step: true,
+        left_mode: left_mode.to_owned(),
+        right_mode: right_mode.to_owned(),
+        left_top2: ZstepTop2StepReport::from(left_step),
+        right_top2: ZstepTop2StepReport::from(right_step),
+    })
 }
 
 fn current_git_sha() -> Result<String, Box<dyn std::error::Error>> {
@@ -308,6 +423,15 @@ fn run_greedy_verification(
             )
             .into());
         }
+        if !case.top2_steps.is_empty() && case.top2_steps.len() != case.max_tokens {
+            return Err(format!(
+                "case {} has {} top2_steps entries, expected {}",
+                case.name,
+                case.top2_steps.len(),
+                case.max_tokens
+            )
+            .into());
+        }
     }
 
     let prompts: Vec<Vec<i32>> = reference
@@ -319,18 +443,22 @@ fn run_greedy_verification(
 
     engine.set_max_prefill_chunk(usize::MAX)?;
     let mut single_outputs = Vec::with_capacity(reference.cases.len());
+    let mut single_top2 = Vec::with_capacity(reference.cases.len());
     for case in &reference.cases {
-        let mut outputs = engine.generate_greedy_with_lengths(
+        let (mut outputs, mut top2) = engine.generate_greedy_with_top2(
             std::slice::from_ref(&case.prompt_token_ids),
             std::slice::from_ref(&case.max_tokens),
         )?;
         single_outputs.push(outputs.remove(0));
+        single_top2.push(top2.remove(0));
     }
-    let batched_outputs = engine.generate_greedy_with_lengths(&prompts, &output_lengths)?;
+    let (batched_outputs, batched_top2) =
+        engine.generate_greedy_with_top2(&prompts, &output_lengths)?;
     let unchunked_schedule = ScheduleReport::from(engine.last_generation_schedule());
 
     engine.set_max_prefill_chunk(max_prefill_chunk)?;
-    let chunked_outputs = engine.generate_greedy_with_lengths(&prompts, &output_lengths)?;
+    let (chunked_outputs, chunked_top2) =
+        engine.generate_greedy_with_top2(&prompts, &output_lengths)?;
     let chunked_schedule = ScheduleReport::from(engine.last_generation_schedule());
 
     let batched_vs_single_exact_match = batched_outputs == single_outputs;
@@ -340,15 +468,52 @@ fn run_greedy_verification(
         let single = &single_outputs[index];
         let batched = &batched_outputs[index];
         let chunked = &chunked_outputs[index];
+        let single_steps = &single_top2[index];
+        let batched_steps = &batched_top2[index];
+        let chunked_steps = &chunked_top2[index];
         if single.len() != case.max_tokens
             || batched.len() != case.max_tokens
             || chunked.len() != case.max_tokens
+            || single_steps.len() != case.max_tokens
+            || batched_steps.len() != case.max_tokens
+            || chunked_steps.len() != case.max_tokens
         {
             return Err(format!("case {} returned an unexpected token count", case.name).into());
         }
-        let single_match = greedy_match(&case.expected_greedy_token_ids, single);
-        let batched_match = greedy_match(&case.expected_greedy_token_ids, batched);
-        let chunked_match = greedy_match(&case.expected_greedy_token_ids, chunked);
+        let single_match = greedy_match(
+            &case.expected_greedy_token_ids,
+            &case.top2_steps,
+            single,
+            single_steps,
+        );
+        let batched_match = greedy_match(
+            &case.expected_greedy_token_ids,
+            &case.top2_steps,
+            batched,
+            batched_steps,
+        );
+        let chunked_match = greedy_match(
+            &case.expected_greedy_token_ids,
+            &case.top2_steps,
+            chunked,
+            chunked_steps,
+        );
+        let single_vs_batched_first_mismatch = mode_pair_mismatch(
+            "single",
+            single,
+            single_steps,
+            "batched",
+            batched,
+            batched_steps,
+        );
+        let batched_vs_chunked_first_mismatch = mode_pair_mismatch(
+            "batched",
+            batched,
+            batched_steps,
+            "chunked",
+            chunked,
+            chunked_steps,
+        );
         case_reports.push(GreedyCaseParityReport {
             name: case.name.clone(),
             prompt_token_ids: case.prompt_token_ids.clone(),
@@ -364,6 +529,8 @@ fn run_greedy_verification(
             single_match,
             batched_match,
             chunked_match,
+            single_vs_batched_first_mismatch,
+            batched_vs_chunked_first_mismatch,
         });
     }
     let all_matched = case_reports.iter().all(|case| case.all_matched);
@@ -478,7 +645,8 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
                     input_len: 512,
                     output_len: 64,
                 };
-                let warmup_result = engine.run_benchmark_tier(&warmup)?;
+                let warmup_result =
+                    engine.run_benchmark_tier_with_seed(&warmup, BENCHMARK_RANDOM_SEED ^ 0xFFFF)?;
                 eprintln!(
                     "[warmup] prompts={} -> out_tok/s={:.2}, median_ttft={:.2}ms",
                     warmup_result.num_prompts,
@@ -492,7 +660,9 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
                 vec![Vec::with_capacity(args.repeats); args.bench_tiers.len()];
             for repeat in 0..args.repeats {
                 for (tier_index, spec) in args.bench_tiers.iter().enumerate() {
-                    let mut res = engine.run_benchmark_tier(spec)?;
+                    let tier_seed = BENCHMARK_RANDOM_SEED
+                        .wrapping_add((repeat as u64) * 1_000 + (tier_index as u64));
+                    let mut res = engine.run_benchmark_tier_with_seed(spec, tier_seed)?;
                     res.repeat = repeat;
                     eprintln!(
                         "[{} repeat={}] conc={} prompts={} in={} out={} -> out_tok/s={:.2}, total_tok/s={:.2}, median_ttft={:.2}ms, median_submit_ttft={:.2}ms, mean_tpot={:.2}ms, p99_tpot={:.2}ms, p99_itl={:.2}ms (steps={}, overlapped={})",
@@ -699,13 +869,86 @@ mod tests {
 
     #[test]
     fn greedy_match_reports_prefix_rate_and_first_divergence() {
-        let report = greedy_match(&[10, 11, 12, 13], &[10, 11, 99, 13]);
+        let vllm_steps = vec![
+            VllmTop2Step {
+                top1_token: 10,
+                top1_logprob: -0.01,
+                top2_token: 50,
+                top2_logprob: -4.01,
+                top1_minus_top2_margin: 4.0,
+            },
+            VllmTop2Step {
+                top1_token: 11,
+                top1_logprob: -0.02,
+                top2_token: 51,
+                top2_logprob: -3.02,
+                top1_minus_top2_margin: 3.0,
+            },
+            VllmTop2Step {
+                top1_token: 12,
+                top1_logprob: -0.68,
+                top2_token: 99,
+                top2_logprob: -0.71,
+                top1_minus_top2_margin: 0.03,
+            },
+            VllmTop2Step {
+                top1_token: 13,
+                top1_logprob: -0.05,
+                top2_token: 53,
+                top2_logprob: -2.05,
+                top1_minus_top2_margin: 2.0,
+            },
+        ];
+        let zstep_steps = vec![
+            StepTop2Logits {
+                top1_token: 10,
+                top1_logit: 20.0,
+                top2_token: 50,
+                top2_logit: 16.0,
+                top1_minus_top2_margin: 4.0,
+            },
+            StepTop2Logits {
+                top1_token: 11,
+                top1_logit: 19.0,
+                top2_token: 51,
+                top2_logit: 16.0,
+                top1_minus_top2_margin: 3.0,
+            },
+            StepTop2Logits {
+                top1_token: 99,
+                top1_logit: 18.125,
+                top2_token: 12,
+                top2_logit: 18.125,
+                top1_minus_top2_margin: 0.0,
+            },
+            StepTop2Logits {
+                top1_token: 13,
+                top1_logit: 17.0,
+                top2_token: 53,
+                top2_logit: 15.0,
+                top1_minus_top2_margin: 2.0,
+            },
+        ];
+        let report = greedy_match(
+            &[10, 11, 12, 13],
+            &vllm_steps,
+            &[10, 11, 99, 13],
+            &zstep_steps,
+        );
         assert_eq!(report.exact_prefix_match_tokens, 2);
         assert_eq!(report.total_tokens, 4);
         assert_eq!(report.exact_token_matches, 3);
         assert_eq!(report.exact_token_match_rate, 0.75);
         assert!(!report.all_matched);
         assert_eq!(report.first_mismatch_token_index, Some(2));
+        assert!((report.mean_top1_minus_top2_margin - 2.25).abs() < 1e-6);
+        assert_eq!(report.min_top1_minus_top2_margin, 0.0);
+        let diag = report.first_mismatch_diagnostics.expect("mismatch diag");
+        assert_eq!(diag.token_index, 2);
+        assert!(diag.prefix_identical_at_step);
+        assert_eq!(diag.expected_token, 12);
+        assert_eq!(diag.generated_token, 99);
+        assert_eq!(diag.zstep_top2.top2_token, 12);
     }
 
     #[test]

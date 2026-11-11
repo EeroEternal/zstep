@@ -232,6 +232,8 @@ class SeqResult:
     req_slot: int
     accepted_token: int
     accepted_logprob_bits: int
+    runner_up_token: int = -1
+    runner_up_logprob_bits: int = 0
 
 
 _LIBATOMIC = ctypes.CDLL("libatomic.so.1")
@@ -514,9 +516,12 @@ class StepResultView:
         )
         self.bridge._mapping[self.base : self.base + STEP_RESULT_HEADER_BYTES] = header
         for index, output in enumerate(outputs):
-            accepted = [output.accepted_token] + [-1] * 7
+            accepted = [output.accepted_token, output.runner_up_token] + [-1] * 6
             drafts = [-1] * 8
-            logprobs = [output.accepted_logprob_bits] + [0] * 7
+            logprobs = [
+                output.accepted_logprob_bits,
+                output.runner_up_logprob_bits,
+            ] + [0] * 6
             packed = struct.pack(
                 "<II8i8i8I",
                 output.req_slot,

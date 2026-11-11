@@ -298,6 +298,11 @@ pub struct StepResultHeader {
 
 /// Per-request output entry inside `StepResultSlot` (supports both 1-token
 /// standard decode and up to 6-token speculative verification).
+///
+/// When `num_accepted == 1`, `accepted_tokens[0]` and `accepted_logprobs_bits[0]`
+/// store the greedy argmax token and its IEEE-754 `f32` top-1 logit bits, while
+/// `accepted_tokens[1]` (when `>= 0`) and `accepted_logprobs_bits[1]` carry the
+/// global runner-up top-2 token and `f32` top-2 logit bits across all TP ranks.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeqStepOutput {

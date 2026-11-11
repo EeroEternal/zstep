@@ -239,6 +239,8 @@ class MicroStep:
                     req_slot=req_slot,
                     accepted_token=int(token),
                     accepted_logprob_bits=struct.unpack("<I", struct.pack("<f", logprob[0]))[0],
+                    runner_up_token=-1,
+                    runner_up_logprob_bits=0,
                 )
                 for req_slot, token, logprob in zip(
                     range(len(host_tokens)), host_tokens, host_logprobs, strict=True
