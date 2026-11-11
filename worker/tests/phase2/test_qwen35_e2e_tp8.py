@@ -161,18 +161,18 @@ def test_qwen35_35b_a3b_mode_b_tp8_greedy_parity() -> None:
                 assert diag is not None
                 assert diag["prefix_identical_at_step"] is True
                 assert diag["vllm_top2"] is not None
-                # When the prefix is still identical to vLLM (`single` mode, or `batched`/`chunked`
-                # if it has not diverged earlier from `single`), any BF16 argmax flip must be a
-                # razor-thin near-tie (`margin < 0.25`), never a confident logit mismatch.
+                # When the prefix is still identical to vLLM (`single` mode), any BF16 argmax flip
+                # must be within 2 BF16 ULPs at logit ~[16, 32) (`2 * 0.125 = 0.25`), never a
+                # confident logit mismatch.
                 if mode == "single":
-                    assert diag["vllm_top2"]["top1_minus_top2_margin"] < 0.25
-                    assert diag["zstep_top2"]["top1_minus_top2_margin"] < 0.25
+                    assert diag["vllm_top2"]["top1_minus_top2_margin"] <= 0.25
+                    assert diag["zstep_top2"]["top1_minus_top2_margin"] <= 0.25
         for pair_key in ("single_vs_batched_first_mismatch", "batched_vs_chunked_first_mismatch"):
             pair_diag = report_case[pair_key]
             if pair_diag is not None:
                 assert pair_diag["prefix_identical_at_step"] is True
-                assert pair_diag["left_top2"]["top1_minus_top2_margin"] < 0.25
-                assert pair_diag["right_top2"]["top1_minus_top2_margin"] < 0.25
+                assert pair_diag["left_top2"]["top1_minus_top2_margin"] <= 0.25
+                assert pair_diag["right_top2"]["top1_minus_top2_margin"] <= 0.25
 
     backward_expected = reference["cases"][0]["expected_greedy_token_ids"][:16]
     assert report["cases"][0]["single_generated_token_ids"][:16] == backward_expected
