@@ -408,6 +408,11 @@ class RuntimeLoop:
                         "runtime step triggered unexpected Triton JIT recompilation: "
                         + ", ".join(recompiled)
                     )
+                if self.args.rank == 0:
+                    print(
+                        f"TRITON_RECOMPILATIONS=0 WATCHED_KERNELS={len(spies)}",
+                        flush=True,
+                    )
         finally:
             if was_gc_enabled:
                 gc.enable()

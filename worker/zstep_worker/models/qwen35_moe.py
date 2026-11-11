@@ -178,12 +178,17 @@ class _Tp8ArgmaxShmChannel:
         world_size: int,
         device: torch.device,
         exchange_group: dist.ProcessGroup,
+        max_rows_per_step: int,
     ) -> None:
+        if max_rows_per_step <= 0:
+            raise ValueError("max_rows_per_step must be positive")
         self.name: str = name
         self.rank: int = rank
         self.world_size: int = world_size
         self.device: torch.device = device
-        self.total_bytes: int = 262_144  # 256 KiB aligned
+        self.max_rows_per_step: int = max_rows_per_step
+        unaligned_bytes = 256 + 4 * 8 * max_rows_per_step * 8
+        self.total_bytes: int = (unaligned_bytes + 4095) & ~4095
         self._closed: bool = False
         self._owns_unlink: bool = False
         self._shm_path: str = f"/dev/shm/{name}"
@@ -247,6 +252,7 @@ class _Tp8ArgmaxShmChannel:
             self.step_counter,
             self._dev_addr,
             local_max_vals.numel(),
+            self.max_rows_per_step,
             self.rank,
             self.world_size,
             vocab_per_rank,
@@ -382,6 +388,7 @@ class Qwen35MoeStepRunner:
             world_size=self.world_size,
             device=self.device,
             exchange_group=self.exchange_group,
+            max_rows_per_step=max(512, self.max_seqs),
         )
 
         # Load TP=8 weight slices directly from safetensors mmap

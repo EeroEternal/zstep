@@ -60,6 +60,7 @@ void launch_tp8_argmax_gather_shm_cuda(
     uint64_t* step_counter,
     std::uintptr_t host_device_address,
     int64_t num_rows,
+    int64_t max_rows_per_step,
     int rank,
     int world_size,
     int vocab_per_rank,
@@ -90,10 +91,12 @@ void launch_tp8_argmax_gather_shm(
     torch::Tensor step_counter,
     std::uintptr_t host_device_address,
     int64_t num_rows,
+    int64_t max_rows_per_step,
     int64_t rank,
     int64_t world_size,
     int64_t vocab_per_rank,
     std::uintptr_t stream_handle) {
+    TORCH_CHECK(num_rows <= max_rows_per_step, "num_rows exceeds max_rows_per_step");
     launch_tp8_argmax_gather_shm_cuda(
         local_max_vals.data_ptr<float>(),
         local_max_ids.data_ptr<int32_t>(),
@@ -102,6 +105,7 @@ void launch_tp8_argmax_gather_shm(
         reinterpret_cast<uint64_t*>(step_counter.data_ptr<int64_t>()),
         host_device_address,
         num_rows,
+        max_rows_per_step,
         static_cast<int>(rank),
         static_cast<int>(world_size),
         static_cast<int>(vocab_per_rank),
@@ -219,16 +223,16 @@ __global__ void tp8_argmax_gather_shm_kernel(
     uint64_t* __restrict__ step_counter,
     char* __restrict__ host_base,
     int64_t num_rows,
+    int64_t max_rows_per_step,
     int rank,
     int world_size,
     int vocab_per_rank) {
     constexpr int kSlots = 4;
     constexpr int kMaxRanks = 8;
-    constexpr int64_t kMaxRowsPerStep = 512;
     // Layout in SHM:
     // [0 .. 64):    ready_flags[8] (uint64_t)
     // [64 .. 128):  done_flags[8]  (uint64_t)
-    // [256 .. ):    4 slots * 8 ranks * 512 rows * sizeof(ValIdxPair) (131 KiB total)
+    // [256 .. ):    4 slots * 8 ranks * max_rows_per_step * sizeof(ValIdxPair)
     uint64_t* ready_flags = reinterpret_cast<uint64_t*>(host_base);
     uint64_t* done_flags = reinterpret_cast<uint64_t*>(host_base + 64);
 
@@ -253,8 +257,8 @@ __global__ void tp8_argmax_gather_shm_kernel(
     }
 
     ValIdxPair* slot_pairs = reinterpret_cast<ValIdxPair*>(host_base + 256)
-        + static_cast<int64_t>(slot) * (kMaxRanks * kMaxRowsPerStep);
-    ValIdxPair* my_pairs = slot_pairs + static_cast<int64_t>(rank) * kMaxRowsPerStep;
+        + static_cast<int64_t>(slot) * (kMaxRanks * max_rows_per_step);
+    ValIdxPair* my_pairs = slot_pairs + static_cast<int64_t>(rank) * max_rows_per_step;
 
     const int base_tok = rank * vocab_per_rank;
     for (int64_t r = threadIdx.x; r < num_rows; r += blockDim.x) {
@@ -280,7 +284,9 @@ __global__ void tp8_argmax_gather_shm_kernel(
             float best_val = -1.0e38f;
             int32_t best_tok = 0;
             for (int peer = 0; peer < world_size; ++peer) {
-                const ValIdxPair p = slot_pairs[static_cast<int64_t>(peer) * kMaxRowsPerStep + r];
+                const ValIdxPair p = slot_pairs[
+                    static_cast<int64_t>(peer) * max_rows_per_step + r
+                ];
                 if (p.val > best_val || (p.val == best_val && p.tok < best_tok)) {
                     best_val = p.val;
                     best_tok = p.tok;
@@ -325,6 +331,7 @@ void launch_tp8_argmax_gather_shm_cuda(
     uint64_t* step_counter,
     std::uintptr_t host_device_address,
     int64_t num_rows,
+    int64_t max_rows_per_step,
     int rank,
     int world_size,
     int vocab_per_rank,
@@ -338,6 +345,7 @@ void launch_tp8_argmax_gather_shm_cuda(
         step_counter,
         reinterpret_cast<char*>(host_device_address),
         num_rows,
+        max_rows_per_step,
         rank,
         world_size,
         vocab_per_rank);
@@ -354,7 +362,7 @@ def get_qwen35_cuda_ext():
     if _QWEN35_EXT is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _QWEN35_EXT = load_inline(
-            name="zstep_qwen35_ops_sm120_v2_ext",
+            name="zstep_qwen35_ops_sm120_v3_ext",
             cpp_sources=[_MOE_ALIGN_CPP],
             cuda_sources=[_MOE_ALIGN_CUDA],
             functions=["launch_moe_align_block_size", "launch_tp8_argmax_gather_shm"],

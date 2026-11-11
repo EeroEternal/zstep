@@ -282,3 +282,28 @@ def test_sparse_moe_tp8_matches_reference_formula() -> None:
         ref[r] = (acc + sh_scale * sh_o.float()).to(torch.bfloat16)
 
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+def test_tp8_argmax_rejects_rows_above_capacity() -> None:
+    device = torch.device("cuda", 0)
+    ext = qwen35_ops.get_qwen35_cuda_ext()
+    local_max_vals = torch.zeros(1, dtype=torch.float32, device=device)
+    local_max_ids = torch.zeros(1, dtype=torch.int32, device=device)
+    out_tokens = torch.zeros(1, dtype=torch.int32, device=device)
+    out_logprob_bits = torch.zeros(1, dtype=torch.int32, device=device)
+    step_counter = torch.zeros(1, dtype=torch.int64, device=device)
+    with pytest.raises(RuntimeError, match="num_rows exceeds max_rows_per_step"):
+        ext.launch_tp8_argmax_gather_shm(
+            local_max_vals,
+            local_max_ids,
+            out_tokens,
+            out_logprob_bits,
+            step_counter,
+            0,
+            513,
+            512,
+            0,
+            8,
+            32768,
+            torch.cuda.current_stream(device).cuda_stream,
+        )
