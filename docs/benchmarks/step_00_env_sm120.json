@@ -1,0 +1,18 @@
+{
+  "step": "0.1",
+  "testbed": "8x NVIDIA RTX 5090 (sm_120, Dual-Socket Xeon Gold 6530, PCIe Gen5 x16, 4 SNC NUMA nodes, P2P=CNS)",
+  "torch_version": "2.14.0a0+4fdf77b940.nv26.08",
+  "cuda_version": "13.4",
+  "triton_version": "3.8.0",
+  "flashinfer_version": "0.7.1+lil.cu134.sm120.g79819b112f8b",
+  "has_flashinfer_b12x": true,
+  "has_cutlass_dsl": true,
+  "direct_bar1_p2p_available": false,
+  "recommended_allreduce_backend": "numa_host_mapped_ddio_allreduce",
+  "gpu_count": 8,
+  "device_name": "NVIDIA GeForce RTX 5090",
+  "sm_count_per_gpu": 170,
+  "total_vram_gib_per_gpu": 31.36,
+  "peer_to_peer_read": "CNS for every distinct GPU pair",
+  "can_device_access_peer": false
+}

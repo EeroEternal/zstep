@@ -1,0 +1,50 @@
+{
+  "step": "0.2",
+  "device": "NVIDIA GeForce RTX 5090",
+  "compute_capability": "12.0",
+  "torch_version": "2.14.0a0+4fdf77b940.nv26.08",
+  "hidden_size": 5120,
+  "out_features": 2048,
+  "rmsnorm_mxfp8_cos_sim": {
+    "6": 0.999647,
+    "17": 0.999647,
+    "48": 0.999648,
+    "192": 0.999649,
+    "4096": 0.999649
+  },
+  "rmsnorm_mxfp8_latency_us": {
+    "6": 3.4,
+    "17": 3.27,
+    "48": 3.22,
+    "192": 4.0,
+    "4096": 15.52
+  },
+  "int64_large_offset_passed": true,
+  "zero_jit_recompilation_passed": true,
+  "b12x_mxfp8_linear_5120x2048": {
+    "6": {
+      "cos_sim": 1.0,
+      "latency_us": 15.52,
+      "tflops": 8.11,
+      "effective_gbps": 702.3
+    },
+    "48": {
+      "cos_sim": 0.99964,
+      "latency_us": 22.17,
+      "tflops": 45.4,
+      "effective_gbps": 518.8
+    },
+    "192": {
+      "cos_sim": 0.999643,
+      "latency_us": 23.36,
+      "tflops": 172.35,
+      "effective_gbps": 580.7
+    },
+    "4096": {
+      "cos_sim": 0.999642,
+      "latency_us": 194.06,
+      "tflops": 442.65,
+      "effective_gbps": 358.3
+    }
+  }
+}

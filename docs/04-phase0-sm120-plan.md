@@ -20,6 +20,7 @@
    * **关键分支判定**：
      * **情况 1（双 PCIe Gen5 Switch 挂载在双路 CPU 下，每 4 卡同 Switch `PIX`/`PXB`，跨组 `SYS`）**：8 卡 AllReduce 必须采用 **Two-Level Hierarchical（Switch 内 4 卡 P2P 直接规约 + 跨 NUMA 仅传 1 份规约值）**，或者对比 `TP=8, EP=8` 与 `TP=4, PP=2` 的实测延迟。
      * **情况 2（8 卡均支持 P2P BAR1 访问）**：直接启用全连接 One-Shot / Two-Shot P2P AllReduce。
+     * **情况 3（实测：任意两卡 `nvidia-smi topo -p2p r = CNS`，`can_device_access_peer=False`）**：CUDA IPC / BAR1 P2P 不可用，`b12x.comm.pcie` 也无法建立通道；使用 POSIX `/dev/shm` + `cudaHostRegisterMapped` 的 Host-Mapped Two-Shot AllReduce，NCCL 走主机 SHM 传输。
 2. **锁定 Python / CUDA `sm_120` 编译环境**（必须使用独立 `.venv`）：
    * **CUDA Toolkit**：`>= 12.8`（推荐 **CUDA 12.9 / 13.0**，完整支持 `sm_120` `mma.sync.aligned.block_scale` NVFP4/MXFP4/MXFP8 PTX 指令）。
    * **核心包**：PyTorch (`cu128`+)、`nvidia-cutlass-dsl`、`triton` (>= 3.3 支持 `sm_120` TMA 与 FP8/FP4)、`flashinfer-python[b12x]`。
@@ -85,13 +86,13 @@
 ## Step 0.5 — mHC 残差、Engram 查表与 8 卡 PCIe Gen5 AllReduce（Day 9–10）
 
 ### 验证动作
-1. **`test_04_mhc_and_engram.py`**：
-   * 用 Triton 实现 `mhc_apply_pre_quantize` 与 `mhc_shifted_post_pre_norm` 多流残差融合算子；
-   * 实现 Engram FP8/E8M0 查表：实测对比 **`VRAM Sharded`（分片常驻 8 张 6000D 显存）** 与 **`Host Pinned UVA`（驻留主机内存走 PCIe 5.0 读取）** 的延迟，确定默认策略。
+1. **`test_04_mhc_and_engram_sm120.py`**：
+   * 验证 `b12x` mHC `post_pre` 多流残差融合算子；
+   * 实现 Engram FP8/E8M0 查表：实测对比 **`VRAM Sharded`** 与 **`Host Pinned UVA`** 的延迟，并验证超过 `2^31` 字节偏移与动态 `M` 零重编译。
 2. **`test_05_pcie_allreduce_8gpu.py`（决定多卡效率的关键战役）**：
-   * 编写 `worker/csrc/comm_pcie_sm120.cu`，测试 8 张 RTX 6000D 在张量大小 `16 KB ~ 8 MB`（对应 `1..800` tokens × `5120` BF16）下的：
-     * 默认 `torch.distributed` NCCL Ring / Tree AllReduce 延迟（含 CUDA Graph 捕获）；
-     * 自定义 PCIe P2P Two-Shot / Hierarchical AllReduce 延迟（含 CUDA Graph 捕获）。
+   * 在 `worker/zstep_worker/kernels_sm120/shm_allreduce.py` 内联编译 CUDA Host-Mapped Two-Shot AllReduce，测试 `M ∈ {6,48,192,4096} × 5120 BF16`（`60 KiB ~ 40.96 MiB`）；
+   * 对比 `torch.distributed` NCCL 与自定义 SHM AllReduce 的数值、CUDA Graph replay、单次延迟和 80 次通信预算；
+   * 显式探测 `b12x.comm.pcie`，在 `CNS` 上记录其 CUDA-IPC 通道不可用，而不是把失败实现计入性能对比。
 
 ---
 

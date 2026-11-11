@@ -290,6 +290,9 @@ def run_step_04_suite() -> dict[str, object]:
                 )
             )
     cases.append(
+        _run_attention_case(mode="verify", batch=1, q_len=6, kv_len=8192, device=device)
+    )
+    cases.append(
         _run_attention_case(mode="verify", batch=8, q_len=6, kv_len=8192, device=device)
     )
     cases.append(
