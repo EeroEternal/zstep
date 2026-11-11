@@ -1,0 +1,19 @@
+[package]
+name = "zs-server"
+description = "zstep master control daemon: HTTP server, tokenizer, Engram preprocessor, and SHM event loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "zstep"
+path = "src/main.rs"
+
+[dependencies]
+zs-kv = { path = "../zs-kv" }
+zs-scheduler = { path = "../zs-scheduler" }
+zs-wire = { path = "../zs-wire" }
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "zs-kv"
+description = "RAII paged allocator for DeepSeek-V4.1 FlatKV 4-group cache and SWA bounded replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

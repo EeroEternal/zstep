@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zs-wire",
+    "crates/zs-kv",
+    "crates/zs-scheduler",
+    "crates/zs-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
