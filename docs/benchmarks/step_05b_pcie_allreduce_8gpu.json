@@ -2,14 +2,24 @@
   "step": "0.5b",
   "device": "NVIDIA GeForce RTX 5090",
   "compute_capability": "12.0",
-  "torch_version": "2.14.0a0+4fdf77b940.nv26.08",
+  "torch_version": "2.14.0+cu130",
   "world_size": 8,
+  "worker_numa_nodes": [
+    0,
+    0,
+    0,
+    1,
+    2,
+    2,
+    2,
+    3
+  ],
   "hidden_size": 5120,
   "dtype": "bfloat16",
   "direct_p2p_available": false,
-  "nccl_transport": "host SHM with NCCL P2P disabled by topology",
+  "nccl_transport": "degraded host SHM fallback (can_device_access_peer=0 across all 8x8 pairs)",
   "host_mapped_shm": {
-    "algorithm": "two-shot reduce-scatter/all-gather",
+    "algorithm": "two-shot reduce-scatter/all-gather with per-rank NUMA first-touch",
     "accumulation": "FP32 with one BF16 rounding",
     "blocks": 32,
     "threads": 256,
@@ -26,17 +36,22 @@
           "max_abs_error": 0.0
         },
         "monotonic_graph_counter_passed": true,
-        "latency_us": 72.529,
-        "80_call_budget_ms": 5.8023,
+        "latency_us": 65.376,
+        "p50_us": 65.155,
+        "p95_us": 69.127,
+        "p99_us": 69.835,
+        "80_call_budget_ms": 5.2301,
+        "80_call_p50_ms": 5.2124,
+        "80_call_p99_ms": 5.5868,
         "rank_latencies_us": [
-          72.529,
-          72.505,
-          72.5,
-          72.432,
-          72.511,
-          72.426,
-          72.517,
-          72.476
+          65.258,
+          65.209,
+          65.28,
+          65.211,
+          65.268,
+          65.249,
+          65.252,
+          65.237
         ]
       },
       "48": {
@@ -50,17 +65,22 @@
           "max_abs_error": 0.0
         },
         "monotonic_graph_counter_passed": true,
-        "latency_us": 126.307,
-        "80_call_budget_ms": 10.1045,
+        "latency_us": 150.747,
+        "p50_us": 150.187,
+        "p95_us": 152.562,
+        "p99_us": 153.041,
+        "80_call_budget_ms": 12.0597,
+        "80_call_p50_ms": 12.015,
+        "80_call_p99_ms": 12.2433,
         "rank_latencies_us": [
-          126.265,
-          126.292,
-          126.267,
-          126.307,
-          126.206,
-          126.179,
-          126.264,
-          126.247
+          150.608,
+          150.58,
+          150.605,
+          150.603,
+          150.573,
+          150.052,
+          150.608,
+          150.562
         ]
       },
       "192": {
@@ -74,17 +94,22 @@
           "max_abs_error": 0.0
         },
         "monotonic_graph_counter_passed": true,
-        "latency_us": 240.432,
-        "80_call_budget_ms": 19.2345,
+        "latency_us": 188.229,
+        "p50_us": 187.492,
+        "p95_us": 190.452,
+        "p99_us": 191.468,
+        "80_call_budget_ms": 15.0583,
+        "80_call_p50_ms": 14.9994,
+        "80_call_p99_ms": 15.3174,
         "rank_latencies_us": [
-          240.329,
-          240.392,
-          240.352,
-          240.432,
-          240.389,
-          240.062,
-          240.411,
-          240.279
+          188.092,
+          188.104,
+          188.139,
+          188.138,
+          188.066,
+          188.097,
+          188.16,
+          187.715
         ]
       },
       "4096": {
@@ -98,17 +123,22 @@
           "max_abs_error": 0.0
         },
         "monotonic_graph_counter_passed": true,
-        "latency_us": 5922.638,
-        "80_call_budget_ms": 473.8111,
+        "latency_us": 4274.534,
+        "p50_us": 4274.363,
+        "p95_us": 4289.518,
+        "p99_us": 4292.745,
+        "80_call_budget_ms": 341.9627,
+        "80_call_p50_ms": 341.949,
+        "80_call_p99_ms": 343.4196,
         "rank_latencies_us": [
-          5921.268,
-          5920.22,
-          5921.45,
-          5921.068,
-          5922.21,
-          5922.111,
-          5921.983,
-          5922.638
+          4273.609,
+          4273.747,
+          4273.598,
+          4273.9,
+          4273.678,
+          4273.49,
+          4273.293,
+          4273.489
         ]
       }
     }
@@ -133,17 +163,22 @@
           "cos_sim": 0.99999154,
           "max_abs_error": 0.00390625
         },
-        "latency_us": 50.782,
-        "80_call_budget_ms": 4.0626,
+        "latency_us": 52.547,
+        "p50_us": 52.416,
+        "p95_us": 53.59,
+        "p99_us": 56.698,
+        "80_call_budget_ms": 4.2038,
+        "80_call_p50_ms": 4.1932,
+        "80_call_p99_ms": 4.5358,
         "rank_latencies_us": [
-          50.782,
-          50.254,
-          50.599,
-          49.91,
-          50.707,
-          50.252,
-          50.681,
-          50.653
+          52.422,
+          52.406,
+          52.215,
+          52.496,
+          52.414,
+          52.338,
+          52.509,
+          52.444
         ]
       },
       "48": {
@@ -156,17 +191,22 @@
           "cos_sim": 0.99999177,
           "max_abs_error": 0.00390625
         },
-        "latency_us": 127.116,
-        "80_call_budget_ms": 10.1693,
+        "latency_us": 110.882,
+        "p50_us": 106.802,
+        "p95_us": 145.69,
+        "p99_us": 155.33,
+        "80_call_budget_ms": 8.8706,
+        "80_call_p50_ms": 8.5441,
+        "80_call_p99_ms": 12.4264,
         "rank_latencies_us": [
-          126.448,
-          126.784,
-          127.074,
-          126.642,
-          127.116,
-          126.901,
-          119.591,
-          127.038
+          110.753,
+          110.746,
+          110.541,
+          110.764,
+          110.654,
+          110.701,
+          110.79,
+          110.703
         ]
       },
       "192": {
@@ -179,17 +219,22 @@
           "cos_sim": 0.99999171,
           "max_abs_error": 0.00390625
         },
-        "latency_us": 154.736,
-        "80_call_budget_ms": 12.3789,
+        "latency_us": 151.135,
+        "p50_us": 151.008,
+        "p95_us": 151.982,
+        "p99_us": 153.152,
+        "80_call_budget_ms": 12.0908,
+        "80_call_p50_ms": 12.0806,
+        "80_call_p99_ms": 12.2521,
         "rank_latencies_us": [
-          154.603,
-          154.637,
-          154.658,
-          154.152,
-          154.651,
-          154.648,
-          154.736,
-          153.742
+          151.083,
+          150.918,
+          150.861,
+          151.001,
+          150.956,
+          151.016,
+          151.052,
+          151.038
         ]
       },
       "4096": {
@@ -202,17 +247,22 @@
           "cos_sim": 0.99999166,
           "max_abs_error": 0.0078125
         },
-        "latency_us": 6302.987,
-        "80_call_budget_ms": 504.239,
+        "latency_us": 6206.324,
+        "p50_us": 6206.572,
+        "p95_us": 6233.32,
+        "p99_us": 6243.15,
+        "80_call_budget_ms": 496.5059,
+        "80_call_p50_ms": 496.5257,
+        "80_call_p99_ms": 499.452,
         "rank_latencies_us": [
-          6301.761,
-          6298.713,
-          6299.742,
-          6301.704,
-          6300.981,
-          6301.045,
-          6301.167,
-          6302.987
+          6205.205,
+          6205.071,
+          6205.206,
+          6205.595,
+          6204.827,
+          6204.641,
+          6205.083,
+          6204.909
         ]
       }
     }

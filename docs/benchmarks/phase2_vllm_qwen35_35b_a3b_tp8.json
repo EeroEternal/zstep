@@ -1,0 +1,93 @@
+{
+  "engine": "vllm",
+  "engine_version": "0.33.0",
+  "model": "Qwen/Qwen3.5-35B-A3B",
+  "dtype": "bfloat16",
+  "tp_size": 8,
+  "max_model_len": 32768,
+  "gpu_memory_utilization": 0.85,
+  "topology": "8x32GB sm_120 PCIe non-P2P 4-NUMA [0,0,0,1,2,2,2,3]",
+  "profiles": {
+    "in512_out256": {
+      "input_len": 512,
+      "output_len": 256,
+      "tiers": {
+        "1": {
+          "concurrency": 1,
+          "completed": 8,
+          "duration_s": 11.087,
+          "output_throughput_tok_s": 184.72,
+          "total_token_throughput_tok_s": 554.16,
+          "mean_ttft_ms": 86.09,
+          "median_ttft_ms": 74.51,
+          "p99_ttft_ms": 155.87,
+          "mean_tpot_ms": 5.09,
+          "median_tpot_ms": 5.04,
+          "p99_tpot_ms": 5.38
+        },
+        "16": {
+          "concurrency": 16,
+          "completed": 48,
+          "duration_s": 7.351,
+          "output_throughput_tok_s": 1671.63,
+          "total_token_throughput_tok_s": 5014.88,
+          "mean_ttft_ms": 397.21,
+          "median_ttft_ms": 392.38,
+          "p99_ttft_ms": 652.58,
+          "mean_tpot_ms": 8.02,
+          "median_tpot_ms": 7.89,
+          "p99_tpot_ms": 9.40
+        },
+        "128": {
+          "concurrency": 128,
+          "completed": 256,
+          "duration_s": 20.032,
+          "output_throughput_tok_s": 3271.56,
+          "total_token_throughput_tok_s": 9814.67,
+          "mean_ttft_ms": 1403.22,
+          "median_ttft_ms": 1240.50,
+          "p99_ttft_ms": 3507.39,
+          "mean_tpot_ms": 33.25,
+          "median_tpot_ms": 34.83,
+          "p99_tpot_ms": 37.87
+        }
+      }
+    },
+    "in1024_out256": {
+      "input_len": 1024,
+      "output_len": 256,
+      "tiers": {
+        "1": {
+          "concurrency": 1,
+          "completed": 20,
+          "output_throughput_tok_s": 181.96,
+          "total_token_throughput_tok_s": 917.22,
+          "mean_ttft_ms": 166.56,
+          "median_ttft_ms": 143.35,
+          "mean_tpot_ms": 4.86,
+          "mean_itl_ms": 4.86
+        },
+        "32": {
+          "concurrency": 32,
+          "completed": 200,
+          "output_throughput_tok_s": 1834.83,
+          "total_token_throughput_tok_s": 9248.90,
+          "mean_ttft_ms": 1168.22,
+          "median_ttft_ms": 1091.90,
+          "mean_tpot_ms": 11.92,
+          "mean_itl_ms": 12.02
+        },
+        "128": {
+          "concurrency": 128,
+          "completed": 400,
+          "output_throughput_tok_s": 2939.12,
+          "total_token_throughput_tok_s": 14815.29,
+          "mean_ttft_ms": 1985.87,
+          "median_ttft_ms": 1355.88,
+          "mean_tpot_ms": 33.77,
+          "mean_itl_ms": 33.84
+        }
+      }
+    }
+  }
+}

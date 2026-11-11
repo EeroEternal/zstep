@@ -23,7 +23,7 @@
 //!
 //! See `docs/03-shm-protocol.md` for the full memory map and barrier rules.
 
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 
 /// ASCII `"ZSTEP_V1"` in little-endian (`0x5A53_5445_505F_5631`).
 pub const ZSTEP_SHM_MAGIC: u64 = 0x5A53_5445_505F_5631;
@@ -93,6 +93,10 @@ pub struct WorkerSlotState {
     pub error_code: AtomicU32,
     pub free_vram_mb: AtomicU32,
     pub total_vram_mb: AtomicU32,
+    /// Host NUMA node (`>= 0`) detected from `/sys/bus/pci/devices/<bdf>/numa_node`
+    /// and pinned via `sched_setaffinity`, or `-1` when the platform exposes no NUMA affinity.
+    pub numa_node: AtomicI32,
+    pub _pad_u32: u32,
     pub _pad: [u64; 2],
 }
 
@@ -105,17 +109,17 @@ pub struct StepHeader {
     pub step_id: AtomicU64,
     pub opcode: u32,
     pub num_seqs: u32,
-    /// Stage 1 (Layers 0..19) active token rows (`T_enc`).
+    /// Stage 1 active token rows (`T_enc`).
     pub num_encoder_tokens: u32,
     /// Stage 1 padded CUDA Graph bucket (`0` selects eager execution).
     pub encoder_graph_bucket: u32,
-    /// Stage 3 (Layers 21..39) narrowed active rows (`T_dec`) after Layer 20 CED cut.
+    /// Stage 2 narrowed active rows (`T_dec`) entering the second half / LM head.
     pub num_decoder_rows: u32,
-    /// Stage 3 padded CUDA Graph bucket (`0` selects eager execution).
+    /// Stage 2 padded CUDA Graph bucket (`0` selects eager execution).
     pub decoder_graph_bucket: u32,
     /// Rows entering the target LM head / verifier (`<= num_decoder_rows`).
     pub num_sample_rows: u32,
-    /// `1` when executing DSpark 6-token speculative verification + next draft.
+    /// `1` when executing speculative verification + next draft.
     pub is_dspark_verify: u32,
     pub flags: u32,
     pub _reserved: [u32; 3],
@@ -152,6 +156,57 @@ pub struct ShmGeometry {
     pub max_pages_per_seq: u32,
     pub page_block_tokens: u32,
     pub spec_verify_width: u32,
+}
+
+/// Probed device and model memory parameters used to derive [`ShmGeometry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VramGeometrySpec {
+    pub world_size: u32,
+    pub per_gpu_vram_mb: u32,
+    pub reserved_weights_and_workspace_mb: u32,
+    pub kv_bytes_per_token_per_gpu: u32,
+    pub max_seqs: u32,
+    pub max_step_tokens: u32,
+    pub max_decoder_rows: u32,
+    pub page_block_tokens: u32,
+    pub spec_verify_width: u32,
+}
+
+impl ShmGeometry {
+    /// Derive shared-memory plan geometry from a probed per-GPU VRAM capacity, per-GPU weight
+    /// + workspace reservation, and per-token KV footprint across all paged attention layers.
+    pub fn from_vram_budget(spec: VramGeometrySpec) -> Option<Self> {
+        if spec.world_size == 0
+            || spec.world_size as usize > MAX_WORKERS
+            || spec.max_seqs == 0
+            || spec.max_step_tokens == 0
+            || spec.max_decoder_rows == 0
+            || spec.max_decoder_rows > spec.max_step_tokens
+            || spec.page_block_tokens == 0
+            || spec.kv_bytes_per_token_per_gpu == 0
+            || spec.per_gpu_vram_mb <= spec.reserved_weights_and_workspace_mb
+        {
+            return None;
+        }
+        let kv_budget_bytes =
+            u64::from(spec.per_gpu_vram_mb - spec.reserved_weights_and_workspace_mb) * 1024 * 1024;
+        let bytes_per_page =
+            u64::from(spec.kv_bytes_per_token_per_gpu) * u64::from(spec.page_block_tokens);
+        let total_pages = (kv_budget_bytes / bytes_per_page) as u32;
+        if total_pages == 0 {
+            return None;
+        }
+        let max_pages_per_seq = total_pages.min(4096);
+        Some(Self {
+            world_size: spec.world_size,
+            max_seqs: spec.max_seqs,
+            max_step_tokens: spec.max_step_tokens,
+            max_decoder_rows: spec.max_decoder_rows,
+            max_pages_per_seq,
+            page_block_tokens: spec.page_block_tokens,
+            spec_verify_width: spec.spec_verify_width,
+        })
+    }
 }
 
 const fn align_up(offset: usize, align: usize) -> usize {
@@ -242,7 +297,7 @@ pub struct StepResultHeader {
 }
 
 /// Per-request output entry inside `StepResultSlot` (supports both 1-token
-/// standard decode and up to 6-token DSpark speculative verification).
+/// standard decode and up to 6-token speculative verification).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeqStepOutput {
@@ -270,21 +325,101 @@ mod tests {
     }
 
     #[test]
-    fn dsv41_flash_8x6000d_geometry_fits_budget() {
-        let geom = ShmGeometry {
+    fn layout_invariants_hold_for_probed_vram_profiles() {
+        // Verified 8x32GB profile (e.g. Qwen3.5-35B-A3B TP=8: ~8.5 GiB weights + ~3.5 GiB workspace,
+        // 10 full-attention GQA layers * 2 KV heads * 256 dim * 2B / TP-replicated = 10 KiB/tok/GPU).
+        let geom_32g = ShmGeometry::from_vram_budget(VramGeometrySpec {
             world_size: 8,
-            max_seqs: 64,
-            max_step_tokens: 16384,
-            max_decoder_rows: 8192,
-            max_pages_per_seq: 2048,
+            per_gpu_vram_mb: 32_607,
+            reserved_weights_and_workspace_mb: 12_288,
+            kv_bytes_per_token_per_gpu: 10_240,
+            max_seqs: 128,
+            max_step_tokens: 8_192,
+            max_decoder_rows: 8_192,
             page_block_tokens: 64,
-            spec_verify_width: 6,
-        };
-        let layout = StepPlanLayout::compute(geom);
-        assert_eq!(layout.token_ids_offset % 256, 0);
-        assert_eq!(layout.global_kv_page_table_offset % 256, 0);
-        assert_eq!(layout.total_slot_bytes % 4096, 0);
-        // Single StepPlanSlot for 64 seqs @ 128K ctx is exactly 980 KiB (1,003,520 bytes)
-        assert_eq!(layout.total_slot_bytes, 1_003_520);
+            spec_verify_width: 4,
+        })
+        .expect("valid 32GB geometry");
+        assert!(geom_32g.max_pages_per_seq > 0);
+
+        for geom in [
+            geom_32g,
+            ShmGeometry {
+                world_size: 1,
+                max_seqs: 1,
+                max_step_tokens: 7,
+                max_decoder_rows: 3,
+                max_pages_per_seq: 5,
+                page_block_tokens: 64,
+                spec_verify_width: 1,
+            },
+        ] {
+            let layout = StepPlanLayout::compute(geom);
+            let regions = [
+                (layout.header_offset, std::mem::size_of::<StepHeader>()),
+                (layout.token_ids_offset, geom.max_step_tokens as usize * 4),
+                (layout.positions_offset, geom.max_step_tokens as usize * 4),
+                (
+                    layout.req_slot_ids_offset,
+                    geom.max_step_tokens as usize * 4,
+                ),
+                (layout.replay_mask_offset, geom.max_step_tokens as usize),
+                (
+                    layout.engram_prev_window_offset,
+                    geom.max_step_tokens as usize * 12,
+                ),
+                (
+                    layout.narrow_keep_indices_offset,
+                    geom.max_decoder_rows as usize * 4,
+                ),
+                (
+                    layout.sample_row_indices_offset,
+                    geom.max_decoder_rows as usize * 4,
+                ),
+                (layout.seq_lens_offset, geom.max_seqs as usize * 4),
+                (
+                    layout.query_start_loc_offset,
+                    (geom.max_seqs as usize + 1) * 4,
+                ),
+                (
+                    layout.global_kv_page_table_offset,
+                    geom.max_seqs as usize * geom.max_pages_per_seq as usize * 4,
+                ),
+                (layout.swa_page_table_offset, geom.max_seqs as usize * 16),
+                (
+                    layout.compressor_slot_ids_offset,
+                    geom.max_seqs as usize * 4,
+                ),
+                (layout.temperatures_offset, geom.max_seqs as usize * 4),
+            ];
+            for window in regions.windows(2) {
+                let (prev_off, prev_len) = window[0];
+                let (next_off, _) = window[1];
+                assert!(
+                    prev_off + prev_len <= next_off,
+                    "overlapping SHM slices: {prev_off}+{prev_len} > {next_off}"
+                );
+                assert_eq!(next_off % 256, 0, "payload slice must be 256B aligned");
+            }
+            let (last_off, last_len) = *regions.last().expect("regions nonempty");
+            assert!(last_off + last_len <= layout.total_slot_bytes);
+            assert_eq!(layout.total_slot_bytes % 4096, 0);
+        }
+
+        // Insufficient VRAM budget must return None cleanly.
+        assert!(
+            ShmGeometry::from_vram_budget(VramGeometrySpec {
+                world_size: 8,
+                per_gpu_vram_mb: 16_384,
+                reserved_weights_and_workspace_mb: 20_000,
+                kv_bytes_per_token_per_gpu: 10_240,
+                max_seqs: 32,
+                max_step_tokens: 1024,
+                max_decoder_rows: 1024,
+                page_block_tokens: 64,
+                spec_verify_width: 1,
+            })
+            .is_none()
+        );
     }
 }

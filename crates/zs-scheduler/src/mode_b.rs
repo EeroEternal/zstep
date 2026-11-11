@@ -37,7 +37,7 @@ use zs_wire::{
 const INHERITED_PLAN_FD_BASE: i32 = 100;
 const INHERITED_DONE_FD_BASE: i32 = 200;
 
-/// Explicit Python worker and micro-step launch parameters.
+/// Explicit Python worker and micro-step / real-model launch parameters.
 #[derive(Debug, Clone)]
 pub struct WorkerLaunchConfig {
     pub python_executable: PathBuf,
@@ -48,6 +48,8 @@ pub struct WorkerLaunchConfig {
     pub router_top_k: u32,
     pub allreduce_blocks: u32,
     pub allreduce_threads: u32,
+    pub model_dir: Option<PathBuf>,
+    pub num_kv_pages: u32,
 }
 
 /// Complete Mode B run configuration; every behavioral parameter is explicit.
@@ -147,6 +149,7 @@ pub struct ModeBMetrics {
     pub control_plane_ipc_us: u64,
     pub publish_signal_us: u64,
     pub accepted_tokens: u64,
+    pub worker_numa_nodes: Vec<i32>,
     pub round_trip_samples_us: Vec<u64>,
     pub control_plane_samples_us: Vec<u64>,
 }
@@ -165,11 +168,18 @@ impl ModeBMetrics {
     }
 
     pub fn to_json_pretty(&self) -> String {
+        let numa_json = self
+            .worker_numa_nodes
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             concat!(
                 "{{\n",
                 "  \"mode\": \"B\",\n",
                 "  \"world_size\": {},\n",
+                "  \"worker_numa_nodes\": [{}],\n",
                 "  \"steps\": {},\n",
                 "  \"init_wall_us\": {},\n",
                 "  \"total_wall_us\": {},\n",
@@ -191,6 +201,7 @@ impl ModeBMetrics {
                 "}}\n"
             ),
             self.world_size,
+            numa_json,
             self.steps,
             self.init_wall_us,
             self.total_wall_us,
@@ -274,6 +285,11 @@ impl ModeBCoordinator {
         let init_start = Instant::now();
         self.wait_all(0, self.config.ready_timeout, true)?;
         let init_wall_us = duration_us(init_start.elapsed());
+        let mut worker_numa_nodes = Vec::with_capacity(self.config.geometry.world_size as usize);
+        for rank in 0..self.config.geometry.world_size as usize {
+            let state = self.arena.worker_state(rank)?;
+            worker_numa_nodes.push(state.numa_node.load(Ordering::Acquire));
+        }
         let wall_start = Instant::now();
         self.prepare_step(1, StepOpcode::NormalStep)?;
         let mut metrics = ModeBMetrics {
@@ -287,6 +303,7 @@ impl ModeBCoordinator {
             control_plane_ipc_us: 0,
             publish_signal_us: 0,
             accepted_tokens: 0,
+            worker_numa_nodes,
             round_trip_samples_us: Vec::with_capacity(self.config.steps as usize),
             control_plane_samples_us: Vec::with_capacity(self.config.steps as usize),
         };
@@ -337,6 +354,43 @@ impl ModeBCoordinator {
         self.workers.wait()?;
         metrics.total_wall_us = duration_us(wall_start.elapsed());
         Ok(metrics)
+    }
+
+    pub(crate) fn wait_workers_ready(&mut self) -> Result<(u64, Vec<i32>)> {
+        let init_start = Instant::now();
+        self.wait_all(0, self.config.ready_timeout, true)?;
+        let init_wall_us = duration_us(init_start.elapsed());
+        let mut worker_numa_nodes = Vec::with_capacity(self.config.geometry.world_size as usize);
+        for rank in 0..self.config.geometry.world_size as usize {
+            let state = self.arena.worker_state(rank)?;
+            worker_numa_nodes.push(state.numa_node.load(Ordering::Acquire));
+        }
+        Ok((init_wall_us, worker_numa_nodes))
+    }
+
+    pub(crate) fn config(&self) -> &ModeBConfig {
+        &self.config
+    }
+
+    pub(crate) fn plan_slot_mut(&mut self, step_id: u64) -> Result<zs_shm::StepPlanSlotMut<'_>> {
+        Ok(self.arena.plan_slot_mut(&self.layout, slot(step_id))?)
+    }
+
+    pub(crate) fn result_slot(&self, step_id: u64) -> Result<zs_shm::ResultSlot<'_>> {
+        Ok(self.arena.result_slot(&self.layout, slot(step_id))?)
+    }
+
+    pub(crate) fn publish_step(&mut self, step_id: u64) -> Result<()> {
+        self.publish_prepared(step_id)
+    }
+
+    pub(crate) fn wait_step_completed(&mut self, step_id: u64) -> Result<()> {
+        self.wait_all(step_id, self.config.step_timeout, false)
+    }
+
+    pub(crate) fn shutdown_and_wait(mut self, step_id: u64) -> Result<()> {
+        self.shutdown(step_id)?;
+        self.workers.wait()
     }
 
     fn prepare_step(&mut self, step_id: u64, opcode: StepOpcode) -> Result<()> {
@@ -490,6 +544,12 @@ fn spawn_workers(
             .arg(config.launch.allreduce_blocks.to_string())
             .arg("--allreduce-threads")
             .arg(config.launch.allreduce_threads.to_string())
+            .arg("--num-kv-pages")
+            .arg(config.launch.num_kv_pages.to_string());
+        if let Some(model_dir) = &config.launch.model_dir {
+            command.arg("--model-dir").arg(model_dir);
+        }
+        command
             .env("PYTHONPATH", &config.launch.worker_root)
             .env("PYTHONUNBUFFERED", "1")
             .env("NCCL_P2P_DISABLE", "1")

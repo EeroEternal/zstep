@@ -18,31 +18,86 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Verify Python StepPlanLayout offsets match Rust zs-wire byte-for-byte."""
+"""Verify Python StepPlanLayout invariants and Rust zs-wire parity across VRAM profiles."""
 
 from __future__ import annotations
 
 from zstep_worker.shm_bridge import ShmGeometry, StepPlanLayout
 
 
-def test_step_plan_layout_matches_rust_wire() -> None:
-    geom = ShmGeometry(
-        world_size=8,
-        max_seqs=64,
-        max_step_tokens=16384,
-        max_decoder_rows=8192,
-        max_pages_per_seq=2048,
-        page_block_tokens=64,
-        spec_verify_width=6,
-    )
-    layout = StepPlanLayout.compute(geom)
-    assert layout.token_ids_offset == 256
-    assert layout.positions_offset == 256 + 65536
-    assert layout.global_kv_page_table_offset % 256 == 0
+def _assert_layout_invariants(geom: ShmGeometry, layout: StepPlanLayout) -> None:
+    regions = [
+        (layout.header_offset, 64),
+        (layout.token_ids_offset, geom.max_step_tokens * 4),
+        (layout.positions_offset, geom.max_step_tokens * 4),
+        (layout.req_slot_ids_offset, geom.max_step_tokens * 4),
+        (layout.replay_mask_offset, geom.max_step_tokens),
+        (layout.engram_prev_window_offset, geom.max_step_tokens * 12),
+        (layout.narrow_keep_indices_offset, geom.max_decoder_rows * 4),
+        (layout.sample_row_indices_offset, geom.max_decoder_rows * 4),
+        (layout.seq_lens_offset, geom.max_seqs * 4),
+        (layout.query_start_loc_offset, (geom.max_seqs + 1) * 4),
+        (
+            layout.global_kv_page_table_offset,
+            geom.max_seqs * geom.max_pages_per_seq * 4,
+        ),
+        (layout.swa_page_table_offset, geom.max_seqs * 16),
+        (layout.compressor_slot_ids_offset, geom.max_seqs * 4),
+        (layout.temperatures_offset, geom.max_seqs * 4),
+    ]
+    for (prev_off, prev_len), (next_off, _next_len) in zip(
+        regions, regions[1:], strict=False
+    ):
+        assert prev_off + prev_len <= next_off
+        assert next_off % 256 == 0
+    last_off, last_len = regions[-1]
+    assert last_off + last_len <= layout.total_slot_bytes
     assert layout.total_slot_bytes % 4096 == 0
-    assert layout.total_slot_bytes == 1_003_520
+
+
+def test_step_plan_layout_invariants_and_vram_derivation() -> None:
+    geom_32g = ShmGeometry.from_vram_budget(
+        world_size=8,
+        per_gpu_vram_mb=32_607,
+        reserved_weights_and_workspace_mb=12_288,
+        kv_bytes_per_token_per_gpu=10_240,
+        max_seqs=128,
+        max_step_tokens=8_192,
+        max_decoder_rows=8_192,
+        page_block_tokens=64,
+        spec_verify_width=4,
+    )
+    assert geom_32g is not None
+    assert geom_32g.max_pages_per_seq > 0
+    _assert_layout_invariants(geom_32g, StepPlanLayout.compute(geom_32g))
+
+    odd_geom = ShmGeometry(
+        world_size=1,
+        max_seqs=3,
+        max_step_tokens=19,
+        max_decoder_rows=7,
+        max_pages_per_seq=11,
+        page_block_tokens=64,
+        spec_verify_width=1,
+    )
+    _assert_layout_invariants(odd_geom, StepPlanLayout.compute(odd_geom))
+
+    assert (
+        ShmGeometry.from_vram_budget(
+            world_size=8,
+            per_gpu_vram_mb=16_384,
+            reserved_weights_and_workspace_mb=20_000,
+            kv_bytes_per_token_per_gpu=10_240,
+            max_seqs=32,
+            max_step_tokens=1024,
+            max_decoder_rows=1024,
+            page_block_tokens=64,
+            spec_verify_width=1,
+        )
+        is None
+    )
 
 
 if __name__ == "__main__":
-    test_step_plan_layout_matches_rust_wire()
-    print("Python <-> Rust StepPlanLayout byte parity OK (980 KiB/slot)")
+    test_step_plan_layout_invariants_and_vram_derivation()
+    print("Python <-> Rust StepPlanLayout invariants and VRAM budget derivation OK")

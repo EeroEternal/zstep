@@ -59,6 +59,47 @@ class ShmGeometry:
     page_block_tokens: int
     spec_verify_width: int
 
+    @classmethod
+    def from_vram_budget(
+        cls,
+        *,
+        world_size: int,
+        per_gpu_vram_mb: int,
+        reserved_weights_and_workspace_mb: int,
+        kv_bytes_per_token_per_gpu: int,
+        max_seqs: int,
+        max_step_tokens: int,
+        max_decoder_rows: int,
+        page_block_tokens: int,
+        spec_verify_width: int,
+    ) -> ShmGeometry | None:
+        if (
+            world_size <= 0
+            or world_size > 8
+            or max_seqs <= 0
+            or max_step_tokens <= 0
+            or max_decoder_rows <= 0
+            or max_decoder_rows > max_step_tokens
+            or page_block_tokens <= 0
+            or kv_bytes_per_token_per_gpu <= 0
+            or per_gpu_vram_mb <= reserved_weights_and_workspace_mb
+        ):
+            return None
+        kv_budget_bytes = (per_gpu_vram_mb - reserved_weights_and_workspace_mb) * 1024 * 1024
+        bytes_per_page = kv_bytes_per_token_per_gpu * page_block_tokens
+        total_pages = kv_budget_bytes // bytes_per_page
+        if total_pages <= 0:
+            return None
+        return cls(
+            world_size=world_size,
+            max_seqs=max_seqs,
+            max_step_tokens=max_step_tokens,
+            max_decoder_rows=max_decoder_rows,
+            max_pages_per_seq=min(total_pages, 4096),
+            page_block_tokens=page_block_tokens,
+            spec_verify_width=spec_verify_width,
+        )
+
 
 @dataclass(frozen=True)
 class StepPlanLayout:
@@ -183,6 +224,7 @@ class WorkerState:
     device_sm_arch: int
     free_vram_mb: int
     total_vram_mb: int
+    numa_node: int
 
 
 @dataclass(frozen=True)
@@ -283,6 +325,9 @@ class ShmBridge:
     def store_u32(self, offset: int, value: int) -> None:
         _ATOMIC_STORE_4(self._address(offset), value, ATOMIC_RELEASE)
 
+    def store_i32(self, offset: int, value: int) -> None:
+        _ATOMIC_STORE_4(self._address(offset), value & 0xFFFF_FFFF, ATOMIC_RELEASE)
+
     def plan(self, step_id: int) -> StepPlanView:
         slot = step_id & 1
         return StepPlanView(
@@ -309,6 +354,7 @@ class ShmBridge:
         device_sm_arch: int,
         free_vram_mb: int,
         total_vram_mb: int,
+        numa_node: int,
     ) -> None:
         base = WORKER_STATES_OFFSET + rank * WORKER_STATE_BYTES
         self.store_u64(base, ready_step_id)
@@ -318,6 +364,7 @@ class ShmBridge:
         self.store_u32(base + 28, error_code)
         self.store_u32(base + 32, free_vram_mb)
         self.store_u32(base + 36, total_vram_mb)
+        self.store_i32(base + 40, numa_node)
         self.store_u32(base + 24, status_code)
 
     def array(self, *, offset: int, count: int, dtype: np.dtype) -> np.ndarray:
@@ -374,11 +421,70 @@ class StepPlanView:
             dtype=np.dtype(np.int32),
         )
 
+    def replay_mask(self, count: int) -> np.ndarray:
+        return self.bridge.array(
+            offset=self.base + self.layout.replay_mask_offset,
+            count=count,
+            dtype=np.dtype(np.uint8),
+        )
+
+    def narrow_keep_indices(self, count: int) -> np.ndarray:
+        return self.bridge.array(
+            offset=self.base + self.layout.narrow_keep_indices_offset,
+            count=count,
+            dtype=np.dtype(np.int32),
+        )
+
     def sample_row_indices(self, count: int) -> np.ndarray:
         return self.bridge.array(
             offset=self.base + self.layout.sample_row_indices_offset,
             count=count,
             dtype=np.dtype(np.int32),
+        )
+
+    def seq_lens(self, count: int) -> np.ndarray:
+        return self.bridge.array(
+            offset=self.base + self.layout.seq_lens_offset,
+            count=count,
+            dtype=np.dtype(np.int32),
+        )
+
+    def query_start_loc(self, count: int) -> np.ndarray:
+        return self.bridge.array(
+            offset=self.base + self.layout.query_start_loc_offset,
+            count=count,
+            dtype=np.dtype(np.int32),
+        )
+
+    def global_kv_page_table(self, num_seqs: int) -> np.ndarray:
+        max_p = self.bridge.superblock.geometry.max_pages_per_seq
+        flat = self.bridge.array(
+            offset=self.base + self.layout.global_kv_page_table_offset,
+            count=num_seqs * max_p,
+            dtype=np.dtype(np.int32),
+        )
+        return flat.reshape(num_seqs, max_p)
+
+    def swa_page_table(self, num_seqs: int) -> np.ndarray:
+        flat = self.bridge.array(
+            offset=self.base + self.layout.swa_page_table_offset,
+            count=num_seqs * 4,
+            dtype=np.dtype(np.int32),
+        )
+        return flat.reshape(num_seqs, 4)
+
+    def compressor_slot_ids(self, num_seqs: int) -> np.ndarray:
+        return self.bridge.array(
+            offset=self.base + self.layout.compressor_slot_ids_offset,
+            count=num_seqs,
+            dtype=np.dtype(np.int32),
+        )
+
+    def temperatures(self, num_seqs: int) -> np.ndarray:
+        return self.bridge.array(
+            offset=self.base + self.layout.temperatures_offset,
+            count=num_seqs,
+            dtype=np.dtype(np.float32),
         )
 
 

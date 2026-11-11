@@ -45,9 +45,15 @@ HIDDEN_SIZE = 5120
 WORLD_SIZE = 8
 WARMUP_CALLS = 10
 TIMED_CALLS_PER_GRAPH = 80
-TIMED_REPLAYS = 5
+TIMED_REPLAYS = 50
 SHM_BLOCKS = 32
 SHM_THREADS = 256
+
+
+def _percentile(samples: list[float], pct: int) -> float:
+    ordered = sorted(samples)
+    idx = (len(ordered) - 1) * pct // 100
+    return ordered[idx]
 
 
 def _make_case(tokens: int, rank: int, device: torch.device):
@@ -105,10 +111,10 @@ def _time_graph(
     graph: torch.cuda.CUDAGraph,
     *,
     reset_operation=None,
-) -> dict[str, float]:
+) -> dict[str, object]:
     graph.replay()
     torch.cuda.synchronize()
-    latencies_us = []
+    latencies_us: list[float] = []
     for _ in range(TIMED_REPLAYS):
         if reset_operation is not None:
             reset_operation()
@@ -120,13 +126,26 @@ def _time_graph(
         end.record()
         torch.cuda.synchronize()
         latencies_us.append(start.elapsed_time(end) * 1000.0 / TIMED_CALLS_PER_GRAPH)
-    per_rank_latencies = [None] * WORLD_SIZE
-    dist.all_gather_object(per_rank_latencies, sum(latencies_us) / len(latencies_us))
-    slowest_rank_us = max(float(value) for value in per_rank_latencies)
+    all_rank_samples: list[list[float]] = [[] for _ in range(WORLD_SIZE)]
+    dist.all_gather_object(all_rank_samples, latencies_us)
+    step_slowest_samples = [
+        max(all_rank_samples[r][step_idx] for r in range(WORLD_SIZE))
+        for step_idx in range(TIMED_REPLAYS)
+    ]
+    mean_us = sum(step_slowest_samples) / len(step_slowest_samples)
+    p50_us = _percentile(step_slowest_samples, 50)
+    p95_us = _percentile(step_slowest_samples, 95)
+    p99_us = _percentile(step_slowest_samples, 99)
+    rank_means = [sum(s) / len(s) for s in all_rank_samples]
     return {
-        "latency_us": round(slowest_rank_us, 3),
-        "80_call_budget_ms": round(slowest_rank_us * TIMED_CALLS_PER_GRAPH / 1000.0, 4),
-        "rank_latencies_us": [round(float(value), 3) for value in per_rank_latencies],
+        "latency_us": round(mean_us, 3),
+        "p50_us": round(p50_us, 3),
+        "p95_us": round(p95_us, 3),
+        "p99_us": round(p99_us, 3),
+        "80_call_budget_ms": round(mean_us * TIMED_CALLS_PER_GRAPH / 1000.0, 4),
+        "80_call_p50_ms": round(p50_us * TIMED_CALLS_PER_GRAPH / 1000.0, 4),
+        "80_call_p99_ms": round(p99_us * TIMED_CALLS_PER_GRAPH / 1000.0, 4),
+        "rank_latencies_us": [round(float(value), 3) for value in rank_means],
     }
 
 
@@ -327,6 +346,8 @@ def _worker(
             threads=SHM_THREADS,
             exchange_group=dist.group.WORLD,
         )
+        numa_nodes = [None] * WORLD_SIZE
+        dist.all_gather_object(numa_nodes, communicator.numa_topology.numa_node)
         shm_results = {}
         nccl_results = {}
         b12x_results = {}
@@ -354,12 +375,13 @@ def _worker(
                     "compute_capability": "12.0",
                     "torch_version": torch.__version__,
                     "world_size": WORLD_SIZE,
+                    "worker_numa_nodes": numa_nodes,
                     "hidden_size": HIDDEN_SIZE,
                     "dtype": "bfloat16",
                     "direct_p2p_available": False,
-                    "nccl_transport": "host SHM with NCCL P2P disabled by topology",
+                    "nccl_transport": "degraded host SHM fallback (can_device_access_peer=0 across all 8x8 pairs)",
                     "host_mapped_shm": {
-                        "algorithm": "two-shot reduce-scatter/all-gather",
+                        "algorithm": "two-shot reduce-scatter/all-gather with per-rank NUMA first-touch",
                         "accumulation": "FP32 with one BF16 rounding",
                         "blocks": SHM_BLOCKS,
                         "threads": SHM_THREADS,

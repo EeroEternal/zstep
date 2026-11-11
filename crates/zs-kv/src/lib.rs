@@ -18,10 +18,17 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Four-group FlatKV block allocator with RAII ownership (`BlockLease`) and
+//! Four-group FlatKV block allocator with RAII ownership (`BlockLease`),
+//! Radix prefix cache (`PrefixTree`, `RadixLease`, `KvCacheManager`), and
 //! SWA 128-token bounded replay planning.
 
+mod radix;
+
 use std::sync::{Arc, Mutex};
+
+pub use radix::{
+    KvCacheManager, KvError, PrefillSchedule, PrefixTree, RadixLease, RequestKvHandle,
+};
 
 /// Physical cache groups used by `DeepSeek-V4.1-Flash` FlatKV attention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +115,27 @@ impl BlockLease {
     pub fn ids(&self) -> &[i32] {
         &self.ids
     }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// Split a multi-block lease into single-block [`BlockLease`] handles without releasing
+    /// or duplicating ownership of any physical block ID.
+    pub fn split_individual(mut self) -> Vec<Self> {
+        let owned_ids = std::mem::take(&mut self.ids);
+        owned_ids
+            .into_iter()
+            .map(|id| Self {
+                pool: Arc::clone(&self.pool),
+                ids: vec![id],
+            })
+            .collect()
+    }
 }
 
 impl Drop for BlockLease {
@@ -136,6 +164,8 @@ pub fn plan_bounded_replay(matched_prefix_tokens: u32, swa_window: u32) -> (u32,
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::*;
 
     #[test]
@@ -155,5 +185,182 @@ mod tests {
         assert_eq!(plan_bounded_replay(0, 128), (0, 0));
         assert_eq!(plan_bounded_replay(64, 128), (0, 64));
         assert_eq!(plan_bounded_replay(1024, 128), (896, 128));
+    }
+
+    #[test]
+    fn radix_prefix_hit_plans_128_token_bounded_replay_and_shares_pages() {
+        let manager = KvCacheManager::new(32, 16, 8, 64, 128, 4).expect("valid manager");
+        let prompt_a: Vec<i32> = (0..350).map(|idx| idx + 1000).collect();
+
+        // Request A misses completely: allocates ceil(350 / 64) = 6 GlobalAndIndex blocks,
+        // 4 SwaWindow blocks, and 1 CompressorTail slot.
+        let mut handle_a = manager.admit_request(&prompt_a).expect("admit A");
+        assert_eq!(handle_a.schedule().skipped_tokens, 0);
+        assert_eq!(handle_a.schedule().replay_tokens, 0);
+        assert_eq!(handle_a.schedule().fresh_tokens, 350);
+        assert_eq!(handle_a.schedule().replay_mask, vec![0u8; 350]);
+        assert_eq!(manager.global_pool().available(), 26);
+        assert_eq!(manager.swa_pool().available(), 12);
+        assert_eq!(manager.compressor_pool().available(), 7);
+
+        // Commit completed full 64-token blocks (5 full blocks = 320 tokens).
+        let promoted = handle_a
+            .commit_completed_blocks(&prompt_a)
+            .expect("commit A");
+        assert_eq!(promoted, 5);
+        assert_eq!(manager.prefix_tree().cached_blocks(), 5);
+        let pages_a = handle_a.global_page_table();
+        assert_eq!(pages_a.len(), 6);
+
+        // Request B shares the first 320 tokens (5 blocks) + 80 new suffix tokens (total 400 tokens -> 7 blocks).
+        let mut prompt_b = prompt_a[..320].to_vec();
+        prompt_b.extend((0..80).map(|idx| idx + 9000));
+        let handle_b = manager.admit_request(&prompt_b).expect("admit B");
+
+        // 320 matched tokens with swa_window = 128 -> skip 192 tokens, replay 128 tokens, 80 fresh tokens!
+        let sched_b = handle_b.schedule();
+        assert_eq!(sched_b.skipped_tokens, 192);
+        assert_eq!(sched_b.replay_tokens, 128);
+        assert_eq!(sched_b.fresh_tokens, 80);
+        assert_eq!(sched_b.scheduled_tokens.len(), 208);
+        assert_eq!(sched_b.scheduled_positions[0], 192);
+        assert_eq!(*sched_b.scheduled_positions.last().expect("nonempty"), 399);
+        assert_eq!(sched_b.replay_mask[..128], vec![1u8; 128]);
+        assert_eq!(sched_b.replay_mask[128..], vec![0u8; 80]);
+
+        // First 5 GlobalAndIndex pages are shared 1:1 with Request A; SWA and Compressor stay private!
+        let pages_b = handle_b.global_page_table();
+        assert_eq!(&pages_b[..5], &pages_a[..5]);
+        assert_ne!(handle_a.swa_page_table(), handle_b.swa_page_table());
+        assert_ne!(handle_a.compressor_slot_id(), handle_b.compressor_slot_id());
+    }
+
+    #[test]
+    fn exact_block_aligned_full_prefix_hit_keeps_final_token_fresh() {
+        let manager = KvCacheManager::new(16, 8, 4, 64, 128, 4).expect("valid manager");
+        let prompt: Vec<i32> = (0..256).collect();
+        {
+            let mut first = manager.admit_request(&prompt).expect("admit first");
+            assert_eq!(first.commit_completed_blocks(&prompt).expect("commit"), 4);
+        }
+        // Re-sending the exact 256-token prompt matches 256 tokens in the Radix tree,
+        // clamps effective_matched to 255 -> skips 127, replays 128, keeps final token fresh!
+        let repeat = manager.admit_request(&prompt).expect("admit repeat");
+        assert_eq!(repeat.schedule().skipped_tokens, 127);
+        assert_eq!(repeat.schedule().replay_tokens, 128);
+        assert_eq!(repeat.schedule().fresh_tokens, 1);
+        assert_eq!(repeat.schedule().scheduled_tokens.len(), 129);
+        assert_eq!(*repeat.schedule().replay_mask.last().expect("nonempty"), 0);
+    }
+
+    #[test]
+    fn lru_eviction_respects_active_pins_and_cascades_unpinned_chains() {
+        // Pool has exactly 6 GlobalAndIndex blocks.
+        let manager = KvCacheManager::new(6, 16, 8, 64, 128, 4).expect("valid manager");
+        let branch_old: Vec<i32> = (0..192).map(|x| x + 100).collect(); // 3 blocks
+        let branch_pinned: Vec<i32> = (0..128).map(|x| x + 500).collect(); // 2 blocks
+
+        {
+            let mut h_old = manager.admit_request(&branch_old).expect("admit old");
+            assert_eq!(
+                h_old.commit_completed_blocks(&branch_old).expect("commit"),
+                3
+            );
+        }
+        // `branch_old` dropped -> its 3 blocks remain cached in PrefixTree (unpinned).
+        assert_eq!(manager.prefix_tree().cached_blocks(), 3);
+        assert_eq!(manager.prefix_tree().evictable_blocks(), 3);
+        assert_eq!(manager.global_pool().available(), 3);
+
+        // `h_pinned` stays alive -> pins 2 blocks. Only 1 free block left in `global_pool`,
+        // plus 3 evictable blocks in `branch_old` = 4 allocatable blocks max.
+        let mut h_pinned = manager.admit_request(&branch_pinned).expect("admit pinned");
+        assert_eq!(
+            h_pinned
+                .commit_completed_blocks(&branch_pinned)
+                .expect("commit"),
+            2
+        );
+        assert_eq!(manager.global_pool().available(), 1);
+        assert_eq!(manager.prefix_tree().evictable_blocks(), 3);
+
+        // Requesting 5 fresh blocks (> 1 free + 3 evictable) fails without corrupting pins!
+        let too_big: Vec<i32> = (0..320).map(|x| x + 900).collect();
+        let err = manager
+            .admit_request(&too_big)
+            .err()
+            .expect("must fail OOM");
+        assert!(matches!(
+            err,
+            KvError::OutOfBlocks {
+                kind: CacheGroupKind::GlobalAndIndex,
+                ..
+            }
+        ));
+
+        // Requesting 4 fresh blocks (256 tokens) succeeds by evicting `branch_old` while keeping `h_pinned` intact!
+        let fits: Vec<i32> = (0..256).map(|x| x + 2000).collect();
+        let h_fits = manager
+            .admit_request(&fits)
+            .expect("admit fits after LRU eviction");
+        assert_eq!(h_fits.global_page_table().len(), 4);
+        assert_eq!(manager.global_pool().available(), 0);
+        // `h_pinned`'s 2 blocks are still in the tree and pinned!
+        assert_eq!(manager.prefix_tree().cached_blocks(), 2);
+        assert_eq!(manager.prefix_tree().evictable_blocks(), 0);
+
+        drop(h_fits);
+        drop(h_pinned);
+        assert_eq!(manager.prefix_tree().evictable_blocks(), 2);
+        assert_eq!(manager.prefix_tree().evict_lru(2), 2);
+        assert_eq!(manager.global_pool().available(), 6);
+    }
+
+    #[test]
+    fn concurrent_duplicate_promotion_returns_redundant_blocks_to_pool() {
+        let manager = KvCacheManager::new(10, 8, 4, 64, 128, 4).expect("valid manager");
+        let shared_prompt: Vec<i32> = (0..128).map(|x| x + 42).collect();
+
+        // Both requests arrive before either commits -> both allocate 2 fresh blocks (4 blocks used).
+        let mut h1 = manager.admit_request(&shared_prompt).expect("admit h1");
+        let mut h2 = manager.admit_request(&shared_prompt).expect("admit h2");
+        assert_eq!(manager.global_pool().available(), 6);
+
+        // h1 commits its 2 blocks -> tree caches 2 blocks.
+        assert_eq!(
+            h1.commit_completed_blocks(&shared_prompt)
+                .expect("commit h1"),
+            2
+        );
+        assert_eq!(manager.global_pool().available(), 6);
+
+        // h2 commits the same 2 blocks -> deduplicated against h1's nodes, returning h2's 2 redundant blocks immediately!
+        assert_eq!(
+            h2.commit_completed_blocks(&shared_prompt)
+                .expect("commit h2"),
+            2
+        );
+        assert_eq!(manager.global_pool().available(), 8);
+        assert_eq!(h1.global_page_table(), h2.global_page_table());
+    }
+
+    #[test]
+    fn unwind_panic_releases_all_leases_and_unpins_tree() {
+        let manager = KvCacheManager::new(12, 8, 4, 64, 128, 4).expect("valid manager");
+        let prompt: Vec<i32> = (0..192).collect();
+
+        let panic_res = catch_unwind(AssertUnwindSafe(|| {
+            let mut handle = manager.admit_request(&prompt).expect("admit");
+            handle.commit_completed_blocks(&prompt).expect("commit");
+            panic!("simulated worker/request unwind");
+        }));
+        assert!(panic_res.is_err());
+
+        // SWA and Compressor leases were returned on unwind, and the 3 promoted tree blocks are unpinned!
+        assert_eq!(manager.swa_pool().available(), 8);
+        assert_eq!(manager.compressor_pool().available(), 4);
+        assert_eq!(manager.prefix_tree().evictable_blocks(), 3);
+        assert_eq!(manager.prefix_tree().evict_lru(3), 3);
+        assert_eq!(manager.global_pool().available(), 12);
     }
 }

@@ -36,31 +36,40 @@ import torch
 import torch.distributed as dist
 from torch.utils.cpp_extension import load_inline
 
+from zstep_worker.numa_pin import DeviceNumaTopology, pin_process_to_device_numa
+
 NUM_RING_SLOTS = 4
 MAX_RANKS = 8
 MAX_BLOCKS = 64
 
 _CPP_SOURCE = r"""
 #include <torch/extension.h>
-#include <c10/cuda/CUDAException.h>
-#include <cuda_runtime.h>
 #include <cstdint>
+#include <stdexcept>
+
+std::uintptr_t register_mapped_host_cuda(std::uintptr_t host_address, int64_t bytes);
+void unregister_mapped_host_cuda(std::uintptr_t host_address);
+void launch_host_mapped_two_shot_cuda(
+    const void* input_ptr,
+    void* output_ptr,
+    int64_t* control_ptr,
+    std::uintptr_t host_device_address,
+    int64_t data_base_offset,
+    int64_t slot_stride_bytes,
+    int64_t rank_stride_bytes,
+    int64_t num_vecs,
+    int rank,
+    int world_size,
+    int blocks,
+    int threads,
+    std::uintptr_t stream_handle);
 
 std::uintptr_t register_mapped_host(std::uintptr_t host_address, int64_t bytes) {
-    void* host = reinterpret_cast<void*>(host_address);
-    C10_CUDA_CHECK(cudaHostRegister(
-        host, static_cast<size_t>(bytes), cudaHostRegisterMapped));
-    void* device = nullptr;
-    cudaError_t status = cudaHostGetDevicePointer(&device, host, 0);
-    if (status != cudaSuccess) {
-        cudaHostUnregister(host);
-        C10_CUDA_CHECK(status);
-    }
-    return reinterpret_cast<std::uintptr_t>(device);
+    return register_mapped_host_cuda(host_address, bytes);
 }
 
 void unregister_mapped_host(std::uintptr_t host_address) {
-    C10_CUDA_CHECK(cudaHostUnregister(reinterpret_cast<void*>(host_address)));
+    unregister_mapped_host_cuda(host_address);
 }
 
 void launch_host_mapped_two_shot(
@@ -74,22 +83,67 @@ void launch_host_mapped_two_shot(
     int64_t rank,
     int64_t world_size,
     int64_t blocks,
-    int64_t threads);
+    int64_t threads,
+    std::uintptr_t stream_handle) {
+    TORCH_CHECK(input.is_cuda() && output.is_cuda(), "input/output must be CUDA tensors");
+    TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be BF16");
+    TORCH_CHECK(output.scalar_type() == at::kBFloat16, "output must be BF16");
+    TORCH_CHECK(input.is_contiguous() && output.is_contiguous(), "input/output must be contiguous");
+    TORCH_CHECK(input.numel() == output.numel(), "input/output sizes must match");
+    TORCH_CHECK(input.numel() % 8 == 0, "input numel must be divisible by 8 for 128-bit vectorization");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(input.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<std::uintptr_t>(output.data_ptr()) % 16 == 0,
+        "input/output pointers must be 16-byte aligned");
+    TORCH_CHECK(control.is_cuda() && control.scalar_type() == at::kLong, "control must be int64 CUDA tensor");
+    TORCH_CHECK(blocks > 0 && blocks <= 64, "blocks must be in [1, 64]");
+    TORCH_CHECK(control.numel() >= blocks, "control tensor must hold at least `blocks` counters");
+    TORCH_CHECK(world_size >= 2 && world_size <= 8 && rank >= 0 && rank < world_size, "invalid rank/world_size");
+    TORCH_CHECK(input.numel() * 2 <= rank_stride_bytes, "input exceeds SHM capacity");
+
+    launch_host_mapped_two_shot_cuda(
+        input.data_ptr(),
+        output.data_ptr(),
+        control.data_ptr<int64_t>(),
+        host_device_address,
+        data_base_offset,
+        slot_stride_bytes,
+        rank_stride_bytes,
+        input.numel() / 8,
+        static_cast<int>(rank),
+        static_cast<int>(world_size),
+        static_cast<int>(blocks),
+        static_cast<int>(threads),
+        stream_handle);
+}
 """
 
 _CUDA_SOURCE = r"""
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
+
+#define ZSTEP_CUDA_CHECK(expr)                                                      \
+    do {                                                                            \
+        cudaError_t _err = (expr);                                                  \
+        if (_err != cudaSuccess) {                                                  \
+            throw std::runtime_error(                                               \
+                std::string("CUDA error: ") + cudaGetErrorString(_err));            \
+        }                                                                           \
+    } while (0)
 
 namespace {
 
 constexpr int kNumRingSlots = 4;
 constexpr int kMaxRanks = 8;
 constexpr int kMaxBlocks = 64;
+// Payloads up to 16 KiB (1024 x 16B uint4, covering B=1..4 decode rows at H=2048 BF16)
+// skip the intermediate Reduce-Scatter SHM write + second .sys barrier and reduce directly
+// from peer SHM inputs into VRAM output in a single barrier round-trip. Larger payloads
+// (> 16 KiB, including 60 KiB M=6 at H=5120) use Two-Shot to avoid 8x cross-NUMA reads.
+constexpr int64_t kOneShotMaxVecs = 1024;
 
 __device__ __forceinline__ uint64_t sys_load_acquire_u64(const uint64_t* addr) {
     uint64_t val;
@@ -185,10 +239,44 @@ __global__ void host_mapped_two_shot_fused_kernel(
     }
     if (threadIdx.x < world_size) {
         while (sys_load_acquire_u64(in_flags + threadIdx.x) < step) {
-            __nanosleep(64);
+            __nanosleep(32);
         }
     }
     __syncthreads();
+
+    if (num_vecs <= kOneShotMaxVecs) {
+        // One-Shot fast path for latency-critical small decode payloads (<= 64 KiB):
+        // reduce all peers' SHM inputs in FP32 directly into VRAM `output_vec`.
+        for (int64_t idx = chunk_begin + threadIdx.x; idx < chunk_end; idx += blockDim.x) {
+            float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
+            for (int peer = 0; peer < kMaxRanks; ++peer) {
+                if (peer < world_size) {
+                    const uint4* peer_in = reinterpret_cast<const uint4*>(
+                        slot_inputs_base + static_cast<int64_t>(peer) * rank_stride_bytes);
+                    Pack128Bf16 p;
+                    p.u4 = ld_cv_uint4(peer_in + idx);
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float2 f2 = __bfloat1622float2(p.pairs[j]);
+                        acc[2 * j] += f2.x;
+                        acc[2 * j + 1] += f2.y;
+                    }
+                }
+            }
+            Pack128Bf16 out_pack;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                out_pack.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+            }
+            output_vec[idx] = out_pack.u4;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            sys_store_release_u64(done_flags + rank, step);
+        }
+        return;
+    }
 
     // Stage 2: Reduce-scatter this rank's 1/world_size slice of [chunk_begin, chunk_end).
     const int64_t sub_begin = chunk_begin + (chunk_len * rank) / world_size;
@@ -250,47 +338,50 @@ __global__ void host_mapped_two_shot_fused_kernel(
 
 }  // namespace
 
-void launch_host_mapped_two_shot(
-    torch::Tensor input,
-    torch::Tensor output,
-    torch::Tensor control,
+std::uintptr_t register_mapped_host_cuda(std::uintptr_t host_address, int64_t bytes) {
+    void* host = reinterpret_cast<void*>(host_address);
+    ZSTEP_CUDA_CHECK(cudaHostRegister(
+        host, static_cast<size_t>(bytes), cudaHostRegisterMapped));
+    void* device = nullptr;
+    cudaError_t status = cudaHostGetDevicePointer(&device, host, 0);
+    if (status != cudaSuccess) {
+        cudaHostUnregister(host);
+        ZSTEP_CUDA_CHECK(status);
+    }
+    return reinterpret_cast<std::uintptr_t>(device);
+}
+
+void unregister_mapped_host_cuda(std::uintptr_t host_address) {
+    ZSTEP_CUDA_CHECK(cudaHostUnregister(reinterpret_cast<void*>(host_address)));
+}
+
+void launch_host_mapped_two_shot_cuda(
+    const void* input_ptr,
+    void* output_ptr,
+    int64_t* control_ptr,
     std::uintptr_t host_device_address,
     int64_t data_base_offset,
     int64_t slot_stride_bytes,
     int64_t rank_stride_bytes,
-    int64_t rank,
-    int64_t world_size,
-    int64_t blocks,
-    int64_t threads) {
-    TORCH_CHECK(input.is_cuda() && output.is_cuda(), "input/output must be CUDA tensors");
-    TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be BF16");
-    TORCH_CHECK(output.scalar_type() == at::kBFloat16, "output must be BF16");
-    TORCH_CHECK(input.is_contiguous() && output.is_contiguous(), "input/output must be contiguous");
-    TORCH_CHECK(input.numel() == output.numel(), "input/output sizes must match");
-    TORCH_CHECK(input.numel() % 8 == 0, "input numel must be divisible by 8 for 128-bit vectorization");
-    TORCH_CHECK(
-        reinterpret_cast<std::uintptr_t>(input.data_ptr()) % 16 == 0 &&
-        reinterpret_cast<std::uintptr_t>(output.data_ptr()) % 16 == 0,
-        "input/output pointers must be 16-byte aligned");
-    TORCH_CHECK(control.is_cuda() && control.scalar_type() == at::kLong, "control must be int64 CUDA tensor");
-    TORCH_CHECK(blocks > 0 && blocks <= kMaxBlocks, "blocks must be in [1, 64]");
-    TORCH_CHECK(control.numel() >= blocks, "control tensor must hold at least `blocks` counters");
-    TORCH_CHECK(world_size >= 2 && world_size <= kMaxRanks && rank >= 0 && rank < world_size, "invalid rank/world_size");
-    TORCH_CHECK(input.numel() * 2 <= rank_stride_bytes, "input exceeds SHM capacity");
-
-    auto stream = at::cuda::getCurrentCUDAStream(input.device().index());
-    host_mapped_two_shot_fused_kernel<<<static_cast<int>(blocks), static_cast<int>(threads), 0, stream>>>(
-        reinterpret_cast<const uint4*>(input.data_ptr()),
-        reinterpret_cast<uint4*>(output.data_ptr()),
-        reinterpret_cast<uint64_t*>(control.data_ptr()),
+    int64_t num_vecs,
+    int rank,
+    int world_size,
+    int blocks,
+    int threads,
+    std::uintptr_t stream_handle) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    host_mapped_two_shot_fused_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const uint4*>(input_ptr),
+        reinterpret_cast<uint4*>(output_ptr),
+        reinterpret_cast<uint64_t*>(control_ptr),
         reinterpret_cast<char*>(host_device_address),
         data_base_offset,
         slot_stride_bytes,
         rank_stride_bytes,
-        input.numel() / 8,
-        static_cast<int>(rank),
-        static_cast<int>(world_size));
-    C10_CUDA_CHECK(cudaGetLastError());
+        num_vecs,
+        rank,
+        world_size);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 """
 
@@ -307,7 +398,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v2_ext",
+            name="zstep_shm_allreduce_sm120_v4_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -351,6 +442,8 @@ class HostMappedShmAllReduce:
             raise ValueError("threads must be a warp multiple in [32, 1024]")
 
         device = torch.device("cuda", torch.cuda.current_device())
+        # Pin CPU affinity to this rank's PCIe NUMA node before touching host-mapped SHM pages.
+        self.numa_topology: DeviceNumaTopology = pin_process_to_device_numa(device.index)
         self.name: str = name
         self.rank: int = rank
         self.world_size: int = world_size
@@ -358,7 +451,9 @@ class HostMappedShmAllReduce:
         self.blocks: int = blocks
         self.threads: int = threads
         self.device: torch.device = device
-        self.rank_stride_bytes: int = _align_up(capacity_elements * 2, 256)
+        # Align each rank's slice to 4 KiB OS page boundaries so per-rank First-Touch places
+        # physical DRAM pages exclusively on that GPU's local NUMA domain.
+        self.rank_stride_bytes: int = _align_up(capacity_elements * 2, 4096)
         self.data_base_offset: int = 16384  # First 16 KiB holds per-block .sys arrival flags
         self.slot_stride_bytes: int = _align_up(
             2 * world_size * self.rank_stride_bytes, 4096
@@ -428,11 +523,29 @@ class HostMappedShmAllReduce:
 
         self._shm_path: str = shm_path
         self._host_address: int = ctypes.addressof(ctypes.c_char.from_buffer(self._mapping))
+        self._first_touch_local_numa_pages()
+        if exchange_group is not None:
+            dist.barrier(group=exchange_group)
         self._device_address: int = self._extension.register_mapped_host(
             self._host_address, self.total_bytes
         )
         self._registered = True
         self.control: torch.Tensor = torch.zeros(MAX_BLOCKS, dtype=torch.int64, device=device)
+
+    def _first_touch_local_numa_pages(self) -> None:
+        """Fault in each rank's input and reduced SHM pages from its NUMA-pinned CPU thread."""
+        mv = memoryview(self._mapping)
+        for slot in range(NUM_RING_SLOTS):
+            slot_base = self.data_base_offset + slot * self.slot_stride_bytes
+            in_base = slot_base + self.rank * self.rank_stride_bytes
+            red_base = (
+                slot_base
+                + (self.world_size + self.rank) * self.rank_stride_bytes
+            )
+            for page_off in range(0, self.rank_stride_bytes, 4096):
+                mv[in_base + page_off] = 0
+                mv[red_base + page_off] = 0
+        mv.release()
 
     def all_reduce(self, input: torch.Tensor, *, output: torch.Tensor) -> torch.Tensor:
         """Reduce all rank inputs into `output` in a single CUDA-Graph-safe launch."""
@@ -442,6 +555,7 @@ class HostMappedShmAllReduce:
             raise ValueError("input/output shapes must match")
         if input.numel() > self.capacity_elements:
             raise ValueError("input exceeds channel capacity")
+        stream_handle = torch.cuda.current_stream(self.device).cuda_stream
         self._extension.launch_host_mapped_two_shot(
             input,
             output,
@@ -454,6 +568,7 @@ class HostMappedShmAllReduce:
             self.world_size,
             self.blocks,
             self.threads,
+            stream_handle,
         )
         return output
 

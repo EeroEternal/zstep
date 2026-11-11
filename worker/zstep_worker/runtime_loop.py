@@ -23,11 +23,15 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import ctypes
+from datetime import timedelta
+import gc
 import os
+from pathlib import Path
 import signal
 import struct
-from datetime import timedelta
+import traceback
 from unittest.mock import patch
 
 from zstep_worker.kernels_sm120.moe_router import (
@@ -38,6 +42,7 @@ from zstep_worker.kernels_sm120.norm_quant import (
     rmsnorm_quantize_mxfp8_group32,
     rmsnorm_quantize_mxfp8_group32_kernel,
 )
+from zstep_worker.numa_pin import DeviceNumaTopology, pin_process_to_device_numa
 from zstep_worker.shm_bridge import SeqResult, ShmBridge, StepHeader, StepPlanView
 
 OPCODE_NORMAL_STEP = 1
@@ -276,84 +281,140 @@ class MicroStep:
 class RuntimeLoop:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        # Pin host CPU affinity to this rank's PCIe NUMA domain BEFORE touching SHM or CUDA.
+        self.numa_topology: DeviceNumaTopology = pin_process_to_device_numa(args.rank)
         self.bridge = ShmBridge(name=args.shm_name)
-        self.micro_step = MicroStep(args, self.bridge)
-        self.current_step = 0
-        self.last_step = 0
+        if args.model_dir:
+            from zstep_worker.models.qwen35_moe import Qwen35MoeStepRunner
 
-    def _write_state(self, *, status: int, error_code: int) -> None:
+            self.runner: MicroStep | Qwen35MoeStepRunner = Qwen35MoeStepRunner(
+                model_dir=Path(args.model_dir),
+                rank=args.rank,
+                bridge=self.bridge,
+                dist_init_file=args.dist_init_file,
+                allreduce_name=args.allreduce_name,
+                allreduce_blocks=args.allreduce_blocks,
+                allreduce_threads=args.allreduce_threads,
+                num_kv_pages=args.num_kv_pages,
+            )
+        else:
+            self.runner = MicroStep(args, self.bridge)
         import torch
 
-        free_bytes, total_bytes = torch.cuda.mem_get_info(self.micro_step.device)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(self.runner.device)
+        self._free_vram_mb: int = free_bytes // (1024 * 1024)
+        self._total_vram_mb: int = total_bytes // (1024 * 1024)
+        self.current_step: int = 0
+        self.last_step: int = 0
+
+    def _write_state(self, *, status: int, error_code: int) -> None:
         self.bridge.write_worker_state(
             rank=self.args.rank,
             ready_step_id=self.last_step,
             status_code=status,
             error_code=error_code,
             device_sm_arch=120,
-            free_vram_mb=free_bytes // (1024 * 1024),
-            total_vram_mb=total_bytes // (1024 * 1024),
+            free_vram_mb=self._free_vram_mb,
+            total_vram_mb=self._total_vram_mb,
+            numa_node=self.numa_topology.numa_node,
         )
 
     def run(self) -> None:
         self._write_state(status=WORKER_STATUS_READY, error_code=0)
         os.eventfd_write(self.args.done_fd, 1)
-        with (
-            patch.object(
-                rmsnorm_quantize_mxfp8_group32_kernel,
-                "_do_compile",
-                wraps=rmsnorm_quantize_mxfp8_group32_kernel._do_compile,
-            ) as norm_compile_spy,
-            patch.object(
-                dsv41_sqrt_softplus_topk_kernel,
-                "_do_compile",
-                wraps=dsv41_sqrt_softplus_topk_kernel._do_compile,
-            ) as router_compile_spy,
-        ):
-            while True:
-                os.eventfd_read(self.args.plan_fd)
-                plan = self.bridge.plan(self.current_step + 1)
-                header = plan.header()
-                expected_step = self.current_step + 1
-                if header.step_id != expected_step:
-                    raise RuntimeError(
-                        f"expected step {expected_step}, acquired {header.step_id}"
+
+        watched_kernels: list[tuple[str, object]] = [
+            ("norm_mxfp8", rmsnorm_quantize_mxfp8_group32_kernel),
+            ("router_dsv41", dsv41_sqrt_softplus_topk_kernel),
+        ]
+        if self.args.model_dir:
+            from zstep_worker.kernels_sm120 import qwen35_ops
+
+            watched_kernels.extend(
+                [
+                    ("zc_rmsnorm", qwen35_ops._zero_centered_rmsnorm_kernel),
+                    ("fused_add_zc_rmsnorm", qwen35_ops._fused_add_zero_centered_rmsnorm_kernel),
+                    ("attn_prologue", qwen35_ops._qwen35_attn_prologue_kernel),
+                    ("gqa_decode_splitk", qwen35_ops._paged_gqa_decode_splitk_kernel),
+                    ("gqa_decode_reduce", qwen35_ops._paged_gqa_decode_reduce_gated_kernel),
+                    ("gqa_prefill", qwen35_ops._paged_gqa_prefill_varlen_gated_kernel),
+                    ("conv1d_decode", qwen35_ops._causal_conv1d_decode_kernel),
+                    ("conv1d_prefill", qwen35_ops._causal_conv1d_prefill_varlen_kernel),
+                    ("gdn_decode", qwen35_ops._gated_delta_decode_kernel),
+                    ("gdn_prefill", qwen35_ops._gated_delta_prefill_varlen_kernel),
+                    ("rmsnorm_gated", qwen35_ops._rmsnorm_gated_silu_kernel),
+                    ("moe_router_shared", qwen35_ops._router_softmax256_topk8_and_shared_act_kernel),
+                    ("moe_gate_up", qwen35_ops._fused_moe_gate_up_silu_kernel),
+                    ("moe_down", qwen35_ops._fused_moe_down_kernel),
+                    ("moe_combine", qwen35_ops._moe_combine_top8_and_shared_kernel),
+                ]
+            )
+
+        gc.collect()
+        was_gc_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with ExitStack() as stack:
+                spies = [
+                    (
+                        name,
+                        stack.enter_context(
+                            patch.object(kernel, "_do_compile", wraps=kernel._do_compile)
+                        ),
                     )
-                self.current_step = header.step_id
-                self._write_state(status=WORKER_STATUS_RUNNING, error_code=0)
-                if header.opcode == OPCODE_SHUTDOWN:
+                    for name, kernel in watched_kernels
+                ]
+                while True:
+                    os.eventfd_read(self.args.plan_fd)
+                    plan = self.bridge.plan(self.current_step + 1)
+                    header = plan.header()
+                    expected_step = self.current_step + 1
+                    if header.step_id != expected_step:
+                        raise RuntimeError(
+                            f"expected step {expected_step}, acquired {header.step_id}"
+                        )
+                    self.current_step = header.step_id
+                    self._write_state(status=WORKER_STATUS_RUNNING, error_code=0)
+                    if header.opcode == OPCODE_SHUTDOWN:
+                        if self.args.rank == 0:
+                            self.bridge.result(header.step_id).write(
+                                step_id=header.step_id,
+                                gpu_exec_us=0,
+                                status_code=0,
+                                outputs=[],
+                            )
+                        self.last_step = header.step_id
+                        self._write_state(status=WORKER_STATUS_READY, error_code=0)
+                        os.eventfd_write(self.args.done_fd, 1)
+                        break
+                    if header.opcode != OPCODE_NORMAL_STEP:
+                        raise RuntimeError(f"unsupported step opcode {header.opcode}")
+                    outputs, gpu_exec_us = self.runner.execute(plan, header)
                     if self.args.rank == 0:
                         self.bridge.result(header.step_id).write(
                             step_id=header.step_id,
-                            gpu_exec_us=0,
+                            gpu_exec_us=gpu_exec_us,
                             status_code=0,
-                            outputs=[],
+                            outputs=outputs,
                         )
                     self.last_step = header.step_id
                     self._write_state(status=WORKER_STATUS_READY, error_code=0)
                     os.eventfd_write(self.args.done_fd, 1)
-                    break
-                if header.opcode != OPCODE_NORMAL_STEP:
-                    raise RuntimeError(f"unsupported step opcode {header.opcode}")
-                outputs, gpu_exec_us = self.micro_step.execute(plan, header)
-                if self.args.rank == 0:
-                    self.bridge.result(header.step_id).write(
-                        step_id=header.step_id,
-                        gpu_exec_us=gpu_exec_us,
-                        status_code=0,
-                        outputs=outputs,
+                recompiled = [
+                    f"{name}={spy.call_count}" for name, spy in spies if spy.call_count != 0
+                ]
+                if recompiled:
+                    raise RuntimeError(
+                        "runtime step triggered unexpected Triton JIT recompilation: "
+                        + ", ".join(recompiled)
                     )
-                self.last_step = header.step_id
-                self._write_state(status=WORKER_STATUS_READY, error_code=0)
-                os.eventfd_write(self.args.done_fd, 1)
-            if norm_compile_spy.call_count != 0 or router_compile_spy.call_count != 0:
-                raise RuntimeError(
-                    "runtime token count triggered Triton recompilation: "
-                    f"norm={norm_compile_spy.call_count}, router={router_compile_spy.call_count}"
-                )
+        finally:
+            if was_gc_enabled:
+                gc.enable()
 
     def report_error(self, error: BaseException) -> None:
         print(f"rank {self.args.rank}: {type(error).__name__}: {error}", flush=True)
+        traceback.print_exc()
         if self.args.rank == 0 and self.current_step > 0:
             self.bridge.result(self.current_step).write(
                 step_id=self.current_step,
@@ -366,7 +427,7 @@ class RuntimeLoop:
         os.eventfd_write(self.args.done_fd, 1)
 
     def close(self) -> None:
-        self.micro_step.close()
+        self.runner.close()
         self.bridge.close()
         os.close(self.args.plan_fd)
         os.close(self.args.done_fd)
@@ -386,6 +447,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--router-top-k", required=True, type=int)
     parser.add_argument("--allreduce-blocks", required=True, type=int)
     parser.add_argument("--allreduce-threads", required=True, type=int)
+    parser.add_argument("--model-dir", default="")
+    parser.add_argument("--num-kv-pages", default=32768, type=int)
     return parser.parse_args()
 
 
@@ -401,7 +464,11 @@ def main() -> int:
         if runtime is not None:
             runtime.report_error(error)
         else:
-            print(f"worker initialization failed: {type(error).__name__}: {error}", flush=True)
+            print(
+                f"rank {args.rank} worker initialization failed: {type(error).__name__}: {error}",
+                flush=True,
+            )
+            traceback.print_exc()
         return 1
     finally:
         if runtime is not None:

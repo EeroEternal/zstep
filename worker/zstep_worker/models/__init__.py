@@ -18,4 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Explicit ZML-style model step definitions (DeepSeek-V4.1-Flash)."""
+"""Explicit real-weight model runners for zstep Mode B workers."""
