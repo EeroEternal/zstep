@@ -22,11 +22,91 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use zs_scheduler::{
-    BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierSpec, ModeBConfig, ModeBCoordinator,
-    ModeBServingEngine, ServingBenchmarkReport, TierAggregateStats, WorkerLaunchConfig,
+    BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierSpec, GenerationScheduleStats,
+    ModeBConfig, ModeBCoordinator, ModeBServingEngine, ServingBenchmarkReport, TierAggregateStats,
+    WorkerLaunchConfig,
 };
 use zs_wire::ShmGeometry;
+
+#[derive(Debug, Deserialize)]
+struct GreedyReference {
+    vllm_version: String,
+    cases: Vec<GreedyReferenceCase>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct GreedyReferenceCase {
+    name: String,
+    prompt_token_ids: Vec<i32>,
+    max_tokens: usize,
+    expected_greedy_token_ids: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GreedyMatchReport {
+    exact_prefix_match_tokens: usize,
+    total_tokens: usize,
+    exact_token_matches: usize,
+    exact_token_match_rate: f64,
+    all_matched: bool,
+    first_mismatch_token_index: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct GreedyCaseParityReport {
+    name: String,
+    prompt_token_ids: Vec<i32>,
+    expected_greedy_token_ids: Vec<i32>,
+    exact_prefix_match_tokens: usize,
+    total_tokens: usize,
+    exact_token_match_rate: f64,
+    all_matched: bool,
+    first_mismatch_token_index: Option<usize>,
+    single_generated_token_ids: Vec<i32>,
+    batched_generated_token_ids: Vec<i32>,
+    chunked_generated_token_ids: Vec<i32>,
+    single_match: GreedyMatchReport,
+    batched_match: GreedyMatchReport,
+    chunked_match: GreedyMatchReport,
+}
+
+#[derive(Debug, Serialize)]
+struct ScheduleReport {
+    prefill_steps: u64,
+    decode_steps: u64,
+    chunked_prefill_steps: u64,
+    decode_steps_with_partial_prefill: u64,
+    max_active_sequences: usize,
+}
+
+impl From<&GenerationScheduleStats> for ScheduleReport {
+    fn from(stats: &GenerationScheduleStats) -> Self {
+        Self {
+            prefill_steps: stats.prefill_steps,
+            decode_steps: stats.decode_steps,
+            chunked_prefill_steps: stats.chunked_prefill_steps,
+            decode_steps_with_partial_prefill: stats.decode_steps_with_partial_prefill,
+            max_active_sequences: stats.max_active_sequences,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct GreedyParityReport {
+    git_sha: String,
+    vllm_version: String,
+    max_prefill_chunk: usize,
+    all_matched: bool,
+    batched_vs_single_exact_match: bool,
+    chunked_vs_unchunked_exact_match: bool,
+    chunked_schedule: ScheduleReport,
+    unchunked_schedule: ScheduleReport,
+    triton_recompilations: Option<u32>,
+    watched_kernels: Option<u32>,
+    cases: Vec<GreedyCaseParityReport>,
+}
 
 const USAGE: &str = "zstep Mode B master\n\
 Usage: zstep --mode-b [OPTIONS]\n\
@@ -42,6 +122,8 @@ Usage: zstep --mode-b [OPTIONS]\n\
   --page-block-tokens N      Tokens per KV page block (default: 64 synthetic, 16 with --model-dir)\n\
   --prompt-ids LIST          Comma-separated prompt token IDs for greedy generation parity check\n\
   --max-new-tokens N         Generated tokens per prompt for --prompt-ids (default: 16)\n\
+  --verify-greedy-json PATH  Multi-case vLLM greedy reference JSON\n\
+  --verify-output-json PATH  Write measured single/batched/chunked parity report\n\
   --bench-tiers SPEC         Semicolon-separated tiers `label:conc:prompts:in_len:out_len`\n\
   --warmup-prompts N         Warm up 512->64 prompts at concurrency 16 (default: 16)\n\
   --repeats N                Interleaved repeat count across all tiers (default: 3)\n\
@@ -72,6 +154,8 @@ struct Arguments {
     page_block_tokens: Option<u32>,
     prompt_ids: Option<Vec<i32>>,
     max_new_tokens: usize,
+    verify_greedy_json: Option<PathBuf>,
+    verify_output_json: Option<PathBuf>,
     bench_tiers: Vec<BenchmarkTierSpec>,
     warmup_prompts: usize,
     repeats: usize,
@@ -105,6 +189,8 @@ impl Default for Arguments {
             page_block_tokens: None,
             prompt_ids: None,
             max_new_tokens: 16,
+            verify_greedy_json: None,
+            verify_output_json: None,
             bench_tiers: Vec::new(),
             warmup_prompts: 16,
             repeats: 3,
@@ -149,6 +235,151 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn greedy_match(expected: &[i32], generated: &[i32]) -> GreedyMatchReport {
+    let first_mismatch = expected
+        .iter()
+        .zip(generated)
+        .position(|(expected_token, generated_token)| expected_token != generated_token);
+    let exact_prefix_match_tokens = first_mismatch.unwrap_or(expected.len());
+    let exact_token_matches = expected
+        .iter()
+        .zip(generated)
+        .filter(|(expected_token, generated_token)| expected_token == generated_token)
+        .count();
+    GreedyMatchReport {
+        exact_prefix_match_tokens,
+        total_tokens: expected.len(),
+        exact_token_matches,
+        exact_token_match_rate: exact_token_matches as f64 / expected.len() as f64,
+        all_matched: exact_prefix_match_tokens == expected.len(),
+        first_mismatch_token_index: first_mismatch,
+    }
+}
+
+fn current_git_sha() -> Result<String, Box<dyn std::error::Error>> {
+    let sha = match std::env::var("ZSTEP_GIT_SHA") {
+        Ok(sha) => sha,
+        Err(std::env::VarError::NotPresent) => {
+            let git_dir = PathBuf::from(".git");
+            let head = std::fs::read_to_string(git_dir.join("HEAD"))?;
+            let head = head.trim();
+            match head.strip_prefix("ref: ") {
+                Some(reference) => std::fs::read_to_string(git_dir.join(reference))?,
+                None => head.to_owned(),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let sha = sha.trim();
+    if sha.len() != 40
+        || !sha
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err("invalid Git SHA provenance".into());
+    }
+    Ok(sha.to_owned())
+}
+
+fn run_greedy_verification(
+    engine: &mut ModeBServingEngine,
+    reference: &GreedyReference,
+    max_prefill_chunk: usize,
+) -> Result<GreedyParityReport, Box<dyn std::error::Error>> {
+    if reference.cases.is_empty() {
+        return Err("greedy reference contains no cases".into());
+    }
+    for case in &reference.cases {
+        if case.prompt_token_ids.is_empty() || case.max_tokens == 0 {
+            return Err(format!(
+                "case {} has an empty prompt or zero output length",
+                case.name
+            )
+            .into());
+        }
+        if case.expected_greedy_token_ids.len() != case.max_tokens {
+            return Err(format!(
+                "case {} expected {} tokens but max_tokens is {}",
+                case.name,
+                case.expected_greedy_token_ids.len(),
+                case.max_tokens
+            )
+            .into());
+        }
+    }
+
+    let prompts: Vec<Vec<i32>> = reference
+        .cases
+        .iter()
+        .map(|case| case.prompt_token_ids.clone())
+        .collect();
+    let output_lengths: Vec<usize> = reference.cases.iter().map(|case| case.max_tokens).collect();
+
+    engine.set_max_prefill_chunk(usize::MAX)?;
+    let mut single_outputs = Vec::with_capacity(reference.cases.len());
+    for case in &reference.cases {
+        let mut outputs = engine.generate_greedy_with_lengths(
+            std::slice::from_ref(&case.prompt_token_ids),
+            std::slice::from_ref(&case.max_tokens),
+        )?;
+        single_outputs.push(outputs.remove(0));
+    }
+    let batched_outputs = engine.generate_greedy_with_lengths(&prompts, &output_lengths)?;
+    let unchunked_schedule = ScheduleReport::from(engine.last_generation_schedule());
+
+    engine.set_max_prefill_chunk(max_prefill_chunk)?;
+    let chunked_outputs = engine.generate_greedy_with_lengths(&prompts, &output_lengths)?;
+    let chunked_schedule = ScheduleReport::from(engine.last_generation_schedule());
+
+    let batched_vs_single_exact_match = batched_outputs == single_outputs;
+    let chunked_vs_unchunked_exact_match = chunked_outputs == batched_outputs;
+    let mut case_reports = Vec::with_capacity(reference.cases.len());
+    for (index, case) in reference.cases.iter().enumerate() {
+        let single = &single_outputs[index];
+        let batched = &batched_outputs[index];
+        let chunked = &chunked_outputs[index];
+        if single.len() != case.max_tokens
+            || batched.len() != case.max_tokens
+            || chunked.len() != case.max_tokens
+        {
+            return Err(format!("case {} returned an unexpected token count", case.name).into());
+        }
+        let single_match = greedy_match(&case.expected_greedy_token_ids, single);
+        let batched_match = greedy_match(&case.expected_greedy_token_ids, batched);
+        let chunked_match = greedy_match(&case.expected_greedy_token_ids, chunked);
+        case_reports.push(GreedyCaseParityReport {
+            name: case.name.clone(),
+            prompt_token_ids: case.prompt_token_ids.clone(),
+            expected_greedy_token_ids: case.expected_greedy_token_ids.clone(),
+            exact_prefix_match_tokens: single_match.exact_prefix_match_tokens,
+            total_tokens: single_match.total_tokens,
+            exact_token_match_rate: single_match.exact_token_match_rate,
+            all_matched: single_match.all_matched,
+            first_mismatch_token_index: single_match.first_mismatch_token_index,
+            single_generated_token_ids: single.clone(),
+            batched_generated_token_ids: batched.clone(),
+            chunked_generated_token_ids: chunked.clone(),
+            single_match,
+            batched_match,
+            chunked_match,
+        });
+    }
+    let all_matched = case_reports.iter().all(|case| case.all_matched);
+    Ok(GreedyParityReport {
+        git_sha: current_git_sha()?,
+        vllm_version: reference.vllm_version.clone(),
+        max_prefill_chunk,
+        all_matched,
+        batched_vs_single_exact_match,
+        chunked_vs_unchunked_exact_match,
+        chunked_schedule,
+        unchunked_schedule,
+        triton_recompilations: None,
+        watched_kernels: None,
+        cases: case_reports,
+    })
 }
 
 fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
@@ -208,6 +439,21 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
                 |n| n.to_string_lossy().into_owned(),
             );
         let mut engine = ModeBServingEngine::launch(config)?;
+
+        if let Some(reference_path) = args.verify_greedy_json {
+            let output_path = args
+                .verify_output_json
+                .ok_or("--verify-output-json is required with --verify-greedy-json")?;
+            let reference_bytes = std::fs::read(reference_path)?;
+            let reference: GreedyReference = serde_json::from_slice(&reference_bytes)?;
+            let report = run_greedy_verification(&mut engine, &reference, args.max_prefill_chunk)?;
+            let mut encoded = serde_json::to_string_pretty(&report)?;
+            encoded.push('\n');
+            std::fs::write(&output_path, encoded)?;
+            println!("VERIFY_GREEDY_REPORT={}", output_path.display());
+            engine.shutdown()?;
+            return Ok(());
+        }
 
         if let Some(prompt) = args.prompt_ids {
             let outs =
@@ -331,6 +577,8 @@ fn parse_arguments(raw: &[String]) -> Result<Arguments, String> {
             "--page-block-tokens" => args.page_block_tokens = Some(parse_number(option, value)?),
             "--prompt-ids" => args.prompt_ids = Some(parse_i32_list(option, value)?),
             "--max-new-tokens" => args.max_new_tokens = parse_number(option, value)?,
+            "--verify-greedy-json" => args.verify_greedy_json = Some(PathBuf::from(value)),
+            "--verify-output-json" => args.verify_output_json = Some(PathBuf::from(value)),
             "--bench-tiers" => args.bench_tiers = parse_bench_tiers(value)?,
             "--warmup-prompts" => args.warmup_prompts = parse_number(option, value)?,
             "--repeats" => args.repeats = parse_number(option, value)?,
@@ -355,6 +603,19 @@ fn parse_arguments(raw: &[String]) -> Result<Arguments, String> {
     }
     if args.max_prefill_chunk == 0 {
         return Err("--max-prefill-chunk must be positive".to_owned());
+    }
+    if args.verify_greedy_json.is_some() != args.verify_output_json.is_some() {
+        return Err(
+            "--verify-greedy-json and --verify-output-json must be provided together".to_owned(),
+        );
+    }
+    if args.verify_greedy_json.is_some()
+        && (args.model_dir.is_none() || args.prompt_ids.is_some() || !args.bench_tiers.is_empty())
+    {
+        return Err(
+            "greedy verification requires --model-dir and excludes --prompt-ids/--bench-tiers"
+                .to_owned(),
+        );
     }
     Ok(args)
 }
@@ -434,5 +695,48 @@ mod tests {
         assert_eq!(tiers[2].num_prompts, 400);
         assert_eq!(tiers[2].input_len, 1024);
         assert_eq!(tiers[2].output_len, 256);
+    }
+
+    #[test]
+    fn greedy_match_reports_prefix_rate_and_first_divergence() {
+        let report = greedy_match(&[10, 11, 12, 13], &[10, 11, 99, 13]);
+        assert_eq!(report.exact_prefix_match_tokens, 2);
+        assert_eq!(report.total_tokens, 4);
+        assert_eq!(report.exact_token_matches, 3);
+        assert_eq!(report.exact_token_match_rate, 0.75);
+        assert!(!report.all_matched);
+        assert_eq!(report.first_mismatch_token_index, Some(2));
+    }
+
+    #[test]
+    fn greedy_verification_arguments_are_paired_and_model_scoped() {
+        let args = |tail: &[&str]| {
+            let raw: Vec<String> = std::iter::once("--mode-b")
+                .chain(tail.iter().copied())
+                .map(str::to_owned)
+                .collect();
+            parse_arguments(&raw[1..])
+        };
+        assert!(args(&["--verify-greedy-json", "reference.json"]).is_err());
+        assert!(
+            args(&[
+                "--model-dir",
+                "model",
+                "--verify-greedy-json",
+                "reference.json",
+                "--verify-output-json",
+                "report.json",
+            ])
+            .is_ok()
+        );
+        assert!(
+            args(&[
+                "--verify-greedy-json",
+                "reference.json",
+                "--verify-output-json",
+                "report.json",
+            ])
+            .is_err()
+        );
     }
 }

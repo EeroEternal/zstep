@@ -375,6 +375,10 @@ impl ModeBCoordinator {
         &self.config
     }
 
+    pub(crate) fn config_mut(&mut self) -> &mut ModeBConfig {
+        &mut self.config
+    }
+
     pub(crate) fn plan_slot_mut(&mut self, step_id: u64) -> Result<zs_shm::StepPlanSlotMut<'_>> {
         Ok(self.arena.plan_slot_mut(&self.layout, slot(step_id))?)
     }

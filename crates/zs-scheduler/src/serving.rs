@@ -565,6 +565,15 @@ impl ActiveSequence {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GenerationScheduleStats {
+    pub prefill_steps: u64,
+    pub decode_steps: u64,
+    pub chunked_prefill_steps: u64,
+    pub decode_steps_with_partial_prefill: u64,
+    pub max_active_sequences: usize,
+}
+
 /// Live Mode B continuous-batching engine keeping the 8 GPU workers warm across runs.
 pub struct ModeBServingEngine {
     coordinator: ModeBCoordinator,
@@ -574,6 +583,7 @@ pub struct ModeBServingEngine {
     step_cursor: u64,
     init_wall_us: u64,
     worker_numa_nodes: Vec<i32>,
+    last_generation_schedule: GenerationScheduleStats,
 }
 
 impl ModeBServingEngine {
@@ -594,6 +604,7 @@ impl ModeBServingEngine {
             step_cursor: 0,
             init_wall_us,
             worker_numa_nodes,
+            last_generation_schedule: GenerationScheduleStats::default(),
         })
     }
 
@@ -605,23 +616,63 @@ impl ModeBServingEngine {
         self.init_wall_us as f64 / 1000.0
     }
 
+    pub fn last_generation_schedule(&self) -> &GenerationScheduleStats {
+        &self.last_generation_schedule
+    }
+
+    pub fn set_max_prefill_chunk(&mut self, max_prefill_chunk: usize) -> Result<()> {
+        if max_prefill_chunk == 0 {
+            return Err(ModeBError::Protocol(
+                "max_prefill_chunk must be positive".to_owned(),
+            ));
+        }
+        self.coordinator.config_mut().max_prefill_chunk = max_prefill_chunk;
+        Ok(())
+    }
+
     /// Generate exact greedy completions for `prompts` (`target_output_len` new tokens each).
     pub fn generate_greedy(
         &mut self,
         prompts: &[Vec<i32>],
         target_output_len: usize,
     ) -> Result<Vec<Vec<i32>>> {
+        if target_output_len == 0 {
+            return Ok(vec![Vec::new(); prompts.len()]);
+        }
+        self.generate_greedy_with_lengths(prompts, &vec![target_output_len; prompts.len()])
+    }
+
+    /// Generate exact greedy completions with an explicit output length for every prompt.
+    pub fn generate_greedy_with_lengths(
+        &mut self,
+        prompts: &[Vec<i32>],
+        target_output_lengths: &[usize],
+    ) -> Result<Vec<Vec<i32>>> {
+        if prompts.len() != target_output_lengths.len() {
+            return Err(ModeBError::Protocol(format!(
+                "prompt count {} differs from output length count {}",
+                prompts.len(),
+                target_output_lengths.len()
+            )));
+        }
+        if target_output_lengths.contains(&0) {
+            return Err(ModeBError::Protocol(
+                "greedy output lengths must be positive".to_owned(),
+            ));
+        }
         let mut completed = vec![Vec::new(); prompts.len()];
-        if prompts.is_empty() || target_output_len == 0 {
+        if prompts.is_empty() {
             return Ok(completed);
         }
+        self.last_generation_schedule = GenerationScheduleStats::default();
         let now = Instant::now();
         let mut waiting: VecDeque<PendingRequest> = prompts
             .iter()
+            .zip(target_output_lengths)
             .enumerate()
-            .map(|(idx, p)| PendingRequest {
+            .map(|(idx, (prompt, &target_output_len))| PendingRequest {
                 request_id: idx,
-                prompt_tokens: p.clone(),
+                prompt_tokens: prompt.clone(),
                 target_output_len,
                 permit_time: now,
                 submit_time: now,
@@ -784,6 +835,9 @@ impl ModeBServingEngine {
                     consecutive_prefills,
                 );
                 if run_prefill {
+                    let continued_chunk = active.iter().any(|seq| {
+                        seq.prefilled_tokens > 0 && seq.prefilled_tokens < seq.prompt_tokens.len()
+                    });
                     self.stage_prefill_step(
                         sid,
                         &mut active,
@@ -792,6 +846,18 @@ impl ModeBServingEngine {
                         page_block_tokens,
                         max_pages_per_seq,
                     )?;
+                    self.last_generation_schedule.prefill_steps += 1;
+                    if continued_chunk
+                        || active
+                            .iter()
+                            .any(|seq| seq.prefilled_tokens < seq.prompt_tokens.len())
+                    {
+                        self.last_generation_schedule.chunked_prefill_steps += 1;
+                    }
+                    self.last_generation_schedule.max_active_sequences = self
+                        .last_generation_schedule
+                        .max_active_sequences
+                        .max(active.len());
                     consecutive_prefills += 1;
                 } else {
                     self.stage_decode_step(
@@ -801,6 +867,11 @@ impl ModeBServingEngine {
                         max_pages_per_seq,
                         true,
                     )?;
+                    self.last_generation_schedule.decode_steps += 1;
+                    if has_partial_prefill {
+                        self.last_generation_schedule
+                            .decode_steps_with_partial_prefill += 1;
+                    }
                     consecutive_prefills = 0;
                 }
                 sid
@@ -821,6 +892,7 @@ impl ModeBServingEngine {
 
             if can_overlap_next {
                 let next_sid = self.step_cursor + 1;
+                self.last_generation_schedule.decode_steps += 1;
                 self.stage_decode_step(
                     next_sid,
                     &mut active,

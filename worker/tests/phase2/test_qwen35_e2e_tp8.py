@@ -18,38 +18,39 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""End-to-end 8-GPU Mode B greedy parity test for Qwen/Qwen3.5-35B-A3B (`TP=8`, `bfloat16`)."""
+"""End-to-end 8-GPU Mode B multi-sequence and chunked-prefill greedy parity."""
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 import torch
 
-EXPECTED_PROMPT_IDS = [760, 6511, 314, 9338, 369]  # "The capital of France is"
-EXPECTED_GREEDY_16 = [
-    11751,
-    13,
-    198,
-    760,
-    6511,
-    314,
-    9338,
-    369,
-    11751,
-    13,
-    198,
-    760,
-    6511,
-    314,
-    9338,
-    369,
-]
+
+def match_statistics(expected: list[int], generated: list[int]) -> dict[str, Any]:
+    total = len(expected)
+    prefix = 0
+    for expected_token, generated_token in zip(expected, generated, strict=True):
+        if expected_token != generated_token:
+            break
+        prefix += 1
+    exact_matches = sum(
+        expected_token == generated_token
+        for expected_token, generated_token in zip(expected, generated, strict=True)
+    )
+    return {
+        "exact_prefix_match_tokens": prefix,
+        "total_tokens": total,
+        "exact_token_match_rate": exact_matches / total,
+        "all_matched": prefix == total,
+    }
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="8 CUDA GPUs required for TP=8")
@@ -61,6 +62,11 @@ def test_qwen35_35b_a3b_mode_b_tp8_greedy_parity() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     zstep_bin = Path(os.environ.get("ZSTEP_BIN", str(repo_root / "target/release/zstep")))
     worker_root = repo_root / "worker"
+    reference_path = repo_root / "docs/benchmarks/phase2_vllm_greedy_reference.json"
+    report_path = repo_root / "docs/benchmarks/phase2_greedy_parity_report.json"
+    reference = json.loads(reference_path.read_text(encoding="utf-8"))
+    assert len(reference["cases"]) == 4
+    assert 65 <= len(reference["cases"][3]["prompt_token_ids"]) <= 72
     shm_name = f"zstep_qwen35_e2e_{os.getpid()}"
 
     cmd = [
@@ -86,23 +92,62 @@ def test_qwen35_35b_a3b_mode_b_tp8_greedy_parity() -> None:
         "512",
         "--max-pages-per-seq",
         "64",
-        "--prompt-ids",
-        ",".join(str(x) for x in EXPECTED_PROMPT_IDS),
-        "--max-new-tokens",
-        "16",
+        "--verify-greedy-json",
+        str(reference_path),
+        "--verify-output-json",
+        str(report_path),
+        "--max-prefill-chunk",
+        "24",
     ]
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=1800)
     assert proc.returncode == 0, (
         f"zstep Mode B exited with {proc.returncode}:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     )
-    match = re.search(r"GENERATED_IDS=\[([0-9,\s-]+)\]", proc.stdout)
-    assert match is not None, f"Missing GENERATED_IDS in stdout:\n{proc.stdout}\n{proc.stderr}"
-    generated = [int(tok.strip()) for tok in match.group(1).split(",") if tok.strip()]
-    assert generated == EXPECTED_GREEDY_16, (
-        f"Greedy token mismatch vs reference!\nGot:      {generated}\nExpected: {EXPECTED_GREEDY_16}"
-    )
+    marker = re.search(r"TRITON_RECOMPILATIONS=(\d+) WATCHED_KERNELS=(\d+)", proc.stdout)
+    assert marker is not None, f"Missing Triton audit marker:\n{proc.stdout}\n{proc.stderr}"
+    assert marker.group(1) == "0"
+    assert marker.group(2) == "17"
 
-    # Verify RAII cleanup of all SHM segments
-    assert not Path(f"/dev/shm/{shm_name}").exists()
-    assert not Path(f"/dev/shm/{shm_name}_ar").exists()
-    assert not Path(f"/dev/shm/{shm_name}_ar_argmax").exists()
+    for suffix in ("", "_ar", "_ar_argmax"):
+        assert not Path(f"/dev/shm/{shm_name}{suffix}").exists()
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert re.fullmatch(r"[0-9a-f]{40}", report["git_sha"])
+    assert report["max_prefill_chunk"] == 24
+    assert len(report["cases"]) == 4
+    assert report["cases"][1]["total_tokens"] == 128
+    assert len(report["cases"][1]["single_generated_token_ids"]) == 128
+    assert report["batched_vs_single_exact_match"] == all(
+        case["batched_generated_token_ids"] == case["single_generated_token_ids"]
+        for case in report["cases"]
+    )
+    assert report["chunked_vs_unchunked_exact_match"] == all(
+        case["chunked_generated_token_ids"] == case["batched_generated_token_ids"]
+        for case in report["cases"]
+    )
+    assert report["unchunked_schedule"]["prefill_steps"] == 1
+    assert report["unchunked_schedule"]["max_active_sequences"] == 4
+    assert report["chunked_schedule"]["max_active_sequences"] == 4
+    assert report["chunked_schedule"]["prefill_steps"] >= 3
+    assert report["chunked_schedule"]["decode_steps_with_partial_prefill"] >= 1
+
+    for reference_case, report_case in zip(reference["cases"], report["cases"], strict=True):
+        assert report_case["name"] == reference_case["name"]
+        expected = reference_case["expected_greedy_token_ids"]
+        for mode in ("single", "batched", "chunked"):
+            generated = report_case[f"{mode}_generated_token_ids"]
+            assert len(generated) == len(expected)
+            expected_stats = match_statistics(expected, generated)
+            actual_stats = report_case[f"{mode}_match"]
+            for key, value in expected_stats.items():
+                if isinstance(value, float):
+                    assert actual_stats[key] == pytest.approx(value)
+                else:
+                    assert actual_stats[key] == value
+
+    backward_expected = reference["cases"][0]["expected_greedy_token_ids"][:16]
+    assert report["cases"][0]["single_generated_token_ids"][:16] == backward_expected
+
+    report["triton_recompilations"] = int(marker.group(1))
+    report["watched_kernels"] = int(marker.group(2))
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

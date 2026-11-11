@@ -42,9 +42,9 @@ NVLink: 无；can_device_access_peer(i, j) == 0 (8x8 全 0)
 
 | 测试项 | 覆盖内容 | 结果 |
 | :--- | :--- | :--- |
-| `cargo test --workspace` + `clippy -D warnings` | `zs-wire` 动态容量属性断言、`zs-shm`、`zs-kv` Radix 前缀树与 RAII 回收、`zs-scheduler` 连续批处理重叠状态机 | **24 passed, 0 warnings** |
+| `cargo test --workspace` + `clippy -D warnings` | `zs-wire` 动态容量属性断言、`zs-shm`、`zs-kv` Radix 前缀树与 RAII 回收、`zs-scheduler` 连续批处理重叠状态机 | **27 passed, 0 warnings** |
 | [`test_qwen35_ops_sm120.py`](../worker/tests/phase2/test_qwen35_ops_sm120.py) | 零中心 RMSNorm + 零重编译断言、`GatedDeltaNet` 变长 Prefill 与单步递推逐位对齐、分页门控 GQA 对齐、**`530,000` 页（`8.6 GB`，偏移 `> 2^31` 元素）`int64` 寻址防溢出测试**、毒化初值下 256 专家 MoE 对齐 | **5 passed** |
-| [`test_qwen35_e2e_tp8.py`](../worker/tests/phase2/test_qwen35_e2e_tp8.py) | 8 卡真权重 `Qwen3.5-35B-A3B` 输入 `"The capital of France is"`（`[760, 6511, 314, 9338, 369]`）连续贪心生成 16 个 token，对比 `vLLM 0.33.0` 参考序列 `[11751, 13, 198, 760, 6511, 314, 9338, 369, 11751, 13, 198, 760, 6511, 314, 9338, 369]` + 15 个 Triton kernel 零重编译检查 + `/dev/shm` RAII 清理检查 | **PASSED（16/16 token 精确一致）** |
+| [`test_qwen35_e2e_tp8.py`](../worker/tests/phase2/test_qwen35_e2e_tp8.py) | 8 卡真权重 `Qwen3.5-35B-A3B` 对 4 个可复现 `vLLM 0.33.0` 贪心参考执行单序列（含 128-token 多 KV 页生成）、4 序列批处理与 `--max-prefill-chunk 24` 混合 Prefill/Decode；逐模式记录精确前缀、全序列匹配率与首个分歧位置，并检查 17 个 Triton kernel 零重编译及 `/dev/shm` RAII 清理 | 实测 token 与调度证据见 [`phase2_greedy_parity_report.json`](benchmarks/phase2_greedy_parity_report.json) |
 
 ---
 
@@ -52,9 +52,13 @@ NVLink: 无；can_device_access_peer(i, j) == 0 (8x8 全 0)
 
 * **测试机器**：同一台 `8 × 32 GB sm_120`（无 NVLink，`can_device_access_peer == 0`，4 NUMA `[0,0,0,1,2,2,2,3]`）
 * **模型与精度**：`Qwen/Qwen3.5-35B-A3B`，`TP=8`，`bfloat16`，贪心解码（无前缀缓存命中，确定性伪随机非重复 token 序列）
+* **vLLM 复测口径**：先执行 `32 × (512 -> 128)`、`max_concurrency=16`  warmup，再以 round-major 顺序交错执行 6 档工况共 3 轮；18 份原始结果与逐指标 `mean/std/min/max` 均由 [`collect_vllm_reference.py`](../worker/tests/phase2/collect_vllm_reference.py) 生成。
 * **原始归档数据**：
-  * `vLLM 0.33.0`：[`docs/benchmarks/phase2_vllm_qwen35_35b_a3b_tp8.json`](benchmarks/phase2_vllm_qwen35_35b_a3b_tp8.json)
+  * `vLLM 0.33.0`：[`docs/benchmarks/phase2_vllm_qwen35_35b_a3b_tp8.json`](benchmarks/phase2_vllm_qwen35_35b_a3b_tp8.json) 与 [`phase2_vllm_raw/`](benchmarks/phase2_vllm_raw/)
+  * 贪心逐 token 参考：[`phase2_vllm_greedy_reference.json`](benchmarks/phase2_vllm_greedy_reference.json)
   * `zstep Mode B`：[`docs/benchmarks/phase2_zstep_qwen35_35b_a3b_tp8.json`](benchmarks/phase2_zstep_qwen35_35b_a3b_tp8.json)
+
+> 下文表格保留初始单轮对照数据；最新 `n=3` 交错复测的逐轮值与聚合统计以上述 vLLM JSON 和原始结果目录为准。
 
 ### 4.1 工况 A：`input_len = 512`, `output_len = 256`（`c = 1, 16, 128`）
 
