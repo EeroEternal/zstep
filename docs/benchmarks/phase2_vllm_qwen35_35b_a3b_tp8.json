@@ -6,8 +6,8 @@
   "dtype": "bfloat16",
   "tp_size": 8,
   "seed": 20261111,
-  "git_sha": "fc40513b0ebb914ea28063406364842eb383a7f5",
-  "collection_timestamp_utc": "2026-11-11T14:42:34.430706+00:00",
+  "git_sha": "9d90e73fead75a6ac1fb249361123ab3d400971d",
+  "collection_timestamp_utc": "2026-11-11T17:19:43.630257+00:00",
   "serve_args": [
     "/models/Qwen3.5-35B-A3B",
     "--served-model-name",
@@ -20,24 +20,25 @@
     "32768",
     "--gpu-memory-utilization",
     "0.85",
+    "--no-enable-prefix-caching",
     "--host",
     "0.0.0.0",
     "--port",
-    "8200",
+    "8201",
     "--seed",
     "20261111"
   ],
-  "vllm_serve_command": "vllm serve /models/Qwen3.5-35B-A3B --served-model-name Qwen/Qwen3.5-35B-A3B --tensor-parallel-size 8 --dtype bfloat16 --max-model-len 32768 --gpu-memory-utilization 0.85 --host 0.0.0.0 --port 8200 --seed 20261111",
+  "vllm_serve_command": "vllm serve /models/Qwen3.5-35B-A3B --served-model-name Qwen/Qwen3.5-35B-A3B --tensor-parallel-size 8 --dtype bfloat16 --max-model-len 32768 --gpu-memory-utilization 0.85 --no-enable-prefix-caching --host 0.0.0.0 --port 8201 --seed 20261111",
   "nvidia_driver_version": "595.99.02",
   "gpu_clocks_mhz": [
-    2670,
-    2775,
-    2692,
+    2752,
+    2760,
+    2602,
     2790,
     2730,
-    2782,
-    2790,
-    2580
+    2715,
+    2647,
+    2722
   ],
   "gpu_memory_clocks_mhz": [
     13801,
@@ -53,21 +54,21 @@
     {
       "name": "NVIDIA GeForce RTX 5090",
       "driver_version": "595.99.02",
-      "graphics_clock_mhz": 2670,
+      "graphics_clock_mhz": 2752,
       "memory_clock_mhz": 13801,
       "memory_total_mib": 32607
     },
     {
       "name": "NVIDIA GeForce RTX 5090",
       "driver_version": "595.99.02",
-      "graphics_clock_mhz": 2775,
+      "graphics_clock_mhz": 2760,
       "memory_clock_mhz": 13801,
       "memory_total_mib": 32607
     },
     {
       "name": "NVIDIA GeForce RTX 5090",
       "driver_version": "595.99.02",
-      "graphics_clock_mhz": 2692,
+      "graphics_clock_mhz": 2602,
       "memory_clock_mhz": 13801,
       "memory_total_mib": 32607
     },
@@ -88,21 +89,21 @@
     {
       "name": "NVIDIA GeForce RTX 5090",
       "driver_version": "595.99.02",
-      "graphics_clock_mhz": 2782,
+      "graphics_clock_mhz": 2715,
       "memory_clock_mhz": 13801,
       "memory_total_mib": 32607
     },
     {
       "name": "NVIDIA GeForce RTX 5090",
       "driver_version": "595.99.02",
-      "graphics_clock_mhz": 2790,
+      "graphics_clock_mhz": 2647,
       "memory_clock_mhz": 13801,
       "memory_total_mib": 32607
     },
     {
       "name": "NVIDIA GeForce RTX 5090",
       "driver_version": "595.99.02",
-      "graphics_clock_mhz": 2580,
+      "graphics_clock_mhz": 2722,
       "memory_clock_mhz": 13801,
       "memory_total_mib": 32607
     }
@@ -114,31 +115,35 @@
     "random_range_ratio": 0.0,
     "ignore_eos": true,
     "temperature": 0.0,
+    "prefix_caching_enabled": false,
+    "seed_schedule": "base_seed + round_index * 1000 + tier_index (warmup uses base_seed + 900000)",
     "rounds": 3,
-    "schedule": "warmup once, then round-major interleaving of all six tiers",
+    "schedule": "warmup once, then round-major interleaving of all six tiers with distinct per-(round, tier) seeds",
     "warmup": {
+      "seed": 21161111,
       "input_len": 512,
       "output_len": 128,
       "num_prompts": 32,
       "max_concurrency": 16,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/warmup.json",
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 32 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename warmup.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 32 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 21161111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename warmup.json"
     },
     "aggregate_std": "population standard deviation across three rounds"
   },
-  "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c1.json",
+  "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c1.json",
   "vllm_bench_commands": {
-    "in512_c1": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c1.json",
-    "in512_c16": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 48 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c16.json",
-    "in512_c128": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 256 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c128.json",
-    "in1024_c1": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 20 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c1.json",
-    "in1024_c32": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 200 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c32.json",
-    "in1024_c128": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 400 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c128.json"
+    "in512_c1": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c1.json",
+    "in512_c16": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 48 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20261112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c16.json",
+    "in512_c128": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 256 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261113 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c128.json",
+    "in1024_c1": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 20 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261114 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c1.json",
+    "in1024_c32": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 200 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20261115 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c32.json",
+    "in1024_c128": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 400 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261116 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c128.json"
   },
   "rounds": [
     {
       "round": 0,
       "tier": "in512_c1",
+      "seed": 20261111,
       "input_len": 512,
       "output_len": 256,
       "num_prompts": 8,
@@ -146,24 +151,25 @@
       "completed": 8,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round0_in512_c1.json",
       "metrics": {
-        "duration_s": 10.814864974934608,
-        "output_throughput_tok_s": 189.36898470268542,
-        "total_throughput_tok_s": 575.8740413712524,
-        "mean_ttft_ms": 84.60139011731371,
-        "median_ttft_ms": 87.26532058790326,
-        "p99_ttft_ms": 94.77542306296527,
-        "mean_tpot_ms": 4.964911313407926,
-        "median_tpot_ms": 4.9409395065523825,
-        "p99_tpot_ms": 5.084577444812977,
-        "mean_itl_ms": 4.964911313407926,
-        "median_itl_ms": 4.859610926359892,
-        "p99_itl_ms": 8.26156343333422
+        "duration_s": 11.519421040080488,
+        "output_throughput_tok_s": 177.78671279348345,
+        "total_throughput_tok_s": 540.6521715223705,
+        "mean_ttft_ms": 170.3757584327832,
+        "median_ttft_ms": 161.90723632462323,
+        "p99_ttft_ms": 207.8587871650234,
+        "mean_tpot_ms": 4.973529622771357,
+        "median_tpot_ms": 4.965817257214119,
+        "p99_tpot_ms": 5.095203391404129,
+        "mean_itl_ms": 4.975968823174875,
+        "median_itl_ms": 4.8484499566257,
+        "p99_itl_ms": 7.798744533210993
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c1.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c1.json"
     },
     {
       "round": 0,
       "tier": "in512_c16",
+      "seed": 20261112,
       "input_len": 512,
       "output_len": 256,
       "num_prompts": 48,
@@ -171,24 +177,25 @@
       "completed": 48,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round0_in512_c16.json",
       "metrics": {
-        "duration_s": 6.460395062807947,
-        "output_throughput_tok_s": 1902.0508622980622,
-        "total_throughput_tok_s": 5783.237656020524,
-        "mean_ttft_ms": 285.6562139932066,
-        "median_ttft_ms": 295.02616892568767,
-        "p99_ttft_ms": 393.65370753221214,
-        "mean_tpot_ms": 7.301206478439698,
-        "median_tpot_ms": 7.350481119846888,
-        "p99_tpot_ms": 7.947910225438868,
-        "mean_itl_ms": 7.313156079877405,
-        "median_itl_ms": 7.013896945863962,
-        "p99_itl_ms": 10.229178331792308
+        "duration_s": 7.217214832082391,
+        "output_throughput_tok_s": 1702.5958469985756,
+        "total_throughput_tok_s": 5178.3133618064585,
+        "mean_ttft_ms": 460.8696768797624,
+        "median_ttft_ms": 464.8014190606773,
+        "p99_ttft_ms": 729.8372996458784,
+        "mean_tpot_ms": 7.603220779979845,
+        "median_tpot_ms": 7.554774634613127,
+        "p99_tpot_ms": 8.57040554635665,
+        "mean_itl_ms": 7.605706304916092,
+        "median_itl_ms": 6.959549617022276,
+        "p99_itl_ms": 10.019296058453616
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 48 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c16.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 48 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20261112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c16.json"
     },
     {
       "round": 0,
       "tier": "in512_c128",
+      "seed": 20261113,
       "input_len": 512,
       "output_len": 256,
       "num_prompts": 256,
@@ -196,24 +203,25 @@
       "completed": 256,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round0_in512_c128.json",
       "metrics": {
-        "duration_s": 16.38785718102008,
-        "output_throughput_tok_s": 3999.058527060012,
-        "total_throughput_tok_s": 12158.819655248974,
-        "mean_ttft_ms": 1175.4800916551176,
-        "median_ttft_ms": 1170.5407483968884,
-        "p99_ttft_ms": 2081.2561308266595,
-        "mean_tpot_ms": 27.255312951256556,
-        "median_tpot_ms": 27.156531081224482,
-        "p99_tpot_ms": 29.753106128533968,
-        "mean_itl_ms": 27.41025141282723,
-        "median_itl_ms": 24.791039992123842,
-        "p99_itl_ms": 112.26343689486384
+        "duration_s": 20.14110399922356,
+        "output_throughput_tok_s": 3253.8434835809603,
+        "total_throughput_tok_s": 9893.946230935606,
+        "mean_ttft_ms": 1581.0322567831463,
+        "median_ttft_ms": 710.9306077472866,
+        "p99_ttft_ms": 4381.518903071992,
+        "mean_tpot_ms": 32.833857742854676,
+        "median_tpot_ms": 34.42453851138114,
+        "p99_tpot_ms": 36.85074466609341,
+        "mean_itl_ms": 32.84895376940311,
+        "median_itl_ms": 25.199743453413248,
+        "p99_itl_ms": 115.5648724315688
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 256 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c128.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 256 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261113 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c128.json"
     },
     {
       "round": 0,
       "tier": "in1024_c1",
+      "seed": 20261114,
       "input_len": 1024,
       "output_len": 256,
       "num_prompts": 20,
@@ -221,24 +229,25 @@
       "completed": 20,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round0_in1024_c1.json",
       "metrics": {
-        "duration_s": 24.828003523871303,
-        "output_throughput_tok_s": 206.21875597356387,
-        "total_throughput_tok_s": 1039.4714168292453,
-        "mean_ttft_ms": 68.98919350933284,
-        "median_ttft_ms": 67.49362242408097,
-        "p99_ttft_ms": 108.72840440366413,
-        "mean_tpot_ms": 4.593590363933175,
-        "median_tpot_ms": 4.5431067171853545,
-        "p99_tpot_ms": 4.794316957704723,
-        "mean_itl_ms": 4.593590363933175,
-        "median_itl_ms": 4.536353517323732,
-        "p99_itl_ms": 6.316651748493316
+        "duration_s": 26.03778298990801,
+        "output_throughput_tok_s": 196.63732515108762,
+        "total_throughput_tok_s": 991.2902342724068,
+        "mean_ttft_ms": 138.70161965023726,
+        "median_ttft_ms": 134.52581246383488,
+        "p99_ttft_ms": 195.15531730838114,
+        "mean_tpot_ms": 4.557508099915496,
+        "median_tpot_ms": 4.5505562011956,
+        "p99_tpot_ms": 4.7503427330258425,
+        "mean_itl_ms": 4.55929605915438,
+        "median_itl_ms": 4.537062020972371,
+        "p99_itl_ms": 5.938554857857523
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 20 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c1.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 20 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261114 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c1.json"
     },
     {
       "round": 0,
       "tier": "in1024_c32",
+      "seed": 20261115,
       "input_len": 1024,
       "output_len": 256,
       "num_prompts": 200,
@@ -246,24 +255,25 @@
       "completed": 200,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round0_in1024_c32.json",
       "metrics": {
-        "duration_s": 21.914933746680617,
-        "output_throughput_tok_s": 2336.30640146266,
-        "total_throughput_tok_s": 11776.170668966299,
-        "mean_ttft_ms": 613.5083249816671,
-        "median_ttft_ms": 488.61582041718066,
-        "p99_ttft_ms": 1514.5471149357036,
-        "mean_tpot_ms": 10.32439710025438,
-        "median_tpot_ms": 9.789355229768974,
-        "p99_tpot_ms": 13.880572829596407,
-        "mean_itl_ms": 10.377300987642363,
-        "median_itl_ms": 8.44919472001493,
-        "p99_itl_ms": 112.84526296425611
+        "duration_s": 25.59123797994107,
+        "output_throughput_tok_s": 2000.6847671899106,
+        "total_throughput_tok_s": 10084.701654616643,
+        "mean_ttft_ms": 994.9675504514016,
+        "median_ttft_ms": 989.3259149976075,
+        "p99_ttft_ms": 1855.1545456890008,
+        "mean_tpot_ms": 11.16005193155405,
+        "median_tpot_ms": 11.110001594266471,
+        "p99_tpot_ms": 14.640733101934778,
+        "mean_itl_ms": 11.242052787178173,
+        "median_itl_ms": 8.445935556665063,
+        "p99_itl_ms": 107.92211920488624
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 200 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c32.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 200 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20261115 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c32.json"
     },
     {
       "round": 0,
       "tier": "in1024_c128",
+      "seed": 20261116,
       "input_len": 1024,
       "output_len": 256,
       "num_prompts": 400,
@@ -271,24 +281,25 @@
       "completed": 400,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round0_in1024_c128.json",
       "metrics": {
-        "duration_s": 34.3412160188891,
-        "output_throughput_tok_s": 2981.839662977448,
-        "total_throughput_tok_s": 15029.986116860193,
-        "mean_ttft_ms": 1713.3983000542503,
-        "median_ttft_ms": 1376.5545084606856,
-        "p99_ttft_ms": 4795.683055189437,
-        "mean_tpot_ms": 34.196129466648955,
-        "median_tpot_ms": 36.15204344375753,
-        "p99_tpot_ms": 51.54298352945012,
-        "mean_itl_ms": 34.21055156191526,
-        "median_itl_ms": 25.478198193013668,
-        "p99_itl_ms": 118.55345334857704
+        "duration_s": 39.80524802627042,
+        "output_throughput_tok_s": 2572.5251085590194,
+        "total_throughput_tok_s": 12966.330461233882,
+        "mean_ttft_ms": 1762.2652217606083,
+        "median_ttft_ms": 796.5444927103817,
+        "p99_ttft_ms": 7502.748475312254,
+        "mean_tpot_ms": 40.902911998285894,
+        "median_tpot_ms": 43.98562883885175,
+        "p99_tpot_ms": 47.836845024927136,
+        "mean_itl_ms": 40.913340889100766,
+        "median_itl_ms": 25.702537735924125,
+        "p99_itl_ms": 115.148323639296
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 400 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c128.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 400 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261116 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c128.json"
     },
     {
       "round": 1,
       "tier": "in512_c1",
+      "seed": 20262111,
       "input_len": 512,
       "output_len": 256,
       "num_prompts": 8,
@@ -296,24 +307,25 @@
       "completed": 8,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round1_in512_c1.json",
       "metrics": {
-        "duration_s": 9.67902862187475,
-        "output_throughput_tok_s": 211.5914809231465,
-        "total_throughput_tok_s": 643.4529996041779,
-        "mean_ttft_ms": 63.76184517284855,
-        "median_ttft_ms": 60.175355058163404,
-        "p99_ttft_ms": 96.96065514814107,
-        "mean_tpot_ms": 4.490600252870982,
-        "median_tpot_ms": 4.4788511333001,
-        "p99_tpot_ms": 4.5532888719702465,
-        "mean_itl_ms": 4.490600252870982,
-        "median_itl_ms": 4.462036304175854,
-        "p99_itl_ms": 5.7461971091106525
+        "duration_s": 10.264439372811466,
+        "output_throughput_tok_s": 199.5238050141111,
+        "total_throughput_tok_s": 606.4627374086141,
+        "mean_ttft_ms": 133.14739475026727,
+        "median_ttft_ms": 125.86645013652742,
+        "p99_ttft_ms": 184.4271722761914,
+        "mean_tpot_ms": 4.505184657333016,
+        "median_tpot_ms": 4.513255796194368,
+        "p99_tpot_ms": 4.547815801630564,
+        "mean_itl_ms": 4.505184657333016,
+        "median_itl_ms": 4.468994680792093,
+        "p99_itl_ms": 5.658366763964295
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in512_c1.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20262111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in512_c1.json"
     },
     {
       "round": 1,
       "tier": "in512_c16",
+      "seed": 20262112,
       "input_len": 512,
       "output_len": 256,
       "num_prompts": 48,
@@ -321,24 +333,25 @@
       "completed": 48,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round1_in512_c16.json",
       "metrics": {
-        "duration_s": 6.559695096686482,
-        "output_throughput_tok_s": 1873.2577991631156,
-        "total_throughput_tok_s": 5695.691560248399,
-        "mean_ttft_ms": 294.9579984124284,
-        "median_ttft_ms": 300.3948354162276,
-        "p99_ttft_ms": 455.8036127826199,
-        "mean_tpot_ms": 7.393227842768802,
-        "median_tpot_ms": 7.415727517731925,
-        "p99_tpot_ms": 8.013255339828046,
-        "mean_itl_ms": 7.393227842768801,
-        "median_itl_ms": 7.0510124787688255,
-        "p99_itl_ms": 10.964227425865882
+        "duration_s": 7.290938114281744,
+        "output_throughput_tok_s": 1685.3798245701519,
+        "total_throughput_tok_s": 5124.031971526392,
+        "mean_ttft_ms": 484.55498123075813,
+        "median_ttft_ms": 485.3242370299995,
+        "p99_ttft_ms": 759.2525962740183,
+        "mean_tpot_ms": 7.604030743918497,
+        "median_tpot_ms": 7.58302741154444,
+        "p99_tpot_ms": 8.588103692704703,
+        "mean_itl_ms": 7.609003949113996,
+        "median_itl_ms": 7.013031747192144,
+        "p99_itl_ms": 10.697157336398968
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 48 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in512_c16.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 48 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20262112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in512_c16.json"
     },
     {
       "round": 1,
       "tier": "in512_c128",
+      "seed": 20262113,
       "input_len": 512,
       "output_len": 256,
       "num_prompts": 256,
@@ -346,24 +359,25 @@
       "completed": 256,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round1_in512_c128.json",
       "metrics": {
-        "duration_s": 16.57044234406203,
-        "output_throughput_tok_s": 3954.993997096561,
-        "total_throughput_tok_s": 12024.844953605187,
-        "mean_ttft_ms": 1221.9437684852892,
-        "median_ttft_ms": 1202.0809380337596,
-        "p99_ttft_ms": 2125.6099299527705,
-        "mean_tpot_ms": 27.42674362974261,
-        "median_tpot_ms": 27.46655541636488,
-        "p99_tpot_ms": 30.021015233451536,
-        "mean_itl_ms": 27.59881343778764,
-        "median_itl_ms": 25.143612176179886,
-        "p99_itl_ms": 112.69359707832336
+        "duration_s": 20.05991538707167,
+        "output_throughput_tok_s": 3267.0127832262456,
+        "total_throughput_tok_s": 9934.388862299742,
+        "mean_ttft_ms": 1567.0260886763572,
+        "median_ttft_ms": 698.2460885774344,
+        "p99_ttft_ms": 4339.951346511953,
+        "mean_tpot_ms": 32.72692278189032,
+        "median_tpot_ms": 34.98431366101345,
+        "p99_tpot_ms": 36.55266242631364,
+        "mean_itl_ms": 32.742973258978054,
+        "median_itl_ms": 25.298707652837038,
+        "p99_itl_ms": 115.50677295308559
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 256 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in512_c128.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 256 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20262113 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in512_c128.json"
     },
     {
       "round": 1,
       "tier": "in1024_c1",
+      "seed": 20262114,
       "input_len": 1024,
       "output_len": 256,
       "num_prompts": 20,
@@ -371,24 +385,25 @@
       "completed": 20,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round1_in1024_c1.json",
       "metrics": {
-        "duration_s": 24.76988238794729,
-        "output_throughput_tok_s": 206.70263668637065,
-        "total_throughput_tok_s": 1041.9104780472371,
-        "mean_ttft_ms": 69.7102394187823,
-        "median_ttft_ms": 64.79975464753807,
-        "p99_ttft_ms": 105.54248277563599,
-        "mean_tpot_ms": 4.57978924489854,
-        "median_tpot_ms": 4.55369331928737,
-        "p99_tpot_ms": 4.84447385440124,
-        "mean_itl_ms": 4.57978924489854,
-        "median_itl_ms": 4.511729581281543,
-        "p99_itl_ms": 6.969940848648549
+        "duration_s": 25.95928221894428,
+        "output_throughput_tok_s": 197.23195567647792,
+        "total_throughput_tok_s": 994.2493703144327,
+        "mean_ttft_ms": 137.72191398311406,
+        "median_ttft_ms": 131.31672516465187,
+        "p99_ttft_ms": 221.59757828339923,
+        "mean_tpot_ms": 4.546216309764514,
+        "median_tpot_ms": 4.530125226387207,
+        "p99_tpot_ms": 4.689772892779871,
+        "mean_itl_ms": 4.546216309764514,
+        "median_itl_ms": 4.506198922172189,
+        "p99_itl_ms": 6.1543333483859906
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 20 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in1024_c1.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 20 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20262114 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in1024_c1.json"
     },
     {
       "round": 1,
       "tier": "in1024_c32",
+      "seed": 20262115,
       "input_len": 1024,
       "output_len": 256,
       "num_prompts": 200,
@@ -396,24 +411,25 @@
       "completed": 200,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round1_in1024_c32.json",
       "metrics": {
-        "duration_s": 17.932223555166274,
-        "output_throughput_tok_s": 2855.195276954334,
-        "total_throughput_tok_s": 14391.634099701421,
-        "mean_ttft_ms": 354.25811373395845,
-        "median_ttft_ms": 356.7153848707676,
-        "p99_ttft_ms": 635.2036059927195,
-        "mean_tpot_ms": 8.982551886170517,
-        "median_tpot_ms": 9.035934520629691,
-        "p99_tpot_ms": 9.849203931971214,
-        "mean_itl_ms": 9.034812073655386,
-        "median_itl_ms": 8.430397137999535,
-        "p99_itl_ms": 42.08257710561156
+        "duration_s": 26.341031522955745,
+        "output_throughput_tok_s": 1943.7355729740539,
+        "total_throughput_tok_s": 9797.072668741195,
+        "mean_ttft_ms": 1062.4876890378073,
+        "median_ttft_ms": 1041.1511303391308,
+        "p99_ttft_ms": 1946.9871057756234,
+        "mean_tpot_ms": 11.316165396176716,
+        "median_tpot_ms": 11.319420638256798,
+        "p99_tpot_ms": 14.826122262770783,
+        "mean_itl_ms": 11.387167736178773,
+        "median_itl_ms": 8.428319822996855,
+        "p99_itl_ms": 110.34695141483098
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 200 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in1024_c32.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 200 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20262115 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in1024_c32.json"
     },
     {
       "round": 1,
       "tier": "in1024_c128",
+      "seed": 20262116,
       "input_len": 1024,
       "output_len": 256,
       "num_prompts": 400,
@@ -421,24 +437,25 @@
       "completed": 400,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round1_in1024_c128.json",
       "metrics": {
-        "duration_s": 25.663455608766526,
-        "output_throughput_tok_s": 3990.109576865424,
-        "total_throughput_tok_s": 20112.17849492124,
-        "mean_ttft_ms": 938.1726531893946,
-        "median_ttft_ms": 943.860451458022,
-        "p99_ttft_ms": 1652.8386955196038,
-        "mean_tpot_ms": 26.348068951414536,
-        "median_tpot_ms": 27.154741349502228,
-        "p99_tpot_ms": 29.284368105159672,
-        "mean_itl_ms": 26.56029088347366,
-        "median_itl_ms": 24.664210621267557,
-        "p99_itl_ms": 114.08671634271745
+        "duration_s": 40.298795273993164,
+        "output_throughput_tok_s": 2541.0188891200887,
+        "total_throughput_tok_s": 12808.075191595057,
+        "mean_ttft_ms": 1765.1896244531963,
+        "median_ttft_ms": 773.2806857675314,
+        "p99_ttft_ms": 7679.0890061156815,
+        "mean_tpot_ms": 41.48290240349175,
+        "median_tpot_ms": 44.35161900177013,
+        "p99_tpot_ms": 47.1451989320819,
+        "mean_itl_ms": 41.49469991621302,
+        "median_itl_ms": 25.720180943608284,
+        "p99_itl_ms": 113.8000891543925
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 400 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in1024_c128.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 400 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20262116 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in1024_c128.json"
     },
     {
       "round": 2,
       "tier": "in512_c1",
+      "seed": 20263111,
       "input_len": 512,
       "output_len": 256,
       "num_prompts": 8,
@@ -446,24 +463,25 @@
       "completed": 8,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round2_in512_c1.json",
       "metrics": {
-        "duration_s": 9.669224159792066,
-        "output_throughput_tok_s": 211.80603181341922,
-        "total_throughput_tok_s": 644.105452213855,
-        "mean_ttft_ms": 65.54437160957605,
-        "median_ttft_ms": 59.958208817988634,
-        "p99_ttft_ms": 96.98414774611591,
-        "mean_tpot_ms": 4.478892627829577,
-        "median_tpot_ms": 4.46185301350174,
-        "p99_tpot_ms": 4.517742088922829,
-        "mean_itl_ms": 4.478892627829577,
-        "median_itl_ms": 4.469942068681121,
-        "p99_itl_ms": 5.5279582459479535
+        "duration_s": 10.270904944743961,
+        "output_throughput_tok_s": 199.39820405484764,
+        "total_throughput_tok_s": 606.7625037450247,
+        "mean_ttft_ms": 132.8907972201705,
+        "median_ttft_ms": 124.23429265618324,
+        "p99_ttft_ms": 192.0388774992898,
+        "mean_tpot_ms": 4.509478588771148,
+        "median_tpot_ms": 4.501171417388261,
+        "p99_tpot_ms": 4.603448364956707,
+        "mean_itl_ms": 4.509478588771148,
+        "median_itl_ms": 4.460468655452132,
+        "p99_itl_ms": 6.075273910537361
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c1.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20263111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c1.json"
     },
     {
       "round": 2,
       "tier": "in512_c16",
+      "seed": 20263112,
       "input_len": 512,
       "output_len": 256,
       "num_prompts": 48,
@@ -471,24 +489,25 @@
       "completed": 48,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round2_in512_c16.json",
       "metrics": {
-        "duration_s": 6.4543733252212405,
-        "output_throughput_tok_s": 1903.8254189578965,
-        "total_throughput_tok_s": 5788.633244067784,
-        "mean_ttft_ms": 280.42022717030096,
-        "median_ttft_ms": 299.0832158830017,
-        "p99_ttft_ms": 395.05862083286047,
-        "mean_tpot_ms": 7.316743859677313,
-        "median_tpot_ms": 7.30903496162272,
-        "p99_tpot_ms": 7.943385893095504,
-        "mean_itl_ms": 7.316743859677313,
-        "median_itl_ms": 7.0144974160939455,
-        "p99_itl_ms": 9.686422673985362
+        "duration_s": 7.1651295139454305,
+        "output_throughput_tok_s": 1714.9724894831238,
+        "total_throughput_tok_s": 5214.420748052447,
+        "mean_ttft_ms": 432.978868552406,
+        "median_ttft_ms": 441.473770653829,
+        "p99_ttft_ms": 675.1337941549718,
+        "mean_tpot_ms": 7.6455760086746585,
+        "median_tpot_ms": 7.63230281151539,
+        "p99_tpot_ms": 8.621884316498157,
+        "mean_itl_ms": 7.65057638539714,
+        "median_itl_ms": 7.027969695627689,
+        "p99_itl_ms": 10.471695009619005
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 48 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c16.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 48 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20263112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c16.json"
     },
     {
       "round": 2,
       "tier": "in512_c128",
+      "seed": 20263113,
       "input_len": 512,
       "output_len": 256,
       "num_prompts": 256,
@@ -496,24 +515,25 @@
       "completed": 256,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round2_in512_c128.json",
       "metrics": {
-        "duration_s": 16.4926479565911,
-        "output_throughput_tok_s": 3973.6493601568254,
-        "total_throughput_tok_s": 12081.565102489756,
-        "mean_ttft_ms": 1240.5128407062875,
-        "median_ttft_ms": 1206.1222409829497,
-        "p99_ttft_ms": 2199.8824674636126,
-        "mean_tpot_ms": 27.201066966767495,
-        "median_tpot_ms": 27.234487976951925,
-        "p99_tpot_ms": 29.812780476869175,
-        "mean_itl_ms": 27.34263884066678,
-        "median_itl_ms": 24.425895884633064,
-        "p99_itl_ms": 112.47515990398819
+        "duration_s": 20.126119604799896,
+        "output_throughput_tok_s": 3256.26605062857,
+        "total_throughput_tok_s": 9901.461578936161,
+        "mean_ttft_ms": 1673.8344728782977,
+        "median_ttft_ms": 1089.5664850249887,
+        "p99_ttft_ms": 4193.468922027387,
+        "mean_tpot_ms": 32.4230296498903,
+        "median_tpot_ms": 33.269393791937645,
+        "p99_tpot_ms": 36.82124623773145,
+        "mean_itl_ms": 32.43843393070911,
+        "median_itl_ms": 25.66393092274666,
+        "p99_itl_ms": 111.97142731398344
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 256 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c128.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 256 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20263113 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c128.json"
     },
     {
       "round": 2,
       "tier": "in1024_c1",
+      "seed": 20263114,
       "input_len": 1024,
       "output_len": 256,
       "num_prompts": 20,
@@ -521,24 +541,25 @@
       "completed": 20,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round2_in1024_c1.json",
       "metrics": {
-        "duration_s": 24.948083598166704,
-        "output_throughput_tok_s": 205.22618420182945,
-        "total_throughput_tok_s": 1034.4682347423466,
-        "mean_ttft_ms": 68.9330626046285,
-        "median_ttft_ms": 64.60288865491748,
-        "p99_ttft_ms": 104.46446210611607,
-        "mean_tpot_ms": 4.617788303351285,
-        "median_tpot_ms": 4.610661790687956,
-        "p99_tpot_ms": 4.8310568697714045,
-        "mean_itl_ms": 4.617788303351285,
-        "median_itl_ms": 4.564235219731927,
-        "p99_itl_ms": 6.698160632513474
+        "duration_s": 25.849294878076762,
+        "output_throughput_tok_s": 198.07116689834203,
+        "total_throughput_tok_s": 998.4024756469553,
+        "mean_ttft_ms": 138.39689935557544,
+        "median_ttft_ms": 131.58707902766764,
+        "p99_ttft_ms": 228.34349022712547,
+        "mean_tpot_ms": 4.5215324669455494,
+        "median_tpot_ms": 4.527033779624046,
+        "p99_tpot_ms": 4.588585171282437,
+        "mean_itl_ms": 4.5215324669455494,
+        "median_itl_ms": 4.49441559612751,
+        "p99_itl_ms": 5.9420065814629215
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 20 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c1.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 20 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20263114 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c1.json"
     },
     {
       "round": 2,
       "tier": "in1024_c32",
+      "seed": 20263115,
       "input_len": 1024,
       "output_len": 256,
       "num_prompts": 200,
@@ -546,24 +567,25 @@
       "completed": 200,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round2_in1024_c32.json",
       "metrics": {
-        "duration_s": 18.012156881857663,
-        "output_throughput_tok_s": 2842.5246535338606,
-        "total_throughput_tok_s": 14327.767723361281,
-        "mean_ttft_ms": 350.2289245137945,
-        "median_ttft_ms": 342.5305534619838,
-        "p99_ttft_ms": 605.6075860233977,
-        "mean_tpot_ms": 9.020068407223066,
-        "median_tpot_ms": 9.10311132925106,
-        "p99_tpot_ms": 9.902045525099133,
-        "mean_itl_ms": 9.083833355088196,
-        "median_itl_ms": 8.43183626420796,
-        "p99_itl_ms": 43.313800571486325
+        "duration_s": 26.490237469784915,
+        "output_throughput_tok_s": 1932.7875055253596,
+        "total_throughput_tok_s": 9742.155021991028,
+        "mean_ttft_ms": 1076.044506020844,
+        "median_ttft_ms": 1071.5392120182514,
+        "p99_ttft_ms": 1938.8013123488047,
+        "mean_tpot_ms": 11.381412162993323,
+        "median_tpot_ms": 11.271606817585875,
+        "p99_tpot_ms": 14.812662532060024,
+        "mean_itl_ms": 11.465945407566757,
+        "median_itl_ms": 8.440449833869934,
+        "p99_itl_ms": 111.01039441302419
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 200 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c32.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 200 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20263115 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c32.json"
     },
     {
       "round": 2,
       "tier": "in1024_c128",
+      "seed": 20263116,
       "input_len": 1024,
       "output_len": 256,
       "num_prompts": 400,
@@ -571,20 +593,20 @@
       "completed": 400,
       "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round2_in1024_c128.json",
       "metrics": {
-        "duration_s": 25.42136867903173,
-        "output_throughput_tok_s": 4028.107270418624,
-        "total_throughput_tok_s": 20303.706166133124,
-        "mean_ttft_ms": 967.3965121607762,
-        "median_ttft_ms": 1057.8070390038192,
-        "p99_ttft_ms": 1611.6026442917064,
-        "mean_tpot_ms": 25.94142062662571,
-        "median_tpot_ms": 26.456779903531366,
-        "p99_tpot_ms": 28.806140602675868,
-        "mean_itl_ms": 26.001325641584263,
-        "median_itl_ms": 24.467236828058958,
-        "p99_itl_ms": 119.00952365249395
+        "duration_s": 39.63126289611682,
+        "output_throughput_tok_s": 2583.818746034294,
+        "total_throughput_tok_s": 13023.960436309344,
+        "mean_ttft_ms": 1653.0664834566414,
+        "median_ttft_ms": 565.7398710027337,
+        "p99_ttft_ms": 7504.185691960155,
+        "mean_tpot_ms": 41.20913990197575,
+        "median_tpot_ms": 43.9924383280324,
+        "p99_tpot_ms": 46.80895976273014,
+        "mean_itl_ms": 41.21439271673377,
+        "median_itl_ms": 27.182237710803747,
+        "p99_itl_ms": 111.74047385342419
       },
-      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 400 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c128.json"
+      "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 400 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20263116 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c128.json"
     }
   ],
   "tiers": [
@@ -598,6 +620,7 @@
         {
           "round": 0,
           "tier": "in512_c1",
+          "seed": 20261111,
           "input_len": 512,
           "output_len": 256,
           "num_prompts": 8,
@@ -605,24 +628,25 @@
           "completed": 8,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round0_in512_c1.json",
           "metrics": {
-            "duration_s": 10.814864974934608,
-            "output_throughput_tok_s": 189.36898470268542,
-            "total_throughput_tok_s": 575.8740413712524,
-            "mean_ttft_ms": 84.60139011731371,
-            "median_ttft_ms": 87.26532058790326,
-            "p99_ttft_ms": 94.77542306296527,
-            "mean_tpot_ms": 4.964911313407926,
-            "median_tpot_ms": 4.9409395065523825,
-            "p99_tpot_ms": 5.084577444812977,
-            "mean_itl_ms": 4.964911313407926,
-            "median_itl_ms": 4.859610926359892,
-            "p99_itl_ms": 8.26156343333422
+            "duration_s": 11.519421040080488,
+            "output_throughput_tok_s": 177.78671279348345,
+            "total_throughput_tok_s": 540.6521715223705,
+            "mean_ttft_ms": 170.3757584327832,
+            "median_ttft_ms": 161.90723632462323,
+            "p99_ttft_ms": 207.8587871650234,
+            "mean_tpot_ms": 4.973529622771357,
+            "median_tpot_ms": 4.965817257214119,
+            "p99_tpot_ms": 5.095203391404129,
+            "mean_itl_ms": 4.975968823174875,
+            "median_itl_ms": 4.8484499566257,
+            "p99_itl_ms": 7.798744533210993
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c1.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c1.json"
         },
         {
           "round": 1,
           "tier": "in512_c1",
+          "seed": 20262111,
           "input_len": 512,
           "output_len": 256,
           "num_prompts": 8,
@@ -630,24 +654,25 @@
           "completed": 8,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round1_in512_c1.json",
           "metrics": {
-            "duration_s": 9.67902862187475,
-            "output_throughput_tok_s": 211.5914809231465,
-            "total_throughput_tok_s": 643.4529996041779,
-            "mean_ttft_ms": 63.76184517284855,
-            "median_ttft_ms": 60.175355058163404,
-            "p99_ttft_ms": 96.96065514814107,
-            "mean_tpot_ms": 4.490600252870982,
-            "median_tpot_ms": 4.4788511333001,
-            "p99_tpot_ms": 4.5532888719702465,
-            "mean_itl_ms": 4.490600252870982,
-            "median_itl_ms": 4.462036304175854,
-            "p99_itl_ms": 5.7461971091106525
+            "duration_s": 10.264439372811466,
+            "output_throughput_tok_s": 199.5238050141111,
+            "total_throughput_tok_s": 606.4627374086141,
+            "mean_ttft_ms": 133.14739475026727,
+            "median_ttft_ms": 125.86645013652742,
+            "p99_ttft_ms": 184.4271722761914,
+            "mean_tpot_ms": 4.505184657333016,
+            "median_tpot_ms": 4.513255796194368,
+            "p99_tpot_ms": 4.547815801630564,
+            "mean_itl_ms": 4.505184657333016,
+            "median_itl_ms": 4.468994680792093,
+            "p99_itl_ms": 5.658366763964295
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in512_c1.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20262111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in512_c1.json"
         },
         {
           "round": 2,
           "tier": "in512_c1",
+          "seed": 20263111,
           "input_len": 512,
           "output_len": 256,
           "num_prompts": 8,
@@ -655,94 +680,94 @@
           "completed": 8,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round2_in512_c1.json",
           "metrics": {
-            "duration_s": 9.669224159792066,
-            "output_throughput_tok_s": 211.80603181341922,
-            "total_throughput_tok_s": 644.105452213855,
-            "mean_ttft_ms": 65.54437160957605,
-            "median_ttft_ms": 59.958208817988634,
-            "p99_ttft_ms": 96.98414774611591,
-            "mean_tpot_ms": 4.478892627829577,
-            "median_tpot_ms": 4.46185301350174,
-            "p99_tpot_ms": 4.517742088922829,
-            "mean_itl_ms": 4.478892627829577,
-            "median_itl_ms": 4.469942068681121,
-            "p99_itl_ms": 5.5279582459479535
+            "duration_s": 10.270904944743961,
+            "output_throughput_tok_s": 199.39820405484764,
+            "total_throughput_tok_s": 606.7625037450247,
+            "mean_ttft_ms": 132.8907972201705,
+            "median_ttft_ms": 124.23429265618324,
+            "p99_ttft_ms": 192.0388774992898,
+            "mean_tpot_ms": 4.509478588771148,
+            "median_tpot_ms": 4.501171417388261,
+            "p99_tpot_ms": 4.603448364956707,
+            "mean_itl_ms": 4.509478588771148,
+            "median_itl_ms": 4.460468655452132,
+            "p99_itl_ms": 6.075273910537361
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c1.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 8 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20263111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c1.json"
         }
       ],
       "aggregates": {
         "duration_s": {
-          "mean": 10.054372585533807,
-          "std": 0.5377642219545578,
-          "min": 9.669224159792066,
-          "max": 10.814864974934608
+          "mean": 10.684921785878638,
+          "std": 0.5900859851765592,
+          "min": 10.264439372811466,
+          "max": 11.519421040080488
         },
         "output_throughput_tok_s": {
-          "mean": 204.25549914641704,
-          "std": 10.526719724387139,
-          "min": 189.36898470268542,
-          "max": 211.80603181341922
+          "mean": 192.23624062081407,
+          "std": 10.217487777493494,
+          "min": 177.78671279348345,
+          "max": 199.5238050141111
         },
         "total_throughput_tok_s": {
-          "mean": 621.1441643964284,
-          "std": 32.01191916185698,
-          "min": 575.8740413712524,
-          "max": 644.105452213855
+          "mean": 584.6258042253364,
+          "std": 31.094294704823543,
+          "min": 540.6521715223705,
+          "max": 606.7625037450247
         },
         "mean_ttft_ms": {
-          "mean": 71.30253563324611,
-          "std": 9.431825488409334,
-          "min": 63.76184517284855,
-          "max": 84.60139011731371
+          "mean": 145.47131680107364,
+          "std": 17.61041113117528,
+          "min": 132.8907972201705,
+          "max": 170.3757584327832
         },
         "median_ttft_ms": {
-          "mean": 69.13296148801844,
-          "std": 12.821820542023602,
-          "min": 59.958208817988634,
-          "max": 87.26532058790326
+          "mean": 137.3359930391113,
+          "std": 17.387265109020113,
+          "min": 124.23429265618324,
+          "max": 161.90723632462323
         },
         "p99_ttft_ms": {
-          "mean": 96.2400753190741,
-          "std": 1.0357099494335191,
-          "min": 94.77542306296527,
-          "max": 96.98414774611591
+          "mean": 194.77494564683488,
+          "std": 9.759600256692247,
+          "min": 184.4271722761914,
+          "max": 207.8587871650234
         },
         "mean_tpot_ms": {
-          "mean": 4.6448013980361615,
-          "std": 0.226402349164073,
-          "min": 4.478892627829577,
-          "max": 4.964911313407926
+          "mean": 4.662730956291841,
+          "std": 0.21977483595092387,
+          "min": 4.505184657333016,
+          "max": 4.973529622771357
         },
         "median_tpot_ms": {
-          "mean": 4.627214551118074,
-          "std": 0.22194555603550445,
-          "min": 4.46185301350174,
-          "max": 4.9409395065523825
+          "mean": 4.660081490265583,
+          "std": 0.216244117371224,
+          "min": 4.501171417388261,
+          "max": 4.965817257214119
         },
         "p99_tpot_ms": {
-          "mean": 4.718536135235351,
-          "std": 0.2592367948218162,
-          "min": 4.517742088922829,
-          "max": 5.084577444812977
+          "mean": 4.748822519330466,
+          "std": 0.24597903288619627,
+          "min": 4.547815801630564,
+          "max": 5.095203391404129
         },
         "mean_itl_ms": {
-          "mean": 4.6448013980361615,
-          "std": 0.226402349164073,
-          "min": 4.478892627829577,
-          "max": 4.964911313407926
+          "mean": 4.663544023093013,
+          "std": 0.22092464966053071,
+          "min": 4.505184657333016,
+          "max": 4.975968823174875
         },
         "median_itl_ms": {
-          "mean": 4.5971964330722885,
-          "std": 0.18558313499820916,
-          "min": 4.462036304175854,
-          "max": 4.859610926359892
+          "mean": 4.592637764289975,
+          "std": 0.18092002208661487,
+          "min": 4.460468655452132,
+          "max": 4.8484499566257
         },
         "p99_itl_ms": {
-          "mean": 6.511906262797609,
-          "std": 1.2403983798646503,
-          "min": 5.5279582459479535,
-          "max": 8.26156343333422
+          "mean": 6.51079506923755,
+          "std": 0.9264855669061205,
+          "min": 5.658366763964295,
+          "max": 7.798744533210993
         }
       }
     },
@@ -756,6 +781,7 @@
         {
           "round": 0,
           "tier": "in512_c16",
+          "seed": 20261112,
           "input_len": 512,
           "output_len": 256,
           "num_prompts": 48,
@@ -763,24 +789,25 @@
           "completed": 48,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round0_in512_c16.json",
           "metrics": {
-            "duration_s": 6.460395062807947,
-            "output_throughput_tok_s": 1902.0508622980622,
-            "total_throughput_tok_s": 5783.237656020524,
-            "mean_ttft_ms": 285.6562139932066,
-            "median_ttft_ms": 295.02616892568767,
-            "p99_ttft_ms": 393.65370753221214,
-            "mean_tpot_ms": 7.301206478439698,
-            "median_tpot_ms": 7.350481119846888,
-            "p99_tpot_ms": 7.947910225438868,
-            "mean_itl_ms": 7.313156079877405,
-            "median_itl_ms": 7.013896945863962,
-            "p99_itl_ms": 10.229178331792308
+            "duration_s": 7.217214832082391,
+            "output_throughput_tok_s": 1702.5958469985756,
+            "total_throughput_tok_s": 5178.3133618064585,
+            "mean_ttft_ms": 460.8696768797624,
+            "median_ttft_ms": 464.8014190606773,
+            "p99_ttft_ms": 729.8372996458784,
+            "mean_tpot_ms": 7.603220779979845,
+            "median_tpot_ms": 7.554774634613127,
+            "p99_tpot_ms": 8.57040554635665,
+            "mean_itl_ms": 7.605706304916092,
+            "median_itl_ms": 6.959549617022276,
+            "p99_itl_ms": 10.019296058453616
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 48 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c16.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 48 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20261112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c16.json"
         },
         {
           "round": 1,
           "tier": "in512_c16",
+          "seed": 20262112,
           "input_len": 512,
           "output_len": 256,
           "num_prompts": 48,
@@ -788,24 +815,25 @@
           "completed": 48,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round1_in512_c16.json",
           "metrics": {
-            "duration_s": 6.559695096686482,
-            "output_throughput_tok_s": 1873.2577991631156,
-            "total_throughput_tok_s": 5695.691560248399,
-            "mean_ttft_ms": 294.9579984124284,
-            "median_ttft_ms": 300.3948354162276,
-            "p99_ttft_ms": 455.8036127826199,
-            "mean_tpot_ms": 7.393227842768802,
-            "median_tpot_ms": 7.415727517731925,
-            "p99_tpot_ms": 8.013255339828046,
-            "mean_itl_ms": 7.393227842768801,
-            "median_itl_ms": 7.0510124787688255,
-            "p99_itl_ms": 10.964227425865882
+            "duration_s": 7.290938114281744,
+            "output_throughput_tok_s": 1685.3798245701519,
+            "total_throughput_tok_s": 5124.031971526392,
+            "mean_ttft_ms": 484.55498123075813,
+            "median_ttft_ms": 485.3242370299995,
+            "p99_ttft_ms": 759.2525962740183,
+            "mean_tpot_ms": 7.604030743918497,
+            "median_tpot_ms": 7.58302741154444,
+            "p99_tpot_ms": 8.588103692704703,
+            "mean_itl_ms": 7.609003949113996,
+            "median_itl_ms": 7.013031747192144,
+            "p99_itl_ms": 10.697157336398968
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 48 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in512_c16.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 48 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20262112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in512_c16.json"
         },
         {
           "round": 2,
           "tier": "in512_c16",
+          "seed": 20263112,
           "input_len": 512,
           "output_len": 256,
           "num_prompts": 48,
@@ -813,94 +841,94 @@
           "completed": 48,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round2_in512_c16.json",
           "metrics": {
-            "duration_s": 6.4543733252212405,
-            "output_throughput_tok_s": 1903.8254189578965,
-            "total_throughput_tok_s": 5788.633244067784,
-            "mean_ttft_ms": 280.42022717030096,
-            "median_ttft_ms": 299.0832158830017,
-            "p99_ttft_ms": 395.05862083286047,
-            "mean_tpot_ms": 7.316743859677313,
-            "median_tpot_ms": 7.30903496162272,
-            "p99_tpot_ms": 7.943385893095504,
-            "mean_itl_ms": 7.316743859677313,
-            "median_itl_ms": 7.0144974160939455,
-            "p99_itl_ms": 9.686422673985362
+            "duration_s": 7.1651295139454305,
+            "output_throughput_tok_s": 1714.9724894831238,
+            "total_throughput_tok_s": 5214.420748052447,
+            "mean_ttft_ms": 432.978868552406,
+            "median_ttft_ms": 441.473770653829,
+            "p99_ttft_ms": 675.1337941549718,
+            "mean_tpot_ms": 7.6455760086746585,
+            "median_tpot_ms": 7.63230281151539,
+            "p99_tpot_ms": 8.621884316498157,
+            "mean_itl_ms": 7.65057638539714,
+            "median_itl_ms": 7.027969695627689,
+            "p99_itl_ms": 10.471695009619005
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 48 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c16.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 48 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20263112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c16.json"
         }
       ],
       "aggregates": {
         "duration_s": {
-          "mean": 6.491487828238557,
-          "std": 0.048292435106245056,
-          "min": 6.4543733252212405,
-          "max": 6.559695096686482
+          "mean": 7.224427486769855,
+          "std": 0.05161374345640897,
+          "min": 7.1651295139454305,
+          "max": 7.290938114281744
         },
         "output_throughput_tok_s": {
-          "mean": 1893.0446934730246,
-          "std": 14.010190402188876,
-          "min": 1873.2577991631156,
-          "max": 1903.8254189578965
+          "mean": 1700.9827203506172,
+          "std": 12.134883253102066,
+          "min": 1685.3798245701519,
+          "max": 1714.9724894831238
         },
         "total_throughput_tok_s": {
-          "mean": 5755.854153445569,
-          "std": 42.59836700899918,
-          "min": 5695.691560248399,
-          "max": 5788.633244067784
+          "mean": 5172.255360461766,
+          "std": 37.14886508529798,
+          "min": 5124.031971526392,
+          "max": 5214.420748052447
         },
         "mean_ttft_ms": {
-          "mean": 287.0114798586453,
-          "std": 6.0118914021365235,
-          "min": 280.42022717030096,
-          "max": 294.9579984124284
+          "mean": 459.46784222097557,
+          "std": 21.079179380934956,
+          "min": 432.978868552406,
+          "max": 484.55498123075813
         },
         "median_ttft_ms": {
-          "mean": 298.16807340830564,
-          "std": 2.285280330492829,
-          "min": 295.02616892568767,
-          "max": 300.3948354162276
+          "mean": 463.8664755815019,
+          "std": 17.91408086457605,
+          "min": 441.473770653829,
+          "max": 485.3242370299995
         },
         "p99_ttft_ms": {
-          "mean": 414.8386470492308,
-          "std": 28.97228282915575,
-          "min": 393.65370753221214,
-          "max": 455.8036127826199
+          "mean": 721.4078966916228,
+          "std": 34.854787744868304,
+          "min": 675.1337941549718,
+          "max": 759.2525962740183
         },
         "mean_tpot_ms": {
-          "mean": 7.337059393628604,
-          "std": 0.04022042236676918,
-          "min": 7.301206478439698,
-          "max": 7.393227842768802
+          "mean": 7.617609177524334,
+          "std": 0.019778300294996227,
+          "min": 7.603220779979845,
+          "max": 7.6455760086746585
         },
         "median_tpot_ms": {
-          "mean": 7.358414533067179,
-          "std": 0.04391681277348417,
-          "min": 7.30903496162272,
-          "max": 7.415727517731925
+          "mean": 7.590034952557652,
+          "std": 0.032036268787485826,
+          "min": 7.554774634613127,
+          "max": 7.63230281151539
         },
         "p99_tpot_ms": {
-          "mean": 7.96818381945414,
-          "std": 0.03192385583854074,
-          "min": 7.943385893095504,
-          "max": 8.013255339828046
+          "mean": 8.593464518519836,
+          "std": 0.021355245786233903,
+          "min": 8.57040554635665,
+          "max": 8.621884316498157
         },
         "mean_itl_ms": {
-          "mean": 7.34104259410784,
-          "std": 0.03692960126445918,
-          "min": 7.313156079877405,
-          "max": 7.393227842768801
+          "mean": 7.62176221314241,
+          "std": 0.020419125125854656,
+          "min": 7.605706304916092,
+          "max": 7.65057638539714
         },
         "median_itl_ms": {
-          "mean": 7.026468946908911,
-          "std": 0.01735662905526783,
-          "min": 7.013896945863962,
-          "max": 7.0510124787688255
+          "mean": 7.000183686614037,
+          "std": 0.02937267760529372,
+          "min": 6.959549617022276,
+          "max": 7.027969695627689
         },
         "p99_itl_ms": {
-          "mean": 10.293276143881185,
-          "std": 0.5236268665872962,
-          "min": 9.686422673985362,
-          "max": 10.964227425865882
+          "mean": 10.396049468157196,
+          "std": 0.28185772296404454,
+          "min": 10.019296058453616,
+          "max": 10.697157336398968
         }
       }
     },
@@ -914,6 +942,7 @@
         {
           "round": 0,
           "tier": "in512_c128",
+          "seed": 20261113,
           "input_len": 512,
           "output_len": 256,
           "num_prompts": 256,
@@ -921,24 +950,25 @@
           "completed": 256,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round0_in512_c128.json",
           "metrics": {
-            "duration_s": 16.38785718102008,
-            "output_throughput_tok_s": 3999.058527060012,
-            "total_throughput_tok_s": 12158.819655248974,
-            "mean_ttft_ms": 1175.4800916551176,
-            "median_ttft_ms": 1170.5407483968884,
-            "p99_ttft_ms": 2081.2561308266595,
-            "mean_tpot_ms": 27.255312951256556,
-            "median_tpot_ms": 27.156531081224482,
-            "p99_tpot_ms": 29.753106128533968,
-            "mean_itl_ms": 27.41025141282723,
-            "median_itl_ms": 24.791039992123842,
-            "p99_itl_ms": 112.26343689486384
+            "duration_s": 20.14110399922356,
+            "output_throughput_tok_s": 3253.8434835809603,
+            "total_throughput_tok_s": 9893.946230935606,
+            "mean_ttft_ms": 1581.0322567831463,
+            "median_ttft_ms": 710.9306077472866,
+            "p99_ttft_ms": 4381.518903071992,
+            "mean_tpot_ms": 32.833857742854676,
+            "median_tpot_ms": 34.42453851138114,
+            "p99_tpot_ms": 36.85074466609341,
+            "mean_itl_ms": 32.84895376940311,
+            "median_itl_ms": 25.199743453413248,
+            "p99_itl_ms": 115.5648724315688
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 256 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c128.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 256 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261113 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in512_c128.json"
         },
         {
           "round": 1,
           "tier": "in512_c128",
+          "seed": 20262113,
           "input_len": 512,
           "output_len": 256,
           "num_prompts": 256,
@@ -946,24 +976,25 @@
           "completed": 256,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round1_in512_c128.json",
           "metrics": {
-            "duration_s": 16.57044234406203,
-            "output_throughput_tok_s": 3954.993997096561,
-            "total_throughput_tok_s": 12024.844953605187,
-            "mean_ttft_ms": 1221.9437684852892,
-            "median_ttft_ms": 1202.0809380337596,
-            "p99_ttft_ms": 2125.6099299527705,
-            "mean_tpot_ms": 27.42674362974261,
-            "median_tpot_ms": 27.46655541636488,
-            "p99_tpot_ms": 30.021015233451536,
-            "mean_itl_ms": 27.59881343778764,
-            "median_itl_ms": 25.143612176179886,
-            "p99_itl_ms": 112.69359707832336
+            "duration_s": 20.05991538707167,
+            "output_throughput_tok_s": 3267.0127832262456,
+            "total_throughput_tok_s": 9934.388862299742,
+            "mean_ttft_ms": 1567.0260886763572,
+            "median_ttft_ms": 698.2460885774344,
+            "p99_ttft_ms": 4339.951346511953,
+            "mean_tpot_ms": 32.72692278189032,
+            "median_tpot_ms": 34.98431366101345,
+            "p99_tpot_ms": 36.55266242631364,
+            "mean_itl_ms": 32.742973258978054,
+            "median_itl_ms": 25.298707652837038,
+            "p99_itl_ms": 115.50677295308559
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 256 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in512_c128.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 256 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20262113 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in512_c128.json"
         },
         {
           "round": 2,
           "tier": "in512_c128",
+          "seed": 20263113,
           "input_len": 512,
           "output_len": 256,
           "num_prompts": 256,
@@ -971,94 +1002,94 @@
           "completed": 256,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round2_in512_c128.json",
           "metrics": {
-            "duration_s": 16.4926479565911,
-            "output_throughput_tok_s": 3973.6493601568254,
-            "total_throughput_tok_s": 12081.565102489756,
-            "mean_ttft_ms": 1240.5128407062875,
-            "median_ttft_ms": 1206.1222409829497,
-            "p99_ttft_ms": 2199.8824674636126,
-            "mean_tpot_ms": 27.201066966767495,
-            "median_tpot_ms": 27.234487976951925,
-            "p99_tpot_ms": 29.812780476869175,
-            "mean_itl_ms": 27.34263884066678,
-            "median_itl_ms": 24.425895884633064,
-            "p99_itl_ms": 112.47515990398819
+            "duration_s": 20.126119604799896,
+            "output_throughput_tok_s": 3256.26605062857,
+            "total_throughput_tok_s": 9901.461578936161,
+            "mean_ttft_ms": 1673.8344728782977,
+            "median_ttft_ms": 1089.5664850249887,
+            "p99_ttft_ms": 4193.468922027387,
+            "mean_tpot_ms": 32.4230296498903,
+            "median_tpot_ms": 33.269393791937645,
+            "p99_tpot_ms": 36.82124623773145,
+            "mean_itl_ms": 32.43843393070911,
+            "median_itl_ms": 25.66393092274666,
+            "p99_itl_ms": 111.97142731398344
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 256 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c128.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 512 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 256 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20263113 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in512_c128.json"
         }
       ],
       "aggregates": {
         "duration_s": {
-          "mean": 16.483649160557736,
-          "std": 0.07481118093039901,
-          "min": 16.38785718102008,
-          "max": 16.57044234406203
+          "mean": 20.109046330365043,
+          "std": 0.03527530024189201,
+          "min": 20.05991538707167,
+          "max": 20.14110399922356
         },
         "output_throughput_tok_s": {
-          "mean": 3975.9006281044663,
-          "std": 18.059565438736648,
-          "min": 3954.993997096561,
-          "max": 3999.058527060012
+          "mean": 3259.0407724785923,
+          "std": 5.72316487592714,
+          "min": 3253.8434835809603,
+          "max": 3267.0127832262456
         },
         "total_throughput_tok_s": {
-          "mean": 12088.409903781305,
-          "std": 54.90867356302354,
-          "min": 12024.844953605187,
-          "max": 12158.819655248974
+          "mean": 9909.93222405717,
+          "std": 17.563512926678374,
+          "min": 9893.946230935606,
+          "max": 9934.388862299742
         },
         "mean_ttft_ms": {
-          "mean": 1212.645566948898,
-          "std": 27.351502410246997,
-          "min": 1175.4800916551176,
-          "max": 1240.5128407062875
+          "mean": 1607.2976061126003,
+          "std": 47.39486023825807,
+          "min": 1567.0260886763572,
+          "max": 1673.8344728782977
         },
         "median_ttft_ms": {
-          "mean": 1192.9146424711992,
-          "std": 15.9065266356957,
-          "min": 1170.5407483968884,
-          "max": 1206.1222409829497
+          "mean": 832.9143937832365,
+          "std": 181.55430080413237,
+          "min": 698.2460885774344,
+          "max": 1089.5664850249887
         },
         "p99_ttft_ms": {
-          "mean": 2135.582842747681,
-          "std": 48.93973285710425,
-          "min": 2081.2561308266595,
-          "max": 2199.8824674636126
+          "mean": 4304.979723870444,
+          "std": 80.65547981116627,
+          "min": 4193.468922027387,
+          "max": 4381.518903071992
         },
         "mean_tpot_ms": {
-          "mean": 27.294374515922218,
-          "std": 0.09618330911508953,
-          "min": 27.201066966767495,
-          "max": 27.42674362974261
+          "mean": 32.66127005821176,
+          "std": 0.1740261294307944,
+          "min": 32.4230296498903,
+          "max": 32.833857742854676
         },
         "median_tpot_ms": {
-          "mean": 27.285858158180428,
-          "std": 0.1316762285162572,
-          "min": 27.156531081224482,
-          "max": 27.46655541636488
+          "mean": 34.22608198811074,
+          "std": 0.7140384130932894,
+          "min": 33.269393791937645,
+          "max": 34.98431366101345
         },
         "p99_tpot_ms": {
-          "mean": 29.86230061295156,
-          "std": 0.11484193494435863,
-          "min": 29.753106128533968,
-          "max": 30.021015233451536
+          "mean": 36.74155111004617,
+          "std": 0.13410627738380207,
+          "min": 36.55266242631364,
+          "max": 36.85074466609341
         },
         "mean_itl_ms": {
-          "mean": 27.45056789709388,
-          "std": 0.10839870918735264,
-          "min": 27.34263884066678,
-          "max": 27.59881343778764
+          "mean": 32.676786986363425,
+          "std": 0.17400594147384846,
+          "min": 32.43843393070911,
+          "max": 32.84895376940311
         },
         "median_itl_ms": {
-          "mean": 24.78684935097893,
-          "std": 0.29302143254130136,
-          "min": 24.425895884633064,
-          "max": 25.143612176179886
+          "mean": 25.387460676332314,
+          "std": 0.1996251922248355,
+          "min": 25.199743453413248,
+          "max": 25.66393092274666
         },
         "p99_itl_ms": {
-          "mean": 112.47739795905846,
-          "std": 0.17561928999278573,
-          "min": 112.26343689486384,
-          "max": 112.69359707832336
+          "mean": 114.34769089954595,
+          "std": 1.6804394977510648,
+          "min": 111.97142731398344,
+          "max": 115.5648724315688
         }
       }
     },
@@ -1072,6 +1103,7 @@
         {
           "round": 0,
           "tier": "in1024_c1",
+          "seed": 20261114,
           "input_len": 1024,
           "output_len": 256,
           "num_prompts": 20,
@@ -1079,24 +1111,25 @@
           "completed": 20,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round0_in1024_c1.json",
           "metrics": {
-            "duration_s": 24.828003523871303,
-            "output_throughput_tok_s": 206.21875597356387,
-            "total_throughput_tok_s": 1039.4714168292453,
-            "mean_ttft_ms": 68.98919350933284,
-            "median_ttft_ms": 67.49362242408097,
-            "p99_ttft_ms": 108.72840440366413,
-            "mean_tpot_ms": 4.593590363933175,
-            "median_tpot_ms": 4.5431067171853545,
-            "p99_tpot_ms": 4.794316957704723,
-            "mean_itl_ms": 4.593590363933175,
-            "median_itl_ms": 4.536353517323732,
-            "p99_itl_ms": 6.316651748493316
+            "duration_s": 26.03778298990801,
+            "output_throughput_tok_s": 196.63732515108762,
+            "total_throughput_tok_s": 991.2902342724068,
+            "mean_ttft_ms": 138.70161965023726,
+            "median_ttft_ms": 134.52581246383488,
+            "p99_ttft_ms": 195.15531730838114,
+            "mean_tpot_ms": 4.557508099915496,
+            "median_tpot_ms": 4.5505562011956,
+            "p99_tpot_ms": 4.7503427330258425,
+            "mean_itl_ms": 4.55929605915438,
+            "median_itl_ms": 4.537062020972371,
+            "p99_itl_ms": 5.938554857857523
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 20 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c1.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 20 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261114 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c1.json"
         },
         {
           "round": 1,
           "tier": "in1024_c1",
+          "seed": 20262114,
           "input_len": 1024,
           "output_len": 256,
           "num_prompts": 20,
@@ -1104,24 +1137,25 @@
           "completed": 20,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round1_in1024_c1.json",
           "metrics": {
-            "duration_s": 24.76988238794729,
-            "output_throughput_tok_s": 206.70263668637065,
-            "total_throughput_tok_s": 1041.9104780472371,
-            "mean_ttft_ms": 69.7102394187823,
-            "median_ttft_ms": 64.79975464753807,
-            "p99_ttft_ms": 105.54248277563599,
-            "mean_tpot_ms": 4.57978924489854,
-            "median_tpot_ms": 4.55369331928737,
-            "p99_tpot_ms": 4.84447385440124,
-            "mean_itl_ms": 4.57978924489854,
-            "median_itl_ms": 4.511729581281543,
-            "p99_itl_ms": 6.969940848648549
+            "duration_s": 25.95928221894428,
+            "output_throughput_tok_s": 197.23195567647792,
+            "total_throughput_tok_s": 994.2493703144327,
+            "mean_ttft_ms": 137.72191398311406,
+            "median_ttft_ms": 131.31672516465187,
+            "p99_ttft_ms": 221.59757828339923,
+            "mean_tpot_ms": 4.546216309764514,
+            "median_tpot_ms": 4.530125226387207,
+            "p99_tpot_ms": 4.689772892779871,
+            "mean_itl_ms": 4.546216309764514,
+            "median_itl_ms": 4.506198922172189,
+            "p99_itl_ms": 6.1543333483859906
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 20 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in1024_c1.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 20 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20262114 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in1024_c1.json"
         },
         {
           "round": 2,
           "tier": "in1024_c1",
+          "seed": 20263114,
           "input_len": 1024,
           "output_len": 256,
           "num_prompts": 20,
@@ -1129,94 +1163,94 @@
           "completed": 20,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round2_in1024_c1.json",
           "metrics": {
-            "duration_s": 24.948083598166704,
-            "output_throughput_tok_s": 205.22618420182945,
-            "total_throughput_tok_s": 1034.4682347423466,
-            "mean_ttft_ms": 68.9330626046285,
-            "median_ttft_ms": 64.60288865491748,
-            "p99_ttft_ms": 104.46446210611607,
-            "mean_tpot_ms": 4.617788303351285,
-            "median_tpot_ms": 4.610661790687956,
-            "p99_tpot_ms": 4.8310568697714045,
-            "mean_itl_ms": 4.617788303351285,
-            "median_itl_ms": 4.564235219731927,
-            "p99_itl_ms": 6.698160632513474
+            "duration_s": 25.849294878076762,
+            "output_throughput_tok_s": 198.07116689834203,
+            "total_throughput_tok_s": 998.4024756469553,
+            "mean_ttft_ms": 138.39689935557544,
+            "median_ttft_ms": 131.58707902766764,
+            "p99_ttft_ms": 228.34349022712547,
+            "mean_tpot_ms": 4.5215324669455494,
+            "median_tpot_ms": 4.527033779624046,
+            "p99_tpot_ms": 4.588585171282437,
+            "mean_itl_ms": 4.5215324669455494,
+            "median_itl_ms": 4.49441559612751,
+            "p99_itl_ms": 5.9420065814629215
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 20 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c1.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 20 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20263114 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c1.json"
         }
       ],
       "aggregates": {
         "duration_s": {
-          "mean": 24.84865650332843,
-          "std": 0.07420164868455119,
-          "min": 24.76988238794729,
-          "max": 24.948083598166704
+          "mean": 25.94878669564302,
+          "std": 0.07730700305687177,
+          "min": 25.849294878076762,
+          "max": 26.03778298990801
         },
         "output_throughput_tok_s": {
-          "mean": 206.04919228725467,
-          "std": 0.614568611609285,
-          "min": 205.22618420182945,
-          "max": 206.70263668637065
+          "mean": 197.31348257530252,
+          "std": 0.5881952711281966,
+          "min": 196.63732515108762,
+          "max": 198.07116689834203
         },
         "total_throughput_tok_s": {
-          "mean": 1038.616709872943,
-          "std": 3.097809907893072,
-          "min": 1034.4682347423466,
-          "max": 1041.9104780472371
+          "mean": 994.6473600779315,
+          "std": 2.917166574074609,
+          "min": 991.2902342724068,
+          "max": 998.4024756469553
         },
         "mean_ttft_ms": {
-          "mean": 69.21083184424788,
-          "std": 0.3538772044485611,
-          "min": 68.9330626046285,
-          "max": 69.7102394187823
+          "mean": 138.27347766297558,
+          "std": 0.4093738993483319,
+          "min": 137.72191398311406,
+          "max": 138.70161965023726
         },
         "median_ttft_ms": {
-          "mean": 65.63208857551217,
-          "std": 1.3187545277743795,
-          "min": 64.60288865491748,
-          "max": 67.49362242408097
+          "mean": 132.4765388853848,
+          "std": 1.4532525479792093,
+          "min": 131.31672516465187,
+          "max": 134.52581246383488
         },
         "p99_ttft_ms": {
-          "mean": 106.24511642847206,
-          "std": 1.8102617705326804,
-          "min": 104.46446210611607,
-          "max": 108.72840440366413
+          "mean": 215.03212860630197,
+          "std": 14.322303178795213,
+          "min": 195.15531730838114,
+          "max": 228.34349022712547
         },
         "mean_tpot_ms": {
-          "mean": 4.597055970727666,
-          "std": 0.015705411671656778,
-          "min": 4.57978924489854,
-          "max": 4.617788303351285
+          "mean": 4.54175229220852,
+          "std": 0.015022364027281465,
+          "min": 4.5215324669455494,
+          "max": 4.557508099915496
         },
         "median_tpot_ms": {
-          "mean": 4.569153942386894,
-          "std": 0.02966698657828966,
-          "min": 4.5431067171853545,
-          "max": 4.610661790687956
+          "mean": 4.53590506906895,
+          "std": 0.010436506925747538,
+          "min": 4.527033779624046,
+          "max": 4.5505562011956
         },
         "p99_tpot_ms": {
-          "mean": 4.823282560625789,
-          "std": 0.021201548427335463,
-          "min": 4.794316957704723,
-          "max": 4.84447385440124
+          "mean": 4.676233599029383,
+          "std": 0.06672761323340028,
+          "min": 4.588585171282437,
+          "max": 4.7503427330258425
         },
         "mean_itl_ms": {
-          "mean": 4.597055970727666,
-          "std": 0.015705411671656778,
-          "min": 4.57978924489854,
-          "max": 4.617788303351285
+          "mean": 4.542348278621481,
+          "std": 0.01565765995333302,
+          "min": 4.5215324669455494,
+          "max": 4.55929605915438
         },
         "median_itl_ms": {
-          "mean": 4.537439439445734,
-          "std": 0.021449086031995298,
-          "min": 4.511729581281543,
-          "max": 4.564235219731927
+          "mean": 4.512558846424024,
+          "std": 0.01798176604932341,
+          "min": 4.49441559612751,
+          "max": 4.537062020972371
         },
         "p99_itl_ms": {
-          "mean": 6.661584409885113,
-          "std": 0.2679552539034932,
-          "min": 6.316651748493316,
-          "max": 6.969940848648549
+          "mean": 6.011631595902145,
+          "std": 0.10091521596677935,
+          "min": 5.938554857857523,
+          "max": 6.1543333483859906
         }
       }
     },
@@ -1230,6 +1264,7 @@
         {
           "round": 0,
           "tier": "in1024_c32",
+          "seed": 20261115,
           "input_len": 1024,
           "output_len": 256,
           "num_prompts": 200,
@@ -1237,24 +1272,25 @@
           "completed": 200,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round0_in1024_c32.json",
           "metrics": {
-            "duration_s": 21.914933746680617,
-            "output_throughput_tok_s": 2336.30640146266,
-            "total_throughput_tok_s": 11776.170668966299,
-            "mean_ttft_ms": 613.5083249816671,
-            "median_ttft_ms": 488.61582041718066,
-            "p99_ttft_ms": 1514.5471149357036,
-            "mean_tpot_ms": 10.32439710025438,
-            "median_tpot_ms": 9.789355229768974,
-            "p99_tpot_ms": 13.880572829596407,
-            "mean_itl_ms": 10.377300987642363,
-            "median_itl_ms": 8.44919472001493,
-            "p99_itl_ms": 112.84526296425611
+            "duration_s": 25.59123797994107,
+            "output_throughput_tok_s": 2000.6847671899106,
+            "total_throughput_tok_s": 10084.701654616643,
+            "mean_ttft_ms": 994.9675504514016,
+            "median_ttft_ms": 989.3259149976075,
+            "p99_ttft_ms": 1855.1545456890008,
+            "mean_tpot_ms": 11.16005193155405,
+            "median_tpot_ms": 11.110001594266471,
+            "p99_tpot_ms": 14.640733101934778,
+            "mean_itl_ms": 11.242052787178173,
+            "median_itl_ms": 8.445935556665063,
+            "p99_itl_ms": 107.92211920488624
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 200 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c32.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 200 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20261115 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c32.json"
         },
         {
           "round": 1,
           "tier": "in1024_c32",
+          "seed": 20262115,
           "input_len": 1024,
           "output_len": 256,
           "num_prompts": 200,
@@ -1262,24 +1298,25 @@
           "completed": 200,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round1_in1024_c32.json",
           "metrics": {
-            "duration_s": 17.932223555166274,
-            "output_throughput_tok_s": 2855.195276954334,
-            "total_throughput_tok_s": 14391.634099701421,
-            "mean_ttft_ms": 354.25811373395845,
-            "median_ttft_ms": 356.7153848707676,
-            "p99_ttft_ms": 635.2036059927195,
-            "mean_tpot_ms": 8.982551886170517,
-            "median_tpot_ms": 9.035934520629691,
-            "p99_tpot_ms": 9.849203931971214,
-            "mean_itl_ms": 9.034812073655386,
-            "median_itl_ms": 8.430397137999535,
-            "p99_itl_ms": 42.08257710561156
+            "duration_s": 26.341031522955745,
+            "output_throughput_tok_s": 1943.7355729740539,
+            "total_throughput_tok_s": 9797.072668741195,
+            "mean_ttft_ms": 1062.4876890378073,
+            "median_ttft_ms": 1041.1511303391308,
+            "p99_ttft_ms": 1946.9871057756234,
+            "mean_tpot_ms": 11.316165396176716,
+            "median_tpot_ms": 11.319420638256798,
+            "p99_tpot_ms": 14.826122262770783,
+            "mean_itl_ms": 11.387167736178773,
+            "median_itl_ms": 8.428319822996855,
+            "p99_itl_ms": 110.34695141483098
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 200 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in1024_c32.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 200 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20262115 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in1024_c32.json"
         },
         {
           "round": 2,
           "tier": "in1024_c32",
+          "seed": 20263115,
           "input_len": 1024,
           "output_len": 256,
           "num_prompts": 200,
@@ -1287,94 +1324,94 @@
           "completed": 200,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round2_in1024_c32.json",
           "metrics": {
-            "duration_s": 18.012156881857663,
-            "output_throughput_tok_s": 2842.5246535338606,
-            "total_throughput_tok_s": 14327.767723361281,
-            "mean_ttft_ms": 350.2289245137945,
-            "median_ttft_ms": 342.5305534619838,
-            "p99_ttft_ms": 605.6075860233977,
-            "mean_tpot_ms": 9.020068407223066,
-            "median_tpot_ms": 9.10311132925106,
-            "p99_tpot_ms": 9.902045525099133,
-            "mean_itl_ms": 9.083833355088196,
-            "median_itl_ms": 8.43183626420796,
-            "p99_itl_ms": 43.313800571486325
+            "duration_s": 26.490237469784915,
+            "output_throughput_tok_s": 1932.7875055253596,
+            "total_throughput_tok_s": 9742.155021991028,
+            "mean_ttft_ms": 1076.044506020844,
+            "median_ttft_ms": 1071.5392120182514,
+            "p99_ttft_ms": 1938.8013123488047,
+            "mean_tpot_ms": 11.381412162993323,
+            "median_tpot_ms": 11.271606817585875,
+            "p99_tpot_ms": 14.812662532060024,
+            "mean_itl_ms": 11.465945407566757,
+            "median_itl_ms": 8.440449833869934,
+            "p99_itl_ms": 111.01039441302419
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 200 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c32.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 200 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20263115 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c32.json"
         }
       ],
       "aggregates": {
         "duration_s": {
-          "mean": 19.28643806123485,
-          "std": 1.8589135734767663,
-          "min": 17.932223555166274,
-          "max": 21.914933746680617
+          "mean": 26.140835657560576,
+          "std": 0.3933690456182031,
+          "min": 25.59123797994107,
+          "max": 26.490237469784915
         },
         "output_throughput_tok_s": {
-          "mean": 2678.008777316951,
-          "std": 241.67543168861357,
-          "min": 2336.30640146266,
-          "max": 2855.195276954334
+          "mean": 1959.0692818964415,
+          "std": 29.76408918337115,
+          "min": 1932.7875055253596,
+          "max": 2000.6847671899106
         },
         "total_throughput_tok_s": {
-          "mean": 13498.524164009666,
-          "std": 1218.1669015157665,
-          "min": 11776.170668966299,
-          "max": 14391.634099701421
+          "mean": 9874.643115116289,
+          "std": 150.21635395635312,
+          "min": 9742.155021991028,
+          "max": 10084.701654616643
         },
         "mean_ttft_ms": {
-          "mean": 439.33178774314,
-          "std": 123.17239459323122,
-          "min": 350.2289245137945,
-          "max": 613.5083249816671
+          "mean": 1044.4999151700176,
+          "std": 35.459255375161554,
+          "min": 994.9675504514016,
+          "max": 1076.044506020844
         },
         "median_ttft_ms": {
-          "mean": 395.95391958331066,
-          "std": 65.77726689433754,
-          "min": 342.5305534619838,
-          "max": 488.61582041718066
+          "mean": 1034.0054191183299,
+          "std": 33.94164053577322,
+          "min": 989.3259149976075,
+          "max": 1071.5392120182514
         },
         "p99_ttft_ms": {
-          "mean": 918.4527689839402,
-          "std": 421.6754937597168,
-          "min": 605.6075860233977,
-          "max": 1514.5471149357036
+          "mean": 1913.6476546044762,
+          "std": 41.49565958390425,
+          "min": 1855.1545456890008,
+          "max": 1946.9871057756234
         },
         "mean_tpot_ms": {
-          "mean": 9.442339131215988,
-          "std": 0.6238971966043079,
-          "min": 8.982551886170517,
-          "max": 10.32439710025438
+          "mean": 11.28587649690803,
+          "std": 0.09287321493984402,
+          "min": 11.16005193155405,
+          "max": 11.381412162993323
         },
         "median_tpot_ms": {
-          "mean": 9.309467026549909,
-          "std": 0.3404386352886085,
-          "min": 9.035934520629691,
-          "max": 9.789355229768974
+          "mean": 11.233676350036381,
+          "std": 0.08960328964514627,
+          "min": 11.110001594266471,
+          "max": 11.319420638256798
         },
         "p99_tpot_ms": {
-          "mean": 11.210607428888919,
-          "std": 1.8880738843633564,
-          "min": 9.849203931971214,
-          "max": 13.880572829596407
+          "mean": 14.759839298921861,
+          "std": 0.08439986456642376,
+          "min": 14.640733101934778,
+          "max": 14.826122262770783
         },
         "mean_itl_ms": {
-          "mean": 9.49864880546198,
-          "std": 0.6216231518887135,
-          "min": 9.034812073655386,
-          "max": 10.377300987642363
+          "mean": 11.3650553103079,
+          "std": 0.09273149734417026,
+          "min": 11.242052787178173,
+          "max": 11.465945407566757
         },
         "median_itl_ms": {
-          "mean": 8.437142707407475,
-          "std": 0.008542288022094896,
-          "min": 8.430397137999535,
-          "max": 8.44919472001493
+          "mean": 8.438235071177283,
+          "std": 0.007360135800643742,
+          "min": 8.428319822996855,
+          "max": 8.445935556665063
         },
         "p99_itl_ms": {
-          "mean": 66.08054688045134,
-          "std": 33.07146786990141,
-          "min": 42.08257710561156,
-          "max": 112.84526296425611
+          "mean": 109.75982167758048,
+          "std": 1.3273788548797352,
+          "min": 107.92211920488624,
+          "max": 111.01039441302419
         }
       }
     },
@@ -1388,6 +1425,7 @@
         {
           "round": 0,
           "tier": "in1024_c128",
+          "seed": 20261116,
           "input_len": 1024,
           "output_len": 256,
           "num_prompts": 400,
@@ -1395,24 +1433,25 @@
           "completed": 400,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round0_in1024_c128.json",
           "metrics": {
-            "duration_s": 34.3412160188891,
-            "output_throughput_tok_s": 2981.839662977448,
-            "total_throughput_tok_s": 15029.986116860193,
-            "mean_ttft_ms": 1713.3983000542503,
-            "median_ttft_ms": 1376.5545084606856,
-            "p99_ttft_ms": 4795.683055189437,
-            "mean_tpot_ms": 34.196129466648955,
-            "median_tpot_ms": 36.15204344375753,
-            "p99_tpot_ms": 51.54298352945012,
-            "mean_itl_ms": 34.21055156191526,
-            "median_itl_ms": 25.478198193013668,
-            "p99_itl_ms": 118.55345334857704
+            "duration_s": 39.80524802627042,
+            "output_throughput_tok_s": 2572.5251085590194,
+            "total_throughput_tok_s": 12966.330461233882,
+            "mean_ttft_ms": 1762.2652217606083,
+            "median_ttft_ms": 796.5444927103817,
+            "p99_ttft_ms": 7502.748475312254,
+            "mean_tpot_ms": 40.902911998285894,
+            "median_tpot_ms": 43.98562883885175,
+            "p99_tpot_ms": 47.836845024927136,
+            "mean_itl_ms": 40.913340889100766,
+            "median_itl_ms": 25.702537735924125,
+            "p99_itl_ms": 115.148323639296
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 400 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c128.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 400 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261116 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round0_in1024_c128.json"
         },
         {
           "round": 1,
           "tier": "in1024_c128",
+          "seed": 20262116,
           "input_len": 1024,
           "output_len": 256,
           "num_prompts": 400,
@@ -1420,24 +1459,25 @@
           "completed": 400,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round1_in1024_c128.json",
           "metrics": {
-            "duration_s": 25.663455608766526,
-            "output_throughput_tok_s": 3990.109576865424,
-            "total_throughput_tok_s": 20112.17849492124,
-            "mean_ttft_ms": 938.1726531893946,
-            "median_ttft_ms": 943.860451458022,
-            "p99_ttft_ms": 1652.8386955196038,
-            "mean_tpot_ms": 26.348068951414536,
-            "median_tpot_ms": 27.154741349502228,
-            "p99_tpot_ms": 29.284368105159672,
-            "mean_itl_ms": 26.56029088347366,
-            "median_itl_ms": 24.664210621267557,
-            "p99_itl_ms": 114.08671634271745
+            "duration_s": 40.298795273993164,
+            "output_throughput_tok_s": 2541.0188891200887,
+            "total_throughput_tok_s": 12808.075191595057,
+            "mean_ttft_ms": 1765.1896244531963,
+            "median_ttft_ms": 773.2806857675314,
+            "p99_ttft_ms": 7679.0890061156815,
+            "mean_tpot_ms": 41.48290240349175,
+            "median_tpot_ms": 44.35161900177013,
+            "p99_tpot_ms": 47.1451989320819,
+            "mean_itl_ms": 41.49469991621302,
+            "median_itl_ms": 25.720180943608284,
+            "p99_itl_ms": 113.8000891543925
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 400 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in1024_c128.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 400 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20262116 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round1_in1024_c128.json"
         },
         {
           "round": 2,
           "tier": "in1024_c128",
+          "seed": 20263116,
           "input_len": 1024,
           "output_len": 256,
           "num_prompts": 400,
@@ -1445,94 +1485,94 @@
           "completed": 400,
           "raw_result_file": "docs/benchmarks/phase2_vllm_raw/round2_in1024_c128.json",
           "metrics": {
-            "duration_s": 25.42136867903173,
-            "output_throughput_tok_s": 4028.107270418624,
-            "total_throughput_tok_s": 20303.706166133124,
-            "mean_ttft_ms": 967.3965121607762,
-            "median_ttft_ms": 1057.8070390038192,
-            "p99_ttft_ms": 1611.6026442917064,
-            "mean_tpot_ms": 25.94142062662571,
-            "median_tpot_ms": 26.456779903531366,
-            "p99_tpot_ms": 28.806140602675868,
-            "mean_itl_ms": 26.001325641584263,
-            "median_itl_ms": 24.467236828058958,
-            "p99_itl_ms": 119.00952365249395
+            "duration_s": 39.63126289611682,
+            "output_throughput_tok_s": 2583.818746034294,
+            "total_throughput_tok_s": 13023.960436309344,
+            "mean_ttft_ms": 1653.0664834566414,
+            "median_ttft_ms": 565.7398710027337,
+            "p99_ttft_ms": 7504.185691960155,
+            "mean_tpot_ms": 41.20913990197575,
+            "median_tpot_ms": 43.9924383280324,
+            "p99_tpot_ms": 46.80895976273014,
+            "mean_itl_ms": 41.21439271673377,
+            "median_itl_ms": 27.182237710803747,
+            "p99_itl_ms": 111.74047385342419
           },
-          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8200 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 400 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20261111 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c128.json"
+          "vllm_bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --base-url http://127.0.0.1:8201 --model Qwen/Qwen3.5-35B-A3B --tokenizer /models/Qwen3.5-35B-A3B --dataset-name random --random-input-len 1024 --random-output-len 256 --random-range-ratio 0.0 --num-prompts 400 --max-concurrency 128 --ignore-eos --temperature 0.0 --seed 20263116 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir docs/benchmarks/phase2_vllm_raw --result-filename round2_in1024_c128.json"
         }
       ],
       "aggregates": {
         "duration_s": {
-          "mean": 28.475346768895786,
-          "std": 4.148973211442397,
-          "min": 25.42136867903173,
-          "max": 34.3412160188891
+          "mean": 39.9117687321268,
+          "std": 0.2827364667676918,
+          "min": 39.63126289611682,
+          "max": 40.298795273993164
         },
         "output_throughput_tok_s": {
-          "mean": 3666.6855034204987,
-          "std": 484.5075335210328,
-          "min": 2981.839662977448,
-          "max": 4028.107270418624
+          "mean": 2565.7875812378006,
+          "std": 18.110818935509858,
+          "min": 2541.0188891200887,
+          "max": 2583.818746034294
         },
         "total_throughput_tok_s": {
-          "mean": 18481.95692597152,
-          "std": 2442.1640079278723,
-          "min": 15029.986116860193,
-          "max": 20303.706166133124
+          "mean": 12932.788696379428,
+          "std": 91.27028437010787,
+          "min": 12808.075191595057,
+          "max": 13023.960436309344
         },
         "mean_ttft_ms": {
-          "mean": 1206.3224884681404,
-          "std": 358.7551788291275,
-          "min": 938.1726531893946,
-          "max": 1713.3983000542503
+          "mean": 1726.840443223482,
+          "std": 52.17972714593706,
+          "min": 1653.0664834566414,
+          "max": 1765.1896244531963
         },
         "median_ttft_ms": {
-          "mean": 1126.0739996408422,
-          "std": 183.1234923529633,
-          "min": 943.860451458022,
-          "max": 1376.5545084606856
+          "mean": 711.855016493549,
+          "std": 103.75460788071096,
+          "min": 565.7398710027337,
+          "max": 796.5444927103817
         },
         "p99_ttft_ms": {
-          "mean": 2686.708131666916,
-          "std": 1491.3654870655362,
-          "min": 1611.6026442917064,
-          "max": 4795.683055189437
+          "mean": 7562.007724462696,
+          "std": 82.7910473543783,
+          "min": 7502.748475312254,
+          "max": 7679.0890061156815
         },
         "mean_tpot_ms": {
-          "mean": 28.82853968156307,
-          "std": 3.7990881178454887,
-          "min": 25.94142062662571,
-          "max": 34.196129466648955
+          "mean": 41.19831810125113,
+          "std": 0.23690370907593877,
+          "min": 40.902911998285894,
+          "max": 41.48290240349175
         },
         "median_tpot_ms": {
-          "mean": 29.921188232263706,
-          "std": 4.4150843740495835,
-          "min": 26.456779903531366,
-          "max": 36.15204344375753
+          "mean": 44.10989538955143,
+          "std": 0.17094701092008815,
+          "min": 43.98562883885175,
+          "max": 44.35161900177013
         },
         "p99_tpot_ms": {
-          "mean": 36.54449741242855,
-          "std": 10.607328119053653,
-          "min": 28.806140602675868,
-          "max": 51.54298352945012
+          "mean": 47.26366790657972,
+          "std": 0.42791214168282415,
+          "min": 46.80895976273014,
+          "max": 47.836845024927136
         },
         "mean_itl_ms": {
-          "mean": 28.92405602899106,
-          "std": 3.745075593374207,
-          "min": 26.001325641584263,
-          "max": 34.21055156191526
+          "mean": 41.20747784068252,
+          "std": 0.23738918991721933,
+          "min": 40.913340889100766,
+          "max": 41.49469991621302
         },
         "median_itl_ms": {
-          "mean": 24.86988188078006,
-          "std": 0.4375966335945067,
-          "min": 24.467236828058958,
-          "max": 25.478198193013668
+          "mean": 26.201652130112052,
+          "std": 0.6934161239783311,
+          "min": 25.702537735924125,
+          "max": 27.182237710803747
         },
         "p99_itl_ms": {
-          "mean": 117.21656444792949,
-          "std": 2.220955035084864,
-          "min": 114.08671634271745,
-          "max": 119.00952365249395
+          "mean": 113.56296221570422,
+          "std": 1.401316507087859,
+          "min": 111.74047385342419,
+          "max": 115.148323639296
         }
       }
     }
