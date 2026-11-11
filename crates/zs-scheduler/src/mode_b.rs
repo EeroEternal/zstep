@@ -57,6 +57,7 @@ pub struct WorkerLaunchConfig {
 pub struct ModeBConfig {
     pub shm_name: String,
     pub geometry: zs_wire::ShmGeometry,
+    pub max_prefill_chunk: usize,
     pub steps: u64,
     pub token_counts: Vec<u32>,
     pub launch: WorkerLaunchConfig,
@@ -194,6 +195,7 @@ impl ModeBMetrics {
                 "  \"round_trip_p99_us\": {},\n",
                 "  \"mean_publish_signal_us\": {:.3},\n",
                 "  \"prepare_next_us\": {},\n",
+                "  \"mean_prepare_next_us_per_step\": {:.3},\n",
                 "  \"hidden_prepare_us\": {},\n",
                 "  \"overlap_hiding_efficiency\": {:.6},\n",
                 "  \"overlap_speedup\": {:.6},\n",
@@ -216,6 +218,7 @@ impl ModeBMetrics {
             percentile(&self.round_trip_samples_us, 99),
             ratio(self.publish_signal_us, self.steps),
             self.prepare_next_us,
+            ratio(self.prepare_next_us, self.steps),
             self.hidden_prepare_us,
             self.overlap_hiding_efficiency(),
             self.overlap_speedup(),
@@ -579,6 +582,11 @@ fn spawn_workers(
 }
 
 fn validate_config(config: &ModeBConfig) -> Result<()> {
+    if config.max_prefill_chunk == 0 {
+        return Err(ModeBError::Protocol(
+            "max_prefill_chunk must be positive".to_owned(),
+        ));
+    }
     if config.steps == 0 {
         return Err(ModeBError::Protocol("steps must be positive".to_owned()));
     }

@@ -1086,12 +1086,7 @@ class Qwen35MoeStepRunner:
             self.page_table_cpu[:max_slot_end], non_blocking=True
         )
 
-        is_decode = (
-            total_tokens == num_seqs
-            and num_sample == num_seqs
-            and num_seqs <= self.max_graph_bucket
-            and int(q_start_np[num_seqs]) == num_seqs
-        )
+        is_decode = header.flags == 1
 
         self.start_event.record()
         if is_decode:

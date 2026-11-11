@@ -25,6 +25,7 @@
 //! while the 8 GPU workers execute the current step.
 
 use std::collections::VecDeque;
+use std::process::Command;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -121,10 +122,13 @@ pub struct BenchmarkTierSpec {
     pub output_len: usize,
 }
 
-/// Per-tier continuous-batching throughput and latency metrics.
+pub const BENCHMARK_RANDOM_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Per-tier continuous-batching throughput and latency metrics for one repeat.
 #[derive(Debug, Clone)]
 pub struct BenchmarkTierResult {
     pub label: String,
+    pub repeat: usize,
     pub concurrency: usize,
     pub num_prompts: usize,
     pub input_len: usize,
@@ -137,12 +141,290 @@ pub struct BenchmarkTierResult {
     pub mean_ttft_ms: f64,
     pub median_ttft_ms: f64,
     pub p99_ttft_ms: f64,
+    pub mean_submit_ttft_ms: f64,
+    pub median_submit_ttft_ms: f64,
+    pub p99_submit_ttft_ms: f64,
     pub mean_tpot_ms: f64,
     pub median_tpot_ms: f64,
     pub p99_tpot_ms: f64,
     pub mean_itl_ms: f64,
     pub median_itl_ms: f64,
     pub p99_itl_ms: f64,
+}
+
+impl BenchmarkTierResult {
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "    {{\n",
+                "      \"label\": {},\n",
+                "      \"repeat\": {},\n",
+                "      \"concurrency\": {},\n",
+                "      \"num_prompts\": {},\n",
+                "      \"input_len\": {},\n",
+                "      \"output_len\": {},\n",
+                "      \"steps\": {},\n",
+                "      \"overlapped_decode_steps\": {},\n",
+                "      \"wall_time_ms\": {:.3},\n",
+                "      \"output_throughput_tok_s\": {:.2},\n",
+                "      \"total_throughput_tok_s\": {:.2},\n",
+                "      \"mean_ttft_ms\": {:.2},\n",
+                "      \"median_ttft_ms\": {:.2},\n",
+                "      \"p99_ttft_ms\": {:.2},\n",
+                "      \"mean_submit_ttft_ms\": {:.2},\n",
+                "      \"median_submit_ttft_ms\": {:.2},\n",
+                "      \"p99_submit_ttft_ms\": {:.2},\n",
+                "      \"mean_tpot_ms\": {:.2},\n",
+                "      \"median_tpot_ms\": {:.2},\n",
+                "      \"p99_tpot_ms\": {:.2},\n",
+                "      \"mean_itl_ms\": {:.2},\n",
+                "      \"median_itl_ms\": {:.2},\n",
+                "      \"p99_itl_ms\": {:.2}\n",
+                "    }}"
+            ),
+            json_string(&self.label),
+            self.repeat,
+            self.concurrency,
+            self.num_prompts,
+            self.input_len,
+            self.output_len,
+            self.steps,
+            self.overlapped_decode_steps,
+            self.wall_time_ms,
+            self.output_throughput_tok_s,
+            self.total_throughput_tok_s,
+            self.mean_ttft_ms,
+            self.median_ttft_ms,
+            self.p99_ttft_ms,
+            self.mean_submit_ttft_ms,
+            self.median_submit_ttft_ms,
+            self.p99_submit_ttft_ms,
+            self.mean_tpot_ms,
+            self.median_tpot_ms,
+            self.p99_tpot_ms,
+            self.mean_itl_ms,
+            self.median_itl_ms,
+            self.p99_itl_ms,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AggregateMetric {
+    pub mean: f64,
+    pub std: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+impl AggregateMetric {
+    fn from_samples(samples: &[f64]) -> Option<Self> {
+        if samples.is_empty() {
+            return None;
+        }
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let variance = samples
+            .iter()
+            .map(|sample| (sample - mean).powi(2))
+            .sum::<f64>()
+            / samples.len() as f64;
+        let min = samples.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        Some(Self {
+            mean,
+            std: variance.sqrt(),
+            min,
+            max,
+        })
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"mean\": {:.6}, \"std\": {:.6}, \"min\": {:.6}, \"max\": {:.6}}}",
+            self.mean, self.std, self.min, self.max
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TierAggregateStats {
+    pub label: String,
+    pub repeats: usize,
+    pub output_throughput_tok_s: AggregateMetric,
+    pub total_throughput_tok_s: AggregateMetric,
+    pub median_ttft_ms: AggregateMetric,
+    pub mean_tpot_ms: AggregateMetric,
+    pub p99_tpot_ms: AggregateMetric,
+    pub p99_itl_ms: AggregateMetric,
+}
+
+impl TierAggregateStats {
+    pub fn from_results(label: String, results: &[BenchmarkTierResult]) -> Option<Self> {
+        macro_rules! metric {
+            ($field:ident) => {
+                AggregateMetric::from_samples(
+                    &results
+                        .iter()
+                        .map(|result| result.$field)
+                        .collect::<Vec<_>>(),
+                )?
+            };
+        }
+        Some(Self {
+            label,
+            repeats: results.len(),
+            output_throughput_tok_s: metric!(output_throughput_tok_s),
+            total_throughput_tok_s: metric!(total_throughput_tok_s),
+            median_ttft_ms: metric!(median_ttft_ms),
+            mean_tpot_ms: metric!(mean_tpot_ms),
+            p99_tpot_ms: metric!(p99_tpot_ms),
+            p99_itl_ms: metric!(p99_itl_ms),
+        })
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "    {{\n",
+                "      \"label\": {},\n",
+                "      \"repeats\": {},\n",
+                "      \"output_throughput_tok_s\": {},\n",
+                "      \"total_throughput_tok_s\": {},\n",
+                "      \"median_ttft_ms\": {},\n",
+                "      \"mean_tpot_ms\": {},\n",
+                "      \"p99_tpot_ms\": {},\n",
+                "      \"p99_itl_ms\": {}\n",
+                "    }}"
+            ),
+            json_string(&self.label),
+            self.repeats,
+            self.output_throughput_tok_s.to_json(),
+            self.total_throughput_tok_s.to_json(),
+            self.median_ttft_ms.to_json(),
+            self.mean_tpot_ms.to_json(),
+            self.p99_tpot_ms.to_json(),
+            self.p99_itl_ms.to_json(),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BenchmarkProvenance {
+    pub git_commit: String,
+    pub nvidia_driver_version: String,
+    pub gpu_graphics_clocks_mhz: Vec<u32>,
+    pub gpu_mem_clocks_mhz: Vec<u32>,
+    pub seed: u64,
+    pub repeats: usize,
+    pub warmup_prompts: usize,
+    pub max_step_tokens: u32,
+    pub max_prefill_chunk: usize,
+}
+
+impl BenchmarkProvenance {
+    pub fn capture(
+        seed: u64,
+        repeats: usize,
+        warmup_prompts: usize,
+        max_step_tokens: u32,
+        max_prefill_chunk: usize,
+    ) -> Result<Self> {
+        let git_commit = match Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+        {
+            Ok(output) if output.status.success() => String::from_utf8(output.stdout)
+                .map_err(|error| ModeBError::Protocol(format!("invalid Git revision: {error}")))?
+                .trim()
+                .to_owned(),
+            _ => read_git_head_fallback()?,
+        };
+
+        let gpu_output = Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=driver_version,clocks.current.graphics,clocks.current.memory",
+                "--format=csv,noheader,nounits",
+            ])
+            .output()?;
+        if !gpu_output.status.success() {
+            return Err(ModeBError::Protocol(
+                "nvidia-smi failed while capturing provenance".to_owned(),
+            ));
+        }
+        let gpu_csv = String::from_utf8(gpu_output.stdout)
+            .map_err(|error| ModeBError::Protocol(format!("invalid nvidia-smi output: {error}")))?;
+        let mut driver_versions = Vec::new();
+        let mut gpu_graphics_clocks_mhz = Vec::new();
+        let mut gpu_mem_clocks_mhz = Vec::new();
+        for line in gpu_csv.lines().filter(|line| !line.trim().is_empty()) {
+            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+            if fields.len() != 3 {
+                return Err(ModeBError::Protocol(format!(
+                    "unexpected nvidia-smi provenance row: {line}"
+                )));
+            }
+            driver_versions.push(fields[0].to_owned());
+            gpu_graphics_clocks_mhz.push(fields[1].parse::<u32>().map_err(|error| {
+                ModeBError::Protocol(format!("invalid graphics clock in `{line}`: {error}"))
+            })?);
+            gpu_mem_clocks_mhz.push(fields[2].parse::<u32>().map_err(|error| {
+                ModeBError::Protocol(format!("invalid memory clock in `{line}`: {error}"))
+            })?);
+        }
+        let nvidia_driver_version = driver_versions.first().cloned().ok_or_else(|| {
+            ModeBError::Protocol("nvidia-smi returned no GPU provenance rows".to_owned())
+        })?;
+        Ok(Self {
+            git_commit,
+            nvidia_driver_version,
+            gpu_graphics_clocks_mhz,
+            gpu_mem_clocks_mhz,
+            seed,
+            repeats,
+            warmup_prompts,
+            max_step_tokens,
+            max_prefill_chunk,
+        })
+    }
+
+    fn to_json(&self) -> String {
+        let graphics_clocks = self
+            .gpu_graphics_clocks_mhz
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mem_clocks = self
+            .gpu_mem_clocks_mhz
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            concat!(
+                "  \"provenance\": {{\n",
+                "    \"git_commit\": {},\n",
+                "    \"nvidia_driver_version\": {},\n",
+                "    \"gpu_graphics_clocks_mhz\": [{}],\n",
+                "    \"gpu_mem_clocks_mhz\": [{}],\n",
+                "    \"seed\": {},\n",
+                "    \"repeats\": {},\n",
+                "    \"warmup_prompts\": {},\n",
+                "    \"max_step_tokens\": {},\n",
+                "    \"max_prefill_chunk\": {}\n",
+                "  }}"
+            ),
+            json_string(&self.git_commit),
+            json_string(&self.nvidia_driver_version),
+            graphics_clocks,
+            mem_clocks,
+            self.seed,
+            self.repeats,
+            self.warmup_prompts,
+            self.max_step_tokens,
+            self.max_prefill_chunk,
+        )
+    }
 }
 
 /// Complete multi-tier benchmark report produced by [`ModeBServingEngine`].
@@ -153,6 +435,8 @@ pub struct ServingBenchmarkReport {
     pub worker_numa_nodes: Vec<i32>,
     pub init_wall_ms: f64,
     pub tiers: Vec<BenchmarkTierResult>,
+    pub tier_aggregates: Vec<TierAggregateStats>,
+    pub provenance: BenchmarkProvenance,
 }
 
 impl ServingBenchmarkReport {
@@ -163,77 +447,70 @@ impl ServingBenchmarkReport {
             .map(i32::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        let mut tiers_json = String::new();
-        for (idx, t) in self.tiers.iter().enumerate() {
-            if idx > 0 {
-                tiers_json.push_str(",\n");
-            }
-            tiers_json.push_str(&format!(
-                concat!(
-                    "    {{\n",
-                    "      \"label\": \"{}\",\n",
-                    "      \"concurrency\": {},\n",
-                    "      \"num_prompts\": {},\n",
-                    "      \"input_len\": {},\n",
-                    "      \"output_len\": {},\n",
-                    "      \"steps\": {},\n",
-                    "      \"overlapped_decode_steps\": {},\n",
-                    "      \"wall_time_ms\": {:.3},\n",
-                    "      \"output_throughput_tok_s\": {:.2},\n",
-                    "      \"total_throughput_tok_s\": {:.2},\n",
-                    "      \"mean_ttft_ms\": {:.2},\n",
-                    "      \"median_ttft_ms\": {:.2},\n",
-                    "      \"p99_ttft_ms\": {:.2},\n",
-                    "      \"mean_tpot_ms\": {:.2},\n",
-                    "      \"median_tpot_ms\": {:.2},\n",
-                    "      \"p99_tpot_ms\": {:.2},\n",
-                    "      \"mean_itl_ms\": {:.2},\n",
-                    "      \"median_itl_ms\": {:.2},\n",
-                    "      \"p99_itl_ms\": {:.2}\n",
-                    "    }}"
-                ),
-                t.label,
-                t.concurrency,
-                t.num_prompts,
-                t.input_len,
-                t.output_len,
-                t.steps,
-                t.overlapped_decode_steps,
-                t.wall_time_ms,
-                t.output_throughput_tok_s,
-                t.total_throughput_tok_s,
-                t.mean_ttft_ms,
-                t.median_ttft_ms,
-                t.p99_ttft_ms,
-                t.mean_tpot_ms,
-                t.median_tpot_ms,
-                t.p99_tpot_ms,
-                t.mean_itl_ms,
-                t.median_itl_ms,
-                t.p99_itl_ms,
-            ));
-        }
+        let tiers_json = self
+            .tiers
+            .iter()
+            .map(BenchmarkTierResult::to_json)
+            .collect::<Vec<_>>()
+            .join(",\n");
+        let aggregates_json = self
+            .tier_aggregates
+            .iter()
+            .map(TierAggregateStats::to_json)
+            .collect::<Vec<_>>()
+            .join(",\n");
         format!(
             concat!(
                 "{{\n",
                 "  \"engine\": \"zstep-mode-b\",\n",
-                "  \"model\": \"{}\",\n",
+                "  \"model\": {},\n",
                 "  \"world_size\": {},\n",
                 "  \"worker_numa_nodes\": [{}],\n",
                 "  \"init_wall_ms\": {:.2},\n",
-                "  \"tiers\": [\n{}\n  ]\n",
+                "{},\n",
+                "  \"tiers\": [\n{}\n  ],\n",
+                "  \"tier_aggregates\": [\n{}\n  ]\n",
                 "}}\n"
             ),
-            self.model_name, self.world_size, numa_str, self.init_wall_ms, tiers_json
+            json_string(&self.model_name),
+            self.world_size,
+            numa_str,
+            self.init_wall_ms,
+            self.provenance.to_json(),
+            tiers_json,
+            aggregates_json,
         )
     }
+}
+
+fn json_string(value: &str) -> String {
+    format!("\"{}\"", value.escape_default())
+}
+
+fn read_git_head_fallback() -> Result<String> {
+    let head = std::fs::read_to_string(".git/HEAD")?;
+    let head = head.trim();
+    let revision = if let Some(reference) = head.strip_prefix("ref: ") {
+        let reference_path = std::path::Path::new(".git").join(reference);
+        std::fs::read_to_string(reference_path)?
+    } else {
+        head.to_owned()
+    };
+    let revision = revision.trim();
+    if revision.len() < 7 || !revision.chars().take(7).all(|c| c.is_ascii_hexdigit()) {
+        return Err(ModeBError::Protocol(
+            ".git/HEAD did not contain a valid revision".to_owned(),
+        ));
+    }
+    Ok(revision.chars().take(7).collect())
 }
 
 struct PendingRequest {
     request_id: usize,
     prompt_tokens: Vec<i32>,
     target_output_len: usize,
-    arrival_time: Instant,
+    permit_time: Instant,
+    submit_time: Instant,
 }
 
 struct ActiveSequence {
@@ -241,11 +518,14 @@ struct ActiveSequence {
     slot_lease: SlotLease,
     kv_leases: Vec<BlockLease>,
     page_ids: Vec<i32>,
+    prompt_tokens: Vec<i32>,
+    prefilled_tokens: usize,
     current_seq_len: usize,
     last_token: i32,
     generated_tokens: Vec<i32>,
     target_output_len: usize,
-    arrival_time: Instant,
+    permit_time: Instant,
+    submit_time: Instant,
     first_token_time: Option<Instant>,
     last_token_time: Option<Instant>,
 }
@@ -343,11 +623,13 @@ impl ModeBServingEngine {
                 request_id: idx,
                 prompt_tokens: p.clone(),
                 target_output_len,
-                arrival_time: now,
+                permit_time: now,
+                submit_time: now,
             })
             .collect();
-        let mut raw_prompts: VecDeque<(usize, Vec<i32>, usize)> = VecDeque::new();
+        let mut raw_prompts = VecDeque::new();
         let mut ttfts = Vec::new();
+        let mut submit_ttfts = Vec::new();
         let mut tpots = Vec::new();
         let mut itls = Vec::new();
         let mut steps = 0u64;
@@ -359,6 +641,7 @@ impl ModeBServingEngine {
             &mut raw_prompts,
             &mut completed,
             &mut ttfts,
+            &mut submit_ttfts,
             &mut tpots,
             &mut itls,
             &mut steps,
@@ -383,6 +666,7 @@ impl ModeBServingEngine {
 
         let mut completed = vec![Vec::new(); spec.num_prompts];
         let mut ttfts_us = Vec::with_capacity(spec.num_prompts);
+        let mut submit_ttfts_us = Vec::with_capacity(spec.num_prompts);
         let mut tpots_us = Vec::with_capacity(spec.num_prompts);
         let mut itls_us = Vec::with_capacity(spec.num_prompts * spec.output_len);
         let mut steps = 0u64;
@@ -391,8 +675,7 @@ impl ModeBServingEngine {
         let wall_start = Instant::now();
         let mut waiting_permitted: VecDeque<PendingRequest> =
             VecDeque::with_capacity(spec.concurrency);
-        let mut unpermitted_pool: VecDeque<(usize, Vec<i32>, usize)> =
-            VecDeque::with_capacity(spec.num_prompts.saturating_sub(initial_admit));
+        let mut unpermitted_pool = VecDeque::with_capacity(spec.num_prompts - initial_admit);
 
         for (req_id, prompt) in all_prompts.into_iter().enumerate() {
             if req_id < initial_admit {
@@ -400,10 +683,11 @@ impl ModeBServingEngine {
                     request_id: req_id,
                     prompt_tokens: prompt,
                     target_output_len: spec.output_len,
-                    arrival_time: wall_start,
+                    permit_time: wall_start,
+                    submit_time: wall_start,
                 });
             } else {
-                unpermitted_pool.push_back((req_id, prompt, spec.output_len));
+                unpermitted_pool.push_back((req_id, prompt, spec.output_len, wall_start));
             }
         }
 
@@ -413,6 +697,7 @@ impl ModeBServingEngine {
             &mut unpermitted_pool,
             &mut completed,
             &mut ttfts_us,
+            &mut submit_ttfts_us,
             &mut tpots_us,
             &mut itls_us,
             &mut steps,
@@ -425,6 +710,7 @@ impl ModeBServingEngine {
 
         Ok(BenchmarkTierResult {
             label: spec.label.clone(),
+            repeat: 0,
             concurrency: spec.concurrency,
             num_prompts: spec.num_prompts,
             input_len: spec.input_len,
@@ -437,6 +723,9 @@ impl ModeBServingEngine {
             mean_ttft_ms: mean_us_as_ms(&ttfts_us),
             median_ttft_ms: percentile_us_as_ms(&ttfts_us, 50),
             p99_ttft_ms: percentile_us_as_ms(&ttfts_us, 99),
+            mean_submit_ttft_ms: mean_us_as_ms(&submit_ttfts_us),
+            median_submit_ttft_ms: percentile_us_as_ms(&submit_ttfts_us, 50),
+            p99_submit_ttft_ms: percentile_us_as_ms(&submit_ttfts_us, 99),
             mean_tpot_ms: mean_us_as_ms(&tpots_us),
             median_tpot_ms: percentile_us_as_ms(&tpots_us, 50),
             p99_tpot_ms: percentile_us_as_ms(&tpots_us, 99),
@@ -451,9 +740,10 @@ impl ModeBServingEngine {
         &mut self,
         concurrency_cap: usize,
         waiting_permitted: &mut VecDeque<PendingRequest>,
-        unpermitted_pool: &mut VecDeque<(usize, Vec<i32>, usize)>,
+        unpermitted_pool: &mut VecDeque<(usize, Vec<i32>, usize, Instant)>,
         completed: &mut [Vec<i32>],
         ttfts_us: &mut Vec<u64>,
+        submit_ttfts_us: &mut Vec<u64>,
         tpots_us: &mut Vec<u64>,
         itls_us: &mut Vec<u64>,
         steps_out: &mut u64,
@@ -462,6 +752,7 @@ impl ModeBServingEngine {
         let geometry = self.coordinator.config().geometry;
         let max_seqs = geometry.max_seqs as usize;
         let max_step_tokens = geometry.max_step_tokens as usize;
+        let max_prefill_chunk = self.coordinator.config().max_prefill_chunk;
         let page_block_tokens = geometry.page_block_tokens as usize;
         let max_pages_per_seq = geometry.max_pages_per_seq as usize;
 
@@ -477,10 +768,18 @@ impl ModeBServingEngine {
             } else {
                 self.step_cursor += 1;
                 let sid = self.step_cursor;
+                let decode_active_count = active
+                    .iter()
+                    .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
+                    .count();
+                let has_partial_prefill = decode_active_count != active.len();
                 let run_prefill = should_schedule_prefill(
+                    decode_active_count,
                     active.len(),
+                    has_partial_prefill,
                     max_seqs,
                     max_step_tokens,
+                    max_prefill_chunk,
                     waiting_permitted,
                     consecutive_prefills,
                 );
@@ -515,9 +814,10 @@ impl ModeBServingEngine {
             // pages and pre-write `plan_slot(step_id + 1)` while the 8 GPUs execute `step_id`.
             let can_overlap_next = waiting_permitted.is_empty()
                 && !active.is_empty()
-                && active
-                    .iter()
-                    .all(|seq| seq.generated_tokens.len() + 1 < seq.target_output_len);
+                && active.iter().all(|seq| {
+                    seq.prefilled_tokens == seq.prompt_tokens.len()
+                        && seq.generated_tokens.len() + 1 < seq.target_output_len
+                });
 
             if can_overlap_next {
                 let next_sid = self.step_cursor + 1;
@@ -564,8 +864,10 @@ impl ModeBServingEngine {
                         let itl = now.duration_since(prev_t).as_micros() as u64;
                         itls_us.push(itl);
                     } else {
-                        let ttft = now.duration_since(seq.arrival_time).as_micros() as u64;
+                        let (ttft, submit_ttft) =
+                            first_token_latency_us(seq.permit_time, seq.submit_time, now);
                         ttfts_us.push(ttft);
+                        submit_ttfts_us.push(submit_ttft);
                         seq.first_token_time = Some(now);
                     }
                     seq.last_token_time = Some(now);
@@ -617,12 +919,15 @@ impl ModeBServingEngine {
                     drop(finished.slot_lease);
 
                     // Release concurrency permit immediately to next waiting request
-                    if let Some((req_id, prompt, target_out)) = unpermitted_pool.pop_front() {
+                    if let Some((req_id, prompt, target_out, submit_time)) =
+                        unpermitted_pool.pop_front()
+                    {
                         waiting_permitted.push_back(PendingRequest {
                             request_id: req_id,
                             prompt_tokens: prompt,
                             target_output_len: target_out,
-                            arrival_time: now,
+                            permit_time: now,
+                            submit_time,
                         });
                     }
                 } else {
@@ -645,24 +950,60 @@ impl ModeBServingEngine {
         let geometry = self.coordinator.config().geometry;
         let max_seqs = geometry.max_seqs as usize;
         let max_step_tokens = geometry.max_step_tokens as usize;
+        let max_prefill_chunk = self.coordinator.config().max_prefill_chunk;
 
         let mut token_cursor = 0usize;
-        let mut scheduled_indices: Vec<usize> = Vec::new();
+        let mut num_seqs = 0usize;
+        let mut num_sample_rows = 0usize;
 
-        while active.len() < max_seqs {
+        for seq in active.iter_mut() {
+            let Some((chunk_start, chunk_end)) = prefill_chunk_range(
+                seq.prompt_tokens.len(),
+                seq.prefilled_tokens,
+                max_step_tokens - token_cursor,
+                max_prefill_chunk,
+            ) else {
+                continue;
+            };
+            let sample_row_index = (chunk_end == seq.prompt_tokens.len()).then(|| {
+                let row = num_sample_rows;
+                num_sample_rows += 1;
+                row
+            });
+            self.stage_prefill_row(
+                step_id,
+                seq,
+                num_seqs,
+                token_cursor,
+                chunk_start,
+                chunk_end,
+                sample_row_index,
+                page_block_tokens,
+                max_pages_per_seq,
+            )?;
+            token_cursor += chunk_end - chunk_start;
+            num_seqs += 1;
+        }
+
+        while active.len() < max_seqs && token_cursor < max_step_tokens {
             let Some(front) = waiting_permitted.front() else {
                 break;
             };
-            let plen = front.prompt_tokens.len();
-            if plen == 0 || plen > max_step_tokens {
-                return Err(ModeBError::Protocol(format!(
-                    "prompt length {plen} invalid for max_step_tokens={max_step_tokens}"
-                )));
+            let prompt_len = front.prompt_tokens.len();
+            if prompt_len == 0 {
+                return Err(ModeBError::Protocol(
+                    "prompt length must be positive".to_owned(),
+                ));
             }
-            if token_cursor > 0 && token_cursor + plen > max_step_tokens {
+            let Some((chunk_start, chunk_end)) = prefill_chunk_range(
+                prompt_len,
+                0,
+                max_step_tokens - token_cursor,
+                max_prefill_chunk,
+            ) else {
                 break;
-            }
-            let needed_pages = plen.div_ceil(page_block_tokens);
+            };
+            let needed_pages = chunk_end.div_ceil(page_block_tokens);
             if self.kv_pool.available() < needed_pages || self.slot_pool.available() == 0 {
                 break;
             }
@@ -673,50 +1014,45 @@ impl ModeBServingEngine {
                 ModeBError::Protocol("SlotPool unexpectedly exhausted".to_owned())
             })?;
             let slot_id = slot_lease.id() as usize;
+            let last_token = *req.prompt_tokens.last().unwrap_or(&0);
             let mut seq = ActiveSequence {
                 request_id: req.request_id,
                 slot_lease,
                 kv_leases: Vec::new(),
                 page_ids: Vec::new(),
-                current_seq_len: plen,
-                last_token: *req.prompt_tokens.last().unwrap_or(&0),
+                prompt_tokens: req.prompt_tokens,
+                prefilled_tokens: 0,
+                current_seq_len: 0,
+                last_token,
                 generated_tokens: Vec::with_capacity(req.target_output_len),
                 target_output_len: req.target_output_len,
-                arrival_time: req.arrival_time,
+                permit_time: req.permit_time,
+                submit_time: req.submit_time,
                 first_token_time: None,
                 last_token_time: None,
             };
-            seq.ensure_kv_pages(
-                plen,
+            let sample_row_index = (chunk_end == prompt_len).then(|| {
+                let row = num_sample_rows;
+                num_sample_rows += 1;
+                row
+            });
+            self.stage_prefill_row(
+                step_id,
+                &mut seq,
+                num_seqs,
+                token_cursor,
+                chunk_start,
+                chunk_end,
+                sample_row_index,
                 page_block_tokens,
                 max_pages_per_seq,
-                &self.kv_pool,
-                &mut self.shadow_page_table,
             )?;
-
-            // Temporarily stash prompt tokens in `generated_tokens`? No, write directly to SHM below!
-            let act_idx = active.len();
-            slot_to_active[slot_id] = act_idx;
-            scheduled_indices.push(act_idx);
-
-            {
-                let mut plan = self.coordinator.plan_slot_mut(step_id)?;
-                let slot_i32 = slot_id as i32;
-                for (offset, &tok) in req.prompt_tokens.iter().enumerate() {
-                    plan.token_ids_mut()?[token_cursor + offset] = tok;
-                    plan.positions_mut()?[token_cursor + offset] = offset as i32;
-                    plan.req_slot_ids_mut()?[token_cursor + offset] = slot_i32;
-                }
-                let seq_batch_pos = scheduled_indices.len() - 1;
-                plan.query_start_loc_mut()?[seq_batch_pos] = token_cursor as i32;
-                plan.seq_lens_mut()?[seq_batch_pos] = plen as i32;
-                plan.sample_row_indices_mut()?[seq_batch_pos] = (token_cursor + plen - 1) as i32;
-            }
-            token_cursor += plen;
+            slot_to_active[slot_id] = active.len();
             active.push(seq);
+            token_cursor += chunk_end - chunk_start;
+            num_seqs += 1;
         }
 
-        let num_seqs = scheduled_indices.len() as u32;
         if num_seqs == 0 {
             return Err(ModeBError::Protocol(
                 "prefill step scheduled zero sequences".to_owned(),
@@ -724,22 +1060,60 @@ impl ModeBServingEngine {
         }
 
         let mut plan = self.coordinator.plan_slot_mut(step_id)?;
-        plan.query_start_loc_mut()?[num_seqs as usize] = token_cursor as i32;
+        plan.query_start_loc_mut()?[num_seqs] = token_cursor as i32;
         plan.global_kv_page_table_mut()?
             .copy_from_slice(&self.shadow_page_table);
         *plan.header_mut()? = StepHeader {
             step_id: AtomicU64::new(0),
             opcode: StepOpcode::NormalStep as u32,
-            num_seqs,
+            num_seqs: num_seqs as u32,
             num_encoder_tokens: token_cursor as u32,
             encoder_graph_bucket: 0,
             num_decoder_rows: token_cursor as u32,
             decoder_graph_bucket: 0,
-            num_sample_rows: num_seqs,
+            num_sample_rows: num_sample_rows as u32,
             is_dspark_verify: 0,
             flags: 0,
             _reserved: [0; 3],
         };
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_prefill_row(
+        &mut self,
+        step_id: u64,
+        seq: &mut ActiveSequence,
+        seq_batch_pos: usize,
+        token_cursor: usize,
+        chunk_start: usize,
+        chunk_end: usize,
+        sample_row_index: Option<usize>,
+        page_block_tokens: usize,
+        max_pages_per_seq: usize,
+    ) -> Result<()> {
+        seq.ensure_kv_pages(
+            chunk_end,
+            page_block_tokens,
+            max_pages_per_seq,
+            &self.kv_pool,
+            &mut self.shadow_page_table,
+        )?;
+        let chunk_len = chunk_end - chunk_start;
+        let slot_i32 = seq.slot_lease.id() as i32;
+        let mut plan = self.coordinator.plan_slot_mut(step_id)?;
+        for (offset, &tok) in seq.prompt_tokens[chunk_start..chunk_end].iter().enumerate() {
+            plan.token_ids_mut()?[token_cursor + offset] = tok;
+            plan.positions_mut()?[token_cursor + offset] = (chunk_start + offset) as i32;
+            plan.req_slot_ids_mut()?[token_cursor + offset] = slot_i32;
+        }
+        plan.query_start_loc_mut()?[seq_batch_pos] = token_cursor as i32;
+        plan.seq_lens_mut()?[seq_batch_pos] = chunk_end as i32;
+        if let Some(sample_row) = sample_row_index {
+            plan.sample_row_indices_mut()?[sample_row] = (token_cursor + chunk_len - 1) as i32;
+        }
+        seq.prefilled_tokens = chunk_end;
+        seq.current_seq_len = chunk_end;
         Ok(())
     }
 
@@ -751,14 +1125,20 @@ impl ModeBServingEngine {
         max_pages_per_seq: usize,
         commit_tokens_immediately: bool,
     ) -> Result<()> {
-        let num_seqs = active.len();
+        let num_seqs = active
+            .iter()
+            .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
+            .count();
         if num_seqs == 0 {
             return Err(ModeBError::Protocol(
-                "decode step scheduled zero active sequences".to_owned(),
+                "decode step scheduled zero prompt-complete sequences".to_owned(),
             ));
         }
 
-        for seq in active.iter_mut() {
+        for seq in active
+            .iter_mut()
+            .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
+        {
             let next_seq_len = seq.current_seq_len + 1;
             seq.ensure_kv_pages(
                 next_seq_len,
@@ -771,7 +1151,11 @@ impl ModeBServingEngine {
 
         let bucket = select_graph_bucket(num_seqs as u32, &DECODE_BUCKETS);
         let mut plan = self.coordinator.plan_slot_mut(step_id)?;
-        for (row, seq) in active.iter_mut().enumerate() {
+        for (row, seq) in active
+            .iter_mut()
+            .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
+            .enumerate()
+        {
             let pos = seq.current_seq_len as i32;
             let next_len = pos + 1;
             if commit_tokens_immediately {
@@ -810,43 +1194,74 @@ impl ModeBServingEngine {
     }
 }
 
+fn prefill_chunk_range(
+    prompt_len: usize,
+    prefilled_tokens: usize,
+    token_budget: usize,
+    max_prefill_chunk: usize,
+) -> Option<(usize, usize)> {
+    if prefilled_tokens >= prompt_len || token_budget == 0 || max_prefill_chunk == 0 {
+        return None;
+    }
+    let chunk_len = (prompt_len - prefilled_tokens)
+        .min(token_budget)
+        .min(max_prefill_chunk);
+    Some((prefilled_tokens, prefilled_tokens + chunk_len))
+}
+
+fn first_token_latency_us(
+    permit_time: Instant,
+    submit_time: Instant,
+    first_token_time: Instant,
+) -> (u64, u64) {
+    (
+        first_token_time.duration_since(permit_time).as_micros() as u64,
+        first_token_time.duration_since(submit_time).as_micros() as u64,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn should_schedule_prefill(
-    active_count: usize,
+    decode_active_count: usize,
+    total_active_count: usize,
+    has_partial_prefill: bool,
     max_seqs: usize,
     max_step_tokens: usize,
+    max_prefill_chunk: usize,
     waiting_permitted: &VecDeque<PendingRequest>,
     consecutive_prefills: usize,
 ) -> bool {
-    if waiting_permitted.is_empty() || active_count >= max_seqs {
+    if (total_active_count >= max_seqs || waiting_permitted.is_empty()) && !has_partial_prefill {
         return false;
     }
-    if active_count == 0 {
+    if decode_active_count > 0 && consecutive_prefills >= 1 {
+        return false;
+    }
+    if has_partial_prefill || decode_active_count == 0 {
         return true;
     }
-    // Interleave 1 CUDA-Graph decode step after every 4 prefill batches during ramp-up so
-    // already-admitted requests make steady progress and stagger completions.
-    if consecutive_prefills >= 4 {
-        return false;
-    }
-    let first_len = waiting_permitted
-        .front()
-        .map_or(1, |req| req.prompt_tokens.len().max(1));
+    let first_len = waiting_permitted.front().map_or(1, |req| {
+        req.prompt_tokens
+            .len()
+            .min(max_prefill_chunk)
+            .min(max_step_tokens)
+            .max(1)
+    });
     let full_prefill_batch = (max_step_tokens / first_len).max(1);
-    let free_slots = max_seqs - active_count;
+    let free_slots = max_seqs - total_active_count;
     if waiting_permitted.len() >= full_prefill_batch.min(free_slots) {
         return true;
     }
-    // Also admit small remainder batches once waiting >= 25 ms so TTFT stays bounded.
     waiting_permitted
         .front()
-        .is_some_and(|req| req.arrival_time.elapsed().as_millis() >= 25)
+        .is_some_and(|req| req.permit_time.elapsed().as_millis() >= 25)
 }
 
 /// Generate `num_prompts` deterministic pseudo-random token sequences in `[256, 65536)`
 /// (avoiding EOS/control token IDs and avoiding artificial prefix-cache collisions).
 pub fn build_deterministic_random_prompts(num_prompts: usize, input_len: usize) -> Vec<Vec<i32>> {
     let mut prompts = Vec::with_capacity(num_prompts);
-    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut state: u64 = BENCHMARK_RANDOM_SEED;
     for p in 0..num_prompts {
         let mut row = Vec::with_capacity(input_len);
         state ^= (p as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -920,11 +1335,14 @@ mod tests {
                 slot_lease: slot_pool.allocate().expect("slot"),
                 kv_leases: Vec::new(),
                 page_ids: Vec::new(),
+                prompt_tokens: vec![42],
+                prefilled_tokens: 1,
                 current_seq_len: 0,
                 last_token: 42,
                 generated_tokens: Vec::new(),
                 target_output_len: 10,
-                arrival_time: Instant::now(),
+                permit_time: Instant::now(),
+                submit_time: Instant::now(),
                 first_token_time: None,
                 last_token_time: None,
             };
@@ -950,6 +1368,64 @@ mod tests {
         // Dropping `seq` releases all 3 KV blocks and the sequence slot
         assert_eq!(kv_pool.available(), 8);
         assert_eq!(slot_pool.available(), 2);
+    }
+
+    #[test]
+    fn chunked_prefill_progresses_to_exact_prompt_end_and_samples_only_final_chunk() {
+        let prompt_len = 10;
+        let mut prefilled_tokens = 0;
+        let mut ranges = Vec::new();
+        while let Some((start, end)) = prefill_chunk_range(prompt_len, prefilled_tokens, 6, 4) {
+            assert!(end - start <= 4);
+            ranges.push((start, end));
+            prefilled_tokens = end;
+        }
+        assert_eq!(ranges, vec![(0, 4), (4, 8), (8, 10)]);
+        assert_eq!(prefilled_tokens, prompt_len);
+        let sample_chunks = ranges.iter().filter(|(_, end)| *end == prompt_len).count();
+        assert_eq!(sample_chunks, 1);
+        assert_eq!(prefill_chunk_range(10, 4, 2, 4), Some((4, 6)));
+        assert_eq!(prefill_chunk_range(10, 10, 6, 4), None);
+    }
+
+    #[test]
+    fn decode_sequences_force_single_prefill_interleaving() {
+        let now = Instant::now();
+        let waiting: VecDeque<PendingRequest> = (0..4)
+            .map(|request_id| PendingRequest {
+                request_id,
+                prompt_tokens: vec![256; 1024],
+                target_output_len: 8,
+                permit_time: now,
+                submit_time: now,
+            })
+            .collect();
+        assert!(should_schedule_prefill(
+            1, 1, false, 8, 4096, 2048, &waiting, 0,
+        ));
+        assert!(!should_schedule_prefill(
+            1, 1, false, 8, 4096, 2048, &waiting, 1,
+        ));
+        assert!(should_schedule_prefill(
+            1, 2, true, 8, 4096, 2048, &waiting, 0,
+        ));
+        assert!(!should_schedule_prefill(
+            1, 2, true, 8, 4096, 2048, &waiting, 1,
+        ));
+        assert!(should_schedule_prefill(
+            0, 1, false, 8, 4096, 2048, &waiting, 4,
+        ));
+    }
+
+    #[test]
+    fn ttft_and_submit_ttft_use_their_respective_start_times() {
+        let submit_time = Instant::now();
+        let permit_time = submit_time + std::time::Duration::from_millis(40);
+        let first_token_time = submit_time + std::time::Duration::from_millis(100);
+        let (ttft_us, submit_ttft_us) =
+            first_token_latency_us(permit_time, submit_time, first_token_time);
+        assert_eq!(ttft_us, 60_000);
+        assert_eq!(submit_ttft_us, 100_000);
     }
 
     #[test]

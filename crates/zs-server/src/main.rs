@@ -23,8 +23,8 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use zs_scheduler::{
-    BenchmarkTierSpec, ModeBConfig, ModeBCoordinator, ModeBServingEngine, ServingBenchmarkReport,
-    WorkerLaunchConfig,
+    BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierSpec, ModeBConfig, ModeBCoordinator,
+    ModeBServingEngine, ServingBenchmarkReport, TierAggregateStats, WorkerLaunchConfig,
 };
 use zs_wire::ShmGeometry;
 
@@ -43,6 +43,9 @@ Usage: zstep --mode-b [OPTIONS]\n\
   --prompt-ids LIST          Comma-separated prompt token IDs for greedy generation parity check\n\
   --max-new-tokens N         Generated tokens per prompt for --prompt-ids (default: 16)\n\
   --bench-tiers SPEC         Semicolon-separated tiers `label:conc:prompts:in_len:out_len`\n\
+  --warmup-prompts N         Warm up 512->64 prompts at concurrency 16 (default: 16)\n\
+  --repeats N                Interleaved repeat count across all tiers (default: 3)\n\
+  --max-prefill-chunk N      Maximum prompt tokens per sequence per prefill step (default: 2048)\n\
   --max-seqs N               Sequence capacity (default: 8 synthetic, 128 with --model-dir)\n\
   --max-step-tokens N        Token capacity (default: 192 synthetic, 4096 with --model-dir)\n\
   --max-decoder-rows N       Decoder row capacity (default: 192 synthetic, 4096 with --model-dir)\n\
@@ -70,6 +73,9 @@ struct Arguments {
     prompt_ids: Option<Vec<i32>>,
     max_new_tokens: usize,
     bench_tiers: Vec<BenchmarkTierSpec>,
+    warmup_prompts: usize,
+    repeats: usize,
+    max_prefill_chunk: usize,
     max_seqs: Option<u32>,
     max_step_tokens: Option<u32>,
     max_decoder_rows: Option<u32>,
@@ -100,6 +106,9 @@ impl Default for Arguments {
             prompt_ids: None,
             max_new_tokens: 16,
             bench_tiers: Vec::new(),
+            warmup_prompts: 16,
+            repeats: 3,
+            max_prefill_chunk: 2048,
             max_seqs: None,
             max_step_tokens: None,
             max_decoder_rows: None,
@@ -170,6 +179,7 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             page_block_tokens,
             spec_verify_width: 6,
         },
+        max_prefill_chunk: args.max_prefill_chunk,
         steps: args.steps,
         token_counts: args.token_counts,
         launch: WorkerLaunchConfig {
@@ -207,32 +217,76 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if !args.bench_tiers.is_empty() {
-            let mut tier_results = Vec::with_capacity(args.bench_tiers.len());
-            for spec in &args.bench_tiers {
-                let res = engine.run_benchmark_tier(spec)?;
+            let provenance = BenchmarkProvenance::capture(
+                BENCHMARK_RANDOM_SEED,
+                args.repeats,
+                args.warmup_prompts,
+                max_step_tokens,
+                args.max_prefill_chunk,
+            )?;
+            if args.warmup_prompts > 0 {
+                let warmup = BenchmarkTierSpec {
+                    label: "warmup".to_owned(),
+                    concurrency: args.warmup_prompts.min(16),
+                    num_prompts: args.warmup_prompts,
+                    input_len: 512,
+                    output_len: 64,
+                };
+                let warmup_result = engine.run_benchmark_tier(&warmup)?;
                 eprintln!(
-                    "[{}] conc={} prompts={} in={} out={} -> out_tok/s={:.2}, total_tok/s={:.2}, median_ttft={:.2}ms, mean_tpot={:.2}ms, p99_tpot={:.2}ms (steps={}, overlapped={})",
-                    res.label,
-                    res.concurrency,
-                    res.num_prompts,
-                    res.input_len,
-                    res.output_len,
-                    res.output_throughput_tok_s,
-                    res.total_throughput_tok_s,
-                    res.median_ttft_ms,
-                    res.mean_tpot_ms,
-                    res.p99_tpot_ms,
-                    res.steps,
-                    res.overlapped_decode_steps,
+                    "[warmup] prompts={} -> out_tok/s={:.2}, median_ttft={:.2}ms",
+                    warmup_result.num_prompts,
+                    warmup_result.output_throughput_tok_s,
+                    warmup_result.median_ttft_ms,
                 );
-                tier_results.push(res);
             }
+
+            let mut tier_results = Vec::with_capacity(args.bench_tiers.len() * args.repeats);
+            let mut results_by_tier =
+                vec![Vec::with_capacity(args.repeats); args.bench_tiers.len()];
+            for repeat in 0..args.repeats {
+                for (tier_index, spec) in args.bench_tiers.iter().enumerate() {
+                    let mut res = engine.run_benchmark_tier(spec)?;
+                    res.repeat = repeat;
+                    eprintln!(
+                        "[{} repeat={}] conc={} prompts={} in={} out={} -> out_tok/s={:.2}, total_tok/s={:.2}, median_ttft={:.2}ms, median_submit_ttft={:.2}ms, mean_tpot={:.2}ms, p99_tpot={:.2}ms, p99_itl={:.2}ms (steps={}, overlapped={})",
+                        res.label,
+                        res.repeat,
+                        res.concurrency,
+                        res.num_prompts,
+                        res.input_len,
+                        res.output_len,
+                        res.output_throughput_tok_s,
+                        res.total_throughput_tok_s,
+                        res.median_ttft_ms,
+                        res.median_submit_ttft_ms,
+                        res.mean_tpot_ms,
+                        res.p99_tpot_ms,
+                        res.p99_itl_ms,
+                        res.steps,
+                        res.overlapped_decode_steps,
+                    );
+                    results_by_tier[tier_index].push(res.clone());
+                    tier_results.push(res);
+                }
+            }
+            let tier_aggregates = args
+                .bench_tiers
+                .iter()
+                .zip(&results_by_tier)
+                .map(|(spec, results)| {
+                    TierAggregateStats::from_results(spec.label.clone(), results)
+                        .expect("repeats is validated as positive")
+                })
+                .collect();
             let report = ServingBenchmarkReport {
                 model_name: model_label,
                 world_size: args.world_size,
                 worker_numa_nodes: engine.worker_numa_nodes().to_vec(),
                 init_wall_ms: engine.init_wall_ms(),
                 tiers: tier_results,
+                tier_aggregates,
+                provenance,
             };
             let encoded = report.to_json_pretty();
             if let Some(path) = args.metrics_output {
@@ -278,6 +332,9 @@ fn parse_arguments(raw: &[String]) -> Result<Arguments, String> {
             "--prompt-ids" => args.prompt_ids = Some(parse_i32_list(option, value)?),
             "--max-new-tokens" => args.max_new_tokens = parse_number(option, value)?,
             "--bench-tiers" => args.bench_tiers = parse_bench_tiers(value)?,
+            "--warmup-prompts" => args.warmup_prompts = parse_number(option, value)?,
+            "--repeats" => args.repeats = parse_number(option, value)?,
+            "--max-prefill-chunk" => args.max_prefill_chunk = parse_number(option, value)?,
             "--max-seqs" => args.max_seqs = Some(parse_number(option, value)?),
             "--max-step-tokens" => args.max_step_tokens = Some(parse_number(option, value)?),
             "--max-decoder-rows" => args.max_decoder_rows = Some(parse_number(option, value)?),
@@ -292,6 +349,12 @@ fn parse_arguments(raw: &[String]) -> Result<Arguments, String> {
             "--step-timeout-secs" => args.step_timeout_secs = parse_number(option, value)?,
             _ => return Err(format!("unknown option {option}")),
         }
+    }
+    if args.repeats == 0 {
+        return Err("--repeats must be positive".to_owned());
+    }
+    if args.max_prefill_chunk == 0 {
+        return Err("--max-prefill-chunk must be positive".to_owned());
     }
     Ok(args)
 }

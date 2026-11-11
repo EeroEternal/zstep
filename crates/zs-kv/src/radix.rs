@@ -20,6 +20,11 @@
 
 //! Deterministic block-granular Radix prefix cache with RAII pin leases (`RadixLease`),
 //! cascading LRU leaf eviction, and four-group FlatKV request admission (`RequestKvHandle`).
+//!
+//! [`PrefixTree`] and [`KvCacheManager`] are currently standalone for pure-attention paged KV
+//! caches. They are intentionally not enabled for `Qwen3.5-35B-A3B` until block-boundary
+//! recurrent-state (`conv_state` and `ssm_state`) snapshotting is implemented for its 30
+//! `GatedDeltaNet` layers.
 
 use std::collections::HashMap;
 use std::fmt;
