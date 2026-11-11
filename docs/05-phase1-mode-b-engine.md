@@ -27,7 +27,12 @@ zstep --mode-b --world-size 8 --steps 200 --token-counts 6,48,192
 | 指标项 | 8 × `sm_120` 实测值 | 说明 |
 | :--- | :---: | :--- |
 | **`world_size` / 总步数** | `8 GPUs` / `200 steps` | 动态轮换 `M ∈ {6, 48, 192}`，**0 次运行时 Triton 重编译** |
-| **主控发布 + 唤醒 8 个 Worker (`mean_publish_signal_us`)** | **`19.30 µs`** | 原子写入 `StepHeader.step_id` + 8 次 `eventfd` 通知总耗时 |
-| **控制面往返开销中位数 (`control_plane_p50_us`)** | **`433 µs`** (`p95 = 525 µs`, `p99 = 592 µs`) | 含跨进程唤醒、Python H2D/D2H 采样回传与 `done_efd` 收集；后续绑入静态 CUDA Graph 锁页缓冲可进一步压至 `<50 µs` |
-| **下一跳调度掩盖率 (`overlap_hiding_efficiency`)** | **`100.0%` (`1.000000`)** | 200 步累计 `prepare_next_us = 671 µs` 全部被 GPU 执行窗口完全掩盖（`hidden_prepare_us = 671 µs`） |
-| **退出后 `/dev/shm` 残留检查** | **0 残留（全自动回收）** | `test_mode_b_e2e.py` 断言主控 IPC 与 8 卡 AllReduce 共享内存段均已彻底 `unlink` |
+| **主控发布 + 唤醒 8 个 Worker (`mean_publish_signal_us`)** | **`23.995 µs`** | 原子写入 `StepHeader.step_id` + 8 次 `eventfd` 通知总耗时 |
+| **控制面 IPC 中位数 (`control_plane_p50_us`)** | **`325 µs`** (`p95 = 346 µs`, `p99 = 385 µs`) | 含跨进程唤醒、Python H2D/D2H 采样回传与 `done_efd` 收集；与下一拍 Rust 准备成本是不同计时口径 |
+| **下一拍 Rust 准备成本 (`mean_prepare_next_us_per_step`)** | **`4.690 µs/step`** | 本轮 `prepare_next_us = 938 µs`，该字段以全部 200 步为分母；其中 199 步发生重叠。仅计算 Rust 元数据准备，不含 IPC 往返 |
+| **准备成本相对 GPU 步耗时** | **`0.166%`** | `4.690 µs / 2,832.095 µs`；`hidden_prepare_us = 938 µs` 表示准备落在 GPU 执行窗口内，不表示获得 100% 端到端加速 |
+| **重叠等效加速 (`overlap_speedup`)** | **`1.000269×`（约 `1.0003×`）** | 按 `(total_wall_us + hidden_prepare_us) / total_wall_us` 计算，避免将窗口内调度比例误读为性能翻倍 |
+| **运行时 Triton 重编译** | **0** | 动态轮换 `M ∈ {6, 48, 192}`；Phase 2 运行时审计另监视 `WATCHED_KERNELS=17` 并要求 `TRITON_RECOMPILATIONS=0` |
+| **退出后 `/dev/shm` 残留检查** | **0 残留（全自动回收）** | `test_mode_b_e2e.py` 的 1-GPU 24 步与 8-GPU 64 步回归均已重跑通过，断言主控 IPC 与 AllReduce 共享内存段彻底 `unlink` |
+
+上一次同口径 200 步记录为 **`5.08 µs/step`**（累计 **`1,016 µs` / 199 步**）、GPU 平均步 **`3,066.94 µs`**、准备/GPU **`0.166%`**、`overlap_speedup = 1.000281×`。本轮 JSON 已更新为上述新测量；两次结果共同支持的结论仅是准备成本约 `0.17%`、等效加速约 `1.0003×`，不是夸张的控制面加速宣传。

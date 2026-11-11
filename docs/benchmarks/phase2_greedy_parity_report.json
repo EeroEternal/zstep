@@ -1,5 +1,5 @@
 {
-  "git_sha": "fc40513b0ebb914ea28063406364842eb383a7f5",
+  "git_sha": "714a8f05b4b68b77efa9b172f0e60e638a8fdfea",
   "vllm_version": "0.33.0",
   "max_prefill_chunk": 24,
   "all_matched": false,

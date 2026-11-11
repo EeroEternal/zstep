@@ -252,7 +252,12 @@ pub struct TierAggregateStats {
     pub repeats: usize,
     pub output_throughput_tok_s: AggregateMetric,
     pub total_throughput_tok_s: AggregateMetric,
+    pub mean_ttft_ms: AggregateMetric,
     pub median_ttft_ms: AggregateMetric,
+    pub p99_ttft_ms: AggregateMetric,
+    pub mean_submit_ttft_ms: AggregateMetric,
+    pub median_submit_ttft_ms: AggregateMetric,
+    pub p99_submit_ttft_ms: AggregateMetric,
     pub mean_tpot_ms: AggregateMetric,
     pub p99_tpot_ms: AggregateMetric,
     pub p99_itl_ms: AggregateMetric,
@@ -275,7 +280,12 @@ impl TierAggregateStats {
             repeats: results.len(),
             output_throughput_tok_s: metric!(output_throughput_tok_s),
             total_throughput_tok_s: metric!(total_throughput_tok_s),
+            mean_ttft_ms: metric!(mean_ttft_ms),
             median_ttft_ms: metric!(median_ttft_ms),
+            p99_ttft_ms: metric!(p99_ttft_ms),
+            mean_submit_ttft_ms: metric!(mean_submit_ttft_ms),
+            median_submit_ttft_ms: metric!(median_submit_ttft_ms),
+            p99_submit_ttft_ms: metric!(p99_submit_ttft_ms),
             mean_tpot_ms: metric!(mean_tpot_ms),
             p99_tpot_ms: metric!(p99_tpot_ms),
             p99_itl_ms: metric!(p99_itl_ms),
@@ -290,7 +300,12 @@ impl TierAggregateStats {
                 "      \"repeats\": {},\n",
                 "      \"output_throughput_tok_s\": {},\n",
                 "      \"total_throughput_tok_s\": {},\n",
+                "      \"mean_ttft_ms\": {},\n",
                 "      \"median_ttft_ms\": {},\n",
+                "      \"p99_ttft_ms\": {},\n",
+                "      \"mean_submit_ttft_ms\": {},\n",
+                "      \"median_submit_ttft_ms\": {},\n",
+                "      \"p99_submit_ttft_ms\": {},\n",
                 "      \"mean_tpot_ms\": {},\n",
                 "      \"p99_tpot_ms\": {},\n",
                 "      \"p99_itl_ms\": {}\n",
@@ -300,7 +315,12 @@ impl TierAggregateStats {
             self.repeats,
             self.output_throughput_tok_s.to_json(),
             self.total_throughput_tok_s.to_json(),
+            self.mean_ttft_ms.to_json(),
             self.median_ttft_ms.to_json(),
+            self.p99_ttft_ms.to_json(),
+            self.mean_submit_ttft_ms.to_json(),
+            self.median_submit_ttft_ms.to_json(),
+            self.p99_submit_ttft_ms.to_json(),
             self.mean_tpot_ms.to_json(),
             self.p99_tpot_ms.to_json(),
             self.p99_itl_ms.to_json(),
@@ -1498,6 +1518,48 @@ mod tests {
             first_token_latency_us(permit_time, submit_time, first_token_time);
         assert_eq!(ttft_us, 60_000);
         assert_eq!(submit_ttft_us, 100_000);
+    }
+
+    #[test]
+    fn tier_aggregates_include_permit_and_submit_ttft_population_stats() {
+        let results = (0..3)
+            .map(|repeat| BenchmarkTierResult {
+                label: "tier".to_owned(),
+                repeat,
+                concurrency: 4,
+                num_prompts: 12,
+                input_len: 512,
+                output_len: 256,
+                steps: 100,
+                overlapped_decode_steps: 90,
+                wall_time_ms: 1_000.0,
+                output_throughput_tok_s: 100.0,
+                total_throughput_tok_s: 300.0,
+                mean_ttft_ms: 40.0,
+                median_ttft_ms: 40.0,
+                p99_ttft_ms: 45.0,
+                mean_submit_ttft_ms: 100.0 * (repeat + 1) as f64,
+                median_submit_ttft_ms: 100.0 * (repeat + 1) as f64,
+                p99_submit_ttft_ms: 110.0 * (repeat + 1) as f64,
+                mean_tpot_ms: 4.0,
+                median_tpot_ms: 4.0,
+                p99_tpot_ms: 5.0,
+                mean_itl_ms: 4.0,
+                median_itl_ms: 4.0,
+                p99_itl_ms: 6.0,
+            })
+            .collect::<Vec<_>>();
+        let aggregate = TierAggregateStats::from_results("tier".to_owned(), &results)
+            .expect("three repeat samples");
+        assert_eq!(aggregate.repeats, 3);
+        assert_eq!(aggregate.mean_ttft_ms.mean, 40.0);
+        assert_eq!(aggregate.mean_submit_ttft_ms.mean, 200.0);
+        assert!((aggregate.mean_submit_ttft_ms.std - 81.649_658).abs() < 1e-6);
+        assert_eq!(aggregate.mean_submit_ttft_ms.min, 100.0);
+        assert_eq!(aggregate.mean_submit_ttft_ms.max, 300.0);
+        let encoded = aggregate.to_json();
+        assert!(encoded.contains("\"median_submit_ttft_ms\""));
+        assert!(encoded.contains("\"p99_submit_ttft_ms\""));
     }
 
     #[test]
