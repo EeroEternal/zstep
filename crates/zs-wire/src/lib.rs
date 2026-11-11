@@ -34,6 +34,18 @@ pub const MAX_WORKERS: usize = 8;
 /// Token ID sentinel indicating the GPU worker should self-bootstrap the token
 /// on-device from the previous in-flight step's output slot (`in_flight_depth = 1`).
 pub const DEVICE_BOOTSTRAP_TOKEN_ID: i32 = -1;
+/// Reserved bytes at the start of the mapping for [`ShmSuperblock`].
+pub const SHM_SUPERBLOCK_REGION_BYTES: usize = 4096;
+/// Byte offset of the fixed eight-entry worker status array.
+pub const WORKER_STATES_OFFSET: usize = 4096;
+/// Reserved bytes for the worker status array.
+pub const WORKER_STATES_REGION_BYTES: usize = 4096;
+/// Worker initialization completed and the process is ready for plans.
+pub const WORKER_STATUS_READY: u32 = 1;
+/// Worker is executing a published plan.
+pub const WORKER_STATUS_RUNNING: u32 = 2;
+/// Worker stopped because of an exception.
+pub const WORKER_STATUS_ERROR: u32 = 99;
 
 /// Step operation codes published in [`StepHeader::opcode`].
 #[repr(u32)]

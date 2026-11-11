@@ -23,6 +23,10 @@
 //! Computes both `encoder_rows` (Layers 0..19) and narrowed `decoder_rows`
 //! (Layers 20..39) plus CUDA Graph bucket targets for all 8 RTX 6000D workers.
 
+mod mode_b;
+
+pub use mode_b::{ModeBConfig, ModeBCoordinator, ModeBError, ModeBMetrics, WorkerLaunchConfig};
+
 /// Select the smallest captured CUDA Graph bucket `>= active_rows`, or `0` (eager)
 /// if `active_rows` exceeds the largest captured graph bucket.
 pub fn select_graph_bucket(active_rows: u32, sorted_buckets: &[u32]) -> u32 {

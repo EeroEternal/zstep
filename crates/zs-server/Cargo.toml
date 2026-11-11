@@ -11,8 +11,8 @@ name = "zstep"
 path = "src/main.rs"
 
 [dependencies]
-zs-kv = { path = "../zs-kv" }
 zs-scheduler = { path = "../zs-scheduler" }
+zs-kv = { path = "../zs-kv" }
 zs-wire = { path = "../zs-wire" }
 
 [lints]

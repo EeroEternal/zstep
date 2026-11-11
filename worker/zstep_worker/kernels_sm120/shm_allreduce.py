@@ -18,23 +18,31 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CUDA-graph-safe host-mapped two-shot BF16 AllReduce for non-P2P systems."""
+"""CUDA-Graph-safe host-mapped two-shot BF16 AllReduce for non-P2P (`CNS`) topologies.
+
+Uses a single fused kernel with per-block independent chunk ownership, 16-byte (`uint4` =
+8x BF16) vectorized PCIe streaming (`st.global.wt` / `ld.global.cv`), PTX `.sys` scope
+release/acquire flag barriers across 8 peers in parallel within warp 0, and a 4-slot
+ring buffer so back-to-back CUDA Graph replays never race or deadlock.
+"""
 
 from __future__ import annotations
 
 import ctypes
+import mmap
 import os
-from multiprocessing import shared_memory
 
 import torch
 import torch.distributed as dist
 from torch.utils.cpp_extension import load_inline
 
+NUM_RING_SLOTS = 4
+MAX_RANKS = 8
+MAX_BLOCKS = 64
+
 _CPP_SOURCE = r"""
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
-#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 
@@ -60,8 +68,8 @@ void launch_host_mapped_two_shot(
     torch::Tensor output,
     torch::Tensor control,
     std::uintptr_t host_device_address,
-    int64_t inputs_offset,
-    int64_t reduced_offset,
+    int64_t data_base_offset,
+    int64_t slot_stride_bytes,
     int64_t rank_stride_bytes,
     int64_t rank,
     int64_t world_size,
@@ -79,126 +87,164 @@ _CUDA_SOURCE = r"""
 
 namespace {
 
-__device__ __forceinline__ unsigned long long device_load(
-    unsigned long long* pointer) {
-    return atomicAdd(pointer, 0ULL);
+constexpr int kNumRingSlots = 4;
+constexpr int kMaxRanks = 8;
+constexpr int kMaxBlocks = 64;
+
+__device__ __forceinline__ uint64_t sys_load_acquire_u64(const uint64_t* addr) {
+    uint64_t val;
+    asm volatile("ld.global.acquire.sys.b64 %0, [%1];" : "=l"(val) : "l"(addr) : "memory");
+    return val;
 }
 
-__device__ __forceinline__ unsigned long long system_load(
-    unsigned long long* pointer) {
-    return atomicAdd_system(pointer, 0ULL);
+__device__ __forceinline__ void sys_store_release_u64(uint64_t* addr, uint64_t val) {
+    asm volatile("st.global.release.sys.b64 [%0], %1;" :: "l"(addr), "l"(val) : "memory");
 }
 
-__global__ void host_mapped_copy_kernel(
-    const __nv_bfloat16* input,
-    unsigned long long* control,
-    unsigned long long* input_arrivals,
-    char* host_base,
-    int64_t inputs_offset,
+__device__ __forceinline__ uint4 ld_cv_uint4(const uint4* addr) {
+    uint4 v;
+    asm volatile(
+        "ld.global.cv.v4.u32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+        : "l"(addr)
+        : "memory");
+    return v;
+}
+
+__device__ __forceinline__ void st_wt_uint4(uint4* addr, uint4 v) {
+    asm volatile(
+        "st.global.wt.v4.u32 [%0], {%1, %2, %3, %4};"
+        :: "l"(addr), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+        : "memory");
+}
+
+union Pack128Bf16 {
+    uint4 u4;
+    __nv_bfloat162 pairs[4];
+};
+
+__global__ void host_mapped_two_shot_fused_kernel(
+    const uint4* __restrict__ input_vec,
+    uint4* __restrict__ output_vec,
+    uint64_t* __restrict__ control,
+    char* __restrict__ host_base,
+    int64_t data_base_offset,
+    int64_t slot_stride_bytes,
     int64_t rank_stride_bytes,
-    int64_t elements,
+    int64_t num_vecs,
     int rank,
     int world_size) {
-    constexpr int copy_blocks_slot = 1;
-    constexpr int copy_ready_slot = 3;
-    const unsigned long long target = control[0] + 1;
-    const int64_t thread = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t thread_count = static_cast<int64_t>(gridDim.x) * blockDim.x;
-    __nv_bfloat16* local_input = reinterpret_cast<__nv_bfloat16*>(
-        host_base + inputs_offset + static_cast<int64_t>(rank) * rank_stride_bytes);
-    for (int64_t index = thread; index < elements; index += thread_count) {
-        local_input[index] = input[index];
+    // Flag layout in first 12 KiB of SHM (each flag cacheline-padded to 8B within 64B per block):
+    // [0 .. 4096):   in_flags[kMaxBlocks][kMaxRanks]  (64 * 8 * 8 = 4096 B)
+    // [4096 .. 8192): red_flags[kMaxBlocks][kMaxRanks] (64 * 8 * 8 = 4096 B)
+    // [8192 .. 12288): done_flags[kMaxBlocks][kMaxRanks] (64 * 8 * 8 = 4096 B)
+    uint64_t* in_flags = reinterpret_cast<uint64_t*>(host_base) + blockIdx.x * kMaxRanks;
+    uint64_t* red_flags = reinterpret_cast<uint64_t*>(host_base + 4096) + blockIdx.x * kMaxRanks;
+    uint64_t* done_flags = reinterpret_cast<uint64_t*>(host_base + 8192) + blockIdx.x * kMaxRanks;
+
+    __shared__ uint64_t s_step;
+    if (threadIdx.x == 0) {
+        const uint64_t next_step = control[blockIdx.x] + 1ULL;
+        control[blockIdx.x] = next_step;
+        s_step = next_step;
+    }
+    __syncthreads();
+    const uint64_t step = s_step;
+    const int slot = static_cast<int>((step - 1ULL) & (kNumRingSlots - 1));
+
+    // Partition `num_vecs` across blocks so each block `b` synchronizes ONLY with peer block `b`.
+    const int64_t chunk_begin = (num_vecs * static_cast<int64_t>(blockIdx.x)) / gridDim.x;
+    const int64_t chunk_end = (num_vecs * static_cast<int64_t>(blockIdx.x + 1)) / gridDim.x;
+    const int64_t chunk_len = chunk_end - chunk_begin;
+
+    // Ring-slot reuse guard: ensure all peers finished reading `slot` from `step - kNumRingSlots`.
+    if (step > static_cast<uint64_t>(kNumRingSlots)) {
+        const uint64_t min_done = step - static_cast<uint64_t>(kNumRingSlots);
+        if (threadIdx.x < world_size) {
+            while (sys_load_acquire_u64(done_flags + threadIdx.x) < min_done) {
+                __nanosleep(64);
+            }
+        }
+        __syncthreads();
+    }
+
+    char* slot_base = host_base + data_base_offset + static_cast<int64_t>(slot) * slot_stride_bytes;
+    char* slot_inputs_base = slot_base;
+    char* slot_reduced_base = slot_base + static_cast<int64_t>(world_size) * rank_stride_bytes;
+
+    // Stage 1: Copy local VRAM chunk -> mapped SHM input buffer.
+    uint4* local_shm_in = reinterpret_cast<uint4*>(
+        slot_inputs_base + static_cast<int64_t>(rank) * rank_stride_bytes);
+    for (int64_t idx = chunk_begin + threadIdx.x; idx < chunk_end; idx += blockDim.x) {
+        st_wt_uint4(local_shm_in + idx, input_vec[idx]);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
         __threadfence_system();
-        atomicAdd(control + copy_blocks_slot, 1ULL);
+        sys_store_release_u64(in_flags + rank, step);
     }
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        while (device_load(control + copy_blocks_slot) < target * gridDim.x) {
-            __nanosleep(128);
+    if (threadIdx.x < world_size) {
+        while (sys_load_acquire_u64(in_flags + threadIdx.x) < step) {
+            __nanosleep(64);
         }
-        atomicAdd_system(input_arrivals + rank, 1ULL);
-        for (int peer = 0; peer < world_size; ++peer) {
-            while (system_load(input_arrivals + peer) < target) {
-                __nanosleep(128);
+    }
+    __syncthreads();
+
+    // Stage 2: Reduce-scatter this rank's 1/world_size slice of [chunk_begin, chunk_end).
+    const int64_t sub_begin = chunk_begin + (chunk_len * rank) / world_size;
+    const int64_t sub_end = chunk_begin + (chunk_len * (rank + 1)) / world_size;
+    uint4* local_shm_red = reinterpret_cast<uint4*>(
+        slot_reduced_base + static_cast<int64_t>(rank) * rank_stride_bytes);
+
+    for (int64_t idx = sub_begin + threadIdx.x; idx < sub_end; idx += blockDim.x) {
+        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        #pragma unroll
+        for (int peer = 0; peer < kMaxRanks; ++peer) {
+            if (peer < world_size) {
+                const uint4* peer_in = reinterpret_cast<const uint4*>(
+                    slot_inputs_base + static_cast<int64_t>(peer) * rank_stride_bytes);
+                Pack128Bf16 p;
+                p.u4 = ld_cv_uint4(peer_in + idx);
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f2 = __bfloat1622float2(p.pairs[j]);
+                    acc[2 * j] += f2.x;
+                    acc[2 * j + 1] += f2.y;
+                }
             }
         }
-        __threadfence_system();
-        atomicAdd(control + copy_ready_slot, 1ULL);
-    }
-}
-
-__global__ void host_mapped_reduce_kernel(
-    unsigned long long* control,
-    unsigned long long* reduced_arrivals,
-    char* host_base,
-    int64_t inputs_offset,
-    int64_t reduced_offset,
-    int64_t rank_stride_bytes,
-    int64_t elements,
-    int rank,
-    int world_size) {
-    constexpr int reduce_blocks_slot = 2;
-    constexpr int reduce_ready_slot = 4;
-    const unsigned long long target = control[0] + 1;
-    const int64_t thread = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t thread_count = static_cast<int64_t>(gridDim.x) * blockDim.x;
-    const int64_t shard_begin = elements * rank / world_size;
-    const int64_t shard_end = elements * (rank + 1) / world_size;
-    __nv_bfloat16* local_reduced = reinterpret_cast<__nv_bfloat16*>(
-        host_base + reduced_offset + static_cast<int64_t>(rank) * rank_stride_bytes);
-    for (int64_t index = shard_begin + thread; index < shard_end; index += thread_count) {
-        float sum = 0.0f;
-        for (int peer = 0; peer < world_size; ++peer) {
-            const __nv_bfloat16* peer_input = reinterpret_cast<const __nv_bfloat16*>(
-                host_base + inputs_offset + static_cast<int64_t>(peer) * rank_stride_bytes);
-            sum += __bfloat162float(peer_input[index]);
+        Pack128Bf16 out_pack;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            out_pack.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
         }
-        local_reduced[index] = __float2bfloat16_rn(sum);
+        st_wt_uint4(local_shm_red + idx, out_pack.u4);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
         __threadfence_system();
-        atomicAdd(control + reduce_blocks_slot, 1ULL);
+        sys_store_release_u64(red_flags + rank, step);
     }
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        while (device_load(control + reduce_blocks_slot) < target * gridDim.x) {
-            __nanosleep(128);
+    if (threadIdx.x < world_size) {
+        while (sys_load_acquire_u64(red_flags + threadIdx.x) < step) {
+            __nanosleep(64);
         }
-        atomicAdd_system(reduced_arrivals + rank, 1ULL);
-        for (int peer = 0; peer < world_size; ++peer) {
-            while (system_load(reduced_arrivals + peer) < target) {
-                __nanosleep(128);
-            }
-        }
-        __threadfence_system();
-        atomicAdd(control + reduce_ready_slot, 1ULL);
     }
-}
+    __syncthreads();
 
-__global__ void host_mapped_gather_kernel(
-    __nv_bfloat16* output,
-    unsigned long long* control,
-    char* host_base,
-    int64_t reduced_offset,
-    int64_t rank_stride_bytes,
-    int64_t elements,
-    int world_size) {
-    const int64_t thread = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t thread_count = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    // Stage 3: AllGather all peers' reduced sub-slices directly into VRAM `output_vec`.
     for (int owner = 0; owner < world_size; ++owner) {
-        const int64_t owner_begin = elements * owner / world_size;
-        const int64_t owner_end = elements * (owner + 1) / world_size;
-        const __nv_bfloat16* owner_reduced = reinterpret_cast<const __nv_bfloat16*>(
-            host_base + reduced_offset + static_cast<int64_t>(owner) * rank_stride_bytes);
-        for (int64_t index = owner_begin + thread; index < owner_end; index += thread_count) {
-            output[index] = owner_reduced[index];
+        const int64_t owner_begin = chunk_begin + (chunk_len * owner) / world_size;
+        const int64_t owner_end = chunk_begin + (chunk_len * (owner + 1)) / world_size;
+        const uint4* owner_red = reinterpret_cast<const uint4*>(
+            slot_reduced_base + static_cast<int64_t>(owner) * rank_stride_bytes);
+        for (int64_t idx = owner_begin + threadIdx.x; idx < owner_end; idx += blockDim.x) {
+            output_vec[idx] = ld_cv_uint4(owner_red + idx);
         }
     }
     __syncthreads();
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        atomicAdd(control, 1ULL);
+    if (threadIdx.x == 0) {
+        sys_store_release_u64(done_flags + rank, step);
     }
 }
 
@@ -209,8 +255,8 @@ void launch_host_mapped_two_shot(
     torch::Tensor output,
     torch::Tensor control,
     std::uintptr_t host_device_address,
-    int64_t inputs_offset,
-    int64_t reduced_offset,
+    int64_t data_base_offset,
+    int64_t slot_stride_bytes,
     int64_t rank_stride_bytes,
     int64_t rank,
     int64_t world_size,
@@ -221,45 +267,28 @@ void launch_host_mapped_two_shot(
     TORCH_CHECK(output.scalar_type() == at::kBFloat16, "output must be BF16");
     TORCH_CHECK(input.is_contiguous() && output.is_contiguous(), "input/output must be contiguous");
     TORCH_CHECK(input.numel() == output.numel(), "input/output sizes must match");
-    TORCH_CHECK(control.is_cuda() && control.scalar_type() == at::kLong, "control must be int64 CUDA storage");
-    TORCH_CHECK(control.numel() >= 5, "control must have five monotonic slots");
-    TORCH_CHECK(input.numel() * input.element_size() <= rank_stride_bytes, "input exceeds SHM capacity");
-    TORCH_CHECK(world_size >= 2 && rank >= 0 && rank < world_size, "invalid rank/world size");
+    TORCH_CHECK(input.numel() % 8 == 0, "input numel must be divisible by 8 for 128-bit vectorization");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(input.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<std::uintptr_t>(output.data_ptr()) % 16 == 0,
+        "input/output pointers must be 16-byte aligned");
+    TORCH_CHECK(control.is_cuda() && control.scalar_type() == at::kLong, "control must be int64 CUDA tensor");
+    TORCH_CHECK(blocks > 0 && blocks <= kMaxBlocks, "blocks must be in [1, 64]");
+    TORCH_CHECK(control.numel() >= blocks, "control tensor must hold at least `blocks` counters");
+    TORCH_CHECK(world_size >= 2 && world_size <= kMaxRanks && rank >= 0 && rank < world_size, "invalid rank/world_size");
+    TORCH_CHECK(input.numel() * 2 <= rank_stride_bytes, "input exceeds SHM capacity");
 
     auto stream = at::cuda::getCurrentCUDAStream(input.device().index());
-    const int grid = static_cast<int>(blocks);
-    const int block = static_cast<int>(threads);
-    auto* control_pointer = reinterpret_cast<unsigned long long*>(control.data_ptr());
-    auto* arrivals = reinterpret_cast<unsigned long long*>(host_device_address);
-    auto* reduced_arrivals = reinterpret_cast<unsigned long long*>(host_device_address + 256);
-    auto* host_base = reinterpret_cast<char*>(host_device_address);
-    host_mapped_copy_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
-        control_pointer,
-        arrivals,
-        host_base,
-        inputs_offset,
+    host_mapped_two_shot_fused_kernel<<<static_cast<int>(blocks), static_cast<int>(threads), 0, stream>>>(
+        reinterpret_cast<const uint4*>(input.data_ptr()),
+        reinterpret_cast<uint4*>(output.data_ptr()),
+        reinterpret_cast<uint64_t*>(control.data_ptr()),
+        reinterpret_cast<char*>(host_device_address),
+        data_base_offset,
+        slot_stride_bytes,
         rank_stride_bytes,
-        input.numel(),
+        input.numel() / 8,
         static_cast<int>(rank),
-        static_cast<int>(world_size));
-    host_mapped_reduce_kernel<<<grid, block, 0, stream>>>(
-        control_pointer,
-        reduced_arrivals,
-        host_base,
-        inputs_offset,
-        reduced_offset,
-        rank_stride_bytes,
-        input.numel(),
-        static_cast<int>(rank),
-        static_cast<int>(world_size));
-    host_mapped_gather_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
-        control_pointer,
-        host_base,
-        reduced_offset,
-        rank_stride_bytes,
-        input.numel(),
         static_cast<int>(world_size));
     C10_CUDA_CHECK(cudaGetLastError());
 }
@@ -278,7 +307,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_ext",
+            name="zstep_shm_allreduce_sm120_v2_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -298,13 +327,7 @@ def get_host_mapped_allreduce_extension():
 
 
 class HostMappedShmAllReduce:
-    """One ordered host-mapped AllReduce channel shared by all ranks.
-
-    All launches, including CUDA Graph replays, advance device and shared-host
-    monotonic counters. Only block zero waits while other blocks retire, so
-    progress does not require simultaneous grid residency. Callers must keep
-    collectives in the same order on every rank and use one stream per channel.
-    """
+    """Ordered host-mapped 4-slot ring Two-Shot AllReduce channel shared by all ranks."""
 
     def __init__(
         self,
@@ -315,69 +338,104 @@ class HostMappedShmAllReduce:
         capacity_elements: int,
         blocks: int,
         threads: int,
-        exchange_group: dist.ProcessGroup,
+        exchange_group: dist.ProcessGroup | None,
+        create_shm: bool = False,
     ) -> None:
-        if world_size < 2 or not 0 <= rank < world_size:
-            raise ValueError("rank/world_size are invalid")
-        if capacity_elements <= 0:
-            raise ValueError("capacity_elements must be positive")
+        if world_size < 2 or world_size > MAX_RANKS or not 0 <= rank < world_size:
+            raise ValueError(f"rank={rank} / world_size={world_size} invalid (max {MAX_RANKS})")
+        if capacity_elements <= 0 or capacity_elements % 8 != 0:
+            raise ValueError("capacity_elements must be positive and divisible by 8")
+        if not 1 <= blocks <= MAX_BLOCKS:
+            raise ValueError(f"blocks must be in [1, {MAX_BLOCKS}]")
         if threads <= 0 or threads > 1024 or threads % 32 != 0:
             raise ValueError("threads must be a warp multiple in [32, 1024]")
-        device = torch.device("cuda", torch.cuda.current_device())
-        if blocks <= 0:
-            raise ValueError("blocks must be positive")
 
-        self.name = name
-        self.rank = rank
-        self.world_size = world_size
-        self.capacity_elements = capacity_elements
-        self.blocks = blocks
-        self.threads = threads
-        self.device = device
-        self.rank_stride_bytes = _align_up(capacity_elements * 2, 256)
-        self.inputs_offset = 4096
-        self.reduced_offset = _align_up(
-            self.inputs_offset + world_size * self.rank_stride_bytes, 4096
+        device = torch.device("cuda", torch.cuda.current_device())
+        self.name: str = name
+        self.rank: int = rank
+        self.world_size: int = world_size
+        self.capacity_elements: int = capacity_elements
+        self.blocks: int = blocks
+        self.threads: int = threads
+        self.device: torch.device = device
+        self.rank_stride_bytes: int = _align_up(capacity_elements * 2, 256)
+        self.data_base_offset: int = 16384  # First 16 KiB holds per-block .sys arrival flags
+        self.slot_stride_bytes: int = _align_up(
+            2 * world_size * self.rank_stride_bytes, 4096
         )
-        self.total_bytes = _align_up(
-            self.reduced_offset + world_size * self.rank_stride_bytes, 4096
+        self.total_bytes: int = _align_up(
+            self.data_base_offset + NUM_RING_SLOTS * self.slot_stride_bytes, 4096
         )
-        self._closed = False
-        self._registered = False
+        self._closed: bool = False
+        self._registered: bool = False
+        self._owns_unlink: bool = False
         self._extension = get_host_mapped_allreduce_extension()
 
-        if rank == 0:
-            self._shm = shared_memory.SharedMemory(
-                name=name, create=True, size=self.total_bytes
-            )
-            self._shm.buf[:512] = bytes(512)
-        dist.barrier(group=exchange_group)
-        if rank != 0:
-            self._shm = shared_memory.SharedMemory(name=name, create=False)
-        if self._shm.size != self.total_bytes:
-            raise RuntimeError("shared-memory geometry differs across ranks")
-        dist.barrier(group=exchange_group)
+        shm_path = f"/dev/shm/{name}"
+        if exchange_group is not None:
+            if rank == 0:
+                fd = os.open(shm_path, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o600)
+                try:
+                    os.ftruncate(fd, self.total_bytes)
+                    self._mapping = mmap.mmap(
+                        fd,
+                        self.total_bytes,
+                        flags=mmap.MAP_SHARED,
+                        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                    )
+                finally:
+                    os.close(fd)
+                self._owns_unlink = True
+                ctypes.memset(
+                    ctypes.addressof(ctypes.c_char.from_buffer(self._mapping)),
+                    0,
+                    self.data_base_offset,
+                )
+            dist.barrier(group=exchange_group)
+            if rank != 0:
+                fd = os.open(shm_path, os.O_RDWR)
+                try:
+                    self._mapping = mmap.mmap(
+                        fd,
+                        self.total_bytes,
+                        flags=mmap.MAP_SHARED,
+                        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                    )
+                finally:
+                    os.close(fd)
+            dist.barrier(group=exchange_group)
+        else:
+            flags = (os.O_CREAT | os.O_RDWR | os.O_TRUNC) if create_shm else os.O_RDWR
+            fd = os.open(shm_path, flags, 0o600)
+            try:
+                if create_shm:
+                    os.ftruncate(fd, self.total_bytes)
+                self._mapping = mmap.mmap(
+                    fd,
+                    self.total_bytes,
+                    flags=mmap.MAP_SHARED,
+                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                )
+            finally:
+                os.close(fd)
+            self._owns_unlink = create_shm
+            if create_shm:
+                ctypes.memset(
+                    ctypes.addressof(ctypes.c_char.from_buffer(self._mapping)),
+                    0,
+                    self.data_base_offset,
+                )
 
-        self._host_address = ctypes.addressof(ctypes.c_char.from_buffer(self._shm.buf))
-        ctypes.memset(
-            self._host_address + self.inputs_offset + rank * self.rank_stride_bytes,
-            0,
-            self.rank_stride_bytes,
-        )
-        ctypes.memset(
-            self._host_address + self.reduced_offset + rank * self.rank_stride_bytes,
-            0,
-            self.rank_stride_bytes,
-        )
-        dist.barrier(group=exchange_group)
-        self._device_address = self._extension.register_mapped_host(
+        self._shm_path: str = shm_path
+        self._host_address: int = ctypes.addressof(ctypes.c_char.from_buffer(self._mapping))
+        self._device_address: int = self._extension.register_mapped_host(
             self._host_address, self.total_bytes
         )
         self._registered = True
-        self.control = torch.zeros(5, dtype=torch.int64, device=device)
+        self.control: torch.Tensor = torch.zeros(MAX_BLOCKS, dtype=torch.int64, device=device)
 
     def all_reduce(self, input: torch.Tensor, *, output: torch.Tensor) -> torch.Tensor:
-        """Reduce all rank inputs into the caller-owned fixed output tensor."""
+        """Reduce all rank inputs into `output` in a single CUDA-Graph-safe launch."""
         if self._closed:
             raise RuntimeError("AllReduce channel is closed")
         if input.shape != output.shape:
@@ -389,8 +447,8 @@ class HostMappedShmAllReduce:
             output,
             self.control,
             self._device_address,
-            self.inputs_offset,
-            self.reduced_offset,
+            self.data_base_offset,
+            self.slot_stride_bytes,
             self.rank_stride_bytes,
             self.rank,
             self.world_size,
@@ -400,16 +458,19 @@ class HostMappedShmAllReduce:
         return output
 
     def close(self) -> None:
-        """Release CUDA registration and the POSIX mapping after all ranks drain."""
+        """Release CUDA host mapping and POSIX shared memory handle."""
         if self._closed:
             return
         torch.cuda.synchronize(self.device)
         if self._registered:
             self._extension.unregister_mapped_host(self._host_address)
             self._registered = False
-        self._shm.close()
-        if self.rank == 0:
-            self._shm.unlink()
+        self._mapping.close()
+        if self._owns_unlink:
+            try:
+                os.unlink(self._shm_path)
+            except FileNotFoundError:
+                pass
         self._closed = True
 
     def __enter__(self) -> HostMappedShmAllReduce:

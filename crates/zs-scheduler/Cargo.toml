@@ -7,6 +7,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+libc = "0.2"
+zs-shm = { path = "../zs-shm" }
 zs-kv = { path = "../zs-kv" }
 zs-wire = { path = "../zs-wire" }
 

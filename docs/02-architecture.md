@@ -97,12 +97,17 @@ sequenceDiagram
 
 ---
 
-## 三、 面向 `8 × RTX 6000D` 的三大专项硬件优化设计
+## 三、 面向 `8 × RTX 6000D` / `sm_120` PCIe 服务器的专项实测架构决策
 
-1. **PCIe Gen5 P2P Two-Shot 自定义低延迟 AllReduce (`comm_pcie_sm120.cu`)**：
-   * `DeepSeek-V4.1-Flash` 每步有 80 次跨 8 卡同步。在 Decode / DSpark Verify 阶段（如 `B=8, T=6*8=48` 行，每行 `5120 * 2B = 10 KB`，总张量仅 `480 KB`），标准 NCCL Ring 需要 14 跳串行接力，延迟高达 ~30 μs/次。
-   * `zstep` 通过 `cudaDeviceEnablePeerAccess` 建立 8 卡 BAR1 / P2P 映射（若跨双路 CPU Root Complex 则走对称两级 P2P + Host Pinned / PCIe Switch 分组规约），利用单次 Kernel 启动完成 Reduce-Scatter + All-Gather（完全支持 CUDA Graph 捕获），将小包延迟压缩至 **8~14 μs/次**。
-2. **Engram 混合驻留策略（VRAM Sharded 优先）**：
-   * 在 40GB/80GB 数据中心卡上，Engram 大表被迫放在主机内存走 UVA；而在 `8 × RTX 6000D`（`672 GB` 总显存）上，`zstep` 支持配置 `engram_placement = "vram_sharded"`（显存充裕时直接按 8 卡切分常驻 GDDR7）或 `"host_uva_shared"`（超长上下文压测需腾出全部显存给 KV 时回退至锁页主机内存）。
-3. **热重载调试通道（`zstep reload-worker`）**：
+1. **384 专家 MXFP4 MoE 采用 `TP=8`（`intermediate=288`/卡）而非 `EP=8`**：
+   * `sm_120` 实测证明：在 `TP=8` 与 Replicated-Input `EP=8` 同样仅需层末 **1 次 AllReduce**（均无 AllToAll）的前提下，`TP=8` 让 8 张卡协同分摊每个激活专家的权重读取，全批次维度全面胜出：
+     * `M=6`（单流 DSpark 6-token 验证）：**`70.24 µs`**（`TP=8`）vs **`320.55 µs`**（`EP=8`），**快 `4.56×`**（单步 40 层省下 `10.0 ms`）；
+     * `M=48`（8 并发验证）：**`435.07 µs`** vs `574.19 µs`（**快 `1.32×`**）；
+     * `M=4096`（Chunked Prefill）：**`2414.73 µs`** vs `8865.44 µs`（**快 `3.67×`**）。
+2. **双模式 PCIe Gen5 AllReduce（兼容 P2P Switch 与非 P2P `CNS` 主板）**：
+   * **当主板支持 PCIe P2P BAR1 时**（如带 PCIe Gen5 Switch 的工作站）：优先启用 P2P One-Shot / Two-Shot 规约（小包延迟 ~12–18 µs）。
+   * **当双路 Xeon 主板禁用 BAR1 P2P（`nvidia-smi topo -p2p r = CNS`）时**：启用 `zstep` 自研单核融合 4 槽环形 [`HostMappedShmAllReduce`](../worker/zstep_worker/kernels_sm120/shm_allreduce.py)（POSIX `/dev/shm` + `cudaHostRegisterMapped` + `128-bit` PTX `.sys` release/acquire & `.cv/.wt` 流式读写，FP32 单次舍入 `max_abs_error = 0.0`）或 NCCL Host-SHM 通道（`M=6` `50.8 µs`，`M=48` 自研 SHM `126.3 µs` 反超 NCCL `127.1 µs`，`M=4096` 自研 SHM `5.92 ms` 快于 NCCL `6.30 ms`）。
+3. **Engram 混合驻留策略（VRAM Sharded vs Host Pinned UVA）**：
+   * 实测第 `(1, 14)` 层 TP8 分片（每层单卡 `12.29 GB`）：在 `8 × RTX 6000D`（`84 GB`/卡）上采用 `"vram_sharded"` 常驻显存，单层查表仅 **`4.1~4.4 µs`**（`M=4096` 达 `537.8 GB/s`）；在 `32 GB` 显存卡上采用 `"host_uva_pinned"` 零拷贝驻留主机内存，`M=6` 单层仅 **`6.0 µs`**（两层合计每步仅多 `3.4 µs` 即可节省 `24.6 GB`/卡显存）。
+4. **热重载调试通道（`zstep reload-worker`）**：
    * 开发调试 `sm_120` 算子时，300GB+ 模型权重加载一次耗时较长。Worker 将权重持有在独立的 `WeightStore` 模块中，收到主控的 `RELOAD_FORWARD` 控制指令时，仅卸载重导 `kernels_sm120` 与 `deepseek_v41` 前向模块并重录 CUDA Graph，实现 **3 秒级算子热迭代**。

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/zs-wire",
+    "crates/zs-shm",
     "crates/zs-kv",
     "crates/zs-scheduler",
     "crates/zs-server",

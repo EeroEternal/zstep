@@ -18,16 +18,29 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Zero-copy POSIX shared-memory reader matching crates/zs-wire/src/lib.rs."""
+"""Zero-copy POSIX shared-memory views matching crates/zs-wire/src/lib.rs."""
 
 from __future__ import annotations
 
+import ctypes
+import mmap
+import os
+import struct
+import time
 from dataclasses import dataclass
+
+import numpy as np
 
 ZSTEP_SHM_MAGIC: int = 0x5A53_5445_505F_5631
 ZSTEP_PROTOCOL_VERSION: int = 1
 STEP_HEADER_BYTES: int = 64
+STEP_RESULT_HEADER_BYTES: int = 64
+SEQ_STEP_OUTPUT_BYTES: int = 104
+WORKER_STATE_BYTES: int = 64
+WORKER_STATES_OFFSET: int = 4096
 VEC_ALIGN: int = 256
+ATOMIC_ACQUIRE: int = 2
+ATOMIC_RELEASE: int = 3
 
 
 def _align_up(offset: int, align: int) -> int:
@@ -133,3 +146,279 @@ class StepPlanLayout:
             compressor_slot_ids_offset=compressor_slot_ids_offset,
             temperatures_offset=temperatures_offset,
         )
+
+
+@dataclass(frozen=True)
+class ShmSuperblock:
+    magic: int
+    protocol_version: int
+    geometry: ShmGeometry
+    master_pid: int
+    total_shm_bytes: int
+    plan_slot_offsets: tuple[int, int]
+    plan_slot_stride: int
+    result_slot_offsets: tuple[int, int]
+    result_slot_stride: int
+
+
+@dataclass(frozen=True)
+class StepHeader:
+    step_id: int
+    opcode: int
+    num_seqs: int
+    num_encoder_tokens: int
+    encoder_graph_bucket: int
+    num_decoder_rows: int
+    decoder_graph_bucket: int
+    num_sample_rows: int
+    is_dspark_verify: int
+    flags: int
+
+
+@dataclass(frozen=True)
+class WorkerState:
+    ready_step_id: int
+    status_code: int
+    error_code: int
+    device_sm_arch: int
+    free_vram_mb: int
+    total_vram_mb: int
+
+
+@dataclass(frozen=True)
+class SeqResult:
+    req_slot: int
+    accepted_token: int
+    accepted_logprob_bits: int
+
+
+_LIBATOMIC = ctypes.CDLL("libatomic.so.1")
+_ATOMIC_LOAD_8 = _LIBATOMIC["__atomic_load_8"]
+_ATOMIC_LOAD_8.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_ATOMIC_LOAD_8.restype = ctypes.c_uint64
+_ATOMIC_STORE_8 = _LIBATOMIC["__atomic_store_8"]
+_ATOMIC_STORE_8.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
+_ATOMIC_STORE_8.restype = None
+_ATOMIC_LOAD_4 = _LIBATOMIC["__atomic_load_4"]
+_ATOMIC_LOAD_4.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_ATOMIC_LOAD_4.restype = ctypes.c_uint32
+_ATOMIC_STORE_4 = _LIBATOMIC["__atomic_store_4"]
+_ATOMIC_STORE_4.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int]
+_ATOMIC_STORE_4.restype = None
+
+
+class ShmBridge:
+    """Owned worker attachment with atomic headers and zero-copy payload arrays."""
+
+    def __init__(self, *, name: str) -> None:
+        if not name or "/" in name or name in {".", ".."}:
+            raise ValueError("SHM name must be one nonempty path component")
+        self.name = name
+        self._closed = False
+
+        path = f"/dev/shm/{name}"
+        fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+        try:
+            prefix = os.pread(fd, 4096, 0)
+            if len(prefix) != 4096:
+                raise RuntimeError("SHM superblock is truncated")
+            self.superblock = self._parse_superblock(prefix)
+            self._mapping = mmap.mmap(
+                fd,
+                self.superblock.total_shm_bytes,
+                flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            )
+        finally:
+            os.close(fd)
+        self.layout = StepPlanLayout.compute(self.superblock.geometry)
+        if self.layout.total_slot_bytes != self.superblock.plan_slot_stride:
+            raise RuntimeError("Python and Rust StepPlanLayout sizes differ")
+
+    @staticmethod
+    def _parse_superblock(prefix: bytes) -> ShmSuperblock:
+        values = struct.unpack_from("<Q9I", prefix, 0)
+        magic = values[0]
+        protocol_version = values[1]
+        if magic != ZSTEP_SHM_MAGIC or protocol_version != ZSTEP_PROTOCOL_VERSION:
+            raise RuntimeError("SHM magic or protocol version mismatch")
+        geometry = ShmGeometry(
+            world_size=values[2],
+            max_seqs=values[3],
+            max_step_tokens=values[4],
+            max_decoder_rows=values[5],
+            max_pages_per_seq=values[6],
+            page_block_tokens=values[7],
+            spec_verify_width=values[8],
+        )
+        total_shm_bytes = struct.unpack_from("<Q", prefix, 48)[0]
+        plan_slot_offsets = struct.unpack_from("<2Q", prefix, 56)
+        plan_slot_stride = struct.unpack_from("<Q", prefix, 72)[0]
+        result_slot_offsets = struct.unpack_from("<2Q", prefix, 80)
+        result_slot_stride = struct.unpack_from("<Q", prefix, 96)[0]
+        return ShmSuperblock(
+            magic=magic,
+            protocol_version=protocol_version,
+            geometry=geometry,
+            master_pid=values[9],
+            total_shm_bytes=total_shm_bytes,
+            plan_slot_offsets=plan_slot_offsets,
+            plan_slot_stride=plan_slot_stride,
+            result_slot_offsets=result_slot_offsets,
+            result_slot_stride=result_slot_stride,
+        )
+
+    def _address(self, offset: int) -> int:
+        return ctypes.addressof(ctypes.c_char.from_buffer(self._mapping, offset))
+
+    def load_u64(self, offset: int) -> int:
+        return int(_ATOMIC_LOAD_8(self._address(offset), ATOMIC_ACQUIRE))
+
+    def store_u64(self, offset: int, value: int) -> None:
+        _ATOMIC_STORE_8(self._address(offset), value, ATOMIC_RELEASE)
+
+    def load_u32(self, offset: int) -> int:
+        return int(_ATOMIC_LOAD_4(self._address(offset), ATOMIC_ACQUIRE))
+
+    def store_u32(self, offset: int, value: int) -> None:
+        _ATOMIC_STORE_4(self._address(offset), value, ATOMIC_RELEASE)
+
+    def plan(self, step_id: int) -> StepPlanView:
+        slot = step_id & 1
+        return StepPlanView(
+            bridge=self,
+            base=self.superblock.plan_slot_offsets[slot],
+            layout=self.layout,
+        )
+
+    def result(self, step_id: int) -> StepResultView:
+        slot = step_id & 1
+        return StepResultView(
+            bridge=self,
+            base=self.superblock.result_slot_offsets[slot],
+            max_seqs=self.superblock.geometry.max_seqs,
+        )
+
+    def write_worker_state(
+        self,
+        *,
+        rank: int,
+        ready_step_id: int,
+        status_code: int,
+        error_code: int,
+        device_sm_arch: int,
+        free_vram_mb: int,
+        total_vram_mb: int,
+    ) -> None:
+        base = WORKER_STATES_OFFSET + rank * WORKER_STATE_BYTES
+        self.store_u64(base, ready_step_id)
+        self.store_u64(base + 8, time.monotonic_ns())
+        self.store_u32(base + 16, os.getpid())
+        self.store_u32(base + 20, device_sm_arch)
+        self.store_u32(base + 28, error_code)
+        self.store_u32(base + 32, free_vram_mb)
+        self.store_u32(base + 36, total_vram_mb)
+        self.store_u32(base + 24, status_code)
+
+    def array(self, *, offset: int, count: int, dtype: np.dtype) -> np.ndarray:
+        return np.frombuffer(self._mapping, dtype=dtype, count=count, offset=offset)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._mapping.close()
+            self._closed = True
+
+
+class StepPlanView:
+    def __init__(self, *, bridge: ShmBridge, base: int, layout: StepPlanLayout) -> None:
+        self.bridge = bridge
+        self.base = base
+        self.layout = layout
+
+    def header(self) -> StepHeader:
+        step_id = self.bridge.load_u64(self.base)
+        fields = struct.unpack_from("<Q12I8x", self.bridge._mapping, self.base)
+        if fields[0] != step_id:
+            raise RuntimeError("StepHeader changed while being acquired")
+        return StepHeader(
+            step_id=step_id,
+            opcode=fields[1],
+            num_seqs=fields[2],
+            num_encoder_tokens=fields[3],
+            encoder_graph_bucket=fields[4],
+            num_decoder_rows=fields[5],
+            decoder_graph_bucket=fields[6],
+            num_sample_rows=fields[7],
+            is_dspark_verify=fields[8],
+            flags=fields[9],
+        )
+
+    def token_ids(self, count: int) -> np.ndarray:
+        return self.bridge.array(
+            offset=self.base + self.layout.token_ids_offset,
+            count=count,
+            dtype=np.dtype(np.int32),
+        )
+
+    def positions(self, count: int) -> np.ndarray:
+        return self.bridge.array(
+            offset=self.base + self.layout.positions_offset,
+            count=count,
+            dtype=np.dtype(np.int32),
+        )
+
+    def req_slot_ids(self, count: int) -> np.ndarray:
+        return self.bridge.array(
+            offset=self.base + self.layout.req_slot_ids_offset,
+            count=count,
+            dtype=np.dtype(np.int32),
+        )
+
+    def sample_row_indices(self, count: int) -> np.ndarray:
+        return self.bridge.array(
+            offset=self.base + self.layout.sample_row_indices_offset,
+            count=count,
+            dtype=np.dtype(np.int32),
+        )
+
+
+class StepResultView:
+    def __init__(self, *, bridge: ShmBridge, base: int, max_seqs: int) -> None:
+        self.bridge = bridge
+        self.base = base
+        self.max_seqs = max_seqs
+
+    def write(
+        self,
+        *,
+        step_id: int,
+        gpu_exec_us: int,
+        status_code: int,
+        outputs: list[SeqResult],
+    ) -> None:
+        if len(outputs) > self.max_seqs:
+            raise ValueError("too many sequence outputs for result slot")
+        header = struct.pack(
+            "<QIII11I",
+            0,
+            gpu_exec_us,
+            status_code,
+            len(outputs),
+            *([0] * 11),
+        )
+        self.bridge._mapping[self.base : self.base + STEP_RESULT_HEADER_BYTES] = header
+        for index, output in enumerate(outputs):
+            accepted = [output.accepted_token] + [-1] * 7
+            drafts = [-1] * 8
+            logprobs = [output.accepted_logprob_bits] + [0] * 7
+            packed = struct.pack(
+                "<II8i8i8I",
+                output.req_slot,
+                1,
+                *accepted,
+                *drafts,
+                *logprobs,
+            )
+            offset = self.base + STEP_RESULT_HEADER_BYTES + index * SEQ_STEP_OUTPUT_BYTES
+            self.bridge._mapping[offset : offset + SEQ_STEP_OUTPUT_BYTES] = packed
+        self.bridge.store_u64(self.base, step_id)
