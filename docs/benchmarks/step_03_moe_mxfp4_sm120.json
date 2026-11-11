@@ -1,0 +1,134 @@
+{
+  "step": "0.3",
+  "device": "NVIDIA GeForce RTX 5090",
+  "compute_capability": "12.0",
+  "torch_version": "2.14.0a0+4fdf77b940.nv26.08",
+  "router": {
+    "without_correction_bias": {
+      "6": {
+        "cos_sim": 1.0,
+        "latency_us": 6.586
+      },
+      "17": {
+        "cos_sim": 1.0,
+        "latency_us": 5.762
+      },
+      "48": {
+        "cos_sim": 0.99999994,
+        "latency_us": 5.479
+      },
+      "192": {
+        "cos_sim": 1.0,
+        "latency_us": 6.427
+      },
+      "4096": {
+        "cos_sim": 0.99999994,
+        "latency_us": 24.167
+      }
+    },
+    "with_correction_bias": {
+      "6": {
+        "cos_sim": 1.00000012,
+        "latency_us": 5.742
+      },
+      "17": {
+        "cos_sim": 1.0,
+        "latency_us": 5.673
+      },
+      "48": {
+        "cos_sim": 1.0,
+        "latency_us": 5.788
+      },
+      "192": {
+        "cos_sim": 1.00000024,
+        "latency_us": 6.886
+      },
+      "4096": {
+        "cos_sim": 1.0,
+        "latency_us": 23.875
+      }
+    },
+    "int64_large_offset": {
+      "passed": true,
+      "logit_elements": 2300001408,
+      "allocation_gib": 8.568
+    },
+    "zero_jit_recompilation_passed": true
+  },
+  "moe_geometry": {
+    "global_experts": 384,
+    "hidden_size": 5120,
+    "global_intermediate_size": 2304,
+    "top_k": 6,
+    "source_format": "MXFP4_E8M0_K32",
+    "swiglu_limit": 10.0
+  },
+  "moe": {
+    "ep8_local_rank": {
+      "num_local_experts": 48,
+      "local_intermediate_size": 2304,
+      "activation_recipe": "W4A16",
+      "communication_included": false,
+      "effective_bandwidth_basis": "unique routed expert MXFP4 values and scales plus BF16 input/output",
+      "results": {
+        "6": {
+          "cos_sim": 0.999987,
+          "latency_us": 320.55,
+          "effective_gbps": 1525.3,
+          "unique_experts": 26
+        },
+        "48": {
+          "cos_sim": 0.999987,
+          "latency_us": 574.19,
+          "effective_gbps": 1573.4,
+          "unique_experts": 48
+        },
+        "192": {
+          "cos_sim": 0.999987,
+          "latency_us": 842.18,
+          "effective_gbps": 1076.2,
+          "unique_experts": 48
+        },
+        "4096": {
+          "cos_sim": 0.999987,
+          "latency_us": 8865.44,
+          "effective_gbps": 111.3,
+          "unique_experts": 48
+        }
+      }
+    },
+    "tp8_local_rank": {
+      "num_local_experts": 384,
+      "local_intermediate_size": 288,
+      "activation_recipe": "W4A16",
+      "communication_included": false,
+      "effective_bandwidth_basis": "unique routed expert MXFP4 values and scales plus BF16 input/output",
+      "results": {
+        "6": {
+          "cos_sim": 0.999987,
+          "latency_us": 70.24,
+          "effective_gbps": 1172.7,
+          "unique_experts": 35
+        },
+        "48": {
+          "cos_sim": 0.999987,
+          "latency_us": 435.07,
+          "effective_gbps": 1093.4,
+          "unique_experts": 202
+        },
+        "192": {
+          "cos_sim": 0.999987,
+          "latency_us": 781.73,
+          "effective_gbps": 1141.4,
+          "unique_experts": 378
+        },
+        "4096": {
+          "cos_sim": 0.999987,
+          "latency_us": 2414.73,
+          "effective_gbps": 408.5,
+          "unique_experts": 384
+        }
+      }
+    }
+  }
+}

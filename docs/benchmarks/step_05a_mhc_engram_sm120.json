@@ -1,0 +1,151 @@
+{
+  "step": "0.5a",
+  "device": "NVIDIA GeForce RTX 5090",
+  "compute_capability": "12.0",
+  "torch_version": "2.14.0a0+4fdf77b940.nv26.08",
+  "mhc": {
+    "operation": "post_pre",
+    "hidden_size": 5120,
+    "streams": 4,
+    "sinkhorn_iters": 20,
+    "results": [
+      {
+        "tokens": 6,
+        "latency_us": 11.41,
+        "residual_cos_sim": 1.0,
+        "y_cos_sim": 1.0000001,
+        "post_cos_sim": 1.0,
+        "comb_cos_sim": 0.9999999
+      },
+      {
+        "tokens": 48,
+        "latency_us": 26.66,
+        "residual_cos_sim": 1.0,
+        "y_cos_sim": 0.9999999,
+        "post_cos_sim": 0.9999999,
+        "comb_cos_sim": 1.0
+      },
+      {
+        "tokens": 192,
+        "latency_us": 83.62,
+        "residual_cos_sim": 0.9999999,
+        "y_cos_sim": 1.0,
+        "post_cos_sim": 1.0,
+        "comb_cos_sim": 1.0
+      },
+      {
+        "tokens": 4096,
+        "latency_us": 1846.08,
+        "residual_cos_sim": 1.0,
+        "y_cos_sim": 1.0,
+        "post_cos_sim": 1.0,
+        "comb_cos_sim": 1.0
+      }
+    ]
+  },
+  "engram": {
+    "layer_ids": [
+      1,
+      14
+    ],
+    "heads_per_token": 24,
+    "head_dim": 256,
+    "tp_size": 8,
+    "tp_rank": 0,
+    "host_memory": "pinned UVA zero-copy",
+    "results": [
+      {
+        "layer_id": 1,
+        "table_rows": 384006168,
+        "local_shard_rows": 48000771,
+        "max_local_weight_byte_offset": 12288197375,
+        "native_b12x_lookup_exact_match": true,
+        "zero_jit_recompilation_passed": true,
+        "results": {
+          "6": {
+            "vram_cos_sim": 1.0,
+            "pinned_cos_sim": 1.0,
+            "vram_latency_us": 4.42,
+            "pinned_latency_us": 6.12,
+            "vram_effective_gbps": 8.6,
+            "pinned_effective_gbps": 6.2,
+            "pinned_over_vram_latency": 1.384
+          },
+          "48": {
+            "vram_cos_sim": 1.0,
+            "pinned_cos_sim": 1.0,
+            "vram_latency_us": 3.65,
+            "pinned_latency_us": 20.03,
+            "vram_effective_gbps": 83.2,
+            "pinned_effective_gbps": 15.2,
+            "pinned_over_vram_latency": 5.482
+          },
+          "192": {
+            "vram_cos_sim": 1.0,
+            "pinned_cos_sim": 1.0,
+            "vram_latency_us": 5.07,
+            "pinned_latency_us": 68.88,
+            "vram_effective_gbps": 239.8,
+            "pinned_effective_gbps": 17.7,
+            "pinned_over_vram_latency": 13.58
+          },
+          "4096": {
+            "vram_cos_sim": 0.9999999,
+            "pinned_cos_sim": 0.9999999,
+            "vram_latency_us": 48.25,
+            "pinned_latency_us": 2400.12,
+            "vram_effective_gbps": 537.8,
+            "pinned_effective_gbps": 10.8,
+            "pinned_over_vram_latency": 49.741
+          }
+        }
+      },
+      {
+        "layer_id": 14,
+        "table_rows": 384016682,
+        "local_shard_rows": 48002086,
+        "max_local_weight_byte_offset": 12288534015,
+        "native_b12x_lookup_exact_match": true,
+        "zero_jit_recompilation_passed": true,
+        "results": {
+          "6": {
+            "vram_cos_sim": 1.0000001,
+            "pinned_cos_sim": 1.0000001,
+            "vram_latency_us": 4.12,
+            "pinned_latency_us": 5.96,
+            "vram_effective_gbps": 9.2,
+            "pinned_effective_gbps": 6.4,
+            "pinned_over_vram_latency": 1.445
+          },
+          "48": {
+            "vram_cos_sim": 1.0,
+            "pinned_cos_sim": 1.0,
+            "vram_latency_us": 3.7,
+            "pinned_latency_us": 18.38,
+            "vram_effective_gbps": 82.2,
+            "pinned_effective_gbps": 16.5,
+            "pinned_over_vram_latency": 4.967
+          },
+          "192": {
+            "vram_cos_sim": 1.0,
+            "pinned_cos_sim": 1.0,
+            "vram_latency_us": 5.19,
+            "pinned_latency_us": 68.4,
+            "vram_effective_gbps": 234.6,
+            "pinned_effective_gbps": 17.8,
+            "pinned_over_vram_latency": 13.192
+          },
+          "4096": {
+            "vram_cos_sim": 1.0,
+            "pinned_cos_sim": 1.0,
+            "vram_latency_us": 48.3,
+            "pinned_latency_us": 2398.21,
+            "vram_effective_gbps": 537.3,
+            "pinned_effective_gbps": 10.8,
+            "pinned_over_vram_latency": 49.655
+          }
+        }
+      }
+    ]
+  }
+}

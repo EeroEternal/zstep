@@ -1,0 +1,127 @@
+{
+  "step": "0.4",
+  "device": "NVIDIA GeForce RTX 5090",
+  "compute_capability": "12.0",
+  "torch_version": "2.14.0a0+4fdf77b940.nv26.08",
+  "geometry": {
+    "cache_format": "deepseek_v41",
+    "local_heads_tp8": 16,
+    "head_dim": 512,
+    "swa_width": 128,
+    "index_topk": 512,
+    "page_size": 64,
+    "raw_slot_indexed_decode": true
+  },
+  "cases": [
+    {
+      "mode": "decode",
+      "batch": 1,
+      "q_len": 1,
+      "rows": 1,
+      "kv_len": 2048,
+      "cos_sim": 0.999596,
+      "latency_us": 14.25,
+      "selected_cache_effective_gbps": 15.1
+    },
+    {
+      "mode": "decode",
+      "batch": 1,
+      "q_len": 1,
+      "rows": 1,
+      "kv_len": 8192,
+      "cos_sim": 0.999613,
+      "latency_us": 13.92,
+      "selected_cache_effective_gbps": 15.4
+    },
+    {
+      "mode": "decode",
+      "batch": 1,
+      "q_len": 1,
+      "rows": 1,
+      "kv_len": 32768,
+      "cos_sim": 0.999581,
+      "latency_us": 13.52,
+      "selected_cache_effective_gbps": 15.9
+    },
+    {
+      "mode": "decode",
+      "batch": 8,
+      "q_len": 1,
+      "rows": 8,
+      "kv_len": 2048,
+      "cos_sim": 0.999597,
+      "latency_us": 13.03,
+      "selected_cache_effective_gbps": 132.0
+    },
+    {
+      "mode": "decode",
+      "batch": 8,
+      "q_len": 1,
+      "rows": 8,
+      "kv_len": 8192,
+      "cos_sim": 0.999593,
+      "latency_us": 13.25,
+      "selected_cache_effective_gbps": 129.8
+    },
+    {
+      "mode": "decode",
+      "batch": 8,
+      "q_len": 1,
+      "rows": 8,
+      "kv_len": 32768,
+      "cos_sim": 0.999586,
+      "latency_us": 13.14,
+      "selected_cache_effective_gbps": 130.9
+    },
+    {
+      "mode": "decode",
+      "batch": 32,
+      "q_len": 1,
+      "rows": 32,
+      "kv_len": 2048,
+      "cos_sim": 0.999598,
+      "latency_us": 22.89,
+      "selected_cache_effective_gbps": 300.6
+    },
+    {
+      "mode": "decode",
+      "batch": 32,
+      "q_len": 1,
+      "rows": 32,
+      "kv_len": 8192,
+      "cos_sim": 0.999625,
+      "latency_us": 22.57,
+      "selected_cache_effective_gbps": 304.9
+    },
+    {
+      "mode": "decode",
+      "batch": 32,
+      "q_len": 1,
+      "rows": 32,
+      "kv_len": 32768,
+      "cos_sim": 0.999626,
+      "latency_us": 22.21,
+      "selected_cache_effective_gbps": 309.9
+    },
+    {
+      "mode": "verify",
+      "batch": 8,
+      "q_len": 6,
+      "rows": 48,
+      "kv_len": 8192,
+      "cos_sim": 0.999595,
+      "latency_us": 60.75,
+      "selected_cache_effective_gbps": 169.9
+    },
+    {
+      "mode": "extend",
+      "batch": 32,
+      "q_len": 128,
+      "rows": 4096,
+      "kv_len": 8192,
+      "cos_sim": 0.999583,
+      "latency_us": 1429.28,
+      "selected_cache_effective_gbps": 616.3
+    }
+  ]
+}
