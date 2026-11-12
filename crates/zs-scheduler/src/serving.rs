@@ -619,6 +619,20 @@ impl ActiveSequence {
             }
         })
     }
+
+    /// Token id and Engram window for a decode step that was planned while the
+    /// previous step was still in flight.
+    ///
+    /// `stage_decode_step(..., commit_tokens_immediately = false)` freezes
+    /// positions from `current_seq_len` before `generated_tokens` contains the
+    /// token that step produced. Call this only after that token has been
+    /// appended, and while `current_seq_len` is still the staged position.
+    fn revise_overlapped_decode(&mut self) -> (i32, [i32; 3]) {
+        let token = self.last_token;
+        let lookback = self.lookback_window(self.current_seq_len);
+        self.current_seq_len += 1;
+        (token, lookback)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1135,10 +1149,12 @@ impl ModeBServingEngine {
                 self.step_cursor = next_sid;
                 {
                     let mut plan = self.coordinator.plan_slot_mut(next_sid)?;
-                    let tids = plan.token_ids_mut()?;
                     for (i, seq) in active.iter_mut().enumerate() {
-                        tids[i] = seq.last_token;
-                        seq.current_seq_len += 1;
+                        // The in-flight step's token is now in `generated_tokens`.
+                        // Recompute the 3-token window the pre-stage froze too early.
+                        let (token, lookback) = seq.revise_overlapped_decode();
+                        plan.token_ids_mut()?[i] = token;
+                        plan.engram_prev_window_mut()?[i * 3..i * 3 + 3].copy_from_slice(&lookback);
                     }
                 }
                 consecutive_prefills = 0;
@@ -1903,6 +1919,45 @@ mod tests {
         // Dropping `seq` releases all 3 KV blocks and the sequence slot
         assert_eq!(kv_pool.available(), 8);
         assert_eq!(slot_pool.available(), 2);
+    }
+
+    #[test]
+    fn overlapped_decode_lookback_includes_token_from_inflight_step() {
+        let slot_pool = SlotPool::new(1);
+        let now = Instant::now();
+        let mut seq = ActiveSequence {
+            request_id: 0,
+            slot_lease: slot_pool.allocate().expect("slot"),
+            kv_leases: Vec::new(),
+            page_ids: Vec::new(),
+            prompt_tokens: vec![10, 11, 12, 13],
+            prefilled_tokens: 4,
+            current_seq_len: 4,
+            last_token: 13,
+            generated_tokens: Vec::new(),
+            generated_top2: Vec::new(),
+            target_output_len: 4,
+            permit_time: now,
+            submit_time: now,
+            first_token_time: None,
+            last_token_time: None,
+        };
+
+        // Commit-true staging of the first decode, matching `stage_decode_step`.
+        let inflight_pos = seq.current_seq_len;
+        assert_eq!(seq.lookback_window(inflight_pos), [11, 12, 13]);
+        seq.current_seq_len = inflight_pos + 1;
+
+        // Pre-stage of the next step runs before harvest, so index 4 is absent.
+        let stale = seq.lookback_window(seq.current_seq_len);
+        assert_eq!(stale, [12, 13, -1]);
+
+        seq.last_token = 99;
+        seq.generated_tokens.push(99);
+        let (token, repaired) = seq.revise_overlapped_decode();
+        assert_eq!(token, 99);
+        assert_eq!(repaired, [12, 13, 99]);
+        assert_eq!(seq.current_seq_len, 6);
     }
 
     #[test]

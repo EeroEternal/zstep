@@ -1,8 +1,8 @@
-# 08 — Phase 3.5 优化计划与落地验证：`DeepSeek-V4.1-Flash` (`TP=8`, `8 × RTX 6000D`) 评测口径对齐、顺风车混合批调度与自适应集合通信
+# 08 — Phase 3.5 / 3.6 优化计划与落地验证：`DeepSeek-V4.1-Flash` (`TP=8`, `8 × RTX 6000D`) 纯引擎同口径对齐、顺风车混合批、自适应通信与 `b12x` 算子吸收
 
-本文档记录基于 Phase 3 初始实测基线、仓库 **PR `#1`**（`fix/phase2-no-apc-and-top2-logits`）在 `8 × RTX 5090` 上验证的口径修复与确定性 Top-2 诊断方案，以及对 `FlashInfer` 实验分支 `b12x`（`sm_120a` CuTe DSL 模板与启动期调优器）的源码拆解所制定的 Phase 3.5 优化计划，并在第 4 节完整归档 **P0-A + P0-B + P1 在 `8 × RTX 6000D` 上的实测落地结果（10/10 全档位反超无缓存 `vLLM 0.31.0`）**。
+本文档记录基于 Phase 3 初始实测基线、仓库 **PR `#1`**（`fix/phase2-no-apc-and-top2-logits`）在 `8 × RTX 5090` 上验证的口径修复与确定性 Top-2 诊断方案、**Issue `#3`** 指出的纯引擎评测边界与分位延迟披露规范，以及对 `FlashInfer` 实验分支 `b12x`（`sm_120a` CuTe DSL 模板与启动期调优器）的源码拆解与微基准验证，完整归档 **P0-A + P0-B + P1 + P2 (`b12x` 选择性吸收 + `vLLM` 纯引擎同口径对标) 在 `8 × RTX 6000D` 上的实测落地结果**。
 
-> **执行状态**：**P0-A、P0-B、P1 已全部编码落地并通过 `8 × RTX 6000D` Warm `n=3` 真权重端到端验收**（最新主表见 [`07-phase3-dsv41-6000d-benchmark.md`](07-phase3-dsv41-6000d-benchmark.md)）；P2（分段 CUDA Graph 与 `b12x` `sm_120a` 单算子吸收）保留为后续可选演进方向。
+> **执行状态**：**P0-A、P0-B、P1 及 Phase 3.6（`b12x` 选择性算子集成 + `vLLM 0.31.0` 进程内 `TokensPrompt` 纯引擎同口径基线）已全部编码落地并通过 `8 × RTX 6000D` Warm `n=3` 真权重端到端验收**（完整四方对比表见 [`07-phase3-dsv41-6000d-benchmark.md`](07-phase3-dsv41-6000d-benchmark.md) 第 6 节）。
 
 ---
 
@@ -72,8 +72,13 @@ flowchart TD
 
 ---
 
-## 4. P2 后续可选演进方向（分段 CUDA Graph 与 `b12x` 算子吸收）
+## 4. Phase 3.6 落地总结：`b12x` 选择性算子吸收与纯引擎同口径验证
 
-若后续场景需在 `max_mixed_step_tokens = 512..1024` 小预算下进一步压缩 `c=32` 的混合步 CPU 发射开销（将 `c=32` `P99 ITL` 压入 `<150 ms` 且不损失吞吐），可按两步推进：
-1. **分段 CUDA Graph（Piecewise CUDAGraph，桶 `(256, 512, 1024)`）**：将注意力前后纯扁平 token 计算（`mHC` + `RMSNorm` + `Engram` + `384 专家路由器` + `DeepGEMM MXFP4 MoE` + `shm_v5`）捕获为分段图，消除小粒度混合步的 40 层 Python 循环开销。
-2. **`b12x` (`sm_120a` CuTe DSL) 计算内核选择性对比**：在保持 `TP=8` 通信全走 `zstep` `shm_v5`（禁用死锁的 `comm.pcie`）的前提下，独立提取 `b12x` 的 `norm.mhc` 与 `moe.decode` 内核做同形状微基准 A/B。
+1. **选择性 `b12x` 算子吸收（[`b12x_dsv41.py`](../worker/zstep_worker/kernels_sm120/b12x_dsv41.py)）**：
+   * 实测表明并非所有 `b12x` 算子均快于 `vLLM 0.31.0` 原生实现（例如 `mhc_shifted_post_pre` 与 `ParallelLMHead` 原生更快，`.wo_a` 3D BMM 不适用 2D Linear），因此仅选择性替换 **40 层 `MXFP4 MoE`（原生 `I_tp8=288` 未填充，每卡省 ~`10 GiB` 显存，`1.50×..2.50×` 解码加速）** 与 **170 层 2D `[32, 32] UE8M0` FP8 Linear（`2.25×..4.64×` 解码加速，`fused_wqa_wkv` 在 `rows > 512` 混合回退 Cutlass）**。
+   * 在 `c=8..128` 区间，端到端吞吐较 Phase 3.5 **再提升 `+16.18% .. +22.86%`**（`in512_c128` 达 **`1,686.53 ± 7.96 tok/s`**，`in1024_c128` 达 **`1,169.71 ± 1.06 tok/s`**），单流 `Mean TPOT` 压入 **`8.93..9.07 ms/tok`**，且 `prime_squares_table` 三模式保持 `128/128` 精确匹配（[`phase36_b12x_greedy_parity_report.json`](benchmarks/phase36_b12x_greedy_parity_report.json)）。
+2. **纯引擎同口径对标落地（[`bench_vllm_pure_engine.py`](../worker/tests/phase3/bench_vllm_pure_engine.py)）**：
+   * 使用 `AsyncLLMEngine`（`OPENAI_API_SERVER` 上下文、`max_num_batched_tokens=8192`）+ `TokensPrompt` + `detokenize=False` 直接喂与 `zstep` 逐位一致的 SplitMix64 `int32` prompt 序列，实测 `vLLM 0.31.0` 纯引擎与 HTTP 基线在 `c=1` `TPOT` 上仅差 **`0.01 ms/tok`**（`10.94 vs 10.95 ms`），证实 `zstep 3.6 + b12x` 相对同口径 `vLLM` 纯引擎在全部 `10 / 10` 档位取得 **`+14.67% .. +49.74%`** 的纯引擎性能优势。
+3. **后续可选演进方向**：
+   * 在 [`zs-server`](../crates/zs-server/src/main.rs) 补齐 `axum` + `tokenizers` `/v1/completions` SSE 流式端到端接口；
+   * 对单请求中等 Eager Prefill（`M=256..1024`）做分段 CUDA Graph 或稠密层 Cutlass 阈值细化，收回 `c=1` 首字的 Python `bind()` 开销。

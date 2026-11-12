@@ -22,7 +22,7 @@ Baseline:  vllm/vllm-openai:v0.31.0, TP=8, --no-enable-prefix-caching, isolated 
 
 ## 2. 归档文件总览
 
-共有 **22 份主 JSON + 19 份 vLLM 逐轮/warmup 原始 JSON = 41 份 JSON**。
+共有 **27 份主 JSON + 19 份 vLLM 逐轮/warmup 原始 JSON = 46 份 JSON**。
 
 | 阶段 | 文件 | 内容 |
 | :--- | :--- | :--- |
@@ -49,10 +49,36 @@ Baseline:  vllm/vllm-openai:v0.31.0, TP=8, --no-enable-prefix-caching, isolated 
 | Phase 3.5 | [`phase3_vllm_dsv41_tp8_6tier.json`](phase3_vllm_dsv41_tp8_6tier.json) | `vLLM 0.31.0`（`--no-enable-prefix-caching`）六档交错独立种子 `n=3` 基线 |
 | Phase 3.5 | [`phase3_vllm_greedy_reference.json`](phase3_vllm_greedy_reference.json) | `DeepSeek-V4.1-Flash` 5 条多 prompt 无缓存 `vLLM 0.31.0` 贪心参考（含 Top-5 logprobs） |
 | Phase 3.5 | [`phase3_greedy_parity_report.json`](phase3_greedy_parity_report.json) | `DeepSeek-V4.1-Flash` 单序列/批处理/Mixed-Chunked 全局 Top-2 贪心审计及 5-kernel 零重编译 |
+| Phase 3.6 | [`phase36_zstep_b12x_dsv41_tp8_in512_out128.json`](phase36_zstep_b12x_dsv41_tp8_in512_out128.json) | **Phase 3.6 套件一主结果**：`zstep + b12x` `512->128` 四档无缓存独立种子 `n=3` |
+| Phase 3.6 | [`phase36_zstep_b12x_dsv41_tp8_6tier.json`](phase36_zstep_b12x_dsv41_tp8_6tier.json) | **Phase 3.6 套件二主结果**：`zstep + b12x` 六档交错无缓存独立种子 `n=3` |
+| Phase 3.6 | [`phase36_vllm_pure_dsv41_tp8_in512_out128.json`](phase36_vllm_pure_dsv41_tp8_in512_out128.json) | `vLLM 0.31.0` 进程内纯引擎（`AsyncLLMEngine` + `TokensPrompt` + `detokenize=False`，无 HTTP/分词/SSE）`512->128` 四档同口径基线 `n=3` |
+| Phase 3.6 | [`phase36_vllm_pure_dsv41_tp8_6tier.json`](phase36_vllm_pure_dsv41_tp8_6tier.json) | `vLLM 0.31.0` 进程内纯引擎（无 HTTP/分词/SSE）六档交错同口径基线 `n=3` |
+| Phase 3.6 | [`phase36_b12x_greedy_parity_report.json`](phase36_b12x_greedy_parity_report.json) | `zstep + b12x` 单序列/批处理/Mixed-Chunked 全局 Top-2 贪心审计（`prime_squares_table` `128/128` 100% 匹配，零重编译） |
 
 ---
 
-## 3. Phase 3.5：`DeepSeek-V4.1-Flash` (`TP=8`, `8 × RTX 6000D`) 无 APC、独立种子、Warm `n=3` 主结果
+## 3. Phase 3.6（`zstep + b12x`）与纯引擎同口径 `vLLM 0.31.0` 主结果（`8 × RTX 6000D`, Warm `n=3`）
+
+为严格消除 API 层开销偏差（无 HTTP、无分词、无增量解码、无 SSE），[`bench_vllm_pure_engine.py`](../../worker/tests/phase3/bench_vllm_pure_engine.py) 在 `vLLM 0.31.0` 进程内以 `OPENAI_API_SERVER` 上下文（`max_num_batched_tokens=8192`、`enable_prefix_caching=False`、`detokenize=False`、`TokensPrompt`）输入与 `zstep` 逐位一致的 SplitMix64 `int32` prompt 序列。
+
+### 3.0 纯引擎同口径四方总览（`vLLM HTTP` / `vLLM 纯引擎` / `zstep 3.5` / `zstep 3.6 + b12x`）
+
+| 套件 / 档位 | `vLLM` HTTP (`tok/s`) | `vLLM` 纯引擎 (`tok/s`) | `zstep` 3.5 (`tok/s`) | **`zstep` 3.6 + `b12x` (`tok/s`)** | 3.6 vs 3.5 / vs `vLLM` 纯引擎 | Mean TPOT `vPure` / **`z3.6`** (`ms`) | Med TTFT `vPure` / **`z3.6`** (`ms`) | P99 ITL `vPure` / **`z3.6`** (`ms`) |
+| :--- | ---: | ---: | ---: | ---: | :--- | :---: | :---: | :---: |
+| Suite 1 `c1` | `83.97 ± 0.05` | `83.59 ± 0.01` | **`96.18 ± 0.57`** | `95.85 ± 0.65` | `-0.34%` / **`+14.67%`** | `10.94` / **`9.05`** | **`141.37`** / `185.21` | `11.39` / **`9.28`** |
+| Suite 1 `c8` | `351.50 ± 10.04` | `348.18 ± 8.30` | `377.50 ± 2.52` | **`441.70 ± 1.60`** | **`+17.01%`** / **`+26.86%`** | `19.02` / **`14.23`** | `590.28` / **`510.32`** | `18.80` / **`14.79`** |
+| Suite 1 `c16` | `509.40 ± 3.55` | `492.61 ± 2.27` | `527.00 ± 1.87` | **`612.24 ± 2.13`** | **`+16.18%`** / **`+24.29%`** | `25.63` / **`22.47`** | `1,084.36` / **`386.49`** | **`25.97`** / `327.96` |
+| Suite 1 `c32` | `635.98 ± 1.49` | `617.07 ± 1.10` | `663.78 ± 3.57` | **`800.74 ± 1.01`** | **`+20.63%`** / **`+29.76%`** | `41.13` / **`35.12`** | `1,430.66` / **`387.05`** | **`86.20`** / `386.75` |
+| Suite 2 `in512_c1` | `87.24 ± 0.07` | `87.06 ± 0.01` | `98.94 ± 0.33` | **`103.99 ± 1.10`** | **`+5.10%`** / **`+19.45%`** | `10.97` / **`8.93`** | **`141.86`** / `184.93` | `11.41` / **`9.27`** |
+| Suite 2 `in512_c16` | `573.38 ± 6.84` | `555.89 ± 1.34` | `609.53 ± 7.15` | **`727.06 ± 1.62`** | **`+19.28%`** / **`+30.79%`** | `25.32` / **`20.01`** | `1,086.45` / **`386.86`** | `26.12` / **`19.09`** |
+| Suite 2 `in512_c128` | `1,152.03 ± 6.34` | `1,126.34 ± 1.87` | `1,372.77 ± 2.51` | **`1,686.53 ± 7.96`** | **`+22.86%`** / **`+49.74%`** | `99.30` / **`65.72`** | `3,066.32` / **`779.52`** | `1,021.41` / **`389.59`** |
+| Suite 2 `in1024_c1` | `84.20 ± 0.02` | `84.57 ± 0.00` | `95.24 ± 0.09` | **`102.27 ± 0.18`** | **`+7.38%`** / **`+20.92%`** | `11.17` / **`9.07`** | **`177.89`** / `191.20` | `11.56` / **`9.47`** |
+| Suite 2 `in1024_c32` | `614.93 ± 3.52` | `605.12 ± 1.35` | `649.63 ± 1.94` | **`778.39 ± 4.56`** | **`+19.82%`** / **`+28.63%`** | `42.27` / **`36.51`** | `2,127.63` / **`391.62`** | **`296.51`** / `391.34` |
+| Suite 2 `in1024_c128` | `878.86 ± 4.26` | `866.25 ± 1.06` | `1,002.13 ± 3.22` | **`1,169.71 ± 1.06`** | **`+16.72%`** / **`+35.03%`** | `122.27` / **`92.32`** | `3,107.53` / **`787.39`** | `1,035.90` / **`394.26`** |
+
+---
+
+## 3A. Phase 3.5（标准算子）历史对照：`DeepSeek-V4.1-Flash` (`TP=8`, `8 × RTX 6000D`)
 
 两套基准共用唯一常驻配置：`allreduce_blocks=8`、`num_kv_pages=2560`、`max_seqs=128`、`max_step_tokens=max_decoder_rows=4096`、`max_prefill_chunk=2048`、`max_mixed_step_tokens=3072`、`max_pages_per_seq=256`，`M<=256` 走 `shm_v5 (b=8)`、`M>256` Eager 步走 `NCCL_LOC`，16 warmup prompts，round-major 交错 `n=3`（与 `--no-enable-prefix-caching` 的 `vLLM 0.31.0` 同享 `(round, tier)` 独立种子）。运行时审计为 **`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=5`**，退出后 `/dev/shm` 无残留。详细架构与物理归因见 **[`07-phase3-dsv41-6000d-benchmark.md`](../07-phase3-dsv41-6000d-benchmark.md)** 与 **[`08-phase3-dsv41-optimization-plan.md`](../08-phase3-dsv41-optimization-plan.md)**。
 

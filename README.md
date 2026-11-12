@@ -31,7 +31,7 @@ zstep/
 │   │   ├── models/
 │   │   │   ├── deepseek_v41.py       # Explicit 40-layer DeepSeek-V4.1-Flash TP=8 runner
 │   │   │   └── qwen35_moe.py         # Explicit 40-layer Qwen3.5-35B-A3B TP=8 runner
-│   │   └── kernels_sm120/            # shm_v5 AllReduce/AllGather/Argmax, GDN/GQA/MoE
+│   │   └── kernels_sm120/            # shm_v5 collectives, b12x SM120 MoE/FP8, GDN/GQA/MoE
 │   └── tests/                        # SHM, Mode B, Phase 0, Phase 2 & Phase 3 harnesses
 └── docs/
     ├── 01-advisor-analysis.md
@@ -42,48 +42,49 @@ zstep/
     ├── 06-phase2-qwen35-benchmark.md
     ├── 07-phase3-dsv41-6000d-benchmark.md
     ├── 08-phase3-dsv41-optimization-plan.md
-    └── benchmarks/                   # 22 primary + 19 raw vLLM JSON artifacts
+    └── benchmarks/                   # 27 primary + 19 raw vLLM JSON artifacts
 ```
 
 ## Current Status
 
-* **Phase 3 / 3.5 — `DeepSeek-V4.1-Flash` (`8 × RTX 6000D`, `TP=8`)**:
+* **Phase 3 / 3.5 / 3.6 — `DeepSeek-V4.1-Flash` (`8 × RTX 6000D`, `TP=8`)**:
   * **Size-Aware `shm_v5` + `NCCL_LOC` Collectives** ([`phase0_6000d_ar_shmv5.json`](docs/benchmarks/phase0_6000d_ar_shmv5.json)): across all decode CUDA Graph buckets (`M=1..128`, `H=5120` BF16), `shm_v5 (blocks=8)` beats `NCCL_LOC` by **`1.19×..3.38×`** (`14.48 µs` vs `48.95 µs` at `M=1`; `14.08 µs` / `3.48×` at `blocks=2`), while eager mixed/prefill payloads (`M > 256`) automatically route to multi-SM `NCCL_LOC` (`3,944.79 µs` vs `4,660.95 µs` at `M=4096`).
-  * **10 / 10 Tier Sweep vs No-APC `vLLM 0.31.0`**: With `--no-enable-prefix-caching` + isolated per-`(round, tier)` seeds on both engines, piggyback mixed decode + chunked prefill (`--max-mixed-step-tokens 3072`), and size-aware collectives, `zstep` **outperforms `vLLM 0.31.0` across all 10 benchmark tiers (`+3.45%..+19.16%`)** — reaching **`95.24..98.94 tok/s`** single-stream (`Mean TPOT = 9.55..9.87 ms`, **`+13.11%..+14.53%`**) and **`1,372.77 tok/s`** (`+19.16%`) / **`1,002.13 tok/s`** (`+14.03%`) at `c=128` with **`3.69×..3.71×` faster Median TTFT** and **`2.46×..2.47×` lower `P99 ITL`** (`415.33..419.58 ms` vs `1,019.66..1,035.37 ms`).
-  * **Deterministic Global Top-2 Greedy Audit**: Runtime emits **`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=5`** and clean `/dev/shm` teardown; [`phase3_greedy_parity_report.json`](docs/benchmarks/phase3_greedy_parity_report.json) achieves **`128 / 128` (`100.00%`) exact token parity** across single, batched, and `chunk=24` mixed-prefill schedules on `prime_squares_table`, while honestly preserving razor-thin BF16 ULP tie divergences (`top1 - top2 = 0.125..0.375`, `all_matched=false`) on open-ended base-model prompts.
+  * **Selective `b12x` SM120 Compute Integration (`Phase 3.6`, [`b12x_dsv41.py`](worker/zstep_worker/kernels_sm120/b12x_dsv41.py))**: replaces all 40 routed `MXFP4` MoE layers (`I_tp8=288` unpadded, saving ~10 GiB VRAM/GPU) and 170 2D `[32, 32] UE8M0` FP8 dense linears (`rows > 512` Cutlass fallback on `fused_wqa_wkv`) over static 256 B-aligned GPU arenas for zero-allocation CUDAGraph replay.
+  * **Symmetric Pure-Engine & HTTP 10 / 10 Tier Sweep vs No-APC `vLLM 0.31.0`**: Benchmarked against **both** in-process `vLLM 0.31.0` Pure Engine ([`bench_vllm_pure_engine.py`](worker/tests/phase3/bench_vllm_pure_engine.py): `AsyncLLMEngine` + `TokensPrompt` + `detokenize=False`, zero HTTP/tokenizer/detokenizer/SSE, identical SplitMix64 `int32` prompt IDs) and `vllm bench serve` `/v1/completions` HTTP. `zstep 3.6 + b12x` beats pure-engine `vLLM 0.31.0` across **all 10 / 10 tiers (`+14.67%..+49.74%`)** and beats `zstep 3.5` by **`+16.18%..+22.86%`** at `c=8..128` — reaching **`8.93..9.07 ms` single-stream `Mean TPOT`** (`102.27..103.99 tok/s` at `output=256`) and **`1,686.53 tok/s`** (`+49.74%`) / **`1,169.71 tok/s`** (`+35.03%`) at `c=128`. Explicit latency trade-offs: at `c=16` (`512->128`) and `c=32`, `--max-mixed-step-tokens 3072` trades higher `P99 ITL` (`328..391 ms` vs `vLLM` `26..297 ms`) for `2.8×..5.4×` lower `Median TTFT`; at `c=1`, eager `b12x` Python `bind()` adds `~20..67 ms` to `Median TTFT` (`184.9..191.2 ms` vs `117.6..171.7 ms` in Phase 3.5).
+  * **Deterministic Global Top-2 Greedy Audit**: Runtime emits **`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=5`** and clean `/dev/shm` teardown; both [`phase3_greedy_parity_report.json`](docs/benchmarks/phase3_greedy_parity_report.json) and [`phase36_b12x_greedy_parity_report.json`](docs/benchmarks/phase36_b12x_greedy_parity_report.json) achieve **`128 / 128` (`100.00%`) exact token parity** across single, batched, and `chunk=24` mixed-prefill schedules on `prime_squares_table`, while honestly preserving razor-thin BF16 ULP tie divergences (`all_matched=false`) on open-ended base-model prompts.
 * **Phase 2 — `Qwen3.5-35B-A3B` (`8 × RTX 5090`, `TP=8`)**:
   * **6 / 6 Uncached Throughput Sweep vs No-APC `vLLM 0.33.0`**: With `--no-enable-prefix-caching` and per-`(round, tier)` isolated seeds, `zstep` leads on uncached output throughput across all 6 tiers (**`+11.00%..+54.08%`**), while explicitly reporting the `max_prefill_chunk=2048` tail-latency tradeoff at `c=32/128`.
   * **Greedy Audit**: Runtime emits **`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=17`**. `chunked` matches `vLLM` **448/448 tokens (100% across all 5 cases)**; remaining `single`/`batched` flips occur strictly at `<= 2` BF16 ULPs (`margin <= 0.25` at logit `~25`), preserved honestly as `all_matched=false` in [`phase2_greedy_parity_report.json`](docs/benchmarks/phase2_greedy_parity_report.json).
 * **Phase 1 / Mode B Control Plane**: 200-step 8-GPU measurement records **`4.690 µs/step`** Rust preparation (`0.166%` of GPU step time, `overlap_speedup=1.000269×`).
 * **KV scope**: [`crates/zs-kv/src/radix.rs`](crates/zs-kv/src/radix.rs) (`PrefixTree` / `KvCacheManager`) is a standalone pure-attention component and is **not wired into `DeepSeek-V4.1-Flash` or `Qwen3.5-35B-A3B` serving**; both runners use `BlockPool` physical-page RAII only.
 
-## Phase 3.5 Warm Single-Config `n=3` Uncached Serving (`DeepSeek-V4.1-Flash`, `8 × RTX 6000D`)
+## Phase 3.6 (`+ b12x`) & Phase 3.5 Warm `n=3` Uncached Serving (`DeepSeek-V4.1-Flash`, `8 × RTX 6000D`)
 
-Unified resident config across all tiers: `allreduce_blocks=8`, `num_kv_pages=2560`, `max_seqs=128`, `max_step_tokens=max_decoder_rows=4096`, `max_prefill_chunk=2048`, `max_mixed_step_tokens=3072`, `max_pages_per_seq=256`, 16 warmup prompts, `n=3` round-major interleaved repeats (`--no-enable-prefix-caching` on `vLLM 0.31.0`, isolated per-`(round, tier)` seeds on both engines). Values are `mean ± population std`; throughput is a **tie** when relative delta is `<3%` or `|delta| <= 2×sqrt(zstep_std²+vllm_std²)`. `ttft_ms` is permit-based (matching `vLLM` `limited_request_func`), whereas `submit_ttft_ms` includes client concurrency-pool queueing.
+Unified resident config across all tiers: `allreduce_blocks=8`, `num_kv_pages=2560`, `max_seqs=128`, `max_step_tokens=max_decoder_rows=4096`, `max_prefill_chunk=2048`, `max_mixed_step_tokens=3072`, `max_pages_per_seq=256`, 16 warmup prompts, `n=3` round-major interleaved repeats (`enable_prefix_caching=False` on `vLLM 0.31.0`, isolated per-`(round, tier)` seeds). **`vLLM Pure`** runs `AsyncLLMEngine` (`OPENAI_API_SERVER`, `max_num_batched_tokens=8192`) in-process with `TokensPrompt` + `detokenize=False` (no HTTP, no tokenizer, no detokenizer, no SSE — exact same `int32` token-ID boundary as `zstep`), alongside **`vLLM HTTP`** (`vllm bench serve` `/v1/completions`).
 
 ### Suite 1: Fixed `512 -> 128` (`c=1, 8, 16, 32`)
 
-Raw artifacts: [`zstep`](docs/benchmarks/phase3_zstep_dsv41_tp8_in512_out128.json), [`vLLM 0.31.0`](docs/benchmarks/phase3_vllm_dsv41_tp8_in512_out128.json).
+Raw artifacts: [`zstep 3.6 + b12x`](docs/benchmarks/phase36_zstep_b12x_dsv41_tp8_in512_out128.json), [`zstep 3.5`](docs/benchmarks/phase3_zstep_dsv41_tp8_in512_out128.json), [`vLLM Pure`](docs/benchmarks/phase36_vllm_pure_dsv41_tp8_in512_out128.json), [`vLLM HTTP`](docs/benchmarks/phase3_vllm_dsv41_tp8_in512_out128.json).
 
-| Tier | zstep Output (`tok/s`) | vLLM Output (`tok/s`) | Delta / verdict | Mean TPOT z / v (`ms`) | z Median TTFT / submit-TTFT (`ms`) | v Median TTFT (`ms`) | z P99 ITL (`ms`) | v P99 ITL (`ms`) |
-| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: |
-| `c1` | **96.18 ± 0.57** | 83.97 ± 0.05 | **+14.53% / zstep faster** | **9.55 ± 0.06** / 10.95 ± 0.00 | **117.56 ± 0.19** / 9,471.93 ± 19.16 | 132.60 ± 1.27 | **9.80 ± 0.03** | 11.38 ± 0.13 |
-| `c8` | **377.50 ± 2.52** | 351.50 ± 10.04 | **+7.40% / zstep faster** | **17.14 ± 0.14** / 18.25 ± 0.17 | **535.78 ± 0.09** / 3,224.43 ± 35.53 | 594.99 ± 1.19 | **17.67 ± 0.12** | 19.00 ± 0.33 |
-| `c16` | **527.00 ± 1.87** | 509.40 ± 3.55 | **+3.45% / zstep faster** | 26.51 ± 0.11 / **23.47 ± 0.23** | **410.34 ± 0.43** / 4,949.74 ± 48.17 | 1,081.25 ± 0.78 | 351.43 ± 0.19 | **25.26 ± 0.15** |
-| `c32` | **663.78 ± 3.57** | 635.98 ± 1.49 | **+4.37% / zstep faster** | 43.11 ± 0.26 / **38.50 ± 0.12** | **411.54 ± 0.40** / 8,399.90 ± 102.45 | 1,228.47 ± 14.19 | 410.91 ± 0.25 | **107.80 ± 0.70** |
+| Tier | `vLLM` HTTP (`tok/s`) | `vLLM` Pure (`tok/s`) | `zstep` 3.5 (`tok/s`) | **`zstep` 3.6 + `b12x` (`tok/s`)** | 3.6 vs `vLLM` Pure | Mean TPOT `vPure` / `z3.5` / **`z3.6`** (`ms`) | Med TTFT `vPure` / `z3.5` / **`z3.6`** (`ms`) | P99 ITL `vPure` / **`z3.6`** (`ms`) |
+| :--- | ---: | ---: | ---: | ---: | :--- | :---: | :---: | :---: |
+| `c1` | 83.97 ± 0.05 | 83.59 ± 0.01 | **96.18 ± 0.57** | 95.85 ± 0.65 | **+14.67%** | 10.94 / 9.55 / **9.05** | 141.37 / **117.56** / 185.21 | 11.39 / **9.28** |
+| `c8` | 351.50 ± 10.04 | 348.18 ± 8.30 | 377.50 ± 2.52 | **441.70 ± 1.60** | **+26.86%** | 19.02 / 17.14 / **14.23** | 590.28 / 535.78 / **510.32** | 18.80 / **14.79** |
+| `c16` | 509.40 ± 3.55 | 492.61 ± 2.27 | 527.00 ± 1.87 | **612.24 ± 2.13** | **+24.29%** | 25.63 / 26.51 / **22.47** | 1,084.36 / 410.34 / **386.49** | **25.97** / 327.96 |
+| `c32` | 635.98 ± 1.49 | 617.07 ± 1.10 | 663.78 ± 3.57 | **800.74 ± 1.01** | **+29.76%** | 41.13 / 43.11 / **35.12** | 1,430.66 / 411.54 / **387.05** | **86.20** / 386.75 |
 
 ### Suite 2: Six-Tier Interleaved (`in512` / `in1024` × `output=256`)
 
-Raw artifacts: [`zstep`](docs/benchmarks/phase3_zstep_dsv41_tp8_6tier.json), [`vLLM 0.31.0`](docs/benchmarks/phase3_vllm_dsv41_tp8_6tier.json).
+Raw artifacts: [`zstep 3.6 + b12x`](docs/benchmarks/phase36_zstep_b12x_dsv41_tp8_6tier.json), [`zstep 3.5`](docs/benchmarks/phase3_zstep_dsv41_tp8_6tier.json), [`vLLM Pure`](docs/benchmarks/phase36_vllm_pure_dsv41_tp8_6tier.json), [`vLLM HTTP`](docs/benchmarks/phase3_vllm_dsv41_tp8_6tier.json).
 
-| Tier | zstep Output (`tok/s`) | vLLM Output (`tok/s`) | Delta / verdict | Mean TPOT z / v (`ms`) | z Median TTFT / submit-TTFT (`ms`) | v Median TTFT (`ms`) | z P99 ITL (`ms`) | v P99 ITL (`ms`) |
-| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: |
-| `in512_c1` | **98.94 ± 0.33** | 87.24 ± 0.07 | **+13.42% / zstep faster** | **9.68 ± 0.03** / 10.98 ± 0.00 | **118.68 ± 0.84** / 7,889.69 ± 26.37 | 133.63 ± 1.67 | **9.87 ± 0.04** | 11.48 ± 0.14 |
-| `in512_c16` | **609.53 ± 7.15** | 573.38 ± 6.84 | **+6.30% / zstep faster** | 24.15 ± 0.31 / 24.07 ± 0.38 | **410.82 ± 0.27** / 7,580.25 ± 54.25 | 1,094.82 ± 18.29 | **23.47 ± 0.25** | 25.12 ± 0.53 |
-| `in512_c128` | **1,372.77 ± 2.51** | 1,152.03 ± 6.34 | **+19.16% / zstep faster** | **82.32 ± 0.17** / 96.30 ± 0.60 | **831.11 ± 0.31** / 8,983.78 ± 1.96 | 3,068.72 ± 1.11 | **415.33 ± 0.14** | 1,019.66 ± 0.68 |
-| `in1024_c1` | **95.24 ± 0.09** | 84.20 ± 0.02 | **+13.11% / zstep faster** | **9.87 ± 0.01** / 11.18 ± 0.00 | **171.66 ± 0.16** / 24,369.74 ± 41.77 | 189.45 ± 0.73 | **10.07 ± 0.01** | 11.72 ± 0.02 |
-| `in1024_c32` | **649.63 ± 1.94** | 614.93 ± 3.52 | **+5.64% / zstep faster** | 44.18 ± 0.17 / **42.06 ± 0.35** | **415.61 ± 0.15** / 37,201.49 ± 204.12 | 1,959.74 ± 61.20 | 415.40 ± 0.11 | **175.89 ± 0.90** |
-| `in1024_c128` | **1,002.13 ± 3.22** | 878.86 ± 4.26 | **+14.03% / zstep faster** | **108.63 ± 0.34** / 120.03 ± 0.49 | **837.54 ± 0.10** / 41,618.50 ± 129.12 | 3,108.79 ± 0.44 | **419.58 ± 0.14** | 1,035.37 ± 0.43 |
+| Tier | `vLLM` HTTP (`tok/s`) | `vLLM` Pure (`tok/s`) | `zstep` 3.5 (`tok/s`) | **`zstep` 3.6 + `b12x` (`tok/s`)** | 3.6 vs `vLLM` Pure | Mean TPOT `vPure` / `z3.5` / **`z3.6`** (`ms`) | Med TTFT `vPure` / `z3.5` / **`z3.6`** (`ms`) | P99 ITL `vPure` / **`z3.6`** (`ms`) |
+| :--- | ---: | ---: | ---: | ---: | :--- | :---: | :---: | :---: |
+| `in512_c1` | 87.24 ± 0.07 | 87.06 ± 0.01 | 98.94 ± 0.33 | **103.99 ± 1.10** | **+19.45%** | 10.97 / 9.68 / **8.93** | 141.86 / **118.68** / 184.93 | 11.41 / **9.27** |
+| `in512_c16` | 573.38 ± 6.84 | 555.89 ± 1.34 | 609.53 ± 7.15 | **727.06 ± 1.62** | **+30.79%** | 25.32 / 24.15 / **20.01** | 1,086.45 / 410.82 / **386.86** | 26.12 / **19.09** |
+| `in512_c128` | 1,152.03 ± 6.34 | 1,126.34 ± 1.87 | 1,372.77 ± 2.51 | **1,686.53 ± 7.96** | **+49.74%** | 99.30 / 82.32 / **65.72** | 3,066.32 / 831.11 / **779.52** | 1,021.41 / **389.59** |
+| `in1024_c1` | 84.20 ± 0.02 | 84.57 ± 0.00 | 95.24 ± 0.09 | **102.27 ± 0.18** | **+20.92%** | 11.17 / 9.87 / **9.07** | 177.89 / **171.66** / 191.20 | 11.56 / **9.47** |
+| `in1024_c32` | 614.93 ± 3.52 | 605.12 ± 1.35 | 649.63 ± 1.94 | **778.39 ± 4.56** | **+28.63%** | 42.27 / 44.18 / **36.51** | 2,127.63 / 415.61 / **391.62** | **296.51** / 391.34 |
+| `in1024_c128` | 878.86 ± 4.26 | 866.25 ± 1.06 | 1,002.13 ± 3.22 | **1,169.71 ± 1.06** | **+35.03%** | 122.27 / 108.63 / **92.32** | 3,107.53 / 837.54 / **787.39** | 1,035.90 / **394.26** |
 
 ## Phase 2 Warm Single-Config `n=3` Uncached Serving (`Qwen3.5-35B-A3B`, `8 × RTX 5090`)
 

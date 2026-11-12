@@ -40,6 +40,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from zstep_worker.kernels_sm120.b12x_dsv41 import (
+    B12xPrepareSummary,
+    install_b12x_dsv41_quant_patches,
+    prepare_b12x_dsv41_model,
+)
 from zstep_worker.kernels_sm120.shm_allreduce import (
     HostMappedShmAllGather,
     HostMappedShmAllReduce,
@@ -222,6 +227,7 @@ def apply_vllm_sm120_dsv41_patches() -> None:
 
     idx_builder_cls.__init__ = _patched_idx_builder_init
     idx_builder_cls.build = _patched_idx_builder_build
+    install_b12x_dsv41_quant_patches()
 
 
 def _select_decode_bucket(num_seqs: int, max_bucket: int) -> int:
@@ -375,6 +381,14 @@ class DeepSeekV41StepRunner:
 
         self.model = get_model(vllm_config=self.vllm_config)
         self.model.eval()
+        self.b12x_summary: B12xPrepareSummary = prepare_b12x_dsv41_model(
+            self.model,
+            rank=rank,
+            device=self.device,
+            max_tokens=max(self.max_step_tokens, 8192),
+            decode_buckets=DECODE_GRAPH_BUCKETS,
+            exchange_group=self.exchange_group,
+        )
 
         # Configure Engram V2 stateless exact lookback path (`lookback_token_ids`).
         lang_model = getattr(self.model, "language_model", self.model)
@@ -1185,9 +1199,16 @@ class DeepSeekV41StepRunner:
         self._zero_all_caches()
         dist.barrier(group=self.exchange_group)
         if self.rank == 0:
+            b12x_info = (
+                f"b12x=on(moe={self.b12x_summary.moe_layers},"
+                f"lin={self.b12x_summary.linear_layers}/{self.b12x_summary.linear_shapes},"
+                f"prep_ms={self.b12x_summary.prepare_ms:.0f})"
+                if self.b12x_summary.enabled
+                else "b12x=off"
+            )
             print(
                 f"[DeepSeekV41StepRunner] ready: max_model_len={self.max_model_len} "
-                f"kv_pages={self.num_kv_pages} buckets={buckets} "
+                f"kv_pages={self.num_kv_pages} buckets={buckets} {b12x_info} "
                 f"shm_ar_warm={self.shm_ar_calls} shm_ag_warm={self.shm_ag_calls} "
                 f"nccl_large_warm={self.nccl_eager_large_calls} "
                 f"nccl_fallback_warm={self.nccl_fallback_calls}",

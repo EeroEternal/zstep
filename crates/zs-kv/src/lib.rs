@@ -235,6 +235,90 @@ mod tests {
         assert_ne!(handle_a.compressor_slot_id(), handle_b.compressor_slot_id());
     }
 
+    /// Witness of the current contract clash, not the desired end state.
+    /// An exact block-aligned hit keeps `replay_mask = 0` on the last token
+    /// (a GlobalAndIndex write) while that token's page stays shared with the
+    /// live owner of the cached block. A private page id without a byte copy
+    /// would drop the other rows of that block, so this is not "fixed" here.
+    #[test]
+    fn shared_exact_prefix_schedules_global_write_on_aliased_page() {
+        let manager = KvCacheManager::new(16, 8, 4, 64, 128, 4).expect("valid manager");
+        let prompt: Vec<i32> = (0..256).collect();
+        let mut first = manager.admit_request(&prompt).expect("admit first");
+        assert_eq!(first.commit_completed_blocks(&prompt).expect("commit"), 4);
+        let repeat = manager.admit_request(&prompt).expect("admit repeat");
+        let shared = first.global_page_table();
+        let pages = repeat.global_page_table();
+        assert_eq!(
+            pages, shared,
+            "exact hit currently aliases every cached page"
+        );
+        let block_tokens = 64usize;
+        let mut aliased_writes = 0usize;
+        for (offset, &mask) in repeat.schedule().replay_mask.iter().enumerate() {
+            if mask != 0 {
+                continue;
+            }
+            let pos = repeat.schedule().scheduled_positions[offset] as usize;
+            let page = pages[pos / block_tokens];
+            if shared.contains(&page) {
+                aliased_writes += 1;
+            }
+        }
+        assert_eq!(aliased_writes, 1);
+    }
+
+    #[test]
+    fn block_ids_stay_unique_across_admit_commit_and_drop() {
+        let manager = KvCacheManager::new(24, 32, 16, 64, 128, 4).expect("valid manager");
+        let mut live = Vec::new();
+        for turn in 0..12u32 {
+            let len = 64 * ((turn % 5) + 1) as usize + (turn as usize % 17);
+            let prompt: Vec<i32> = (0..len).map(|i| (i as i32) + (turn as i32) * 3).collect();
+            if let Ok(mut handle) = manager.admit_request(&prompt) {
+                let _ = handle.commit_completed_blocks(&prompt);
+                live.push(handle);
+            }
+            if live.len() > 4 {
+                live.remove(0);
+            }
+            let tail_blocks: usize = live
+                .iter()
+                .map(|handle| {
+                    let prefix_blocks = handle.matched_prefix_tokens() as usize / 64;
+                    handle.global_page_table().len() - prefix_blocks
+                })
+                .sum();
+            assert_eq!(
+                manager.global_pool().available()
+                    + manager.prefix_tree().cached_blocks()
+                    + tail_blocks,
+                manager.global_pool().capacity()
+            );
+            assert_eq!(manager.swa_pool().available() + live.len() * 4, 32);
+            assert_eq!(
+                manager.compressor_pool().available() + live.len(),
+                manager.compressor_pool().capacity()
+            );
+        }
+        drop(live);
+        let cached = manager.prefix_tree().cached_blocks();
+        assert_eq!(
+            manager.global_pool().available() + cached,
+            manager.global_pool().capacity()
+        );
+        assert_eq!(manager.prefix_tree().evict_lru(cached), cached);
+        assert_eq!(
+            manager.global_pool().available(),
+            manager.global_pool().capacity()
+        );
+        assert_eq!(manager.swa_pool().available(), 32);
+        assert_eq!(
+            manager.compressor_pool().available(),
+            manager.compressor_pool().capacity()
+        );
+    }
+
     #[test]
     fn exact_block_aligned_full_prefix_hit_keeps_final_token_fresh() {
         let manager = KvCacheManager::new(16, 8, 4, 64, 128, 4).expect("valid manager");
