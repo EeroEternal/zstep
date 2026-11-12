@@ -19,3 +19,19 @@
 # SOFTWARE.
 
 """Explicit real-weight model runners for zstep Mode B workers."""
+
+from __future__ import annotations
+
+__all__ = ["DeepSeekV41StepRunner", "Qwen35MoeStepRunner"]
+
+
+def __getattr__(name: str):
+    if name == "DeepSeekV41StepRunner":
+        from zstep_worker.models.deepseek_v41 import DeepSeekV41StepRunner
+
+        return DeepSeekV41StepRunner
+    if name == "Qwen35MoeStepRunner":
+        from zstep_worker.models.qwen35_moe import Qwen35MoeStepRunner
+
+        return Qwen35MoeStepRunner
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

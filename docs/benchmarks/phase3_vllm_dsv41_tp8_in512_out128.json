@@ -1,0 +1,1113 @@
+{
+  "engine": "vllm",
+  "vllm_version": "0.31.0",
+  "model": "DeepSeek-V4.1-Flash",
+  "container_image": "vllm/vllm-openai:v0.31.0",
+  "dtype": "bfloat16",
+  "tp_size": 8,
+  "spec_mode": "off",
+  "engram_memory": "device",
+  "seed": 20261112,
+  "git_sha": "05c116477f08215b6f0e2c042ed1c5fcd0427d27",
+  "collection_timestamp_utc": "2026-11-12T02:46:30.411301+00:00",
+  "serve_args": [
+    "/models/DeepSeek-V4.1-Flash",
+    "--served-model-name",
+    "DeepSeek-V4.1-Flash",
+    "--tensor-parallel-size",
+    "8",
+    "--dtype",
+    "bfloat16",
+    "--max-model-len",
+    "32768",
+    "--max-num-seqs",
+    "128",
+    "--gpu-memory-utilization",
+    "0.95",
+    "--engram-config",
+    "{\"cpu_offload\": false}",
+    "--limit-mm-per-prompt",
+    "{\"image\": 0}",
+    "--no-enable-prefix-caching",
+    "--host",
+    "0.0.0.0",
+    "--port",
+    "8000",
+    "--seed",
+    "20261112"
+  ],
+  "serve_env": {
+    "NCCL_P2P_DISABLE": "1",
+    "NCCL_P2P_LEVEL": "LOC",
+    "sm120_flashinfer_page_block_size_64_shim": true
+  },
+  "vllm_serve_command": "vllm serve /models/DeepSeek-V4.1-Flash --served-model-name DeepSeek-V4.1-Flash --tensor-parallel-size 8 --dtype bfloat16 --max-model-len 32768 --max-num-seqs 128 --gpu-memory-utilization 0.95 --engram-config '{\"cpu_offload\": false}' --limit-mm-per-prompt '{\"image\": 0}' --no-enable-prefix-caching --host 0.0.0.0 --port 8000 --seed 20261112",
+  "nvidia_driver_version": "595.99.02",
+  "gpu_clocks_mhz": [
+    2430,
+    2422,
+    2422,
+    2422,
+    2422,
+    2430,
+    2422,
+    2422
+  ],
+  "gpu_memory_clocks_mhz": [
+    12481,
+    12481,
+    12481,
+    12481,
+    12481,
+    12481,
+    12481,
+    12481
+  ],
+  "gpus": [
+    {
+      "name": "NVIDIA RTX 6000D",
+      "driver_version": "595.99.02",
+      "graphics_clock_mhz": 2430,
+      "memory_clock_mhz": 12481,
+      "memory_total_mib": 85651
+    },
+    {
+      "name": "NVIDIA RTX 6000D",
+      "driver_version": "595.99.02",
+      "graphics_clock_mhz": 2422,
+      "memory_clock_mhz": 12481,
+      "memory_total_mib": 85651
+    },
+    {
+      "name": "NVIDIA RTX 6000D",
+      "driver_version": "595.99.02",
+      "graphics_clock_mhz": 2422,
+      "memory_clock_mhz": 12481,
+      "memory_total_mib": 85651
+    },
+    {
+      "name": "NVIDIA RTX 6000D",
+      "driver_version": "595.99.02",
+      "graphics_clock_mhz": 2422,
+      "memory_clock_mhz": 12481,
+      "memory_total_mib": 85651
+    },
+    {
+      "name": "NVIDIA RTX 6000D",
+      "driver_version": "595.99.02",
+      "graphics_clock_mhz": 2422,
+      "memory_clock_mhz": 12481,
+      "memory_total_mib": 85651
+    },
+    {
+      "name": "NVIDIA RTX 6000D",
+      "driver_version": "595.99.02",
+      "graphics_clock_mhz": 2430,
+      "memory_clock_mhz": 12481,
+      "memory_total_mib": 85651
+    },
+    {
+      "name": "NVIDIA RTX 6000D",
+      "driver_version": "595.99.02",
+      "graphics_clock_mhz": 2422,
+      "memory_clock_mhz": 12481,
+      "memory_total_mib": 85651
+    },
+    {
+      "name": "NVIDIA RTX 6000D",
+      "driver_version": "595.99.02",
+      "graphics_clock_mhz": 2422,
+      "memory_clock_mhz": 12481,
+      "memory_total_mib": 85651
+    }
+  ],
+  "benchmark": {
+    "backend": "openai",
+    "endpoint": "/v1/completions",
+    "tier_suite": "in512_out128",
+    "dataset_name": "random",
+    "random_range_ratio": 0.0,
+    "ignore_eos": true,
+    "temperature": 0.0,
+    "prefix_caching_enabled": false,
+    "seed_schedule": "base_seed + round_index * 1000 + tier_index (warmup uses base_seed + 900000)",
+    "rounds": 3,
+    "schedule": "warmup once, then round-major interleaving across all tiers with distinct per-(round, tier) seeds",
+    "warmup": {
+      "seed": 21161112,
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 32,
+      "max_concurrency": 16,
+      "raw_result_file": "raw_vllm/warmup.json",
+      "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 32 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 21161112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename warmup.json"
+    },
+    "aggregate_std": "population standard deviation across 3 rounds"
+  },
+  "vllm_bench_commands": {
+    "c1": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 16 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round0_c1.json",
+    "c8": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 32 --max-concurrency 8 --ignore-eos --temperature 0.0 --seed 20261113 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round0_c8.json",
+    "c16": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 64 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20261114 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round0_c16.json",
+    "c32": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 128 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20261115 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round0_c32.json"
+  },
+  "rounds": [
+    {
+      "round": 0,
+      "tier": "c1",
+      "seed": 20261112,
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 16,
+      "max_concurrency": 1,
+      "completed": 16,
+      "raw_result_file": "raw_vllm/round0_c1.json",
+      "metrics": {
+        "duration_s": 24.406133617041633,
+        "output_throughput_tok_s": 83.9133322850441,
+        "total_throughput_tok_s": 419.56666142522056,
+        "mean_ttft_ms": 134.76279756287113,
+        "median_ttft_ms": 134.13357303943485,
+        "p99_ttft_ms": 141.64395763655193,
+        "mean_tpot_ms": 10.944545003468644,
+        "median_tpot_ms": 10.944315948703244,
+        "p99_tpot_ms": 10.948135399563958,
+        "mean_itl_ms": 10.944545003468644,
+        "median_itl_ms": 10.944781999569386,
+        "p99_itl_ms": 11.417674494441599
+      },
+      "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 16 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round0_c1.json"
+    },
+    {
+      "round": 0,
+      "tier": "c8",
+      "seed": 20261113,
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 32,
+      "max_concurrency": 8,
+      "completed": 32,
+      "raw_result_file": "raw_vllm/round0_c8.json",
+      "metrics": {
+        "duration_s": 12.1407469289843,
+        "output_throughput_tok_s": 337.3762770906117,
+        "total_throughput_tok_s": 1686.8813854530586,
+        "mean_ttft_ms": 685.9705680290062,
+        "median_ttft_ms": 593.3368979603983,
+        "p99_ttft_ms": 1276.5194753161632,
+        "mean_tpot_ms": 18.47589150127633,
+        "median_tpot_ms": 17.901074216888087,
+        "p99_tpot_ms": 24.780607085929837,
+        "mean_itl_ms": 18.47589150127633,
+        "median_itl_ms": 17.907742992974818,
+        "p99_itl_ms": 19.440878370078277
+      },
+      "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 32 --max-concurrency 8 --ignore-eos --temperature 0.0 --seed 20261113 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round0_c8.json"
+    },
+    {
+      "round": 0,
+      "tier": "c16",
+      "seed": 20261114,
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 64,
+      "max_concurrency": 16,
+      "completed": 64,
+      "raw_result_file": "raw_vllm/round0_c16.json",
+      "metrics": {
+        "duration_s": 16.232931363978423,
+        "output_throughput_tok_s": 504.653153291734,
+        "total_throughput_tok_s": 2523.26576645867,
+        "mean_ttft_ms": 1035.36857411018,
+        "median_ttft_ms": 1080.893061007373,
+        "p99_ttft_ms": 1138.2781412138138,
+        "mean_tpot_ms": 23.77910624317173,
+        "median_tpot_ms": 23.493774751784265,
+        "p99_tpot_ms": 30.88220549421935,
+        "mean_itl_ms": 23.77910624317173,
+        "median_itl_ms": 23.479240480810404,
+        "p99_itl_ms": 25.43921397184021
+      },
+      "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 64 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20261114 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round0_c16.json"
+    },
+    {
+      "round": 0,
+      "tier": "c32",
+      "seed": 20261115,
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 128,
+      "max_concurrency": 32,
+      "completed": 128,
+      "raw_result_file": "raw_vllm/round0_c32.json",
+      "metrics": {
+        "duration_s": 25.76610177697148,
+        "output_throughput_tok_s": 635.8742250503427,
+        "total_throughput_tok_s": 3179.3711252517137,
+        "mean_ttft_ms": 1541.6117370104985,
+        "median_ttft_ms": 1246.1985950358212,
+        "p99_ttft_ms": 2203.4364149346948,
+        "mean_tpot_ms": 38.46745735367092,
+        "median_tpot_ms": 41.22915259822763,
+        "p99_tpot_ms": 48.80170969047774,
+        "mean_itl_ms": 38.46745735367093,
+        "median_itl_ms": 33.91888702753931,
+        "p99_itl_ms": 107.01352275791582
+      },
+      "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 128 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20261115 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round0_c32.json"
+    },
+    {
+      "round": 1,
+      "tier": "c1",
+      "seed": 20262112,
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 16,
+      "max_concurrency": 1,
+      "completed": 16,
+      "raw_result_file": "raw_vllm/round1_c1.json",
+      "metrics": {
+        "duration_s": 24.374085069051944,
+        "output_throughput_tok_s": 84.02366670166296,
+        "total_throughput_tok_s": 420.1183335083148,
+        "mean_ttft_ms": 132.40681729803327,
+        "median_ttft_ms": 131.0124205192551,
+        "p99_ttft_ms": 142.2645587765146,
+        "mean_tpot_ms": 10.947261688033189,
+        "median_tpot_ms": 10.946571515730076,
+        "p99_tpot_ms": 10.954029669831176,
+        "mean_itl_ms": 10.947261688033189,
+        "median_itl_ms": 10.952520940918475,
+        "p99_itl_ms": 11.517277563689277
+      },
+      "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 16 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20262112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round1_c1.json"
+    },
+    {
+      "round": 1,
+      "tier": "c8",
+      "seed": 20262113,
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 32,
+      "max_concurrency": 8,
+      "completed": 32,
+      "raw_result_file": "raw_vllm/round1_c8.json",
+      "metrics": {
+        "duration_s": 11.464805557974614,
+        "output_throughput_tok_s": 357.26728894681787,
+        "total_throughput_tok_s": 1786.3364447340894,
+        "mean_ttft_ms": 550.8083186578006,
+        "median_ttft_ms": 596.0895404568873,
+        "p99_ttft_ms": 650.0197658943944,
+        "mean_tpot_ms": 18.207583660171615,
+        "median_tpot_ms": 17.918230913484134,
+        "p99_tpot_ms": 21.511518907225433,
+        "mean_itl_ms": 18.207583660171615,
+        "median_itl_ms": 17.890688963234425,
+        "p99_itl_ms": 18.92810702091083
+      },
+      "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 32 --max-concurrency 8 --ignore-eos --temperature 0.0 --seed 20262113 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round1_c8.json"
+    },
+    {
+      "round": 1,
+      "tier": "c16",
+      "seed": 20262114,
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 64,
+      "max_concurrency": 16,
+      "completed": 64,
+      "raw_result_file": "raw_vllm/round1_c16.json",
+      "metrics": {
+        "duration_s": 15.963335931999609,
+        "output_throughput_tok_s": 513.1759448586539,
+        "total_throughput_tok_s": 2565.8797242932696,
+        "mean_ttft_ms": 1037.1258015275089,
+        "median_ttft_ms": 1082.3256174917333,
+        "p99_ttft_ms": 1143.5644197440706,
+        "mean_tpot_ms": 23.22765150331795,
+        "median_tpot_ms": 22.64823598418693,
+        "p99_tpot_ms": 30.545979852826644,
+        "mean_itl_ms": 23.227651503317947,
+        "median_itl_ms": 22.53137552179396,
+        "p99_itl_ms": 25.25139248697087
+      },
+      "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 64 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20262114 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round1_c16.json"
+    },
+    {
+      "round": 1,
+      "tier": "c32",
+      "seed": 20262115,
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 128,
+      "max_concurrency": 32,
+      "completed": 128,
+      "raw_result_file": "raw_vllm/round1_c32.json",
+      "metrics": {
+        "duration_s": 25.68614359793719,
+        "output_throughput_tok_s": 637.8536325443486,
+        "total_throughput_tok_s": 3189.268162721743,
+        "mean_ttft_ms": 1537.5911315859412,
+        "median_ttft_ms": 1227.7373799588531,
+        "p99_ttft_ms": 2187.153238611063,
+        "mean_tpot_ms": 38.3642962077163,
+        "median_tpot_ms": 41.16054159436946,
+        "p99_tpot_ms": 48.83071954114597,
+        "mean_itl_ms": 38.3642962077163,
+        "median_itl_ms": 33.92029501264915,
+        "p99_itl_ms": 107.67256738036008
+      },
+      "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 128 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20262115 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round1_c32.json"
+    },
+    {
+      "round": 2,
+      "tier": "c1",
+      "seed": 20263112,
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 16,
+      "max_concurrency": 1,
+      "completed": 16,
+      "raw_result_file": "raw_vllm/round2_c1.json",
+      "metrics": {
+        "duration_s": 24.385752155911177,
+        "output_throughput_tok_s": 83.98346653021153,
+        "total_throughput_tok_s": 419.9173326510576,
+        "mean_ttft_ms": 133.06488705711672,
+        "median_ttft_ms": 132.64261349104345,
+        "p99_ttft_ms": 141.04083359707147,
+        "mean_tpot_ms": 10.948926769678232,
+        "median_tpot_ms": 10.947941968356824,
+        "p99_tpot_ms": 10.958394884291346,
+        "mean_itl_ms": 10.948926769678232,
+        "median_itl_ms": 10.947479051537812,
+        "p99_itl_ms": 11.210172417340802
+      },
+      "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 16 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20263112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round2_c1.json"
+    },
+    {
+      "round": 2,
+      "tier": "c8",
+      "seed": 20263113,
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 32,
+      "max_concurrency": 8,
+      "completed": 32,
+      "raw_result_file": "raw_vllm/round2_c8.json",
+      "metrics": {
+        "duration_s": 11.382725697010756,
+        "output_throughput_tok_s": 359.84351279550384,
+        "total_throughput_tok_s": 1799.2175639775191,
+        "mean_ttft_ms": 549.2524618857715,
+        "median_ttft_ms": 595.5543824820779,
+        "p99_ttft_ms": 644.2173825914506,
+        "mean_tpot_ms": 18.05972307528012,
+        "median_tpot_ms": 17.691252487766608,
+        "p99_tpot_ms": 21.380121075790232,
+        "mean_itl_ms": 18.059723075280125,
+        "median_itl_ms": 17.625804990530014,
+        "p99_itl_ms": 18.63972335588187
+      },
+      "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 32 --max-concurrency 8 --ignore-eos --temperature 0.0 --seed 20263113 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round2_c8.json"
+    },
+    {
+      "round": 2,
+      "tier": "c16",
+      "seed": 20263114,
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 64,
+      "max_concurrency": 16,
+      "completed": 64,
+      "raw_result_file": "raw_vllm/round2_c16.json",
+      "metrics": {
+        "duration_s": 16.051369233988225,
+        "output_throughput_tok_s": 510.36144521887394,
+        "total_throughput_tok_s": 2551.8072260943695,
+        "mean_ttft_ms": 1036.23836548104,
+        "median_ttft_ms": 1080.5257380125113,
+        "p99_ttft_ms": 1145.0366230448708,
+        "mean_tpot_ms": 23.40543633124078,
+        "median_tpot_ms": 23.132910342854043,
+        "p99_tpot_ms": 30.63565471804495,
+        "mean_itl_ms": 23.40543633124078,
+        "median_itl_ms": 23.018365551251918,
+        "p99_itl_ms": 25.080584853421897
+      },
+      "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 64 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20263114 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round2_c16.json"
+    },
+    {
+      "round": 2,
+      "tier": "c32",
+      "seed": 20263115,
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 128,
+      "max_concurrency": 32,
+      "completed": 128,
+      "raw_result_file": "raw_vllm/round2_c32.json",
+      "metrics": {
+        "duration_s": 25.83370046201162,
+        "output_throughput_tok_s": 634.2103418011145,
+        "total_throughput_tok_s": 3171.051709005573,
+        "mean_ttft_ms": 1534.6142285688984,
+        "median_ttft_ms": 1211.462216975633,
+        "p99_ttft_ms": 2170.9378938004375,
+        "mean_tpot_ms": 38.65936088011834,
+        "median_tpot_ms": 40.52286202364829,
+        "p99_tpot_ms": 49.4296800089802,
+        "mean_itl_ms": 38.65936088011835,
+        "median_itl_ms": 34.29731447249651,
+        "p99_itl_ms": 108.71811064425859
+      },
+      "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 128 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20263115 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round2_c32.json"
+    }
+  ],
+  "tiers": [
+    {
+      "name": "c1",
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 16,
+      "max_concurrency": 1,
+      "rounds": [
+        {
+          "round": 0,
+          "tier": "c1",
+          "seed": 20261112,
+          "input_len": 512,
+          "output_len": 128,
+          "num_prompts": 16,
+          "max_concurrency": 1,
+          "completed": 16,
+          "raw_result_file": "raw_vllm/round0_c1.json",
+          "metrics": {
+            "duration_s": 24.406133617041633,
+            "output_throughput_tok_s": 83.9133322850441,
+            "total_throughput_tok_s": 419.56666142522056,
+            "mean_ttft_ms": 134.76279756287113,
+            "median_ttft_ms": 134.13357303943485,
+            "p99_ttft_ms": 141.64395763655193,
+            "mean_tpot_ms": 10.944545003468644,
+            "median_tpot_ms": 10.944315948703244,
+            "p99_tpot_ms": 10.948135399563958,
+            "mean_itl_ms": 10.944545003468644,
+            "median_itl_ms": 10.944781999569386,
+            "p99_itl_ms": 11.417674494441599
+          },
+          "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 16 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20261112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round0_c1.json"
+        },
+        {
+          "round": 1,
+          "tier": "c1",
+          "seed": 20262112,
+          "input_len": 512,
+          "output_len": 128,
+          "num_prompts": 16,
+          "max_concurrency": 1,
+          "completed": 16,
+          "raw_result_file": "raw_vllm/round1_c1.json",
+          "metrics": {
+            "duration_s": 24.374085069051944,
+            "output_throughput_tok_s": 84.02366670166296,
+            "total_throughput_tok_s": 420.1183335083148,
+            "mean_ttft_ms": 132.40681729803327,
+            "median_ttft_ms": 131.0124205192551,
+            "p99_ttft_ms": 142.2645587765146,
+            "mean_tpot_ms": 10.947261688033189,
+            "median_tpot_ms": 10.946571515730076,
+            "p99_tpot_ms": 10.954029669831176,
+            "mean_itl_ms": 10.947261688033189,
+            "median_itl_ms": 10.952520940918475,
+            "p99_itl_ms": 11.517277563689277
+          },
+          "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 16 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20262112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round1_c1.json"
+        },
+        {
+          "round": 2,
+          "tier": "c1",
+          "seed": 20263112,
+          "input_len": 512,
+          "output_len": 128,
+          "num_prompts": 16,
+          "max_concurrency": 1,
+          "completed": 16,
+          "raw_result_file": "raw_vllm/round2_c1.json",
+          "metrics": {
+            "duration_s": 24.385752155911177,
+            "output_throughput_tok_s": 83.98346653021153,
+            "total_throughput_tok_s": 419.9173326510576,
+            "mean_ttft_ms": 133.06488705711672,
+            "median_ttft_ms": 132.64261349104345,
+            "p99_ttft_ms": 141.04083359707147,
+            "mean_tpot_ms": 10.948926769678232,
+            "median_tpot_ms": 10.947941968356824,
+            "p99_tpot_ms": 10.958394884291346,
+            "mean_itl_ms": 10.948926769678232,
+            "median_itl_ms": 10.947479051537812,
+            "p99_itl_ms": 11.210172417340802
+          },
+          "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 16 --max-concurrency 1 --ignore-eos --temperature 0.0 --seed 20263112 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round2_c1.json"
+        }
+      ],
+      "aggregates": {
+        "duration_s": {
+          "mean": 24.38865694733492,
+          "std": 0.013244010393971153,
+          "min": 24.374085069051944,
+          "max": 24.406133617041633
+        },
+        "output_throughput_tok_s": {
+          "mean": 83.97348850563954,
+          "std": 0.04559306674941779,
+          "min": 83.9133322850441,
+          "max": 84.02366670166296
+        },
+        "total_throughput_tok_s": {
+          "mean": 419.86744252819767,
+          "std": 0.227965333747064,
+          "min": 419.56666142522056,
+          "max": 420.1183335083148
+        },
+        "mean_ttft_ms": {
+          "mean": 133.41150063934037,
+          "std": 0.9925611596984157,
+          "min": 132.40681729803327,
+          "max": 134.76279756287113
+        },
+        "median_ttft_ms": {
+          "mean": 132.59620234991112,
+          "std": 1.2746277258012766,
+          "min": 131.0124205192551,
+          "max": 134.13357303943485
+        },
+        "p99_ttft_ms": {
+          "mean": 141.64978333671266,
+          "std": 0.4996006957478181,
+          "min": 141.04083359707147,
+          "max": 142.2645587765146
+        },
+        "mean_tpot_ms": {
+          "mean": 10.946911153726688,
+          "std": 0.0018059391838963826,
+          "min": 10.944545003468644,
+          "max": 10.948926769678232
+        },
+        "median_tpot_ms": {
+          "mean": 10.946276477596713,
+          "std": 0.0014949448723707444,
+          "min": 10.944315948703244,
+          "max": 10.947941968356824
+        },
+        "p99_tpot_ms": {
+          "mean": 10.953519984562158,
+          "std": 0.004203894307501726,
+          "min": 10.948135399563958,
+          "max": 10.958394884291346
+        },
+        "mean_itl_ms": {
+          "mean": 10.946911153726688,
+          "std": 0.0018059391838963826,
+          "min": 10.944545003468644,
+          "max": 10.948926769678232
+        },
+        "median_itl_ms": {
+          "mean": 10.948260664008558,
+          "std": 0.0032073864585754476,
+          "min": 10.944781999569386,
+          "max": 10.952520940918475
+        },
+        "p99_itl_ms": {
+          "mean": 11.381708158490559,
+          "std": 0.1279285626687457,
+          "min": 11.210172417340802,
+          "max": 11.517277563689277
+        }
+      }
+    },
+    {
+      "name": "c8",
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 32,
+      "max_concurrency": 8,
+      "rounds": [
+        {
+          "round": 0,
+          "tier": "c8",
+          "seed": 20261113,
+          "input_len": 512,
+          "output_len": 128,
+          "num_prompts": 32,
+          "max_concurrency": 8,
+          "completed": 32,
+          "raw_result_file": "raw_vllm/round0_c8.json",
+          "metrics": {
+            "duration_s": 12.1407469289843,
+            "output_throughput_tok_s": 337.3762770906117,
+            "total_throughput_tok_s": 1686.8813854530586,
+            "mean_ttft_ms": 685.9705680290062,
+            "median_ttft_ms": 593.3368979603983,
+            "p99_ttft_ms": 1276.5194753161632,
+            "mean_tpot_ms": 18.47589150127633,
+            "median_tpot_ms": 17.901074216888087,
+            "p99_tpot_ms": 24.780607085929837,
+            "mean_itl_ms": 18.47589150127633,
+            "median_itl_ms": 17.907742992974818,
+            "p99_itl_ms": 19.440878370078277
+          },
+          "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 32 --max-concurrency 8 --ignore-eos --temperature 0.0 --seed 20261113 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round0_c8.json"
+        },
+        {
+          "round": 1,
+          "tier": "c8",
+          "seed": 20262113,
+          "input_len": 512,
+          "output_len": 128,
+          "num_prompts": 32,
+          "max_concurrency": 8,
+          "completed": 32,
+          "raw_result_file": "raw_vllm/round1_c8.json",
+          "metrics": {
+            "duration_s": 11.464805557974614,
+            "output_throughput_tok_s": 357.26728894681787,
+            "total_throughput_tok_s": 1786.3364447340894,
+            "mean_ttft_ms": 550.8083186578006,
+            "median_ttft_ms": 596.0895404568873,
+            "p99_ttft_ms": 650.0197658943944,
+            "mean_tpot_ms": 18.207583660171615,
+            "median_tpot_ms": 17.918230913484134,
+            "p99_tpot_ms": 21.511518907225433,
+            "mean_itl_ms": 18.207583660171615,
+            "median_itl_ms": 17.890688963234425,
+            "p99_itl_ms": 18.92810702091083
+          },
+          "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 32 --max-concurrency 8 --ignore-eos --temperature 0.0 --seed 20262113 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round1_c8.json"
+        },
+        {
+          "round": 2,
+          "tier": "c8",
+          "seed": 20263113,
+          "input_len": 512,
+          "output_len": 128,
+          "num_prompts": 32,
+          "max_concurrency": 8,
+          "completed": 32,
+          "raw_result_file": "raw_vllm/round2_c8.json",
+          "metrics": {
+            "duration_s": 11.382725697010756,
+            "output_throughput_tok_s": 359.84351279550384,
+            "total_throughput_tok_s": 1799.2175639775191,
+            "mean_ttft_ms": 549.2524618857715,
+            "median_ttft_ms": 595.5543824820779,
+            "p99_ttft_ms": 644.2173825914506,
+            "mean_tpot_ms": 18.05972307528012,
+            "median_tpot_ms": 17.691252487766608,
+            "p99_tpot_ms": 21.380121075790232,
+            "mean_itl_ms": 18.059723075280125,
+            "median_itl_ms": 17.625804990530014,
+            "p99_itl_ms": 18.63972335588187
+          },
+          "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 32 --max-concurrency 8 --ignore-eos --temperature 0.0 --seed 20263113 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round2_c8.json"
+        }
+      ],
+      "aggregates": {
+        "duration_s": {
+          "mean": 11.662759394656556,
+          "std": 0.33964524445711297,
+          "min": 11.382725697010756,
+          "max": 12.1407469289843
+        },
+        "output_throughput_tok_s": {
+          "mean": 351.4956929443112,
+          "std": 10.039178597438754,
+          "min": 337.3762770906117,
+          "max": 359.84351279550384
+        },
+        "total_throughput_tok_s": {
+          "mean": 1757.4784647215556,
+          "std": 50.19589298719378,
+          "min": 1686.8813854530586,
+          "max": 1799.2175639775191
+        },
+        "mean_ttft_ms": {
+          "mean": 595.3437828575261,
+          "std": 64.08596214180855,
+          "min": 549.2524618857715,
+          "max": 685.9705680290062
+        },
+        "median_ttft_ms": {
+          "mean": 594.9936069664545,
+          "std": 1.1916688753064733,
+          "min": 593.3368979603983,
+          "max": 596.0895404568873
+        },
+        "p99_ttft_ms": {
+          "mean": 856.9188746006694,
+          "std": 296.7118860708718,
+          "min": 644.2173825914506,
+          "max": 1276.5194753161632
+        },
+        "mean_tpot_ms": {
+          "mean": 18.24773274557602,
+          "std": 0.17225562689047944,
+          "min": 18.05972307528012,
+          "max": 18.47589150127633
+        },
+        "median_tpot_ms": {
+          "mean": 17.83685253937961,
+          "std": 0.10319276244583497,
+          "min": 17.691252487766608,
+          "max": 17.918230913484134
+        },
+        "p99_tpot_ms": {
+          "mean": 22.557415689648497,
+          "std": 1.5729486823375152,
+          "min": 21.380121075790232,
+          "max": 24.780607085929837
+        },
+        "mean_itl_ms": {
+          "mean": 18.247732745576023,
+          "std": 0.17225562689047816,
+          "min": 18.059723075280125,
+          "max": 18.47589150127633
+        },
+        "median_itl_ms": {
+          "mean": 17.808078982246418,
+          "std": 0.12907508415587818,
+          "min": 17.625804990530014,
+          "max": 17.907742992974818
+        },
+        "p99_itl_ms": {
+          "mean": 19.00290291562366,
+          "std": 0.3313187373637163,
+          "min": 18.63972335588187,
+          "max": 19.440878370078277
+        }
+      }
+    },
+    {
+      "name": "c16",
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 64,
+      "max_concurrency": 16,
+      "rounds": [
+        {
+          "round": 0,
+          "tier": "c16",
+          "seed": 20261114,
+          "input_len": 512,
+          "output_len": 128,
+          "num_prompts": 64,
+          "max_concurrency": 16,
+          "completed": 64,
+          "raw_result_file": "raw_vllm/round0_c16.json",
+          "metrics": {
+            "duration_s": 16.232931363978423,
+            "output_throughput_tok_s": 504.653153291734,
+            "total_throughput_tok_s": 2523.26576645867,
+            "mean_ttft_ms": 1035.36857411018,
+            "median_ttft_ms": 1080.893061007373,
+            "p99_ttft_ms": 1138.2781412138138,
+            "mean_tpot_ms": 23.77910624317173,
+            "median_tpot_ms": 23.493774751784265,
+            "p99_tpot_ms": 30.88220549421935,
+            "mean_itl_ms": 23.77910624317173,
+            "median_itl_ms": 23.479240480810404,
+            "p99_itl_ms": 25.43921397184021
+          },
+          "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 64 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20261114 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round0_c16.json"
+        },
+        {
+          "round": 1,
+          "tier": "c16",
+          "seed": 20262114,
+          "input_len": 512,
+          "output_len": 128,
+          "num_prompts": 64,
+          "max_concurrency": 16,
+          "completed": 64,
+          "raw_result_file": "raw_vllm/round1_c16.json",
+          "metrics": {
+            "duration_s": 15.963335931999609,
+            "output_throughput_tok_s": 513.1759448586539,
+            "total_throughput_tok_s": 2565.8797242932696,
+            "mean_ttft_ms": 1037.1258015275089,
+            "median_ttft_ms": 1082.3256174917333,
+            "p99_ttft_ms": 1143.5644197440706,
+            "mean_tpot_ms": 23.22765150331795,
+            "median_tpot_ms": 22.64823598418693,
+            "p99_tpot_ms": 30.545979852826644,
+            "mean_itl_ms": 23.227651503317947,
+            "median_itl_ms": 22.53137552179396,
+            "p99_itl_ms": 25.25139248697087
+          },
+          "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 64 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20262114 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round1_c16.json"
+        },
+        {
+          "round": 2,
+          "tier": "c16",
+          "seed": 20263114,
+          "input_len": 512,
+          "output_len": 128,
+          "num_prompts": 64,
+          "max_concurrency": 16,
+          "completed": 64,
+          "raw_result_file": "raw_vllm/round2_c16.json",
+          "metrics": {
+            "duration_s": 16.051369233988225,
+            "output_throughput_tok_s": 510.36144521887394,
+            "total_throughput_tok_s": 2551.8072260943695,
+            "mean_ttft_ms": 1036.23836548104,
+            "median_ttft_ms": 1080.5257380125113,
+            "p99_ttft_ms": 1145.0366230448708,
+            "mean_tpot_ms": 23.40543633124078,
+            "median_tpot_ms": 23.132910342854043,
+            "p99_tpot_ms": 30.63565471804495,
+            "mean_itl_ms": 23.40543633124078,
+            "median_itl_ms": 23.018365551251918,
+            "p99_itl_ms": 25.080584853421897
+          },
+          "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 64 --max-concurrency 16 --ignore-eos --temperature 0.0 --seed 20263114 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round2_c16.json"
+        }
+      ],
+      "aggregates": {
+        "duration_s": {
+          "mean": 16.08254550998875,
+          "std": 0.11224792314309325,
+          "min": 15.963335931999609,
+          "max": 16.232931363978423
+        },
+        "output_throughput_tok_s": {
+          "mean": 509.39684778975396,
+          "std": 3.545638651779489,
+          "min": 504.653153291734,
+          "max": 513.1759448586539
+        },
+        "total_throughput_tok_s": {
+          "mean": 2546.98423894877,
+          "std": 17.728193258897445,
+          "min": 2523.26576645867,
+          "max": 2565.8797242932696
+        },
+        "mean_ttft_ms": {
+          "mean": 1036.2442470395763,
+          "std": 0.7173971441264956,
+          "min": 1035.36857411018,
+          "max": 1037.1258015275089
+        },
+        "median_ttft_ms": {
+          "mean": 1081.248138837206,
+          "std": 0.7765100273489538,
+          "min": 1080.5257380125113,
+          "max": 1082.3256174917333
+        },
+        "p99_ttft_ms": {
+          "mean": 1142.2930613342517,
+          "std": 2.9018997593352283,
+          "min": 1138.2781412138138,
+          "max": 1145.0366230448708
+        },
+        "mean_tpot_ms": {
+          "mean": 23.470731359243487,
+          "std": 0.2298161048000556,
+          "min": 23.22765150331795,
+          "max": 23.77910624317173
+        },
+        "median_tpot_ms": {
+          "mean": 23.09164035960841,
+          "std": 0.3464210930022656,
+          "min": 22.64823598418693,
+          "max": 23.493774751784265
+        },
+        "p99_tpot_ms": {
+          "mean": 30.68794668836365,
+          "std": 0.14215662278473604,
+          "min": 30.545979852826644,
+          "max": 30.88220549421935
+        },
+        "mean_itl_ms": {
+          "mean": 23.470731359243484,
+          "std": 0.22981610480005688,
+          "min": 23.227651503317947,
+          "max": 23.77910624317173
+        },
+        "median_itl_ms": {
+          "mean": 23.009660517952096,
+          "std": 0.3870132024762409,
+          "min": 22.53137552179396,
+          "max": 23.479240480810404
+        },
+        "p99_itl_ms": {
+          "mean": 25.257063770744328,
+          "std": 0.14646463450062736,
+          "min": 25.080584853421897,
+          "max": 25.43921397184021
+        }
+      }
+    },
+    {
+      "name": "c32",
+      "input_len": 512,
+      "output_len": 128,
+      "num_prompts": 128,
+      "max_concurrency": 32,
+      "rounds": [
+        {
+          "round": 0,
+          "tier": "c32",
+          "seed": 20261115,
+          "input_len": 512,
+          "output_len": 128,
+          "num_prompts": 128,
+          "max_concurrency": 32,
+          "completed": 128,
+          "raw_result_file": "raw_vllm/round0_c32.json",
+          "metrics": {
+            "duration_s": 25.76610177697148,
+            "output_throughput_tok_s": 635.8742250503427,
+            "total_throughput_tok_s": 3179.3711252517137,
+            "mean_ttft_ms": 1541.6117370104985,
+            "median_ttft_ms": 1246.1985950358212,
+            "p99_ttft_ms": 2203.4364149346948,
+            "mean_tpot_ms": 38.46745735367092,
+            "median_tpot_ms": 41.22915259822763,
+            "p99_tpot_ms": 48.80170969047774,
+            "mean_itl_ms": 38.46745735367093,
+            "median_itl_ms": 33.91888702753931,
+            "p99_itl_ms": 107.01352275791582
+          },
+          "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 128 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20261115 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round0_c32.json"
+        },
+        {
+          "round": 1,
+          "tier": "c32",
+          "seed": 20262115,
+          "input_len": 512,
+          "output_len": 128,
+          "num_prompts": 128,
+          "max_concurrency": 32,
+          "completed": 128,
+          "raw_result_file": "raw_vllm/round1_c32.json",
+          "metrics": {
+            "duration_s": 25.68614359793719,
+            "output_throughput_tok_s": 637.8536325443486,
+            "total_throughput_tok_s": 3189.268162721743,
+            "mean_ttft_ms": 1537.5911315859412,
+            "median_ttft_ms": 1227.7373799588531,
+            "p99_ttft_ms": 2187.153238611063,
+            "mean_tpot_ms": 38.3642962077163,
+            "median_tpot_ms": 41.16054159436946,
+            "p99_tpot_ms": 48.83071954114597,
+            "mean_itl_ms": 38.3642962077163,
+            "median_itl_ms": 33.92029501264915,
+            "p99_itl_ms": 107.67256738036008
+          },
+          "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 128 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20262115 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round1_c32.json"
+        },
+        {
+          "round": 2,
+          "tier": "c32",
+          "seed": 20263115,
+          "input_len": 512,
+          "output_len": 128,
+          "num_prompts": 128,
+          "max_concurrency": 32,
+          "completed": 128,
+          "raw_result_file": "raw_vllm/round2_c32.json",
+          "metrics": {
+            "duration_s": 25.83370046201162,
+            "output_throughput_tok_s": 634.2103418011145,
+            "total_throughput_tok_s": 3171.051709005573,
+            "mean_ttft_ms": 1534.6142285688984,
+            "median_ttft_ms": 1211.462216975633,
+            "p99_ttft_ms": 2170.9378938004375,
+            "mean_tpot_ms": 38.65936088011834,
+            "median_tpot_ms": 40.52286202364829,
+            "p99_tpot_ms": 49.4296800089802,
+            "mean_itl_ms": 38.65936088011835,
+            "median_itl_ms": 34.29731447249651,
+            "p99_itl_ms": 108.71811064425859
+          },
+          "vllm_bench_command": "vllm bench serve --backend openai --endpoint /v1/completions --base-url http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash --tokenizer /models/DeepSeek-V4.1-Flash --dataset-name random --random-input-len 512 --random-output-len 128 --random-range-ratio 0.0 --num-prompts 128 --max-concurrency 32 --ignore-eos --temperature 0.0 --seed 20263115 --percentile-metrics ttft,tpot,itl --metric-percentiles 99 --save-result --result-dir raw_vllm --result-filename round2_c32.json"
+        }
+      ],
+      "aggregates": {
+        "duration_s": {
+          "mean": 25.7619819456401,
+          "std": 0.06031023567919101,
+          "min": 25.68614359793719,
+          "max": 25.83370046201162
+        },
+        "output_throughput_tok_s": {
+          "mean": 635.979399798602,
+          "std": 1.4892253368082045,
+          "min": 634.2103418011145,
+          "max": 637.8536325443486
+        },
+        "total_throughput_tok_s": {
+          "mean": 3179.8969989930097,
+          "std": 7.446126684041025,
+          "min": 3171.051709005573,
+          "max": 3189.268162721743
+        },
+        "mean_ttft_ms": {
+          "mean": 1537.939032388446,
+          "std": 2.8672934187550125,
+          "min": 1534.6142285688984,
+          "max": 1541.6117370104985
+        },
+        "median_ttft_ms": {
+          "mean": 1228.4660639901024,
+          "std": 14.190424600133909,
+          "min": 1211.462216975633,
+          "max": 1246.1985950358212
+        },
+        "p99_ttft_ms": {
+          "mean": 2187.1758491153983,
+          "std": 13.267475328904192,
+          "min": 2170.9378938004375,
+          "max": 2203.4364149346948
+        },
+        "mean_tpot_ms": {
+          "mean": 38.497038147168524,
+          "std": 0.12226217112661822,
+          "min": 38.3642962077163,
+          "max": 38.65936088011834
+        },
+        "median_tpot_ms": {
+          "mean": 40.97085207208179,
+          "std": 0.3180127671275661,
+          "min": 40.52286202364829,
+          "max": 41.22915259822763
+        },
+        "p99_tpot_ms": {
+          "mean": 49.02070308020131,
+          "std": 0.2894327660142757,
+          "min": 48.80170969047774,
+          "max": 49.4296800089802
+        },
+        "mean_itl_ms": {
+          "mean": 38.497038147168524,
+          "std": 0.12226217112662079,
+          "min": 38.3642962077163,
+          "max": 38.65936088011835
+        },
+        "median_itl_ms": {
+          "mean": 34.04549883756166,
+          "std": 0.17806147085346596,
+          "min": 33.91888702753931,
+          "max": 34.29731447249651
+        },
+        "p99_itl_ms": {
+          "mean": 107.80140026084483,
+          "std": 0.701832553100392,
+          "min": 107.01352275791582,
+          "max": 108.71811064425859
+        }
+      }
+    }
+  ]
+}

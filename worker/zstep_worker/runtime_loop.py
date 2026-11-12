@@ -34,16 +34,28 @@ import struct
 import traceback
 from unittest.mock import patch
 
-from zstep_worker.kernels_sm120.moe_router import (
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+from zstep_worker.kernels_sm120.moe_router import (  # noqa: E402
     dsv41_sqrt_softplus_topk,
     dsv41_sqrt_softplus_topk_kernel,
 )
-from zstep_worker.kernels_sm120.norm_quant import (
+from zstep_worker.kernels_sm120.norm_quant import (  # noqa: E402
     rmsnorm_quantize_mxfp8_group32,
     rmsnorm_quantize_mxfp8_group32_kernel,
 )
-from zstep_worker.numa_pin import DeviceNumaTopology, pin_process_to_device_numa
-from zstep_worker.shm_bridge import SeqResult, ShmBridge, StepHeader, StepPlanView
+from zstep_worker.numa_pin import (  # noqa: E402
+    DeviceNumaTopology,
+    pin_process_to_device_numa,
+)
+from zstep_worker.shm_bridge import (  # noqa: E402
+    SeqResult,
+    ShmBridge,
+    StepHeader,
+    StepPlanView,
+)
 
 OPCODE_NORMAL_STEP = 1
 OPCODE_SHUTDOWN = 99
@@ -280,16 +292,41 @@ class MicroStep:
             self.exchange_group = None
 
 
+def _probe_model_type(model_dir: str) -> str:
+    if not model_dir:
+        return ""
+    import json
+
+    cfg_path = Path(model_dir) / "config.json"
+    if not cfg_path.is_file():
+        return ""
+    return str(json.loads(cfg_path.read_text(encoding="utf-8")).get("model_type", ""))
+
+
 class RuntimeLoop:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         # Pin host CPU affinity to this rank's PCIe NUMA domain BEFORE touching SHM or CUDA.
         self.numa_topology: DeviceNumaTopology = pin_process_to_device_numa(args.rank)
         self.bridge = ShmBridge(name=args.shm_name)
-        if args.model_dir:
+        self.model_type = _probe_model_type(args.model_dir)
+        if args.model_dir and self.model_type == "deepseek_v41":
+            from zstep_worker.models.deepseek_v41 import DeepSeekV41StepRunner
+
+            self.runner: object = DeepSeekV41StepRunner(
+                model_dir=Path(args.model_dir),
+                rank=args.rank,
+                bridge=self.bridge,
+                dist_init_file=args.dist_init_file,
+                allreduce_name=args.allreduce_name,
+                allreduce_blocks=args.allreduce_blocks,
+                allreduce_threads=args.allreduce_threads,
+                num_kv_pages=args.num_kv_pages,
+            )
+        elif args.model_dir:
             from zstep_worker.models.qwen35_moe import Qwen35MoeStepRunner
 
-            self.runner: MicroStep | Qwen35MoeStepRunner = Qwen35MoeStepRunner(
+            self.runner = Qwen35MoeStepRunner(
                 model_dir=Path(args.model_dir),
                 rank=args.rank,
                 bridge=self.bridge,
@@ -329,7 +366,11 @@ class RuntimeLoop:
             ("norm_mxfp8", rmsnorm_quantize_mxfp8_group32_kernel),
             ("router_dsv41", dsv41_sqrt_softplus_topk_kernel),
         ]
-        if self.args.model_dir:
+        if self.args.model_dir and self.model_type == "deepseek_v41":
+            extra_watched = getattr(self.runner, "watched_triton_kernels", None)
+            if callable(extra_watched):
+                watched_kernels.extend(extra_watched())
+        elif self.args.model_dir:
             from zstep_worker.kernels_sm120 import qwen35_ops
 
             watched_kernels.extend(
@@ -378,11 +419,12 @@ class RuntimeLoop:
                     self.current_step = header.step_id
                     self._write_state(status=WORKER_STATUS_RUNNING, error_code=0)
                     if header.opcode == OPCODE_SHUTDOWN:
+                        recompiled_count = sum(spy.call_count for _, spy in spies)
                         if self.args.rank == 0:
                             self.bridge.result(header.step_id).write(
                                 step_id=header.step_id,
-                                gpu_exec_us=0,
-                                status_code=0,
+                                gpu_exec_us=len(spies),
+                                status_code=recompiled_count,
                                 outputs=[],
                             )
                         self.last_step = header.step_id

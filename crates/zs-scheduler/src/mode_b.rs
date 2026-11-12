@@ -400,6 +400,17 @@ impl ModeBCoordinator {
         self.workers.wait()
     }
 
+    pub(crate) fn shutdown_and_wait_with_stats(mut self, step_id: u64) -> Result<(u32, u32)> {
+        self.shutdown(step_id)?;
+        let (recompilations, watched) = {
+            let result = self.arena.result_slot(&self.layout, slot(step_id))?;
+            let header = result.header()?;
+            (header.status_code, header.gpu_exec_us)
+        };
+        self.workers.wait()?;
+        Ok((recompilations, watched))
+    }
+
     fn prepare_step(&mut self, step_id: u64, opcode: StepOpcode) -> Result<()> {
         let token_count = if opcode == StepOpcode::Shutdown {
             0
@@ -559,7 +570,11 @@ fn spawn_workers(
         command
             .env("PYTHONPATH", &config.launch.worker_root)
             .env("PYTHONUNBUFFERED", "1")
+            .env("OMP_NUM_THREADS", "1")
+            .env("MKL_NUM_THREADS", "1")
+            .env("OPENBLAS_NUM_THREADS", "1")
             .env("NCCL_P2P_DISABLE", "1")
+            .env("NCCL_P2P_LEVEL", "LOC")
             .env("NCCL_IB_DISABLE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())

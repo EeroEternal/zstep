@@ -185,6 +185,7 @@ Usage: zstep --mode-b [OPTIONS]\n\
   --warmup-prompts N         Warm up 512->64 prompts at concurrency 16 (default: 16)\n\
   --repeats N                Interleaved repeat count across all tiers (default: 3)\n\
   --max-prefill-chunk N      Maximum prompt tokens per sequence per prefill step (default: 2048)\n\
+  --max-mixed-step-tokens N  Piggyback decode+prefill token cap (default: 3072 on deepseek_v41, 0=off)\n\
   --max-seqs N               Sequence capacity (default: 8 synthetic, 128 with --model-dir)\n\
   --max-step-tokens N        Token capacity (default: 192 synthetic, 4096 with --model-dir)\n\
   --max-decoder-rows N       Decoder row capacity (default: 192 synthetic, 4096 with --model-dir)\n\
@@ -207,7 +208,7 @@ struct Arguments {
     shm_name: Option<String>,
     metrics_output: Option<PathBuf>,
     model_dir: Option<PathBuf>,
-    num_kv_pages: u32,
+    num_kv_pages: Option<u32>,
     page_block_tokens: Option<u32>,
     prompt_ids: Option<Vec<i32>>,
     max_new_tokens: usize,
@@ -217,6 +218,7 @@ struct Arguments {
     warmup_prompts: usize,
     repeats: usize,
     max_prefill_chunk: usize,
+    max_mixed_step_tokens: Option<usize>,
     max_seqs: Option<u32>,
     max_step_tokens: Option<u32>,
     max_decoder_rows: Option<u32>,
@@ -242,7 +244,7 @@ impl Default for Arguments {
             shm_name: None,
             metrics_output: None,
             model_dir: None,
-            num_kv_pages: 49_152,
+            num_kv_pages: None,
             page_block_tokens: None,
             prompt_ids: None,
             max_new_tokens: 16,
@@ -252,6 +254,7 @@ impl Default for Arguments {
             warmup_prompts: 16,
             repeats: 3,
             max_prefill_chunk: 2048,
+            max_mixed_step_tokens: None,
             max_seqs: None,
             max_step_tokens: None,
             max_decoder_rows: None,
@@ -549,8 +552,26 @@ fn run_greedy_verification(
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct ModelConfigProbe {
+    #[serde(default)]
+    model_type: String,
+}
+
+fn is_deepseek_v41_model_dir(model_dir: Option<&PathBuf>) -> bool {
+    let Some(dir) = model_dir else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(dir.join("config.json")) else {
+        return false;
+    };
+    serde_json::from_slice::<ModelConfigProbe>(&bytes)
+        .is_ok_and(|probe| probe.model_type == "deepseek_v41")
+}
+
 fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let has_model = args.model_dir.is_some();
+    let is_dsv41 = is_deepseek_v41_model_dir(args.model_dir.as_ref());
     let max_seqs = args.max_seqs.unwrap_or(if has_model { 128 } else { 8 });
     let max_step_tokens = args
         .max_step_tokens
@@ -561,9 +582,16 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let max_pages_per_seq = args
         .max_pages_per_seq
         .unwrap_or(if has_model { 256 } else { 16 });
-    let page_block_tokens = args
-        .page_block_tokens
-        .unwrap_or(if has_model { 16 } else { 64 });
+    let page_block_tokens = args.page_block_tokens.unwrap_or(if is_dsv41 {
+        128
+    } else if has_model {
+        16
+    } else {
+        64
+    });
+    let num_kv_pages = args
+        .num_kv_pages
+        .unwrap_or(if is_dsv41 { 2_560 } else { 49_152 });
 
     let shm_name = args.shm_name.unwrap_or_else(unique_shm_name);
     let config = ModeBConfig {
@@ -590,7 +618,7 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             allreduce_blocks: args.allreduce_blocks,
             allreduce_threads: args.allreduce_threads,
             model_dir: args.model_dir.clone(),
-            num_kv_pages: args.num_kv_pages,
+            num_kv_pages,
         },
         ready_timeout: Duration::from_secs(args.ready_timeout_secs),
         step_timeout: Duration::from_secs(args.step_timeout_secs),
@@ -605,7 +633,14 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
                 || "Qwen3.5-35B-A3B".to_owned(),
                 |n| n.to_string_lossy().into_owned(),
             );
+        let mixed_step_tokens = match args.max_mixed_step_tokens {
+            Some(0) => None,
+            Some(explicit) => Some(explicit),
+            None if is_dsv41 => Some(3072),
+            None => None,
+        };
         let mut engine = ModeBServingEngine::launch(config)?;
+        engine.set_max_mixed_step_tokens(mixed_step_tokens);
 
         if let Some(reference_path) = args.verify_greedy_json {
             let output_path = args
@@ -613,12 +648,15 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("--verify-output-json is required with --verify-greedy-json")?;
             let reference_bytes = std::fs::read(reference_path)?;
             let reference: GreedyReference = serde_json::from_slice(&reference_bytes)?;
-            let report = run_greedy_verification(&mut engine, &reference, args.max_prefill_chunk)?;
+            let mut report =
+                run_greedy_verification(&mut engine, &reference, args.max_prefill_chunk)?;
+            let (recompilations, watched) = engine.shutdown_with_stats()?;
+            report.triton_recompilations = Some(recompilations);
+            report.watched_kernels = Some(watched);
             let mut encoded = serde_json::to_string_pretty(&report)?;
             encoded.push('\n');
             std::fs::write(&output_path, encoded)?;
             println!("VERIFY_GREEDY_REPORT={}", output_path.display());
-            engine.shutdown()?;
             return Ok(());
         }
 
@@ -645,8 +683,10 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
                     input_len: 512,
                     output_len: 64,
                 };
-                let warmup_result =
-                    engine.run_benchmark_tier_with_seed(&warmup, BENCHMARK_RANDOM_SEED ^ 0xFFFF)?;
+                let warmup_result = engine.run_benchmark_tier_with_seed(
+                    &warmup,
+                    BENCHMARK_RANDOM_SEED.wrapping_add(900_000),
+                )?;
                 eprintln!(
                     "[warmup] prompts={} -> out_tok/s={:.2}, median_ttft={:.2}ms",
                     warmup_result.num_prompts,
@@ -743,7 +783,7 @@ fn parse_arguments(raw: &[String]) -> Result<Arguments, String> {
             "--shm-name" => args.shm_name = Some(value.clone()),
             "--metrics-output" => args.metrics_output = Some(PathBuf::from(value)),
             "--model-dir" => args.model_dir = Some(PathBuf::from(value)),
-            "--num-kv-pages" => args.num_kv_pages = parse_number(option, value)?,
+            "--num-kv-pages" => args.num_kv_pages = Some(parse_number(option, value)?),
             "--page-block-tokens" => args.page_block_tokens = Some(parse_number(option, value)?),
             "--prompt-ids" => args.prompt_ids = Some(parse_i32_list(option, value)?),
             "--max-new-tokens" => args.max_new_tokens = parse_number(option, value)?,
@@ -753,6 +793,9 @@ fn parse_arguments(raw: &[String]) -> Result<Arguments, String> {
             "--warmup-prompts" => args.warmup_prompts = parse_number(option, value)?,
             "--repeats" => args.repeats = parse_number(option, value)?,
             "--max-prefill-chunk" => args.max_prefill_chunk = parse_number(option, value)?,
+            "--max-mixed-step-tokens" => {
+                args.max_mixed_step_tokens = Some(parse_number(option, value)?);
+            }
             "--max-seqs" => args.max_seqs = Some(parse_number(option, value)?),
             "--max-step-tokens" => args.max_step_tokens = Some(parse_number(option, value)?),
             "--max-decoder-rows" => args.max_decoder_rows = Some(parse_number(option, value)?),

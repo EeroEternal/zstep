@@ -600,6 +600,25 @@ impl ActiveSequence {
         }
         Ok(())
     }
+
+    /// Chronological 3-token accepted history immediately preceding `start_pos`,
+    /// padded with `-1` (`DEAD_ID`) before sequence start (`pos < 0`).
+    fn lookback_window(&self, start_pos: usize) -> [i32; 3] {
+        let prompt_len = self.prompt_tokens.len();
+        [3usize, 2, 1].map(|back| {
+            let Some(idx) = start_pos.checked_sub(back) else {
+                return -1;
+            };
+            if idx < prompt_len {
+                self.prompt_tokens[idx]
+            } else {
+                self.generated_tokens
+                    .get(idx - prompt_len)
+                    .copied()
+                    .unwrap_or(-1)
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -620,7 +639,13 @@ pub struct ModeBServingEngine {
     step_cursor: u64,
     init_wall_us: u64,
     worker_numa_nodes: Vec<i32>,
+    max_mixed_step_tokens: Option<usize>,
     last_generation_schedule: GenerationScheduleStats,
+}
+
+enum MixedStepOutcome {
+    MixedOrPrefill { had_decodes: bool, had_chunk: bool },
+    PureDecodeFallback,
 }
 
 impl ModeBServingEngine {
@@ -641,6 +666,7 @@ impl ModeBServingEngine {
             step_cursor: 0,
             init_wall_us,
             worker_numa_nodes,
+            max_mixed_step_tokens: None,
             last_generation_schedule: GenerationScheduleStats::default(),
         })
     }
@@ -665,6 +691,10 @@ impl ModeBServingEngine {
         }
         self.coordinator.config_mut().max_prefill_chunk = max_prefill_chunk;
         Ok(())
+    }
+
+    pub fn set_max_mixed_step_tokens(&mut self, max_mixed_step_tokens: Option<usize>) {
+        self.max_mixed_step_tokens = max_mixed_step_tokens.filter(|&cap| cap > 0);
     }
 
     /// Generate exact greedy completions for `prompts` (`target_output_len` new tokens each).
@@ -903,55 +933,109 @@ impl ModeBServingEngine {
                     .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
                     .count();
                 let has_partial_prefill = decode_active_count != active.len();
-                let run_prefill = should_schedule_prefill(
-                    decode_active_count,
-                    active.len(),
-                    has_partial_prefill,
-                    max_seqs,
-                    max_step_tokens,
-                    max_prefill_chunk,
-                    waiting_permitted,
-                    consecutive_prefills,
-                );
-                if run_prefill {
-                    let continued_chunk = active.iter().any(|seq| {
-                        seq.prefilled_tokens > 0 && seq.prefilled_tokens < seq.prompt_tokens.len()
-                    });
-                    self.stage_prefill_step(
-                        sid,
-                        &mut active,
-                        &mut slot_to_active,
-                        waiting_permitted,
-                        page_block_tokens,
-                        max_pages_per_seq,
-                    )?;
-                    self.last_generation_schedule.prefill_steps += 1;
-                    if continued_chunk
-                        || active
-                            .iter()
-                            .any(|seq| seq.prefilled_tokens < seq.prompt_tokens.len())
-                    {
-                        self.last_generation_schedule.chunked_prefill_steps += 1;
+                if let Some(mixed_cap) = self.max_mixed_step_tokens {
+                    let can_attempt_mixed = has_partial_prefill
+                        || (active.len() < max_seqs && !waiting_permitted.is_empty());
+                    if can_attempt_mixed {
+                        match self.stage_mixed_step(
+                            sid,
+                            mixed_cap,
+                            &mut active,
+                            &mut slot_to_active,
+                            waiting_permitted,
+                            page_block_tokens,
+                            max_pages_per_seq,
+                        )? {
+                            MixedStepOutcome::MixedOrPrefill {
+                                had_decodes,
+                                had_chunk,
+                            } => {
+                                self.last_generation_schedule.prefill_steps += 1;
+                                if had_chunk {
+                                    self.last_generation_schedule.chunked_prefill_steps += 1;
+                                }
+                                if had_decodes && (has_partial_prefill || had_chunk) {
+                                    self.last_generation_schedule
+                                        .decode_steps_with_partial_prefill += 1;
+                                }
+                                self.last_generation_schedule.max_active_sequences = self
+                                    .last_generation_schedule
+                                    .max_active_sequences
+                                    .max(active.len());
+                                consecutive_prefills += 1;
+                            }
+                            MixedStepOutcome::PureDecodeFallback => {
+                                self.last_generation_schedule.decode_steps += 1;
+                                if has_partial_prefill {
+                                    self.last_generation_schedule
+                                        .decode_steps_with_partial_prefill += 1;
+                                }
+                                consecutive_prefills = 0;
+                            }
+                        }
+                    } else {
+                        self.stage_decode_step(
+                            sid,
+                            &mut active,
+                            page_block_tokens,
+                            max_pages_per_seq,
+                            true,
+                        )?;
+                        self.last_generation_schedule.decode_steps += 1;
+                        consecutive_prefills = 0;
                     }
-                    self.last_generation_schedule.max_active_sequences = self
-                        .last_generation_schedule
-                        .max_active_sequences
-                        .max(active.len());
-                    consecutive_prefills += 1;
                 } else {
-                    self.stage_decode_step(
-                        sid,
-                        &mut active,
-                        page_block_tokens,
-                        max_pages_per_seq,
-                        true,
-                    )?;
-                    self.last_generation_schedule.decode_steps += 1;
-                    if has_partial_prefill {
-                        self.last_generation_schedule
-                            .decode_steps_with_partial_prefill += 1;
+                    let run_prefill = should_schedule_prefill(
+                        decode_active_count,
+                        active.len(),
+                        has_partial_prefill,
+                        max_seqs,
+                        max_step_tokens,
+                        max_prefill_chunk,
+                        waiting_permitted,
+                        consecutive_prefills,
+                    );
+                    if run_prefill {
+                        let continued_chunk = active.iter().any(|seq| {
+                            seq.prefilled_tokens > 0
+                                && seq.prefilled_tokens < seq.prompt_tokens.len()
+                        });
+                        self.stage_prefill_step(
+                            sid,
+                            &mut active,
+                            &mut slot_to_active,
+                            waiting_permitted,
+                            page_block_tokens,
+                            max_pages_per_seq,
+                        )?;
+                        self.last_generation_schedule.prefill_steps += 1;
+                        if continued_chunk
+                            || active
+                                .iter()
+                                .any(|seq| seq.prefilled_tokens < seq.prompt_tokens.len())
+                        {
+                            self.last_generation_schedule.chunked_prefill_steps += 1;
+                        }
+                        self.last_generation_schedule.max_active_sequences = self
+                            .last_generation_schedule
+                            .max_active_sequences
+                            .max(active.len());
+                        consecutive_prefills += 1;
+                    } else {
+                        self.stage_decode_step(
+                            sid,
+                            &mut active,
+                            page_block_tokens,
+                            max_pages_per_seq,
+                            true,
+                        )?;
+                        self.last_generation_schedule.decode_steps += 1;
+                        if has_partial_prefill {
+                            self.last_generation_schedule
+                                .decode_steps_with_partial_prefill += 1;
+                        }
+                        consecutive_prefills = 0;
                     }
-                    consecutive_prefills = 0;
                 }
                 sid
             };
@@ -1255,6 +1339,245 @@ impl ModeBServingEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn stage_mixed_step(
+        &mut self,
+        step_id: u64,
+        mixed_cap: usize,
+        active: &mut Vec<ActiveSequence>,
+        slot_to_active: &mut [usize],
+        waiting_permitted: &mut VecDeque<PendingRequest>,
+        page_block_tokens: usize,
+        max_pages_per_seq: usize,
+    ) -> Result<MixedStepOutcome> {
+        let geometry = self.coordinator.config().geometry;
+        let max_seqs = geometry.max_seqs as usize;
+        let max_step_tokens = geometry.max_step_tokens as usize;
+        let max_prefill_chunk = self.coordinator.config().max_prefill_chunk;
+
+        let decode_active_count = active
+            .iter()
+            .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
+            .count();
+        let continued_chunk = active
+            .iter()
+            .any(|seq| seq.prefilled_tokens > 0 && seq.prefilled_tokens < seq.prompt_tokens.len());
+
+        let step_budget = if decode_active_count > 0 {
+            mixed_cap.max(decode_active_count + 1).min(max_step_tokens)
+        } else {
+            max_step_tokens
+        };
+
+        // Pass 1 (Region 0): Reserve KV pages and stage all prompt-complete active decode
+        // sequences first (`q_len == 1, pos > 0`) so in-flight decodes never starve.
+        for seq in active
+            .iter_mut()
+            .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
+        {
+            let next_seq_len = seq.current_seq_len + 1;
+            seq.ensure_kv_pages(
+                next_seq_len,
+                page_block_tokens,
+                max_pages_per_seq,
+                &self.kv_pool,
+                &mut self.shadow_page_table,
+            )?;
+        }
+
+        let mut token_cursor = 0usize;
+        let mut num_seqs = 0usize;
+        let mut num_sample_rows = 0usize;
+
+        if decode_active_count > 0 {
+            let mut plan = self.coordinator.plan_slot_mut(step_id)?;
+            for seq in active
+                .iter_mut()
+                .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
+            {
+                let start_pos = seq.current_seq_len;
+                let lookback = seq.lookback_window(start_pos);
+                let pos = start_pos as i32;
+                let next_len = pos + 1;
+                plan.token_ids_mut()?[num_seqs] = seq.last_token;
+                plan.positions_mut()?[num_seqs] = pos;
+                plan.req_slot_ids_mut()?[num_seqs] = seq.slot_lease.id() as i32;
+                plan.engram_prev_window_mut()?[num_seqs * 3..num_seqs * 3 + 3]
+                    .copy_from_slice(&lookback);
+                plan.sample_row_indices_mut()?[num_sample_rows] = token_cursor as i32;
+                plan.seq_lens_mut()?[num_seqs] = next_len;
+                plan.query_start_loc_mut()?[num_seqs] = token_cursor as i32;
+                seq.current_seq_len = next_len as usize;
+                token_cursor += 1;
+                num_seqs += 1;
+                num_sample_rows += 1;
+            }
+        }
+
+        let mut prefill_seqs_staged = 0usize;
+
+        // Pass 2 (Region 2 / 0): Stage partial-prefill continuations (`first_pos > 0`).
+        for seq in active.iter_mut() {
+            if token_cursor >= step_budget {
+                break;
+            }
+            if seq.prefilled_tokens >= seq.prompt_tokens.len() {
+                continue;
+            }
+            let prompt_len = seq.prompt_tokens.len();
+            let prefilled = seq.prefilled_tokens;
+            let Some((chunk_start, chunk_end)) = prefill_chunk_range(
+                prompt_len,
+                prefilled,
+                step_budget - token_cursor,
+                max_prefill_chunk,
+            ) else {
+                continue;
+            };
+            let needed_pages = chunk_end.div_ceil(page_block_tokens);
+            let extra_pages = needed_pages.saturating_sub(seq.page_ids.len());
+            if extra_pages > self.kv_pool.available() {
+                continue;
+            }
+            let sample_row_index = (chunk_end == prompt_len).then(|| {
+                let row = num_sample_rows;
+                num_sample_rows += 1;
+                row
+            });
+            self.stage_prefill_row(
+                step_id,
+                seq,
+                num_seqs,
+                token_cursor,
+                chunk_start,
+                chunk_end,
+                sample_row_index,
+                page_block_tokens,
+                max_pages_per_seq,
+            )?;
+            token_cursor += chunk_end - chunk_start;
+            num_seqs += 1;
+            prefill_seqs_staged += 1;
+        }
+
+        // Pass 3 (Region 3 / 1): Admit new waiting requests (`first_pos == 0`).
+        while active.len() < max_seqs && token_cursor < step_budget {
+            let Some(front) = waiting_permitted.front() else {
+                break;
+            };
+            let prompt_len = front.prompt_tokens.len();
+            if prompt_len == 0 {
+                return Err(ModeBError::Protocol(
+                    "prompt length must be positive".to_owned(),
+                ));
+            }
+            let remaining_budget = step_budget - token_cursor;
+            if num_seqs > 0 && remaining_budget < 16 && prompt_len > remaining_budget {
+                break;
+            }
+            let Some((chunk_start, chunk_end)) =
+                prefill_chunk_range(prompt_len, 0, remaining_budget, max_prefill_chunk)
+            else {
+                break;
+            };
+            let needed_pages = chunk_end.div_ceil(page_block_tokens);
+            if self.kv_pool.available() < needed_pages || self.slot_pool.available() == 0 {
+                break;
+            }
+            let req = waiting_permitted.pop_front().ok_or_else(|| {
+                ModeBError::Protocol("waiting queue unexpectedly empty".to_owned())
+            })?;
+            let slot_lease = self.slot_pool.allocate().ok_or_else(|| {
+                ModeBError::Protocol("SlotPool unexpectedly exhausted".to_owned())
+            })?;
+            let slot_id = slot_lease.id() as usize;
+            let last_token = *req.prompt_tokens.last().unwrap_or(&0);
+            let mut seq = ActiveSequence {
+                request_id: req.request_id,
+                slot_lease,
+                kv_leases: Vec::new(),
+                page_ids: Vec::new(),
+                prompt_tokens: req.prompt_tokens,
+                prefilled_tokens: 0,
+                current_seq_len: 0,
+                last_token,
+                generated_tokens: Vec::with_capacity(req.target_output_len),
+                generated_top2: Vec::new(),
+                target_output_len: req.target_output_len,
+                permit_time: req.permit_time,
+                submit_time: req.submit_time,
+                first_token_time: None,
+                last_token_time: None,
+            };
+            let sample_row_index = (chunk_end == prompt_len).then(|| {
+                let row = num_sample_rows;
+                num_sample_rows += 1;
+                row
+            });
+            self.stage_prefill_row(
+                step_id,
+                &mut seq,
+                num_seqs,
+                token_cursor,
+                chunk_start,
+                chunk_end,
+                sample_row_index,
+                page_block_tokens,
+                max_pages_per_seq,
+            )?;
+            slot_to_active[slot_id] = active.len();
+            active.push(seq);
+            token_cursor += chunk_end - chunk_start;
+            num_seqs += 1;
+            prefill_seqs_staged += 1;
+        }
+
+        if num_seqs == 0 {
+            return Err(ModeBError::Protocol(
+                "mixed step scheduled zero sequences (KV pool or slots exhausted)".to_owned(),
+            ));
+        }
+
+        let is_pure_decode_fallback = prefill_seqs_staged == 0 && decode_active_count == num_seqs;
+        let bucket = if is_pure_decode_fallback {
+            select_graph_bucket(num_seqs as u32, &DECODE_BUCKETS)
+        } else {
+            0
+        };
+        let flags = u32::from(is_pure_decode_fallback);
+
+        let mut plan = self.coordinator.plan_slot_mut(step_id)?;
+        plan.query_start_loc_mut()?[num_seqs] = token_cursor as i32;
+        plan.global_kv_page_table_mut()?
+            .copy_from_slice(&self.shadow_page_table);
+        *plan.header_mut()? = StepHeader {
+            step_id: AtomicU64::new(0),
+            opcode: StepOpcode::NormalStep as u32,
+            num_seqs: num_seqs as u32,
+            num_encoder_tokens: token_cursor as u32,
+            encoder_graph_bucket: bucket,
+            num_decoder_rows: token_cursor as u32,
+            decoder_graph_bucket: bucket,
+            num_sample_rows: num_sample_rows as u32,
+            is_dspark_verify: 0,
+            flags,
+            _reserved: [0; 3],
+        };
+
+        if is_pure_decode_fallback {
+            Ok(MixedStepOutcome::PureDecodeFallback)
+        } else {
+            let had_chunk = continued_chunk
+                || active
+                    .iter()
+                    .any(|seq| seq.prefilled_tokens < seq.prompt_tokens.len());
+            Ok(MixedStepOutcome::MixedOrPrefill {
+                had_decodes: decode_active_count > 0,
+                had_chunk,
+            })
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn stage_prefill_row(
         &mut self,
         step_id: u64,
@@ -1276,12 +1599,15 @@ impl ModeBServingEngine {
         )?;
         let chunk_len = chunk_end - chunk_start;
         let slot_i32 = seq.slot_lease.id() as i32;
+        let lookback = seq.lookback_window(chunk_start);
         let mut plan = self.coordinator.plan_slot_mut(step_id)?;
         for (offset, &tok) in seq.prompt_tokens[chunk_start..chunk_end].iter().enumerate() {
             plan.token_ids_mut()?[token_cursor + offset] = tok;
             plan.positions_mut()?[token_cursor + offset] = (chunk_start + offset) as i32;
             plan.req_slot_ids_mut()?[token_cursor + offset] = slot_i32;
         }
+        plan.engram_prev_window_mut()?[seq_batch_pos * 3..seq_batch_pos * 3 + 3]
+            .copy_from_slice(&lookback);
         plan.query_start_loc_mut()?[seq_batch_pos] = token_cursor as i32;
         plan.seq_lens_mut()?[seq_batch_pos] = chunk_end as i32;
         if let Some(sample_row) = sample_row_index {
@@ -1331,7 +1657,9 @@ impl ModeBServingEngine {
             .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
             .enumerate()
         {
-            let pos = seq.current_seq_len as i32;
+            let start_pos = seq.current_seq_len;
+            let lookback = seq.lookback_window(start_pos);
+            let pos = start_pos as i32;
             let next_len = pos + 1;
             if commit_tokens_immediately {
                 plan.token_ids_mut()?[row] = seq.last_token;
@@ -1339,6 +1667,7 @@ impl ModeBServingEngine {
             }
             plan.positions_mut()?[row] = pos;
             plan.req_slot_ids_mut()?[row] = seq.slot_lease.id() as i32;
+            plan.engram_prev_window_mut()?[row * 3..row * 3 + 3].copy_from_slice(&lookback);
             plan.sample_row_indices_mut()?[row] = row as i32;
             plan.seq_lens_mut()?[row] = next_len;
             plan.query_start_loc_mut()?[row] = row as i32;
@@ -1366,6 +1695,12 @@ impl ModeBServingEngine {
         self.step_cursor += 1;
         let stop_step = self.step_cursor;
         self.coordinator.shutdown_and_wait(stop_step)
+    }
+
+    pub fn shutdown_with_stats(mut self) -> Result<(u32, u32)> {
+        self.step_cursor += 1;
+        let stop_step = self.step_cursor;
+        self.coordinator.shutdown_and_wait_with_stats(stop_step)
     }
 }
 
@@ -1689,5 +2024,39 @@ mod tests {
         for (p0, p1) in round0.iter().zip(&round1) {
             assert_ne!(p0, p1);
         }
+    }
+
+    #[test]
+    fn engram_lookback_window_spans_prompt_boundary_and_generated_tokens() {
+        let slot_pool = SlotPool::new(1);
+        let mut seq = ActiveSequence {
+            request_id: 0,
+            slot_lease: slot_pool.allocate().expect("slot"),
+            kv_leases: Vec::new(),
+            page_ids: Vec::new(),
+            prompt_tokens: vec![101, 102],
+            prefilled_tokens: 2,
+            current_seq_len: 2,
+            last_token: 201,
+            generated_tokens: vec![201, 202],
+            generated_top2: Vec::new(),
+            target_output_len: 8,
+            permit_time: Instant::now(),
+            submit_time: Instant::now(),
+            first_token_time: None,
+            last_token_time: None,
+        };
+        // Initial prefill start (`chunk_start = 0`)
+        assert_eq!(seq.lookback_window(0), [-1, -1, -1]);
+        // Chunked prefill at offset 1 (`chunk_start = 1`)
+        assert_eq!(seq.lookback_window(1), [-1, -1, 101]);
+        // Decode step 1 (`pos = 2`, feeding `201`)
+        assert_eq!(seq.lookback_window(2), [-1, 101, 102]);
+        // Overlapped decode step 2 (`pos = 3`, feeding `202`)
+        assert_eq!(seq.lookback_window(3), [101, 102, 201]);
+        // Steady-state decode step 3 (`pos = 4`)
+        seq.generated_tokens.push(203);
+        assert_eq!(seq.lookback_window(4), [102, 201, 202]);
+        assert_eq!(seq.lookback_window(5), [201, 202, 203]);
     }
 }

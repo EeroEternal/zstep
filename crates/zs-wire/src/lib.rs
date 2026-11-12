@@ -347,8 +347,28 @@ mod tests {
         .expect("valid 32GB geometry");
         assert!(geom_32g.max_pages_per_seq > 0);
 
+        // Verified 8x84GB profile (DeepSeek-V4.1-Flash TP=8 on 8x RTX 6000D 85,651 MiB:
+        // ~65.1 GiB weights incl. VRAM-resident Engram + ~4.9 GiB workspace,
+        // 4 MLA+Indexer KV source layers [2,8,14,20] with compress_ratios [2,2,2,1] ->
+        // 227,840 B per 256-token page = 890 B/tok/GPU).
+        let geom_84g = ShmGeometry::from_vram_budget(VramGeometrySpec {
+            world_size: 8,
+            per_gpu_vram_mb: 85_651,
+            reserved_weights_and_workspace_mb: 71_680,
+            kv_bytes_per_token_per_gpu: 890,
+            max_seqs: 128,
+            max_step_tokens: 8_192,
+            max_decoder_rows: 8_192,
+            page_block_tokens: 256,
+            spec_verify_width: 6,
+        })
+        .expect("valid 84GB DeepSeek-V4.1-Flash geometry");
+        assert_eq!(geom_84g.page_block_tokens, 256);
+        assert!(geom_84g.max_pages_per_seq >= 128);
+
         for geom in [
             geom_32g,
+            geom_84g,
             ShmGeometry {
                 world_size: 1,
                 max_seqs: 1,

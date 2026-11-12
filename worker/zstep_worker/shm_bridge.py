@@ -430,6 +430,14 @@ class StepPlanView:
             dtype=np.dtype(np.uint8),
         )
 
+    def engram_prev_window(self, num_seqs: int) -> np.ndarray:
+        flat = self.bridge.array(
+            offset=self.base + self.layout.engram_prev_window_offset,
+            count=num_seqs * 3,
+            dtype=np.dtype(np.int32),
+        )
+        return flat.reshape(num_seqs, 3)
+
     def narrow_keep_indices(self, count: int) -> np.ndarray:
         return self.bridge.array(
             offset=self.base + self.layout.narrow_keep_indices_offset,
