@@ -52,11 +52,20 @@ void launch_moe_align_block_size_cuda(
     int64_t max_padded_slots,
     std::uintptr_t stream_handle);
 
+void launch_local_top2_bf16_cuda(
+    const void* logits_bf16,
+    float* out_top2_vals,
+    int32_t* out_top2_ids,
+    int64_t num_rows,
+    int64_t stride_row,
+    int vocab_per_rank,
+    std::uintptr_t stream_handle);
+
 void launch_tp8_argmax_gather_shm_cuda(
-    const float* local_max_vals,
-    const int32_t* local_max_ids,
-    int32_t* out_tokens,
-    uint32_t* out_logprob_bits,
+    const float* local_top2_vals,
+    const int32_t* local_top2_ids,
+    int32_t* out_top2_tokens,
+    uint32_t* out_top2_logit_bits,
     uint64_t* step_counter,
     std::uintptr_t host_device_address,
     int64_t num_rows,
@@ -83,11 +92,40 @@ void launch_moe_align_block_size(
         stream_handle);
 }
 
+void launch_local_top2_bf16(
+    torch::Tensor logits_bf16,
+    torch::Tensor out_top2_vals,
+    torch::Tensor out_top2_ids,
+    int64_t num_rows,
+    std::uintptr_t stream_handle) {
+    TORCH_CHECK(logits_bf16.scalar_type() == torch::kBFloat16, "logits_bf16 must be bfloat16");
+    TORCH_CHECK(logits_bf16.dim() == 2, "logits_bf16 must be 2D");
+    TORCH_CHECK(logits_bf16.stride(1) == 1, "logits_bf16 inner dimension must be contiguous");
+    const int64_t vocab_per_rank = logits_bf16.size(1);
+    TORCH_CHECK(vocab_per_rank >= 2, "vocab_per_rank must be at least 2");
+    TORCH_CHECK(num_rows >= 0 && num_rows <= logits_bf16.size(0), "num_rows out of bounds");
+    TORCH_CHECK(out_top2_vals.is_contiguous() && out_top2_vals.numel() >= num_rows * 2,
+                "out_top2_vals must be contiguous with at least num_rows * 2 floats");
+    TORCH_CHECK(out_top2_ids.is_contiguous() && out_top2_ids.numel() >= num_rows * 2,
+                "out_top2_ids must be contiguous with at least num_rows * 2 int32s");
+    if (num_rows == 0) {
+        return;
+    }
+    launch_local_top2_bf16_cuda(
+        logits_bf16.data_ptr(),
+        out_top2_vals.data_ptr<float>(),
+        out_top2_ids.data_ptr<int32_t>(),
+        num_rows,
+        logits_bf16.stride(0),
+        static_cast<int>(vocab_per_rank),
+        stream_handle);
+}
+
 void launch_tp8_argmax_gather_shm(
-    torch::Tensor local_max_vals,
-    torch::Tensor local_max_ids,
-    torch::Tensor out_tokens,
-    torch::Tensor out_logprob_bits,
+    torch::Tensor local_top2_vals,
+    torch::Tensor local_top2_ids,
+    torch::Tensor out_top2_tokens,
+    torch::Tensor out_top2_logit_bits,
     torch::Tensor step_counter,
     std::uintptr_t host_device_address,
     int64_t num_rows,
@@ -97,11 +135,19 @@ void launch_tp8_argmax_gather_shm(
     int64_t vocab_per_rank,
     std::uintptr_t stream_handle) {
     TORCH_CHECK(num_rows <= max_rows_per_step, "num_rows exceeds max_rows_per_step");
+    TORCH_CHECK(local_top2_vals.is_contiguous() && local_top2_vals.numel() >= num_rows * 2,
+                "local_top2_vals must hold at least num_rows * 2 floats");
+    TORCH_CHECK(local_top2_ids.is_contiguous() && local_top2_ids.numel() >= num_rows * 2,
+                "local_top2_ids must hold at least num_rows * 2 int32s");
+    TORCH_CHECK(out_top2_tokens.is_contiguous() && out_top2_tokens.numel() >= num_rows * 2,
+                "out_top2_tokens must hold at least num_rows * 2 int32s");
+    TORCH_CHECK(out_top2_logit_bits.is_contiguous() && out_top2_logit_bits.numel() >= num_rows * 2,
+                "out_top2_logit_bits must hold at least num_rows * 2 int32s");
     launch_tp8_argmax_gather_shm_cuda(
-        local_max_vals.data_ptr<float>(),
-        local_max_ids.data_ptr<int32_t>(),
-        out_tokens.data_ptr<int32_t>(),
-        reinterpret_cast<uint32_t*>(out_logprob_bits.data_ptr<int32_t>()),
+        local_top2_vals.data_ptr<float>(),
+        local_top2_ids.data_ptr<int32_t>(),
+        out_top2_tokens.data_ptr<int32_t>(),
+        reinterpret_cast<uint32_t*>(out_top2_logit_bits.data_ptr<int32_t>()),
         reinterpret_cast<uint64_t*>(step_counter.data_ptr<int64_t>()),
         host_device_address,
         num_rows,
@@ -114,6 +160,7 @@ void launch_tp8_argmax_gather_shm(
 """
 
 _MOE_ALIGN_CUDA = r"""
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <stdexcept>
@@ -213,13 +260,75 @@ struct alignas(8) ValIdxPair {
     int32_t tok;
 };
 
-// Synchronizes per-rank local argmax `(max_logit, global_token_id)` across 8 PCIe ranks via
-// mapped host SHM (64 bytes per row across 8 ranks) using a 4-slot lock-free ring.
+struct alignas(16) Top2Acc {
+    float v1;
+    int32_t i1;
+    float v2;
+    int32_t i2;
+};
+
+__device__ __forceinline__ void merge_candidate(Top2Acc& acc, float v, int32_t idx) {
+    if (idx < 0) {
+        return;
+    }
+    if (acc.i1 < 0 || v > acc.v1 || (v == acc.v1 && idx < acc.i1)) {
+        acc.v2 = acc.v1;
+        acc.i2 = acc.i1;
+        acc.v1 = v;
+        acc.i1 = idx;
+    } else if (acc.i2 < 0 || v > acc.v2 || (v == acc.v2 && idx < acc.i2)) {
+        acc.v2 = v;
+        acc.i2 = idx;
+    }
+}
+
+__device__ __forceinline__ void merge_top2(Top2Acc& acc, const Top2Acc& other) {
+    merge_candidate(acc, other.v1, other.i1);
+    merge_candidate(acc, other.v2, other.i2);
+}
+
+// Deterministic per-row BF16 Top-2 reduction with strict `(val DESC, idx ASC)` tie-breaking.
+__global__ void local_top2_bf16_kernel(
+    const __nv_bfloat16* __restrict__ logits,
+    float* __restrict__ out_top2_vals,
+    int32_t* __restrict__ out_top2_ids,
+    int64_t stride_row,
+    int vocab_per_rank) {
+    __shared__ Top2Acc s_acc[256];
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    const int tid = threadIdx.x;
+    const __nv_bfloat16* row_ptr = logits + row * stride_row;
+
+    Top2Acc acc{-1.0e38f, -1, -1.0e38f, -1};
+    for (int col = tid; col < vocab_per_rank; col += 256) {
+        const float v = __bfloat162float(row_ptr[col]);
+        merge_candidate(acc, v, col);
+    }
+    s_acc[tid] = acc;
+    __syncthreads();
+
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            merge_top2(s_acc[tid], s_acc[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out_top2_vals[row * 2 + 0] = s_acc[0].v1;
+        out_top2_vals[row * 2 + 1] = s_acc[0].v2;
+        out_top2_ids[row * 2 + 0] = s_acc[0].i1;
+        out_top2_ids[row * 2 + 1] = s_acc[0].i2;
+    }
+}
+
+// Synchronizes per-rank local Top-2 `(logit, global_token_id)` across 8 PCIe ranks via
+// mapped host SHM (128 bytes per row across 8 ranks) using a 4-slot lock-free ring.
 __global__ void tp8_argmax_gather_shm_kernel(
-    const float* __restrict__ local_max_vals,
-    const int32_t* __restrict__ local_max_ids,
-    int32_t* __restrict__ out_tokens,
-    uint32_t* __restrict__ out_logprob_bits,
+    const float* __restrict__ local_top2_vals,
+    const int32_t* __restrict__ local_top2_ids,
+    int32_t* __restrict__ out_top2_tokens,
+    uint32_t* __restrict__ out_top2_logit_bits,
     uint64_t* __restrict__ step_counter,
     char* __restrict__ host_base,
     int64_t num_rows,
@@ -232,7 +341,7 @@ __global__ void tp8_argmax_gather_shm_kernel(
     // Layout in SHM:
     // [0 .. 64):    ready_flags[8] (uint64_t)
     // [64 .. 128):  done_flags[8]  (uint64_t)
-    // [256 .. ):    4 slots * 8 ranks * max_rows_per_step * sizeof(ValIdxPair)
+    // [256 .. ):    4 slots * 8 ranks * (max_rows_per_step * 2) * sizeof(ValIdxPair)
     uint64_t* ready_flags = reinterpret_cast<uint64_t*>(host_base);
     uint64_t* done_flags = reinterpret_cast<uint64_t*>(host_base + 64);
 
@@ -256,16 +365,21 @@ __global__ void tp8_argmax_gather_shm_kernel(
         __syncthreads();
     }
 
+    const int64_t pairs_per_rank = max_rows_per_step * 2;
     ValIdxPair* slot_pairs = reinterpret_cast<ValIdxPair*>(host_base + 256)
-        + static_cast<int64_t>(slot) * (kMaxRanks * max_rows_per_step);
-    ValIdxPair* my_pairs = slot_pairs + static_cast<int64_t>(rank) * max_rows_per_step;
+        + static_cast<int64_t>(slot) * (kMaxRanks * pairs_per_rank);
+    ValIdxPair* my_pairs = slot_pairs + static_cast<int64_t>(rank) * pairs_per_rank;
 
     const int base_tok = rank * vocab_per_rank;
     for (int64_t r = threadIdx.x; r < num_rows; r += blockDim.x) {
-        ValIdxPair p;
-        p.val = local_max_vals[r];
-        p.tok = base_tok + local_max_ids[r];
-        my_pairs[r] = p;
+        ValIdxPair p0;
+        p0.val = local_top2_vals[r * 2 + 0];
+        p0.tok = base_tok + local_top2_ids[r * 2 + 0];
+        ValIdxPair p1;
+        p1.val = local_top2_vals[r * 2 + 1];
+        p1.tok = base_tok + local_top2_ids[r * 2 + 1];
+        my_pairs[r * 2 + 0] = p0;
+        my_pairs[r * 2 + 1] = p1;
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -281,19 +395,19 @@ __global__ void tp8_argmax_gather_shm_kernel(
 
     if (rank == 0) {
         for (int64_t r = threadIdx.x; r < num_rows; r += blockDim.x) {
-            float best_val = -1.0e38f;
-            int32_t best_tok = 0;
+            Top2Acc acc{-1.0e38f, -1, -1.0e38f, -1};
             for (int peer = 0; peer < world_size; ++peer) {
-                const ValIdxPair p = slot_pairs[
-                    static_cast<int64_t>(peer) * max_rows_per_step + r
-                ];
-                if (p.val > best_val || (p.val == best_val && p.tok < best_tok)) {
-                    best_val = p.val;
-                    best_tok = p.tok;
-                }
+                const int64_t peer_row_base =
+                    static_cast<int64_t>(peer) * pairs_per_rank + r * 2;
+                const ValIdxPair p0 = slot_pairs[peer_row_base + 0];
+                const ValIdxPair p1 = slot_pairs[peer_row_base + 1];
+                merge_candidate(acc, p0.val, p0.tok);
+                merge_candidate(acc, p1.val, p1.tok);
             }
-            out_tokens[r] = best_tok;
-            out_logprob_bits[r] = __float_as_uint(0.0f);
+            out_top2_tokens[r * 2 + 0] = acc.i1;
+            out_top2_tokens[r * 2 + 1] = acc.i2;
+            out_top2_logit_bits[r * 2 + 0] = __float_as_uint(acc.v1);
+            out_top2_logit_bits[r * 2 + 1] = __float_as_uint(acc.v2);
         }
     }
     __syncthreads();
@@ -323,11 +437,29 @@ void launch_moe_align_block_size_cuda(
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 
+void launch_local_top2_bf16_cuda(
+    const void* logits_bf16,
+    float* out_top2_vals,
+    int32_t* out_top2_ids,
+    int64_t num_rows,
+    int64_t stride_row,
+    int vocab_per_rank,
+    std::uintptr_t stream_handle) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    local_top2_bf16_kernel<<<static_cast<unsigned int>(num_rows), 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(logits_bf16),
+        out_top2_vals,
+        out_top2_ids,
+        stride_row,
+        vocab_per_rank);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_tp8_argmax_gather_shm_cuda(
-    const float* local_max_vals,
-    const int32_t* local_max_ids,
-    int32_t* out_tokens,
-    uint32_t* out_logprob_bits,
+    const float* local_top2_vals,
+    const int32_t* local_top2_ids,
+    int32_t* out_top2_tokens,
+    uint32_t* out_top2_logit_bits,
     uint64_t* step_counter,
     std::uintptr_t host_device_address,
     int64_t num_rows,
@@ -338,10 +470,10 @@ void launch_tp8_argmax_gather_shm_cuda(
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     tp8_argmax_gather_shm_kernel<<<1, 128, 0, stream>>>(
-        local_max_vals,
-        local_max_ids,
-        out_tokens,
-        out_logprob_bits,
+        local_top2_vals,
+        local_top2_ids,
+        out_top2_tokens,
+        out_top2_logit_bits,
         step_counter,
         reinterpret_cast<char*>(host_device_address),
         num_rows,
@@ -357,15 +489,19 @@ _QWEN35_EXT = None
 
 
 def get_qwen35_cuda_ext():
-    """Compile or return the inline CUDA helper extension for MoE align + TP8 argmax."""
+    """Compile or return the inline CUDA helper extension for MoE align + TP8 Top-2 gather."""
     global _QWEN35_EXT
     if _QWEN35_EXT is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _QWEN35_EXT = load_inline(
-            name="zstep_qwen35_ops_sm120_v3_ext",
+            name="zstep_qwen35_ops_sm120_v4_ext",
             cpp_sources=[_MOE_ALIGN_CPP],
             cuda_sources=[_MOE_ALIGN_CUDA],
-            functions=["launch_moe_align_block_size", "launch_tp8_argmax_gather_shm"],
+            functions=[
+                "launch_moe_align_block_size",
+                "launch_local_top2_bf16",
+                "launch_tp8_argmax_gather_shm",
+            ],
             extra_cflags=["-O3"],
             extra_cuda_cflags=["-O3", "-gencode=arch=compute_120,code=sm_120"],
             with_cuda=True,

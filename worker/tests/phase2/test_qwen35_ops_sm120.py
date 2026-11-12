@@ -22,6 +22,9 @@
 
 from __future__ import annotations
 
+import ctypes
+import mmap
+import struct
 from unittest.mock import patch
 
 import pytest
@@ -29,6 +32,7 @@ import torch
 import torch.nn.functional as F
 
 from zstep_worker.kernels_sm120 import qwen35_ops
+from zstep_worker.kernels_sm120.shm_allreduce import get_host_mapped_allreduce_extension
 from zstep_worker.models.qwen35_moe import _build_rope_caches
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -284,18 +288,94 @@ def test_sparse_moe_tp8_matches_reference_formula() -> None:
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
+def test_local_top2_bf16_and_shm_gather_top2_exact_with_ties() -> None:
+    device = torch.device("cuda", 0)
+    ext = qwen35_ops.get_qwen35_cuda_ext()
+    ar_ext = get_host_mapped_allreduce_extension()
+    stream = torch.cuda.current_stream(device).cuda_stream
+
+    vocab_per_rank = 31_040
+    rows = 5
+    torch.manual_seed(20261112)
+    logits = torch.randn((rows, vocab_per_rank), device=device, dtype=torch.bfloat16)
+    # Row 0: 3-way tie at maximum BF16 value -> smallest two indices (17, 1024) must win
+    logits[0].fill_(torch.tensor(-4.0, dtype=torch.bfloat16))
+    for tie_col in (9000, 17, 1024):
+        logits[0, tie_col] = torch.tensor(19.5, dtype=torch.bfloat16)
+    # Row 1: distinct top-1 with 2-way tie for runner-up -> (30001, 42) must win
+    logits[1].fill_(torch.tensor(-8.0, dtype=torch.bfloat16))
+    logits[1, 30001] = torch.tensor(21.25, dtype=torch.bfloat16)
+    logits[1, 555] = torch.tensor(21.125, dtype=torch.bfloat16)
+    logits[1, 42] = torch.tensor(21.125, dtype=torch.bfloat16)
+
+    out_vals = torch.empty((rows, 2), dtype=torch.float32, device=device)
+    out_ids = torch.empty((rows, 2), dtype=torch.int32, device=device)
+    ext.launch_local_top2_bf16(logits, out_vals, out_ids, rows, stream)
+    torch.cuda.synchronize(device)
+
+    vals_cpu = out_vals.cpu().tolist()
+    ids_cpu = out_ids.cpu().tolist()
+    assert ids_cpu[0] == [17, 1024]
+    assert vals_cpu[0] == [19.5, 19.5]
+    assert ids_cpu[1] == [30001, 42]
+    assert vals_cpu[1] == [21.25, 21.125]
+    for r in range(2, rows):
+        row_list = logits[r].float().cpu().tolist()
+        ordered = sorted(range(vocab_per_rank), key=lambda idx: (-row_list[idx], idx))
+        assert ids_cpu[r] == [ordered[0], ordered[1]]
+        assert vals_cpu[r] == [row_list[ordered[0]], row_list[ordered[1]]]
+
+    # Verify host-mapped SHM ring Top-2 gather (`world_size=1` single-process check)
+    max_rows_per_step = 16
+    shm_bytes = (256 + 4 * 8 * (max_rows_per_step * 2) * 8 + 4095) & ~4095
+    mapping = mmap.mmap(-1, shm_bytes, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+    host_addr = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+    ctypes.memset(host_addr, 0, shm_bytes)
+    dev_addr = ar_ext.register_mapped_host(host_addr, shm_bytes)
+    try:
+        out_tokens = torch.zeros((rows, 2), dtype=torch.int32, device=device)
+        out_bits = torch.zeros((rows, 2), dtype=torch.int32, device=device)
+        step_counter = torch.zeros(1, dtype=torch.int64, device=device)
+        for _ in range(6):
+            ext.launch_tp8_argmax_gather_shm(
+                out_vals,
+                out_ids,
+                out_tokens,
+                out_bits,
+                step_counter,
+                dev_addr,
+                rows,
+                max_rows_per_step,
+                0,
+                1,
+                vocab_per_rank,
+                stream,
+            )
+        torch.cuda.synchronize(device)
+        assert out_tokens.cpu().tolist() == ids_cpu
+        bits_cpu = out_bits.cpu().tolist()
+        for r in range(rows):
+            for k in range(2):
+                unpacked = struct.unpack("<f", struct.pack("<I", bits_cpu[r][k] & 0xFFFF_FFFF))[0]
+                assert unpacked == vals_cpu[r][k]
+    finally:
+        torch.cuda.synchronize(device)
+        ar_ext.unregister_mapped_host(host_addr)
+        mapping.close()
+
+
 def test_tp8_argmax_rejects_rows_above_capacity() -> None:
     device = torch.device("cuda", 0)
     ext = qwen35_ops.get_qwen35_cuda_ext()
-    local_max_vals = torch.zeros(1, dtype=torch.float32, device=device)
-    local_max_ids = torch.zeros(1, dtype=torch.int32, device=device)
-    out_tokens = torch.zeros(1, dtype=torch.int32, device=device)
-    out_logprob_bits = torch.zeros(1, dtype=torch.int32, device=device)
+    local_top2_vals = torch.zeros((1, 2), dtype=torch.float32, device=device)
+    local_top2_ids = torch.zeros((1, 2), dtype=torch.int32, device=device)
+    out_tokens = torch.zeros((1, 2), dtype=torch.int32, device=device)
+    out_logprob_bits = torch.zeros((1, 2), dtype=torch.int32, device=device)
     step_counter = torch.zeros(1, dtype=torch.int64, device=device)
     with pytest.raises(RuntimeError, match="num_rows exceeds max_rows_per_step"):
         ext.launch_tp8_argmax_gather_shm(
-            local_max_vals,
-            local_max_ids,
+            local_top2_vals,
+            local_top2_ids,
             out_tokens,
             out_logprob_bits,
             step_counter,

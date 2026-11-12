@@ -168,7 +168,7 @@ class FullAttnLayerWeights:
 
 
 class _Tp8ArgmaxShmChannel:
-    """Host-mapped SHM ring for lock-free TP=8 `(max_logit, argmax_token)` gather."""
+    """Host-mapped SHM ring for lock-free TP=8 Top-2 `(logit, token_id)` gather."""
 
     def __init__(
         self,
@@ -187,7 +187,7 @@ class _Tp8ArgmaxShmChannel:
         self.world_size: int = world_size
         self.device: torch.device = device
         self.max_rows_per_step: int = max_rows_per_step
-        unaligned_bytes = 256 + 4 * 8 * max_rows_per_step * 8
+        unaligned_bytes = 256 + 4 * 8 * (max_rows_per_step * 2) * 8
         self.total_bytes: int = (unaligned_bytes + 4095) & ~4095
         self._closed: bool = False
         self._owns_unlink: bool = False
@@ -236,22 +236,31 @@ class _Tp8ArgmaxShmChannel:
 
     def gather_argmax(
         self,
-        local_max_vals: torch.Tensor,
-        local_max_ids: torch.Tensor,
+        logits: torch.Tensor,
         *,
+        local_top2_vals: torch.Tensor,
+        local_top2_ids: torch.Tensor,
         out_tokens: torch.Tensor,
         out_logprob_bits: torch.Tensor,
         vocab_per_rank: int,
     ) -> None:
+        rows = logits.shape[0]
         stream_handle = torch.cuda.current_stream(self.device).cuda_stream
+        self._qwen_ext.launch_local_top2_bf16(
+            logits,
+            local_top2_vals,
+            local_top2_ids,
+            rows,
+            stream_handle,
+        )
         self._qwen_ext.launch_tp8_argmax_gather_shm(
-            local_max_vals,
-            local_max_ids,
+            local_top2_vals,
+            local_top2_ids,
             out_tokens,
             out_logprob_bits,
             self.step_counter,
             self._dev_addr,
-            local_max_vals.numel(),
+            rows,
             self.max_rows_per_step,
             self.rank,
             self.world_size,
@@ -461,8 +470,8 @@ class Qwen35MoeStepRunner:
             dtype=torch.int32,
             pin_memory=True,
         )
-        self.out_tokens_cpu: torch.Tensor = torch.zeros(ms, dtype=torch.int32, pin_memory=True)
-        self.out_logprobs_cpu: torch.Tensor = torch.zeros(ms, dtype=torch.int32, pin_memory=True)
+        self.out_tokens_cpu: torch.Tensor = torch.zeros((ms, 2), dtype=torch.int32, pin_memory=True)
+        self.out_logprobs_cpu: torch.Tensor = torch.zeros((ms, 2), dtype=torch.int32, pin_memory=True)
         self.req_slots_sample_cpu: list[int] = [0] * ms
 
         # Activation & scratch workspaces
@@ -558,16 +567,16 @@ class Qwen35MoeStepRunner:
             (ms, self.vocab_per_rank), dtype=torch.bfloat16, device=self.device
         )
         self.local_max_vals_buf: torch.Tensor = torch.empty(
-            ms, dtype=torch.float32, device=self.device
+            (ms, 2), dtype=torch.float32, device=self.device
         )
         self.local_max_ids_buf: torch.Tensor = torch.empty(
-            ms, dtype=torch.int32, device=self.device
+            (ms, 2), dtype=torch.int32, device=self.device
         )
         self.out_tokens_gpu: torch.Tensor = torch.zeros(
-            ms, dtype=torch.int32, device=self.device
+            (ms, 2), dtype=torch.int32, device=self.device
         )
         self.out_logprobs_gpu: torch.Tensor = torch.zeros(
-            ms, dtype=torch.int32, device=self.device
+            (ms, 2), dtype=torch.int32, device=self.device
         )
 
         self.start_event: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
@@ -861,12 +870,10 @@ class Qwen35MoeStepRunner:
 
         logits = self.logits_local_buf[:bucket]
         torch.matmul(normed, self.lm_head_weight.t(), out=logits)
-        max_vals, max_ids = logits.max(dim=-1)
-        self.local_max_vals_buf[:bucket].copy_(max_vals.float())
-        self.local_max_ids_buf[:bucket].copy_(max_ids.to(torch.int32))
         self.argmax_channel.gather_argmax(
-            self.local_max_vals_buf[:bucket],
-            self.local_max_ids_buf[:bucket],
+            logits,
+            local_top2_vals=self.local_max_vals_buf[:bucket],
+            local_top2_ids=self.local_max_ids_buf[:bucket],
             out_tokens=self.out_tokens_gpu[:bucket],
             out_logprob_bits=self.out_logprobs_gpu[:bucket],
             vocab_per_rank=self.vocab_per_rank,
@@ -1000,12 +1007,10 @@ class Qwen35MoeStepRunner:
             )
             logits = self.logits_local_buf[:num_sample_rows]
             torch.matmul(sampled_normed, self.lm_head_weight.t(), out=logits)
-            max_vals, max_ids = logits.max(dim=-1)
-            self.local_max_vals_buf[:num_sample_rows].copy_(max_vals.float())
-            self.local_max_ids_buf[:num_sample_rows].copy_(max_ids.to(torch.int32))
             self.argmax_channel.gather_argmax(
-                self.local_max_vals_buf[:num_sample_rows],
-                self.local_max_ids_buf[:num_sample_rows],
+                logits,
+                local_top2_vals=self.local_max_vals_buf[:num_sample_rows],
+                local_top2_ids=self.local_max_ids_buf[:num_sample_rows],
                 out_tokens=self.out_tokens_gpu[:num_sample_rows],
                 out_logprob_bits=self.out_logprobs_gpu[:num_sample_rows],
                 vocab_per_rank=self.vocab_per_rank,
@@ -1171,8 +1176,10 @@ class Qwen35MoeStepRunner:
                 outputs.append(
                     SeqResult(
                         req_slot=req_slot,
-                        accepted_token=int(toks_out[i]),
-                        accepted_logprob_bits=int(lps_out[i]) & 0xFFFF_FFFF,
+                        accepted_token=int(toks_out[i][0]),
+                        accepted_logprob_bits=int(lps_out[i][0]) & 0xFFFF_FFFF,
+                        runner_up_token=int(toks_out[i][1]),
+                        runner_up_logprob_bits=int(lps_out[i][1]) & 0xFFFF_FFFF,
                     )
                 )
         return outputs, gpu_exec_us

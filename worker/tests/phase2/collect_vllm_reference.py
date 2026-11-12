@@ -105,6 +105,18 @@ PROMPTS = (
         ),
         max_tokens=64,
     ),
+    PromptSpec(
+        name="prime_squares_table",
+        text=(
+            "Continue this exact numbered arithmetic table without commentary, "
+            "one line per prime p:\n"
+            "1. p=2, p^2=4, 2p+1=5\n"
+            "2. p=3, p^2=9, 2p+1=7\n"
+            "3. p=5, p^2=25, 2p+1=11\n"
+            "4."
+        ),
+        max_tokens=128,
+    ),
 )
 
 TIERS = (
@@ -187,6 +199,7 @@ def serve_arguments(model_name: str, seed: int, vllm_url: str) -> list[str]:
         "32768",
         "--gpu-memory-utilization",
         "0.85",
+        "--no-enable-prefix-caching",
         "--host",
         "0.0.0.0",
         "--port",
@@ -292,7 +305,61 @@ def encode_prompts(tokenizer_dir: str) -> list[list[int]]:
         raise RuntimeError(f"Prompt 2 length is not approximately 40 tokens: {len(encoded[2])}")
     if not 65 <= len(encoded[3]) <= 72:
         raise RuntimeError(f"Prompt 3 must span three 24-token chunks: {len(encoded[3])}")
+    if not 45 <= len(encoded[4]) <= 90:
+        raise RuntimeError(f"Prompt 4 unexpected length: {len(encoded[4])}")
     return encoded
+
+
+def _parse_token_id_key(raw_key: str) -> int:
+    if not raw_key.startswith("token_id:"):
+        raise RuntimeError(
+            f"expected return_tokens_as_token_ids format 'token_id:<int>', got {raw_key!r}"
+        )
+    return int(raw_key.removeprefix("token_id:"))
+
+
+def _extract_top2_steps(
+    prompt_name: str,
+    generated: list[int],
+    logprobs_obj: dict[str, Any],
+) -> list[dict[str, Any]]:
+    top_logprobs = logprobs_obj.get("top_logprobs")
+    if not isinstance(top_logprobs, list) or len(top_logprobs) != len(generated):
+        raise RuntimeError(
+            f"{prompt_name}: expected {len(generated)} top_logprobs entries, got {type(top_logprobs)}"
+        )
+    steps: list[dict[str, Any]] = []
+    for step_idx, (chosen_tok, step_dict) in enumerate(
+        zip(generated, top_logprobs, strict=True)
+    ):
+        if not isinstance(step_dict, dict) or len(step_dict) < 2:
+            raise RuntimeError(
+                f"{prompt_name} step {step_idx}: expected >=2 top_logprobs candidates, got {step_dict}"
+            )
+        parsed = [
+            (_parse_token_id_key(key), float(val)) for key, val in step_dict.items()
+        ]
+        chosen_matches = [lp for tok, lp in parsed if tok == chosen_tok]
+        if not chosen_matches:
+            raise RuntimeError(
+                f"{prompt_name} step {step_idx}: chosen token {chosen_tok} missing from top_logprobs"
+            )
+        top1_lp = chosen_matches[0]
+        others = sorted(
+            [(tok, lp) for tok, lp in parsed if tok != chosen_tok],
+            key=lambda item: (-item[1], item[0]),
+        )
+        top2_tok, top2_lp = others[0]
+        steps.append(
+            {
+                "top1_token": int(chosen_tok),
+                "top1_logprob": top1_lp,
+                "top2_token": int(top2_tok),
+                "top2_logprob": top2_lp,
+                "top1_minus_top2_margin": top1_lp - top2_lp,
+            }
+        )
+    return steps
 
 
 def collect_greedy(args: argparse.Namespace) -> dict[str, Any]:
@@ -307,9 +374,10 @@ def collect_greedy(args: argparse.Namespace) -> dict[str, Any]:
             "temperature": 0.0,
             "top_p": 1.0,
             "max_tokens": prompt.max_tokens,
-            "logprobs": 1,
+            "logprobs": 5,
             "ignore_eos": True,
             "return_token_ids": True,
+            "return_tokens_as_token_ids": True,
             "seed": args.seed,
         }
         response = request_json(
@@ -333,8 +401,21 @@ def collect_greedy(args: argparse.Namespace) -> dict[str, Any]:
         returned_prompt = choice.get("prompt_token_ids")
         if returned_prompt is not None and returned_prompt != tokens:
             raise RuntimeError(f"vLLM changed the prompt token IDs for {prompt.name}")
-        if choice.get("logprobs") is None:
+        logprobs_obj = choice.get("logprobs")
+        if not isinstance(logprobs_obj, dict):
             raise RuntimeError(f"vLLM omitted requested logprobs for {prompt.name}")
+        top2_steps = _extract_top2_steps(prompt.name, generated, logprobs_obj)
+        if prompt.name == "prime_squares_table":
+            # Guard that the 128-token structured arithmetic prompt never loops: every 16-token
+            # sliding window across all 128 tokens must be distinct.
+            windows_16 = {
+                tuple(generated[idx : idx + 16]) for idx in range(len(generated) - 15)
+            }
+            if len(windows_16) != len(generated) - 15:
+                raise RuntimeError(
+                    f"prime_squares_table repeated a 16-token window: {generated[-32:]}"
+                )
+        margins = [step["top1_minus_top2_margin"] for step in top2_steps]
         cases.append(
             {
                 "name": prompt.name,
@@ -342,6 +423,7 @@ def collect_greedy(args: argparse.Namespace) -> dict[str, Any]:
                 "prompt_token_ids": tokens,
                 "max_tokens": prompt.max_tokens,
                 "expected_greedy_token_ids": generated,
+                "top2_steps": top2_steps,
             }
         )
         response_metadata.append(
@@ -350,19 +432,26 @@ def collect_greedy(args: argparse.Namespace) -> dict[str, Any]:
                 "response_id": response.get("id"),
                 "finish_reason": choice.get("finish_reason"),
                 "usage": response.get("usage"),
-                "token_id_source": "choices[0].token_ids (return_token_ids=true)",
+                "token_id_source": "choices[0].token_ids (return_token_ids=true, return_tokens_as_token_ids=true)",
+                "mean_top1_minus_top2_margin": statistics.fmean(margins),
+                "min_top1_minus_top2_margin": min(margins),
             }
         )
-        print(f"collected {prompt.name}: prompt={len(tokens)} output={len(generated)}", flush=True)
+        print(
+            f"collected {prompt.name}: prompt={len(tokens)} output={len(generated)} "
+            f"min_margin={min(margins):.4f} mean_margin={statistics.fmean(margins):.4f}",
+            flush=True,
+        )
     return {
         **common_provenance(args),
         "request_parameters": {
             "endpoint": "/v1/completions",
             "temperature": 0.0,
             "top_p": 1.0,
-            "logprobs": 1,
+            "logprobs": 5,
             "ignore_eos": True,
             "return_token_ids": True,
+            "return_tokens_as_token_ids": True,
         },
         "cases": cases,
         "response_metadata": response_metadata,
@@ -372,6 +461,7 @@ def collect_greedy(args: argparse.Namespace) -> dict[str, Any]:
 def benchmark_command(
     args: argparse.Namespace,
     tier: TierSpec,
+    tier_seed: int,
     result_filename: str,
     raw_results_dir: Path,
     recorded_url: str,
@@ -406,7 +496,7 @@ def benchmark_command(
         "--temperature",
         "0.0",
         "--seed",
-        str(args.seed),
+        str(tier_seed),
         "--percentile-metrics",
         "ttft,tpot,itl",
         "--metric-percentiles",
@@ -474,6 +564,7 @@ def aggregate_metrics(rounds: list[dict[str, Any]]) -> dict[str, dict[str, float
 def run_benchmark(
     args: argparse.Namespace,
     tier: TierSpec,
+    tier_seed: int,
     result_filename: str,
     raw_results_dir: Path,
 ) -> tuple[dict[str, Any], list[str]]:
@@ -481,10 +572,10 @@ def run_benchmark(
     result_path.unlink(missing_ok=True)
     recorded_url = public_url(args.vllm_url)
     recorded_command = benchmark_command(
-        args, tier, result_filename, raw_results_dir, recorded_url
+        args, tier, tier_seed, result_filename, raw_results_dir, recorded_url
     )
     actual_command = benchmark_command(
-        args, tier, result_filename, raw_results_dir, args.vllm_url
+        args, tier, tier_seed, result_filename, raw_results_dir, args.vllm_url
     )
     subprocess.run(actual_command, check=True, timeout=args.bench_timeout_s)
     raw = json.loads(result_path.read_text(encoding="utf-8"))
@@ -504,21 +595,26 @@ def collect_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         raw_results_dir = args.output_json.parent / "phase2_vllm_raw"
     raw_results_dir.mkdir(parents=True, exist_ok=True)
     warmup = TierSpec("warmup", 512, 128, 32, 16)
+    warmup_seed = args.seed + 900_000
     _, warmup_command = run_benchmark(
-        args, warmup, "warmup.json", raw_results_dir
+        args, warmup, warmup_seed, "warmup.json", raw_results_dir
     )
     rounds = []
     tier_results: dict[str, list[dict[str, Any]]] = {tier.name: [] for tier in TIERS}
     commands: dict[str, list[str]] = {}
     for round_index in range(3):
-        for tier in TIERS:
+        for tier_index, tier in enumerate(TIERS):
+            tier_seed = args.seed + round_index * 1_000 + tier_index
             filename = f"round{round_index}_{tier.name}.json"
             started = time.monotonic()
-            raw, command = run_benchmark(args, tier, filename, raw_results_dir)
+            raw, command = run_benchmark(
+                args, tier, tier_seed, filename, raw_results_dir
+            )
             metrics = extract_metrics(raw)
             result = {
                 "round": round_index,
                 "tier": tier.name,
+                "seed": tier_seed,
                 "input_len": tier.input_len,
                 "output_len": tier.output_len,
                 "num_prompts": tier.num_prompts,
@@ -530,9 +626,10 @@ def collect_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             }
             rounds.append(result)
             tier_results[tier.name].append(result)
-            commands[tier.name] = command
+            if round_index == 0:
+                commands[tier.name] = command
             print(
-                f"round={round_index} tier={tier.name} "
+                f"round={round_index} tier={tier.name} seed={tier_seed} "
                 f"out={metrics['output_throughput_tok_s']:.2f} tok/s "
                 f"p99_itl={metrics['p99_itl_ms']:.2f} ms "
                 f"collector_wall={time.monotonic() - started:.1f}s",
@@ -561,9 +658,12 @@ def collect_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "random_range_ratio": 0.0,
             "ignore_eos": True,
             "temperature": 0.0,
+            "prefix_caching_enabled": False,
+            "seed_schedule": "base_seed + round_index * 1000 + tier_index (warmup uses base_seed + 900000)",
             "rounds": 3,
-            "schedule": "warmup once, then round-major interleaving of all six tiers",
+            "schedule": "warmup once, then round-major interleaving of all six tiers with distinct per-(round, tier) seeds",
             "warmup": {
+                "seed": warmup_seed,
                 "input_len": 512,
                 "output_len": 128,
                 "num_prompts": 32,
