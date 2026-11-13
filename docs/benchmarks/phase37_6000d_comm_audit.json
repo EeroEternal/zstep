@@ -1,0 +1,2176 @@
+{
+  "provenance": {
+    "device_name": "NVIDIA RTX 6000D",
+    "world_size": 8,
+    "compute_capability": "12.0",
+    "multi_processor_count": 156,
+    "worker_numa_nodes": [
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1
+    ],
+    "torch_version": "2.13.0+cu130",
+    "nvidia_driver_version": "595.99.02",
+    "git_sha": "79e293a963a1db853e85937a10589f0fd1ba0c90",
+    "nccl_env": {
+      "NCCL_P2P_DISABLE": "1",
+      "NCCL_P2P_LEVEL": "LOC",
+      "NCCL_IB_DISABLE": "1"
+    },
+    "hybrid_thresholds": {
+      "default_one_shot_max_vecs": 4096,
+      "default_one_shot_max_bytes": 65536,
+      "shm_max_ar_numel": 1638400,
+      "shm_max_ag_numel": 4194304
+    }
+  },
+  "pcie_cx8_acs_audit": {
+    "iommu_groups_count": 0,
+    "intel_root_ports_8086_352a": 8,
+    "mellanox_cx8_bridge_functions_15b3_197c": 32,
+    "mellanox_cx8_downstream_ports_sysfs": 28,
+    "mellanox_cx8_acs_active_ports_lspci": 20,
+    "default_acs_ctl_hex": "0x001d",
+    "gpu_bar2_bytes_gib": 128,
+    "default_can_device_access_peer_matrix": [
+      [
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      [
+        1,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      [
+        1,
+        1,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      [
+        1,
+        1,
+        1,
+        0,
+        1,
+        1,
+        1,
+        1
+      ],
+      [
+        1,
+        1,
+        1,
+        1,
+        0,
+        1,
+        1,
+        1
+      ],
+      [
+        1,
+        1,
+        1,
+        1,
+        1,
+        0,
+        1,
+        1
+      ],
+      [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        0,
+        1
+      ],
+      [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        0
+      ]
+    ],
+    "root_acs_disable_experiment_summary": {
+      "kernel_cmdline_finding": "`pcie_acs_override` is an out-of-tree VFIO patch absent in mainline Ubuntu 6.8 kernels; mainline equivalent is `pci=disable_acs_redir=pci:15b3:197c` or runtime `setpci -s <BDF> ECAP_ACS+06.w=0000` + `nvidia.ko` reload.",
+      "acs_cleared_ports": 20,
+      "acs_cleared_can_device_access_peer": 1,
+      "copy_engine_dma_p2p_gbps": {
+        "intra_cx8_pxb_pair": 107.9,
+        "same_socket_cross_cx8_node": 34.9,
+        "cross_socket_upi_sys": 31.1
+      },
+      "sm_bar_mmio_ld_st_result": "W0R0 (`st.global` dropped + `ld.global` returns `0xFFFFFFFF` PCIe Unsupported Request poison) across all 4 intra-switch PXB pairs `(0,1),(2,3),(4,5),(6,7)` under every ACSCtl mask (`0x0000`, `0x000c`, `0x001c`, `0x001d`).",
+      "bidirectional_nccl_p2p_result": "Deadlocks on concurrent multi-pair BAR1 P2P across 2-tier PCIe switch + dual-socket UPI due to non-posted/posted PCIe credit dependency loops; all 20 ports restored to `ACSCtl = 0x001d`.",
+      "architectural_conclusion": "Host DRAM mapped rings (`shm_v5` for CUDAGraph & small/mid M + `NCCL_LOC` for large-M Eager prefill) are hardware-optimal on CX-8 `15b3:197c` topologies."
+    }
+  },
+  "allreduce_h2048_8gpu": {
+    "1": {
+      "payload_bytes": 4096,
+      "prod_algorithm": "one-shot",
+      "prod_threads": 256,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 29.65,
+          "p95_us": 30.07,
+          "p99_us": 30.27
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 14.24,
+          "p95_us": 14.5,
+          "p99_us": 14.64
+        },
+        "shm_v5_prod": {
+          "p50_us": 14.5,
+          "p95_us": 14.71,
+          "p99_us": 14.91
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 12.65,
+          "p95_us": 12.86,
+          "p99_us": 12.87
+        },
+        "shm_v5_pkt64_push_ablation": {
+          "p50_us": 39.69,
+          "p95_us": 44.55,
+          "p99_us": 46.45
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 31.71,
+          "p95_us": 34.37,
+          "p99_us": 37.38
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 17.38,
+          "p95_us": 20.0,
+          "p99_us": 20.16
+        },
+        "shm_v5_prod": {
+          "p50_us": 17.12,
+          "p95_us": 19.17,
+          "p99_us": 19.84
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 15.07,
+          "p95_us": 17.15,
+          "p99_us": 18.05
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 17.12
+      }
+    },
+    "2": {
+      "payload_bytes": 8192,
+      "prod_algorithm": "one-shot",
+      "prod_threads": 256,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 30.66,
+          "p95_us": 30.98,
+          "p99_us": 31.1
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 14.7,
+          "p95_us": 15.05,
+          "p99_us": 15.11
+        },
+        "shm_v5_prod": {
+          "p50_us": 14.91,
+          "p95_us": 15.12,
+          "p99_us": 15.22
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 12.8,
+          "p95_us": 13.01,
+          "p99_us": 13.07
+        },
+        "shm_v5_pkt64_push_ablation": {
+          "p50_us": 43.17,
+          "p95_us": 61.81,
+          "p99_us": 69.81
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 31.84,
+          "p95_us": 34.37,
+          "p99_us": 48.54
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 17.89,
+          "p95_us": 20.03,
+          "p99_us": 20.1
+        },
+        "shm_v5_prod": {
+          "p50_us": 17.09,
+          "p95_us": 19.2,
+          "p99_us": 20.03
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 15.04,
+          "p95_us": 17.73,
+          "p99_us": 21.28
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 17.09
+      }
+    },
+    "4": {
+      "payload_bytes": 16384,
+      "prod_algorithm": "one-shot",
+      "prod_threads": 256,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 31.69,
+          "p95_us": 32.12,
+          "p99_us": 32.34
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 15.26,
+          "p95_us": 15.53,
+          "p99_us": 15.72
+        },
+        "shm_v5_prod": {
+          "p50_us": 15.52,
+          "p95_us": 15.73,
+          "p99_us": 15.93
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 13.39,
+          "p95_us": 13.57,
+          "p99_us": 13.63
+        },
+        "shm_v5_pkt64_push_ablation": {
+          "p50_us": 656.41,
+          "p95_us": 891.29,
+          "p99_us": 930.26
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 33.66,
+          "p95_us": 35.81,
+          "p99_us": 37.38
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 17.98,
+          "p95_us": 32.42,
+          "p99_us": 38.37
+        },
+        "shm_v5_prod": {
+          "p50_us": 17.98,
+          "p95_us": 20.13,
+          "p99_us": 22.05
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 15.1,
+          "p95_us": 17.25,
+          "p99_us": 19.14
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 17.98
+      }
+    },
+    "8": {
+      "payload_bytes": 32768,
+      "prod_algorithm": "one-shot",
+      "prod_threads": 256,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 34.76,
+          "p95_us": 34.99,
+          "p99_us": 35.19
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 17.16,
+          "p95_us": 17.37,
+          "p99_us": 17.57
+        },
+        "shm_v5_prod": {
+          "p50_us": 17.3,
+          "p95_us": 17.57,
+          "p99_us": 17.59
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 15.11,
+          "p95_us": 15.32,
+          "p99_us": 15.34
+        },
+        "shm_v5_pkt64_push_ablation": {
+          "p50_us": 2472.75,
+          "p95_us": 2548.32,
+          "p99_us": 2605.73
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 35.9,
+          "p95_us": 40.06,
+          "p99_us": 44.0
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 19.94,
+          "p95_us": 21.98,
+          "p99_us": 22.11
+        },
+        "shm_v5_prod": {
+          "p50_us": 20.0,
+          "p95_us": 22.21,
+          "p99_us": 24.13
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 17.18,
+          "p95_us": 19.2,
+          "p99_us": 20.03
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 20.0
+      }
+    },
+    "16": {
+      "payload_bytes": 65536,
+      "prod_algorithm": "one-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 36.83,
+          "p95_us": 37.24,
+          "p99_us": 37.35
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 30.61,
+          "p95_us": 31.02,
+          "p99_us": 31.23
+        },
+        "shm_v5_prod": {
+          "p50_us": 27.09,
+          "p95_us": 27.4,
+          "p99_us": 27.41
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 24.89,
+          "p95_us": 25.09,
+          "p99_us": 25.15
+        },
+        "shm_v5_pkt64_push_ablation": {
+          "p50_us": 5832.15,
+          "p95_us": 6047.3,
+          "p99_us": 6179.49
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 38.46,
+          "p95_us": 41.89,
+          "p99_us": 49.25
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 33.63,
+          "p95_us": 35.71,
+          "p99_us": 36.45
+        },
+        "shm_v5_prod": {
+          "p50_us": 29.63,
+          "p95_us": 32.13,
+          "p99_us": 32.29
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 27.62,
+          "p95_us": 29.25,
+          "p99_us": 29.63
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 29.63
+      }
+    },
+    "32": {
+      "payload_bytes": 131072,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 55.87,
+          "p95_us": 56.28,
+          "p99_us": 56.48
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 33.95,
+          "p95_us": 34.3,
+          "p99_us": 34.38
+        },
+        "shm_v5_prod": {
+          "p50_us": 34.56,
+          "p95_us": 34.78,
+          "p99_us": 34.98
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 32.36,
+          "p95_us": 32.67,
+          "p99_us": 32.75
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 57.5,
+          "p95_us": 58.94,
+          "p99_us": 59.14
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 36.42,
+          "p95_us": 38.46,
+          "p99_us": 38.53
+        },
+        "shm_v5_prod": {
+          "p50_us": 36.54,
+          "p95_us": 38.5,
+          "p99_us": 38.59
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 34.37,
+          "p95_us": 36.45,
+          "p99_us": 38.37
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 36.54
+      }
+    },
+    "64": {
+      "payload_bytes": 262144,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 95.8,
+          "p95_us": 96.61,
+          "p99_us": 96.84
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 42.66,
+          "p95_us": 42.91,
+          "p99_us": 43.11
+        },
+        "shm_v5_prod": {
+          "p50_us": 42.96,
+          "p95_us": 43.24,
+          "p99_us": 43.38
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 40.64,
+          "p95_us": 41.05,
+          "p99_us": 41.14
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 96.61,
+          "p95_us": 99.42,
+          "p99_us": 100.51
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 44.61,
+          "p95_us": 46.69,
+          "p99_us": 48.06
+        },
+        "shm_v5_prod": {
+          "p50_us": 44.61,
+          "p95_us": 46.72,
+          "p99_us": 48.06
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 42.53,
+          "p95_us": 44.7,
+          "p99_us": 45.95
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 44.61
+      }
+    },
+    "128": {
+      "payload_bytes": 524288,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 174.32,
+          "p95_us": 174.86,
+          "p99_us": 175.17
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 72.25,
+          "p95_us": 72.59,
+          "p99_us": 72.76
+        },
+        "shm_v5_prod": {
+          "p50_us": 70.82,
+          "p95_us": 71.03,
+          "p99_us": 71.13
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 68.97,
+          "p95_us": 69.21,
+          "p99_us": 69.22
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 176.99,
+          "p95_us": 179.1,
+          "p99_us": 180.38
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 74.72,
+          "p95_us": 77.28,
+          "p99_us": 77.41
+        },
+        "shm_v5_prod": {
+          "p50_us": 73.22,
+          "p95_us": 75.23,
+          "p99_us": 75.42
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 71.17,
+          "p95_us": 73.28,
+          "p99_us": 73.28
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 73.22
+      }
+    },
+    "256": {
+      "payload_bytes": 1048576,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 342.71,
+          "p95_us": 343.6,
+          "p99_us": 344.02
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 130.72,
+          "p95_us": 131.13,
+          "p99_us": 131.34
+        },
+        "shm_v5_prod": {
+          "p50_us": 128.69,
+          "p95_us": 129.0,
+          "p99_us": 129.12
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 126.93,
+          "p95_us": 127.24,
+          "p99_us": 127.35
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 344.99,
+          "p95_us": 347.68,
+          "p99_us": 349.15
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 132.67,
+          "p95_us": 135.07,
+          "p99_us": 136.1
+        },
+        "shm_v5_prod": {
+          "p50_us": 130.62,
+          "p95_us": 132.67,
+          "p99_us": 133.66
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 128.58,
+          "p95_us": 130.59,
+          "p99_us": 130.69
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 130.62
+      }
+    },
+    "512": {
+      "payload_bytes": 2097152,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 285.54,
+          "p95_us": 299.87,
+          "p99_us": 301.89
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 250.78,
+          "p95_us": 253.41,
+          "p99_us": 255.46
+        },
+        "shm_v5_prod": {
+          "p50_us": 246.69,
+          "p95_us": 248.74,
+          "p99_us": 248.8
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 244.67,
+          "p95_us": 246.72,
+          "p99_us": 247.42
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 246.69
+      }
+    },
+    "1024": {
+      "payload_bytes": 4194304,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 472.19,
+          "p95_us": 489.06,
+          "p99_us": 491.65
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 488.99,
+          "p95_us": 493.12,
+          "p99_us": 497.12
+        },
+        "shm_v5_prod": {
+          "p50_us": 478.69,
+          "p95_us": 480.83,
+          "p99_us": 482.72
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 476.74,
+          "p95_us": 478.85,
+          "p99_us": 479.78
+        },
+        "hybrid_selected_backend": "nccl_loc",
+        "hybrid_p50_us": 472.19
+      }
+    },
+    "2048": {
+      "payload_bytes": 8388608,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 878.75,
+          "p95_us": 902.24,
+          "p99_us": 905.34
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 968.48,
+          "p95_us": 976.8,
+          "p99_us": 979.87
+        },
+        "shm_v5_prod": {
+          "p50_us": 943.04,
+          "p95_us": 952.29,
+          "p99_us": 953.18
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 940.86,
+          "p95_us": 949.22,
+          "p99_us": 950.85
+        },
+        "hybrid_selected_backend": "nccl_loc",
+        "hybrid_p50_us": 878.75
+      }
+    },
+    "3072": {
+      "payload_bytes": 12582912,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 1248.16,
+          "p95_us": 1275.81,
+          "p99_us": 1281.89
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 1451.62,
+          "p95_us": 1464.22,
+          "p99_us": 1468.29
+        },
+        "shm_v5_prod": {
+          "p50_us": 1407.55,
+          "p95_us": 1419.1,
+          "p99_us": 1420.0
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 1405.34,
+          "p95_us": 1415.1,
+          "p99_us": 1416.1
+        },
+        "hybrid_selected_backend": "nccl_loc",
+        "hybrid_p50_us": 1248.16
+      }
+    },
+    "4096": {
+      "payload_bytes": 16777216,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 1639.49,
+          "p95_us": 1671.78,
+          "p99_us": 1693.89
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 1943.42,
+          "p95_us": 1956.42,
+          "p99_us": 1958.4
+        },
+        "shm_v5_prod": {
+          "p50_us": 1874.43,
+          "p95_us": 1883.71,
+          "p99_us": 1884.7
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 1872.38,
+          "p95_us": 1881.98,
+          "p99_us": 1882.69
+        },
+        "hybrid_selected_backend": "nccl_loc",
+        "hybrid_p50_us": 1639.49
+      }
+    }
+  },
+  "allreduce_h5120_8gpu": {
+    "1": {
+      "payload_bytes": 10240,
+      "prod_algorithm": "one-shot",
+      "prod_threads": 256,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 45.74,
+          "p95_us": 46.24,
+          "p99_us": 46.35
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 14.84,
+          "p95_us": 15.06,
+          "p99_us": 15.11
+        },
+        "shm_v5_prod": {
+          "p50_us": 14.91,
+          "p95_us": 15.22,
+          "p99_us": 15.32
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 12.99,
+          "p95_us": 13.19,
+          "p99_us": 13.28
+        },
+        "shm_v5_pkt64_push_ablation": {
+          "p50_us": 47.88,
+          "p95_us": 71.0,
+          "p99_us": 81.87
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 48.03,
+          "p95_us": 49.09,
+          "p99_us": 49.76
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 17.86,
+          "p95_us": 19.39,
+          "p99_us": 20.03
+        },
+        "shm_v5_prod": {
+          "p50_us": 17.86,
+          "p95_us": 19.9,
+          "p99_us": 22.08
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 15.07,
+          "p95_us": 17.28,
+          "p99_us": 17.98
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 17.86
+      }
+    },
+    "2": {
+      "payload_bytes": 20480,
+      "prod_algorithm": "one-shot",
+      "prod_threads": 256,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 47.35,
+          "p95_us": 47.66,
+          "p99_us": 47.87
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 15.52,
+          "p95_us": 15.73,
+          "p99_us": 15.93
+        },
+        "shm_v5_prod": {
+          "p50_us": 15.67,
+          "p95_us": 15.94,
+          "p99_us": 16.04
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 13.68,
+          "p95_us": 13.88,
+          "p99_us": 13.89
+        },
+        "shm_v5_pkt64_push_ablation": {
+          "p50_us": 902.03,
+          "p95_us": 1263.3,
+          "p99_us": 1422.29
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 49.95,
+          "p95_us": 50.88,
+          "p99_us": 52.74
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 17.98,
+          "p95_us": 20.1,
+          "p99_us": 20.67
+        },
+        "shm_v5_prod": {
+          "p50_us": 17.98,
+          "p95_us": 19.26,
+          "p99_us": 21.28
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 15.94,
+          "p95_us": 17.98,
+          "p99_us": 19.87
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 17.98
+      }
+    },
+    "4": {
+      "payload_bytes": 40960,
+      "prod_algorithm": "one-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 51.17,
+          "p95_us": 51.56,
+          "p99_us": 51.66
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 24.58,
+          "p95_us": 24.86,
+          "p99_us": 24.96
+        },
+        "shm_v5_prod": {
+          "p50_us": 19.82,
+          "p95_us": 20.03,
+          "p99_us": 20.04
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 17.5,
+          "p95_us": 17.69,
+          "p99_us": 17.79
+        },
+        "shm_v5_pkt64_push_ablation": {
+          "p50_us": 3212.26,
+          "p95_us": 3323.15,
+          "p99_us": 3364.31
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 52.29,
+          "p95_us": 54.88,
+          "p99_us": 56.93
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 27.58,
+          "p95_us": 29.66,
+          "p99_us": 30.27
+        },
+        "shm_v5_prod": {
+          "p50_us": 22.08,
+          "p95_us": 24.16,
+          "p99_us": 24.22
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 20.03,
+          "p95_us": 22.11,
+          "p99_us": 22.21
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 22.08
+      }
+    },
+    "8": {
+      "payload_bytes": 81920,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 53.4,
+          "p95_us": 53.63,
+          "p99_us": 53.83
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 30.83,
+          "p95_us": 31.24,
+          "p99_us": 31.44
+        },
+        "shm_v5_prod": {
+          "p50_us": 32.11,
+          "p95_us": 32.52,
+          "p99_us": 32.52
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 29.9,
+          "p95_us": 30.21,
+          "p99_us": 30.41
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 54.34,
+          "p95_us": 56.48,
+          "p99_us": 56.99
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 33.66,
+          "p95_us": 36.32,
+          "p99_us": 36.61
+        },
+        "shm_v5_prod": {
+          "p50_us": 34.37,
+          "p95_us": 36.54,
+          "p99_us": 37.44
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 32.22,
+          "p95_us": 33.76,
+          "p99_us": 34.4
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 34.37
+      }
+    },
+    "16": {
+      "payload_bytes": 163840,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 75.02,
+          "p95_us": 75.52,
+          "p99_us": 75.74
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 35.8,
+          "p95_us": 36.01,
+          "p99_us": 36.21
+        },
+        "shm_v5_prod": {
+          "p50_us": 36.2,
+          "p95_us": 36.54,
+          "p99_us": 36.64
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 33.96,
+          "p95_us": 34.36,
+          "p99_us": 34.36
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 76.67,
+          "p95_us": 77.76,
+          "p99_us": 79.42
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 38.37,
+          "p95_us": 40.42,
+          "p99_us": 40.64
+        },
+        "shm_v5_prod": {
+          "p50_us": 38.46,
+          "p95_us": 40.54,
+          "p99_us": 42.43
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 36.42,
+          "p95_us": 38.46,
+          "p99_us": 38.53
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 38.46
+      }
+    },
+    "32": {
+      "payload_bytes": 327680,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 114.96,
+          "p95_us": 115.76,
+          "p99_us": 116.09
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 60.99,
+          "p95_us": 61.4,
+          "p99_us": 61.5
+        },
+        "shm_v5_prod": {
+          "p50_us": 49.33,
+          "p95_us": 49.65,
+          "p99_us": 49.75
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 47.47,
+          "p95_us": 47.78,
+          "p99_us": 47.89
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 116.86,
+          "p95_us": 118.34,
+          "p99_us": 118.82
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 63.04,
+          "p95_us": 65.09,
+          "p99_us": 66.46
+        },
+        "shm_v5_prod": {
+          "p50_us": 52.13,
+          "p95_us": 53.76,
+          "p99_us": 54.21
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 50.11,
+          "p95_us": 51.1,
+          "p99_us": 52.03
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 52.13
+      }
+    },
+    "64": {
+      "payload_bytes": 655360,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 224.92,
+          "p95_us": 225.74,
+          "p99_us": 226.18
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 93.29,
+          "p95_us": 93.7,
+          "p99_us": 93.88
+        },
+        "shm_v5_prod": {
+          "p50_us": 92.11,
+          "p95_us": 92.32,
+          "p99_us": 92.42
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 90.07,
+          "p95_us": 90.31,
+          "p99_us": 90.43
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 226.24,
+          "p95_us": 228.93,
+          "p99_us": 230.56
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 95.74,
+          "p95_us": 97.89,
+          "p99_us": 99.9
+        },
+        "shm_v5_prod": {
+          "p50_us": 95.1,
+          "p95_us": 96.83,
+          "p99_us": 97.76
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 91.71,
+          "p95_us": 93.95,
+          "p99_us": 95.9
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 95.1
+      }
+    },
+    "128": {
+      "payload_bytes": 1310720,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 431.48,
+          "p95_us": 432.51,
+          "p99_us": 433.1
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 160.2,
+          "p95_us": 160.62,
+          "p99_us": 160.83
+        },
+        "shm_v5_prod": {
+          "p50_us": 157.98,
+          "p95_us": 158.28,
+          "p99_us": 158.36
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 156.31,
+          "p95_us": 156.53,
+          "p99_us": 156.63
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 433.09,
+          "p95_us": 437.12,
+          "p99_us": 439.14
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 162.62,
+          "p95_us": 165.44,
+          "p99_us": 165.54
+        },
+        "shm_v5_prod": {
+          "p50_us": 160.35,
+          "p95_us": 162.62,
+          "p99_us": 163.36
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 158.62,
+          "p95_us": 161.15,
+          "p99_us": 161.28
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 160.35
+      }
+    },
+    "256": {
+      "payload_bytes": 2621440,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 319.15,
+          "p95_us": 322.62,
+          "p99_us": 324.24
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 307.3,
+          "p95_us": 307.89,
+          "p99_us": 308.18
+        },
+        "shm_v5_prod": {
+          "p50_us": 302.24,
+          "p95_us": 302.55,
+          "p99_us": 302.56
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 300.24,
+          "p95_us": 300.6,
+          "p99_us": 300.91
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 321.66,
+          "p95_us": 338.02,
+          "p99_us": 340.1
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 309.89,
+          "p95_us": 312.9,
+          "p99_us": 313.95
+        },
+        "shm_v5_prod": {
+          "p50_us": 304.67,
+          "p95_us": 306.75,
+          "p99_us": 306.82
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 302.56,
+          "p95_us": 304.7,
+          "p99_us": 304.8
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 304.67
+      }
+    },
+    "320": {
+      "payload_bytes": 3276800,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 400.38,
+          "p95_us": 419.07,
+          "p99_us": 420.74
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 390.05,
+          "p95_us": 394.82,
+          "p99_us": 396.74
+        },
+        "shm_v5_prod": {
+          "p50_us": 383.9,
+          "p95_us": 385.89,
+          "p99_us": 386.69
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 381.89,
+          "p95_us": 383.9,
+          "p99_us": 384.74
+        },
+        "hybrid_selected_backend": "shm_v5_prod",
+        "hybrid_p50_us": 383.9
+      }
+    },
+    "384": {
+      "payload_bytes": 3932160,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 450.46,
+          "p95_us": 471.87,
+          "p99_us": 481.09
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 458.3,
+          "p95_us": 462.43,
+          "p99_us": 464.45
+        },
+        "shm_v5_prod": {
+          "p50_us": 450.11,
+          "p95_us": 452.26,
+          "p99_us": 456.26
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 448.06,
+          "p95_us": 450.14,
+          "p99_us": 456.1
+        },
+        "hybrid_selected_backend": "nccl_loc",
+        "hybrid_p50_us": 450.46
+      }
+    },
+    "512": {
+      "payload_bytes": 5242880,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 584.58,
+          "p95_us": 611.14,
+          "p99_us": 615.26
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 607.94,
+          "p95_us": 613.95,
+          "p99_us": 615.36
+        },
+        "shm_v5_prod": {
+          "p50_us": 594.85,
+          "p95_us": 597.6,
+          "p99_us": 597.92
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 592.83,
+          "p95_us": 596.61,
+          "p99_us": 597.92
+        },
+        "hybrid_selected_backend": "nccl_loc",
+        "hybrid_p50_us": 584.58
+      }
+    },
+    "1024": {
+      "payload_bytes": 10485760,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 1067.81,
+          "p95_us": 1087.42,
+          "p99_us": 1094.62
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 1208.8,
+          "p95_us": 1225.22,
+          "p99_us": 1227.36
+        },
+        "shm_v5_prod": {
+          "p50_us": 1175.04,
+          "p95_us": 1185.76,
+          "p99_us": 1188.42
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 1173.41,
+          "p95_us": 1183.26,
+          "p99_us": 1186.34
+        },
+        "hybrid_selected_backend": "nccl_loc",
+        "hybrid_p50_us": 1067.81
+      }
+    },
+    "2048": {
+      "payload_bytes": 20971520,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 2002.78,
+          "p95_us": 2052.0,
+          "p99_us": 2066.34
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 2443.14,
+          "p95_us": 2461.6,
+          "p99_us": 2468.22
+        },
+        "shm_v5_prod": {
+          "p50_us": 2335.3,
+          "p95_us": 2337.38,
+          "p99_us": 2338.34
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 2335.3,
+          "p95_us": 2338.3,
+          "p99_us": 2339.39
+        },
+        "hybrid_selected_backend": "nccl_loc",
+        "hybrid_p50_us": 2002.78
+      }
+    },
+    "3072": {
+      "payload_bytes": 31457280,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 2883.87,
+          "p95_us": 2967.62,
+          "p99_us": 3008.1
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 3724.99,
+          "p95_us": 3742.53,
+          "p99_us": 3759.04
+        },
+        "shm_v5_prod": {
+          "p50_us": 3502.72,
+          "p95_us": 3505.76,
+          "p99_us": 3507.78
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 3503.01,
+          "p95_us": 3508.19,
+          "p99_us": 3510.14
+        },
+        "hybrid_selected_backend": "nccl_loc",
+        "hybrid_p50_us": 2883.87
+      }
+    },
+    "4096": {
+      "payload_bytes": 41943040,
+      "prod_algorithm": "two-shot",
+      "prod_threads": 512,
+      "prod_max_abs_diff_vs_fp32_ref": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 3978.82,
+          "p95_us": 4051.97,
+          "p99_us": 4059.23
+        },
+        "shm_v5_legacy_t256_os40k": {
+          "p50_us": 4987.84,
+          "p95_us": 5002.91,
+          "p99_us": 5004.26
+        },
+        "shm_v5_prod": {
+          "p50_us": 4662.85,
+          "p95_us": 4668.06,
+          "p99_us": 4671.33
+        },
+        "shm_v5_nodone_ablation": {
+          "p50_us": 4660.83,
+          "p95_us": 4666.78,
+          "p99_us": 4668.42
+        },
+        "hybrid_selected_backend": "nccl_loc",
+        "hybrid_p50_us": 3978.82
+      }
+    }
+  },
+  "allgather_640_to_5120_8gpu": {
+    "1": {
+      "input_bytes_per_rank": 1280,
+      "output_bytes": 10240,
+      "prod_threads": 256,
+      "prod_max_abs_diff": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 24.95,
+          "p95_us": 25.35,
+          "p99_us": 25.55
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 15.93,
+          "p95_us": 16.28,
+          "p99_us": 16.36
+        },
+        "shm_ag_prod": {
+          "p50_us": 15.26,
+          "p95_us": 15.52,
+          "p99_us": 15.67
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 14.23,
+          "p95_us": 14.44,
+          "p99_us": 14.5
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 33.5,
+          "p95_us": 41.7,
+          "p99_us": 51.84
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 19.1,
+          "p95_us": 21.25,
+          "p99_us": 21.28
+        },
+        "shm_ag_prod": {
+          "p50_us": 17.18,
+          "p95_us": 21.28,
+          "p99_us": 24.16
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 17.95,
+          "p95_us": 22.08,
+          "p99_us": 28.1
+        },
+        "hybrid_selected_backend": "shm_ag_prod",
+        "hybrid_p50_us": 17.18
+      }
+    },
+    "2": {
+      "input_bytes_per_rank": 2560,
+      "output_bytes": 20480,
+      "prod_threads": 256,
+      "prod_max_abs_diff": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 28.63,
+          "p95_us": 28.93,
+          "p99_us": 29.05
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 15.52,
+          "p95_us": 15.72,
+          "p99_us": 15.73
+        },
+        "shm_ag_prod": {
+          "p50_us": 15.72,
+          "p95_us": 15.93,
+          "p99_us": 15.94
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 13.68,
+          "p95_us": 13.88,
+          "p99_us": 13.89
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 39.2,
+          "p95_us": 49.28,
+          "p99_us": 352.0
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 17.98,
+          "p95_us": 20.03,
+          "p99_us": 20.45
+        },
+        "shm_ag_prod": {
+          "p50_us": 18.05,
+          "p95_us": 20.1,
+          "p99_us": 21.95
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 15.14,
+          "p95_us": 17.18,
+          "p99_us": 23.26
+        },
+        "hybrid_selected_backend": "shm_ag_prod",
+        "hybrid_p50_us": 18.05
+      }
+    },
+    "4": {
+      "input_bytes_per_rank": 5120,
+      "output_bytes": 40960,
+      "prod_threads": 256,
+      "prod_max_abs_diff": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 30.88,
+          "p95_us": 30.99,
+          "p99_us": 31.1
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 15.52,
+          "p95_us": 15.73,
+          "p99_us": 15.93
+        },
+        "shm_ag_prod": {
+          "p50_us": 15.73,
+          "p95_us": 15.96,
+          "p99_us": 16.14
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 13.78,
+          "p95_us": 13.89,
+          "p99_us": 14.09
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 39.52,
+          "p95_us": 45.57,
+          "p99_us": 57.95
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 17.98,
+          "p95_us": 19.26,
+          "p99_us": 21.82
+        },
+        "shm_ag_prod": {
+          "p50_us": 18.02,
+          "p95_us": 20.03,
+          "p99_us": 21.22
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 16.61,
+          "p95_us": 17.25,
+          "p99_us": 17.63
+        },
+        "hybrid_selected_backend": "shm_ag_prod",
+        "hybrid_p50_us": 18.02
+      }
+    },
+    "8": {
+      "input_bytes_per_rank": 10240,
+      "output_bytes": 81920,
+      "prod_threads": 256,
+      "prod_max_abs_diff": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 31.91,
+          "p95_us": 32.52,
+          "p99_us": 32.73
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 15.87,
+          "p95_us": 16.13,
+          "p99_us": 16.28
+        },
+        "shm_ag_prod": {
+          "p50_us": 16.13,
+          "p95_us": 16.35,
+          "p99_us": 16.54
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 14.09,
+          "p95_us": 14.29,
+          "p99_us": 14.31
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 39.78,
+          "p95_us": 43.84,
+          "p99_us": 46.66
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 18.02,
+          "p95_us": 20.06,
+          "p99_us": 21.15
+        },
+        "shm_ag_prod": {
+          "p50_us": 19.1,
+          "p95_us": 20.03,
+          "p99_us": 20.06
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 17.02,
+          "p95_us": 18.78,
+          "p99_us": 19.65
+        },
+        "hybrid_selected_backend": "shm_ag_prod",
+        "hybrid_p50_us": 19.1
+      }
+    },
+    "16": {
+      "input_bytes_per_rank": 20480,
+      "output_bytes": 163840,
+      "prod_threads": 256,
+      "prod_max_abs_diff": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 43.16,
+          "p95_us": 43.39,
+          "p99_us": 43.58
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 16.49,
+          "p95_us": 16.7,
+          "p99_us": 16.75
+        },
+        "shm_ag_prod": {
+          "p50_us": 16.69,
+          "p95_us": 16.96,
+          "p99_us": 17.07
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 14.65,
+          "p95_us": 14.85,
+          "p99_us": 14.93
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 43.71,
+          "p95_us": 45.34,
+          "p99_us": 62.02
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 19.14,
+          "p95_us": 21.22,
+          "p99_us": 21.28
+        },
+        "shm_ag_prod": {
+          "p50_us": 19.84,
+          "p95_us": 22.02,
+          "p99_us": 22.24
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 17.12,
+          "p95_us": 19.07,
+          "p99_us": 19.2
+        },
+        "hybrid_selected_backend": "shm_ag_prod",
+        "hybrid_p50_us": 19.84
+      }
+    },
+    "32": {
+      "input_bytes_per_rank": 40960,
+      "output_bytes": 327680,
+      "prod_threads": 512,
+      "prod_max_abs_diff": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 63.75,
+          "p95_us": 64.28,
+          "p99_us": 64.57
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 25.55,
+          "p95_us": 25.78,
+          "p99_us": 25.91
+        },
+        "shm_ag_prod": {
+          "p50_us": 19.82,
+          "p95_us": 20.05,
+          "p99_us": 20.23
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 17.7,
+          "p95_us": 17.78,
+          "p99_us": 17.92
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 65.7,
+          "p95_us": 67.46,
+          "p99_us": 69.95
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 28.22,
+          "p95_us": 30.3,
+          "p99_us": 30.34
+        },
+        "shm_ag_prod": {
+          "p50_us": 22.08,
+          "p95_us": 24.16,
+          "p99_us": 24.35
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 20.06,
+          "p95_us": 22.08,
+          "p99_us": 22.18
+        },
+        "hybrid_selected_backend": "shm_ag_prod",
+        "hybrid_p50_us": 22.08
+      }
+    },
+    "64": {
+      "input_bytes_per_rank": 81920,
+      "output_bytes": 655360,
+      "prod_threads": 512,
+      "prod_max_abs_diff": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 119.46,
+          "p95_us": 119.97,
+          "p99_us": 120.48
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 36.76,
+          "p95_us": 37.07,
+          "p99_us": 37.23
+        },
+        "shm_ag_prod": {
+          "p50_us": 35.83,
+          "p95_us": 36.11,
+          "p99_us": 36.15
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 33.89,
+          "p95_us": 34.0,
+          "p99_us": 34.16
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 120.99,
+          "p95_us": 123.14,
+          "p99_us": 123.65
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 39.81,
+          "p95_us": 40.58,
+          "p99_us": 42.43
+        },
+        "shm_ag_prod": {
+          "p50_us": 38.34,
+          "p95_us": 40.45,
+          "p99_us": 40.58
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 36.38,
+          "p95_us": 37.86,
+          "p99_us": 38.5
+        },
+        "hybrid_selected_backend": "shm_ag_prod",
+        "hybrid_p50_us": 38.34
+      }
+    },
+    "128": {
+      "input_bytes_per_rank": 163840,
+      "output_bytes": 1310720,
+      "prod_threads": 512,
+      "prod_max_abs_diff": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 106.87,
+          "p95_us": 108.39,
+          "p99_us": 108.71
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 60.58,
+          "p95_us": 60.98,
+          "p99_us": 61.09
+        },
+        "shm_ag_prod": {
+          "p50_us": 58.43,
+          "p95_us": 58.63,
+          "p99_us": 58.74
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 56.69,
+          "p95_us": 56.91,
+          "p99_us": 57.1
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 108.58,
+          "p95_us": 114.53,
+          "p99_us": 118.94
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 63.04,
+          "p95_us": 65.12,
+          "p99_us": 66.14
+        },
+        "shm_ag_prod": {
+          "p50_us": 60.83,
+          "p95_us": 62.37,
+          "p99_us": 62.4
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 58.72,
+          "p95_us": 60.99,
+          "p99_us": 61.02
+        },
+        "hybrid_selected_backend": "shm_ag_prod",
+        "hybrid_p50_us": 60.83
+      }
+    },
+    "256": {
+      "input_bytes_per_rank": 327680,
+      "output_bytes": 2621440,
+      "prod_threads": 512,
+      "prod_max_abs_diff": 0.0,
+      "cudagraph": {
+        "nccl_loc": {
+          "p50_us": 174.15,
+          "p95_us": 177.21,
+          "p99_us": 178.66
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 114.24,
+          "p95_us": 114.9,
+          "p99_us": 115.2
+        },
+        "shm_ag_prod": {
+          "p50_us": 109.22,
+          "p95_us": 109.45,
+          "p99_us": 109.55
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 107.52,
+          "p95_us": 107.79,
+          "p99_us": 107.89
+        }
+      },
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 176.32,
+          "p95_us": 188.42,
+          "p99_us": 190.69
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 116.29,
+          "p95_us": 120.35,
+          "p99_us": 120.42
+        },
+        "shm_ag_prod": {
+          "p50_us": 111.49,
+          "p95_us": 112.35,
+          "p99_us": 114.21
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 109.54,
+          "p95_us": 111.52,
+          "p99_us": 112.35
+        },
+        "hybrid_selected_backend": "shm_ag_prod",
+        "hybrid_p50_us": 111.49
+      }
+    },
+    "512": {
+      "input_bytes_per_rank": 655360,
+      "output_bytes": 5242880,
+      "prod_threads": 512,
+      "prod_max_abs_diff": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 303.2,
+          "p95_us": 315.58,
+          "p99_us": 317.31
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 222.14,
+          "p95_us": 226.85,
+          "p99_us": 228.32
+        },
+        "shm_ag_prod": {
+          "p50_us": 211.94,
+          "p95_us": 213.47,
+          "p99_us": 213.95
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 210.43,
+          "p95_us": 212.48,
+          "p99_us": 212.67
+        },
+        "hybrid_selected_backend": "shm_ag_prod",
+        "hybrid_p50_us": 211.94
+      }
+    },
+    "1024": {
+      "input_bytes_per_rank": 1310720,
+      "output_bytes": 10485760,
+      "prod_threads": 512,
+      "prod_max_abs_diff": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 550.02,
+          "p95_us": 558.94,
+          "p99_us": 561.41
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 431.01,
+          "p95_us": 438.21,
+          "p99_us": 442.11
+        },
+        "shm_ag_prod": {
+          "p50_us": 413.5,
+          "p95_us": 415.42,
+          "p99_us": 416.32
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 412.35,
+          "p95_us": 413.95,
+          "p99_us": 414.66
+        },
+        "hybrid_selected_backend": "shm_ag_prod",
+        "hybrid_p50_us": 413.5
+      }
+    },
+    "2048": {
+      "input_bytes_per_rank": 2621440,
+      "output_bytes": 20971520,
+      "prod_threads": 512,
+      "prod_max_abs_diff": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 1032.48,
+          "p95_us": 1044.42,
+          "p99_us": 1045.92
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 845.41,
+          "p95_us": 854.78,
+          "p99_us": 860.06
+        },
+        "shm_ag_prod": {
+          "p50_us": 816.74,
+          "p95_us": 819.14,
+          "p99_us": 820.74
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 814.94,
+          "p95_us": 816.77,
+          "p99_us": 817.73
+        },
+        "hybrid_selected_backend": "shm_ag_prod",
+        "hybrid_p50_us": 816.74
+      }
+    },
+    "3072": {
+      "input_bytes_per_rank": 3932160,
+      "output_bytes": 31457280,
+      "prod_threads": 512,
+      "prod_max_abs_diff": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 1502.4,
+          "p95_us": 1511.58,
+          "p99_us": 1516.51
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 1260.1,
+          "p95_us": 1266.59,
+          "p99_us": 1271.36
+        },
+        "shm_ag_prod": {
+          "p50_us": 1220.16,
+          "p95_us": 1222.3,
+          "p99_us": 1222.62
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 1218.37,
+          "p95_us": 1220.51,
+          "p99_us": 1221.28
+        },
+        "hybrid_selected_backend": "shm_ag_prod",
+        "hybrid_p50_us": 1220.16
+      }
+    },
+    "4096": {
+      "input_bytes_per_rank": 5242880,
+      "output_bytes": 41943040,
+      "prod_threads": 512,
+      "prod_max_abs_diff": 0.0,
+      "cudagraph": {},
+      "eager": {
+        "nccl_loc": {
+          "p50_us": 2061.66,
+          "p95_us": 2075.84,
+          "p99_us": 2079.1
+        },
+        "shm_ag_legacy_t256": {
+          "p50_us": 1673.79,
+          "p95_us": 1685.95,
+          "p99_us": 1687.52
+        },
+        "shm_ag_prod": {
+          "p50_us": 1623.84,
+          "p95_us": 1626.62,
+          "p99_us": 1630.82
+        },
+        "shm_ag_nodone_ablation": {
+          "p50_us": 1621.92,
+          "p95_us": 1624.64,
+          "p99_us": 1626.66
+        },
+        "hybrid_selected_backend": "shm_ag_prod",
+        "hybrid_p50_us": 1623.84
+      }
+    }
+  },
+  "dsv41_e2e_amdahl_ablation": {
+    "benchmark_protocol": "DeepSeek-V4.1-Flash TP=8 on 8x RTX 6000D, b12x=on(moe=40,lin=210/6), --no-enable-prefix-caching, isolated per-(round,tier) seeds, Warm n=3.",
+    "greedy_parity_gate": {
+      "prime_squares_table_exact_tokens": "128/128 (single, batched, chunked)",
+      "triton_recompilations": 0,
+      "unprepared_warnings": 0
+    },
+    "suite1_in512_out128_tok_s": {
+      "c1": {
+        "phase37_main": "95.66+-0.20",
+        "nodone_adaptive": "97.78+-0.08",
+        "delta_pct": 2.22
+      },
+      "c8": {
+        "phase37_main": "446.37+-1.62",
+        "nodone_adaptive": "450.46+-0.78",
+        "delta_pct": 0.92
+      },
+      "c16": {
+        "phase37_main": "631.57+-0.97",
+        "nodone_adaptive": "637.96+-3.87",
+        "delta_pct": 1.01
+      },
+      "c32": {
+        "phase37_main": "820.22+-1.82",
+        "nodone_adaptive": "844.80+-3.07",
+        "delta_pct": 3.0
+      }
+    },
+    "suite2_six_tier_tok_s": {
+      "in512_c1": {
+        "phase37_main": "101.61+-0.11",
+        "nodone_adaptive": "103.52+-0.04",
+        "delta_pct": 1.88
+      },
+      "in512_c16": {
+        "phase37_main": "741.71+-5.61",
+        "nodone_adaptive": "750.63+-0.19",
+        "delta_pct": 1.2
+      },
+      "in512_c128": {
+        "phase37_main": "1717.41+-4.17",
+        "nodone_adaptive": "1728.71+-8.00",
+        "delta_pct": 0.66
+      },
+      "in1024_c1": {
+        "phase37_main": "99.33+-0.04",
+        "nodone_adaptive": "101.67+-0.15",
+        "delta_pct": 2.36
+      },
+      "in1024_c32": {
+        "phase37_main": "796.36+-0.84",
+        "nodone_adaptive": "815.37+-3.65",
+        "delta_pct": 2.39
+      },
+      "in1024_c128": {
+        "phase37_main": "1189.11+-2.74",
+        "nodone_adaptive": "1191.83+-4.23",
+        "delta_pct": 0.23
+      }
+    },
+    "engineering_decision": "Retain `done-wait` (`my_done` entry spin + `peer_done` exit release store): removing `done-wait` saves only ~0.6-2.0 us/call (~0.05-0.16 ms/step = <2% E2E, inside the <3% GPU boost-clock noise band) while forfeiting unconditional 4-slot ring overwrite safety under future multi-stream overlap. Ship stateless adaptive `256->512` CTA thread scaling + `64 KiB` one-shot threshold + hybrid `NCCL_LOC` large-M Eager routing, which captures the `c=32` wave-tail fix and 2K-4K prefill bandwidth gains with zero ring-safety compromise."
+  }
+}

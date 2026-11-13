@@ -105,6 +105,8 @@ NVLink: 无；can_device_access_peer(i, j) == 0 (8x8 全 0)
 
 ## 5. `H=2048, blocks=8` 全尺寸 AllReduce 实测
 
+> **口径与演进说明（`zstep#14`）**：下表归档自 Phase 2 历史单文件 SHM 基线（[`phase2_allreduce_h2048_8gpu.json`](benchmarks/phase2_allreduce_h2048_8gpu.json)，`Host A: 8 × RTX 5090` 4-NUMA，旧 `host_mapped_two_shot_fused_kernel`，`kOneShotMaxVecsLegacy = 1024` 即 `<= 16 KiB` One-Shot）。当前 `main` 生产路径已全面切换至每卡独立 NUMA 页 `shm_v5`（`DEFAULT_ONE_SHOT_MAX_VECS = 4096` 即 `<= 64 KiB` One-Shot、`vecs_per_cta > 256` 无状态自适应 `256 -> 512` 线程、保留 4 槽环形安全握手 `done-wait`），并在 `Qwen35MoeStepRunner` 中对大 `M` Eager Prefill（`numel > 320 * 5120`，即 `H=2048` 下 `M >= 1024`）自动切换至多 SM `NCCL_LOC`（`M <= 800` 及 100% CUDAGraph 解码桶走 `shm_v5`）。在 `8 × RTX 6000D` 2-NUMA 上的最新双端实测见 [`phase37_6000d_comm_audit.json`](benchmarks/phase37_6000d_comm_audit.json) 与 [`07-phase3-dsv41-6000d-benchmark.md` §8](07-phase3-dsv41-6000d-benchmark.md)：`H=2048` 下 `M=1..256` CUDAGraph `shm_v5` 全部领先 `NCCL_LOC`（`14.50..128.69 µs` vs `29.65..342.71 µs`，其中 `M=16` 因升入 `64 KiB` One-Shot + `512` 线程由 `30.61 µs` 降至 **`27.09 µs`**），Eager `M=512` `shm_v5` 仍更快（**`246.69 vs 285.54 µs`**），`M=1024..4096` 路由至 `NCCL_LOC`（**`472.19 / 878.75 / 1,248.16 / 1,639.49 µs`** vs `shm_v5` `478.69 / 943.04 / 1,407.55 / 1,874.43 µs`，4K Prefill 80 次调用每步省约 `18.8 ms`）。
+
 来源：[`phase2_allreduce_h2048_8gpu.json`](benchmarks/phase2_allreduce_h2048_8gpu.json)。8 卡均为 `sm_120`、BF16、无 P2P；每个 Graph 含 10 次调用，预热 300 次、计时 1,000 次。下表不省略中间劣势区间；`80 次` 列是按 Graph `p50` 推算的通信时间，不是独立端到端测量。
 
 | `M` | 载荷 | 算法 | `zstep p50/p95/p99 (µs)` | `NCCL SHM p50/p95/p99 (µs)` | `zstep 80 次 (ms)` |
