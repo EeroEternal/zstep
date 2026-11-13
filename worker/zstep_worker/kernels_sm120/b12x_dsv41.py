@@ -32,12 +32,15 @@ FlashInfer sparse MLA+SWA untouched:
    - Uses `b12x.moe.fused_moe` (`ActivationMode.A8`, `W13Layout("w31")`,
      `swiglu_limit=10.0`, `B12X_W4A8_TINY_DECODE=0`) for `1.50x-2.50x` decode
      CUDAGraph speedup across `M = 1..128`.
-2. **Block32 `[32, 32] UE8M0` 2D FP8 Dense Linears (`fused_wqa_wkv`, `wq_b`,
-   `indexer.wq_b`, `wo_b`, `shared_experts.gate_up_proj`,
-   `shared_experts.down_proj`, `engram.wkv`)**:
-   - Uses `b12x.gemm.block_fp8_linear` (`2.25x-4.64x` decode CUDAGraph speedup),
-     with a hybrid `rows > 512` eager fallback to `FlashInferCutlassMxfp8LinearKernel`
-     solely on `fused_wqa_wkv` (`1792 x 5120`).
+2. **Block32 `[32, 32] UE8M0` 2D FP8 Dense Linears (`210 layers`, `7 shapes`:
+   `fused_wqa_wkv`, `wq_b`, `indexer.wq_b`, `wo_b`,
+   `shared_experts.gate_up_proj`, `shared_experts.down_proj`, `engram.wkv`)**:
+   - Uses `b12x.gemm.block_fp8_linear` (`2.25x-4.64x` decode CUDAGraph speedup
+     including `K % 32 == 0` `5120 x 288` `shared_experts.down_proj`) with
+     pre-resolved fast bindings and per-shape `156-SM` autotuned eager Cutlass
+     hybrid crossover (`rows > 2048` on `1792 x 5120`, `rows > 512` on
+     `3200 x 6144`), while retaining `PreparationSession` across the runner
+     lifetime so autotuned plans and compiled caches are never evicted.
    - Leaves 3D BMM `.wo_a` on standard `ModelOptLinearMethod`.
 """
 
@@ -61,12 +64,16 @@ _DEFAULT_COMPAT_CANDIDATES: tuple[str, ...] = (
     "/usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/_compat",
 )
 
-# `fused_wqa_wkv` (`5120 -> 1792`) is faster on `b12x` for decode & `M <= 512`,
-# while FlashInfer's Cutlass MXFP8 kernel is faster for large eager chunks (`M > 512`).
-_CUTLASS_LARGE_M_FALLBACK_SHAPES: frozenset[tuple[int, int]] = frozenset(
-    {(1792, 5120)}
-)
-_CUTLASS_LARGE_M_THRESHOLD: int = 512
+# Per-shape eager Cutlass crossover thresholds measured on RTX 6000D (`sm_120`,
+# 156 SMs) with retained `PreparationSession` + `autotune=True`:
+# - `fused_wqa_wkv` (`1792 x 5120`): `b12x` fast-bind wins for `M <= 2048`
+#   (`125-131 us` vs Cutlass `165-176 us`), Cutlass wins at `M >= 3072` (`219 vs 299 us`).
+# - `engram.wkv` (`3200 x 6144`): `b12x` fast-bind wins for `M <= 512`
+#   (`127-143 us` vs `160 us`), Cutlass wins at `M >= 1024` (`170 vs 189 us`).
+_CUTLASS_LARGE_M_THRESHOLDS: dict[tuple[int, int], int] = {
+    (1792, 5120): 2048,
+    (3200, 6144): 512,
+}
 
 
 @dataclass(frozen=True)
@@ -172,7 +179,7 @@ def _specs_nbytes(specs: Any) -> int:
     for sp in specs:
         elem_size = torch.empty((), dtype=sp.dtype).element_size()
         nbytes = int(math.prod(sp.shape)) * elem_size
-        total = _align_up(total, 256) + nbytes
+        total = _align_up(total, 1024) + nbytes
     return total
 
 
@@ -182,7 +189,7 @@ def _slice_arena_for_specs(
     views: list[torch.Tensor] = []
     offset = 0
     for sp in specs:
-        offset = _align_up(offset, 256)
+        offset = _align_up(offset, 1024)
         elem_size = torch.empty((), dtype=sp.dtype).element_size()
         nbytes = int(math.prod(sp.shape)) * elem_size
         chunk = arena_u8[offset : offset + nbytes]
@@ -197,6 +204,10 @@ def install_b12x_dsv41_quant_patches() -> bool:
         return False
 
     from b12x.gemm import block_fp8_linear
+    from b12x.gemm._shared.block_fp8 import (
+        BlockFP8LinearBinding,
+        _block_fp8_linear_x_q_from_scratch,
+    )
     from b12x.moe import fused_moe
     from vllm.config.quantization import QuantSpec
     from vllm.model_executor.layers.fused_moe import (
@@ -207,7 +218,7 @@ def install_b12x_dsv41_quant_patches() -> bool:
     from vllm.model_executor.layers.linear import (
         LinearBase,
         UnquantizedLinearMethod,
-         WEIGHT_LOADER_V2_SUPPORTED,
+        WEIGHT_LOADER_V2_SUPPORTED,
     )
     import vllm.models.deepseek_v41.quant_config as dsv41_qcfg
     from vllm.model_executor.layers.quantization.modelopt import (
@@ -234,6 +245,7 @@ def install_b12x_dsv41_quant_patches() -> bool:
             self._b12x_enabled: bool = False
             self._fallback_to_vllm: bool = False
             self._b12x_eplan: Any = None
+            self._b12x_moe_state: Any = None
             self._b12x_scratch: tuple[torch.Tensor, ...] | None = None
 
         @property
@@ -404,16 +416,27 @@ def install_b12x_dsv41_quant_patches() -> bool:
                 else topk_ids.to(dtype=torch.int32).contiguous()
             )
             out_2d = torch.empty_like(x_2d)
-            binding = fused_moe.bind(
-                self._b12x_eplan,
-                scratch=self._b12x_scratch,
-                a=x_2d,
-                experts=layer._b12x_prepared_experts,
-                topk_weights=wts,
-                topk_ids=ids,
-                output=out_2d,
-                input_scales_static=True,
-            )
+            if self._b12x_moe_state is not None:
+                binding = self._b12x_moe_state.bind(
+                    scratch=self._b12x_scratch,
+                    a=x_2d,
+                    experts=layer._b12x_prepared_experts,
+                    topk_weights=wts,
+                    topk_ids=ids,
+                    output=out_2d,
+                    input_scales_static=True,
+                )
+            else:
+                binding = fused_moe.bind(
+                    self._b12x_eplan,
+                    scratch=self._b12x_scratch,
+                    a=x_2d,
+                    experts=layer._b12x_prepared_experts,
+                    topk_weights=wts,
+                    topk_ids=ids,
+                    output=out_2d,
+                    input_scales_static=True,
+                )
             binding.run()
             return out_2d.view(orig_shape)
 
@@ -433,10 +456,12 @@ def install_b12x_dsv41_quant_patches() -> bool:
             self._is_shared_expert: bool = ".shared_experts." in layer_prefix
             self._orig_kernel: Any = None
             self._cutlass_fallback_kernel: Any = None
+            self._cutlass_large_m_threshold: int = 0
             self._b12x_enabled: bool = False
             self._b12x_caps: tuple[int, ...] = ()
             self._b12x_plans: tuple[Any, ...] = ()
             self._b12x_scratches: tuple[list[torch.Tensor], ...] = ()
+            self._b12x_fast_plans: tuple[tuple[Any, ...], ...] = ()
             self._out_features: int = 0
             self._in_features: int = 0
 
@@ -484,7 +509,7 @@ def install_b12x_dsv41_quant_patches() -> bool:
             in_features = int(weight.shape[1])
             if (
                 out_features % 32 != 0
-                or in_features % 64 != 0
+                or in_features % 32 != 0
                 or wscale.shape[1] != in_features // 32
                 or wscale.shape[0] not in (out_features, out_features // 32)
             ):
@@ -492,10 +517,10 @@ def install_b12x_dsv41_quant_patches() -> bool:
                 super().process_weights_after_loading(layer)
                 return
 
-            keep_cutlass_fallback = (
-                out_features,
-                in_features,
-            ) in _CUTLASS_LARGE_M_FALLBACK_SHAPES
+            cutlass_threshold = _CUTLASS_LARGE_M_THRESHOLDS.get(
+                (out_features, in_features), 0
+            )
+            keep_cutlass_fallback = cutlass_threshold > 0
 
             try:
                 raw_scale_u8 = (
@@ -529,6 +554,7 @@ def install_b12x_dsv41_quant_patches() -> bool:
                 self.kernel = self._orig_kernel
                 super().process_weights_after_loading(layer)
                 self._cutlass_fallback_kernel = self.kernel
+                self._cutlass_large_m_threshold = cutlass_threshold
                 self.kernel = None
             else:
                 device = weight.device
@@ -575,7 +601,7 @@ def install_b12x_dsv41_quant_patches() -> bool:
 
             if (
                 self._cutlass_fallback_kernel is not None
-                and rows > _CUTLASS_LARGE_M_THRESHOLD
+                and rows > self._cutlass_large_m_threshold
                 and not torch.cuda.is_current_stream_capturing()
             ):
                 out_fb = self._cutlass_fallback_kernel.apply_weights(
@@ -592,14 +618,40 @@ def install_b12x_dsv41_quant_patches() -> bool:
                 dtype=torch.bfloat16,
                 device=x_2d.device,
             )
-            binding = block_fp8_linear.bind(
-                self._b12x_plans[pidx],
-                scratch=self._b12x_scratches[pidx],
-                source=x_2d,
-                packed_weight=layer._b12x_packed_weight,
-                output=out_2d.view(rows, self._out_features, 1),
-            )
-            block_fp8_linear.run(binding=binding)
+            fast = self._b12x_fast_plans
+            if fast:
+                plan, state, scr_u8, ws, cap, mma_tiler_mn, exact_x_q = fast[pidx]
+                x_q = (
+                    exact_x_q
+                    if rows == cap
+                    else _block_fp8_linear_x_q_from_scratch(
+                        scr_u8,
+                        tokens=rows,
+                        in_features=self._in_features,
+                        output_dtype=torch.bfloat16,
+                    )
+                )
+                binding = BlockFP8LinearBinding(
+                    plan=plan,
+                    source=x_2d,
+                    packed_weight=layer._b12x_packed_weight,
+                    x_q=x_q,
+                    output=out_2d.view(rows, self._out_features, 1),
+                    workspace=ws,
+                    bias=None,
+                    expected_m=cap,
+                    mma_tiler_mn=mma_tiler_mn,
+                )
+                state.run_binding(binding)
+            else:
+                binding = block_fp8_linear.bind(
+                    self._b12x_plans[pidx],
+                    scratch=self._b12x_scratches[pidx],
+                    source=x_2d,
+                    packed_weight=layer._b12x_packed_weight,
+                    output=out_2d.view(rows, self._out_features, 1),
+                )
+                block_fp8_linear.run(binding=binding)
             if bias is not None:
                 out_2d.add_(bias)
             return out_2d.view(out_shape)
@@ -672,9 +724,15 @@ def prepare_b12x_dsv41_model(
         return B12xPrepareSummary(False, 0, 0, 0, 0, 0, 0.0)
 
     from b12x.gemm import block_fp8_linear
+    from b12x.gemm._shared.block_fp8 import (
+        _SCRATCH_ALIGN_BYTES,
+        _block_fp8_linear_scratch_layout,
+        _block_fp8_linear_x_q_from_scratch,
+    )
     from b12x.moe import fused_moe
     from b12x.moe.fused_moe.workloads import make_tuning_routes
     from b12x.preparation import PreparationSession, PreparedCall
+    from b12x.preparation.types import require_prepared
 
     moe_layers: list[tuple[str, torch.nn.Module, Any]] = []
     linear_layers: list[tuple[str, torch.nn.Module, Any]] = []
@@ -838,13 +896,16 @@ def prepare_b12x_dsv41_model(
     # 3. Run `PreparationSession` on rank 0 FIRST so compilation & GPU autotuning
     # happen free of multi-rank filesystem races or GPU power throttling, then
     # let ranks 1..7 load the warm persistent cache in <1s.
+    # IMPORTANT: Do NOT call `sess.close()` here — `sess.prepare()` already drains
+    # and closes its `CompilePool`, whereas `sess.close()` clears `plan._prepared`
+    # and evicts unretained compiled programs before CUDAGraph capture & serving!
     cache_dir = os.environ.get(
         "ZSTEP_B12X_CACHE_DIR",
-        str(Path.home() / ".cache" / "b12x_zstep_dsv41_v1"),
+        str(Path.home() / ".cache" / "b12x_zstep_dsv41_v2"),
     )
     autotune = _env_flag("ZSTEP_B12X_AUTOTUNE", default=True)
 
-    def _run_session() -> None:
+    def _run_session() -> Any:
         sess = PreparationSession(
             device=rank,
             autotune=autotune,
@@ -852,72 +913,128 @@ def prepare_b12x_dsv41_model(
         )
         try:
             sess.prepare(tuple(requests))
-        finally:
+            return sess
+        except BaseException:
             sess.close()
+            raise
 
-    if exchange_group is not None and dist.is_initialized():
-        if rank == 0:
-            _run_session()
-        dist.barrier(group=exchange_group)
-        if rank != 0:
-            _run_session()
-        dist.barrier(group=exchange_group)
-    else:
-        _run_session()
+    active_sess: Any = None
+    try:
+        if exchange_group is not None and dist.is_initialized():
+            if rank == 0:
+                active_sess = _run_session()
+            dist.barrier(group=exchange_group)
+            if rank != 0:
+                active_sess = _run_session()
+            dist.barrier(group=exchange_group)
+        else:
+            active_sess = _run_session()
 
-    torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
-    # 4. Pre-allocate static 256B-aligned scratch arenas (zero-alloc CUDAGraph capture & replay).
-    moe_scratch_bytes = 0
-    if moe_layers:
-        for _mname, _layer, qm in moe_layers:
-            moe_scratch_bytes = max(
-                moe_scratch_bytes, _specs_nbytes(qm._b12x_eplan.scratch_specs())
+        # 4. Pre-allocate static 1024B-aligned scratch arenas (zero-alloc CUDAGraph capture & replay).
+        moe_scratch_bytes = 0
+        if moe_layers:
+            for _mname, _layer, qm in moe_layers:
+                moe_scratch_bytes = max(
+                    moe_scratch_bytes, _specs_nbytes(qm._b12x_eplan.scratch_specs())
+                )
+            moe_arena = torch.empty(
+                max(1024, moe_scratch_bytes), dtype=torch.uint8, device=device
             )
-        moe_arena = torch.empty(
-            max(256, moe_scratch_bytes), dtype=torch.uint8, device=device
+            for _mname, _layer, qm in moe_layers:
+                qm._b12x_moe_state = require_prepared(qm._b12x_eplan, "moe.decode")
+                qm._b12x_scratch = tuple(
+                    _slice_arena_for_specs(moe_arena, qm._b12x_eplan.scratch_specs())
+                )
+
+        # Separate linear scratch arenas for main stream (slot 0) vs `SharedExperts` aux stream (slot 1).
+        slot_max_bytes: dict[int, int] = {0: 0, 1: 0}
+        for skey, plans in shape_plans.items():
+            max_for_shape = max(_specs_nbytes(p.scratch_specs()) for p in plans)
+            for slot in shape_streams[skey]:
+                slot_max_bytes[slot] = max(slot_max_bytes[slot], max_for_shape)
+
+        slot_arenas: dict[int, torch.Tensor] = {}
+        linear_scratch_bytes = 0
+        for slot, nbytes in slot_max_bytes.items():
+            if nbytes > 0 or any(slot in s for s in shape_streams.values()):
+                alloc_bytes = max(1024, nbytes)
+                slot_arenas[slot] = torch.empty(
+                    alloc_bytes, dtype=torch.uint8, device=device
+                )
+                linear_scratch_bytes += alloc_bytes
+
+        slot_shape_scratches: dict[
+            tuple[int, tuple[int, int]], tuple[list[torch.Tensor], ...]
+        ] = {}
+        slot_shape_fast_plans: dict[
+            tuple[int, tuple[int, int]], tuple[tuple[Any, ...], ...]
+        ] = {}
+        for skey, plans in shape_plans.items():
+            for slot in shape_streams[skey]:
+                arena = slot_arenas[slot]
+                scratches_for_shape = tuple(
+                    _slice_arena_for_specs(arena, p.scratch_specs()) for p in plans
+                )
+                slot_shape_scratches[(slot, skey)] = scratches_for_shape
+                fast_for_shape: list[tuple[Any, ...]] = []
+                for cap, p, scr_list in zip(
+                    caps_tuple, plans, scratches_for_shape, strict=True
+                ):
+                    state = require_prepared(p, "gemm.block_fp8_linear")
+                    splan = state.scratch
+                    scr_u8 = scr_list[0]
+                    ws: torch.Tensor | None = None
+                    if splan.workspace_nbytes:
+                        ws_off = _align_up(
+                            _block_fp8_linear_scratch_layout(
+                                tokens=splan.caps.max_tokens,
+                                in_features=splan.caps.in_features,
+                                out_features=splan.caps.out_features,
+                                output_dtype=splan.caps.output_dtype,
+                            ).nbytes,
+                            _SCRATCH_ALIGN_BYTES,
+                        )
+                        ws = scr_u8.narrow(0, ws_off, splan.workspace_nbytes).view(
+                            torch.float32
+                        )
+                    exact_x_q = _block_fp8_linear_x_q_from_scratch(
+                        scr_u8,
+                        tokens=int(cap),
+                        in_features=int(splan.caps.in_features),
+                        output_dtype=splan.caps.output_dtype,
+                    )
+                    fast_for_shape.append(
+                        (
+                            p,
+                            state,
+                            scr_u8,
+                            ws,
+                            int(cap),
+                            splan.mma_tiler_mn,
+                            exact_x_q,
+                        )
+                    )
+                slot_shape_fast_plans[(slot, skey)] = tuple(fast_for_shape)
+
+        for _lname, _layer, qm in linear_layers:
+            skey = (int(qm._out_features), int(qm._in_features))
+            slot = 1 if qm._is_shared_expert else 0
+            qm._b12x_caps = caps_tuple
+            qm._b12x_plans = shape_plans[skey]
+            qm._b12x_scratches = slot_shape_scratches[(slot, skey)]
+            qm._b12x_fast_plans = slot_shape_fast_plans[(slot, skey)]
+
+        model._b12x_session = active_sess  # type: ignore[attr-defined]
+        model._b12x_scratch_arenas = (  # type: ignore[attr-defined]
+            moe_arena if moe_layers else None,
+            slot_arenas,
         )
-        for _mname, _layer, qm in moe_layers:
-            qm._b12x_scratch = tuple(
-                _slice_arena_for_specs(moe_arena, qm._b12x_eplan.scratch_specs())
-            )
-
-    # Separate linear scratch arenas for main stream (slot 0) vs `SharedExperts` aux stream (slot 1).
-    slot_max_bytes: dict[int, int] = {0: 0, 1: 0}
-    for skey, plans in shape_plans.items():
-        max_for_shape = max(_specs_nbytes(p.scratch_specs()) for p in plans)
-        for slot in shape_streams[skey]:
-            slot_max_bytes[slot] = max(slot_max_bytes[slot], max_for_shape)
-
-    slot_arenas: dict[int, torch.Tensor] = {}
-    linear_scratch_bytes = 0
-    for slot, nbytes in slot_max_bytes.items():
-        if nbytes > 0 or any(slot in s for s in shape_streams.values()):
-            alloc_bytes = max(256, nbytes)
-            slot_arenas[slot] = torch.empty(
-                alloc_bytes, dtype=torch.uint8, device=device
-            )
-            linear_scratch_bytes += alloc_bytes
-
-    slot_shape_scratches: dict[tuple[int, tuple[int, int]], tuple[list[torch.Tensor], ...]] = {}
-    for skey, plans in shape_plans.items():
-        for slot in shape_streams[skey]:
-            arena = slot_arenas[slot]
-            slot_shape_scratches[(slot, skey)] = tuple(
-                _slice_arena_for_specs(arena, p.scratch_specs()) for p in plans
-            )
-
-    for _lname, _layer, qm in linear_layers:
-        skey = (int(qm._out_features), int(qm._in_features))
-        slot = 1 if qm._is_shared_expert else 0
-        qm._b12x_caps = caps_tuple
-        qm._b12x_plans = shape_plans[skey]
-        qm._b12x_scratches = slot_shape_scratches[(slot, skey)]
-
-    model._b12x_scratch_arenas = (  # type: ignore[attr-defined]
-        moe_arena if moe_layers else None,
-        slot_arenas,
-    )
+    except BaseException:
+        if active_sess is not None:
+            active_sess.close()
+        raise
 
     prepare_ms = (time.perf_counter() - t0) * 1000.0
     return B12xPrepareSummary(
@@ -929,3 +1046,13 @@ def prepare_b12x_dsv41_model(
         linear_scratch_bytes=linear_scratch_bytes,
         prepare_ms=prepare_ms,
     )
+
+
+def close_b12x_dsv41_model(model: torch.nn.Module | None) -> None:
+    """Close any retained `b12x` `PreparationSession` attached to `model` during runner teardown."""
+    if model is None:
+        return
+    sess = getattr(model, "_b12x_session", None)
+    if sess is not None:
+        model._b12x_session = None  # type: ignore[attr-defined]
+        sess.close()
