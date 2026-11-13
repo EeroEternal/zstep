@@ -367,16 +367,7 @@ impl BenchmarkProvenance {
         max_step_tokens: u32,
         max_prefill_chunk: usize,
     ) -> Result<Self> {
-        let git_commit = match Command::new("git")
-            .args(["rev-parse", "--short", "HEAD"])
-            .output()
-        {
-            Ok(output) if output.status.success() => String::from_utf8(output.stdout)
-                .map_err(|error| ModeBError::Protocol(format!("invalid Git revision: {error}")))?
-                .trim()
-                .to_owned(),
-            _ => read_git_head_fallback()?,
-        };
+        let git_commit = zs_wire::resolve_git_sha(true).map_err(ModeBError::Protocol)?;
 
         let gpu_output = Command::new("nvidia-smi")
             .args([
@@ -542,24 +533,6 @@ fn json_string(value: &str) -> String {
     }
     out.push('"');
     out
-}
-
-fn read_git_head_fallback() -> Result<String> {
-    let head = std::fs::read_to_string(".git/HEAD")?;
-    let head = head.trim();
-    let revision = if let Some(reference) = head.strip_prefix("ref: ") {
-        let reference_path = std::path::Path::new(".git").join(reference);
-        std::fs::read_to_string(reference_path)?
-    } else {
-        head.to_owned()
-    };
-    let revision = revision.trim();
-    if revision.len() < 7 || !revision.chars().take(7).all(|c| c.is_ascii_hexdigit()) {
-        return Err(ModeBError::Protocol(
-            ".git/HEAD did not contain a valid revision".to_owned(),
-        ));
-    }
-    Ok(revision.chars().take(7).collect())
 }
 
 struct PendingRequest {

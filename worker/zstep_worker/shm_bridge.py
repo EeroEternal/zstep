@@ -33,16 +33,35 @@ from typing import Any
 import numpy as np
 
 ZSTEP_SHM_MAGIC: int = 0x5A53_5445_505F_5631
-ZSTEP_PROTOCOL_VERSION: int = 2
+ZSTEP_PROTOCOL_VERSION: int = 3
 SHM_SUPERBLOCK_STRUCT_BYTES: int = 128
 SHM_SUPERBLOCK_REGION_BYTES: int = 4096
+SUPERBLOCK_TOTAL_BYTES_OFFSET: int = 48
+SUPERBLOCK_PLAN_OFFSETS_OFFSET: int = 56
+SUPERBLOCK_PLAN_STRIDE_OFFSET: int = 72
+SUPERBLOCK_RESULT_OFFSETS_OFFSET: int = 80
+SUPERBLOCK_RESULT_STRIDE_OFFSET: int = 96
+SUPERBLOCK_LAYOUT_HASH_OFFSET: int = 104
+SUPERBLOCK_MAX_DECODE_GRAPH_SEQS_OFFSET: int = 112
 SUPERBLOCK_ABORT_OFFSET: int = 128
 STEP_HEADER_BYTES: int = 64
+STEP_HEADER_FLAGS_OFFSET: int = 40
 STEP_RESULT_HEADER_BYTES: int = 64
 SEQ_STEP_OUTPUT_BYTES: int = 104
+SEQ_OUTPUT_LOGPROBS_OFFSET: int = 72
 WORKER_STATE_BYTES: int = 64
 WORKER_STATES_OFFSET: int = 4096
 WORKER_STATES_REGION_BYTES: int = 4096
+WORKER_HEARTBEAT_OFFSET: int = 8
+WORKER_PID_OFFSET: int = 16
+WORKER_SM_ARCH_OFFSET: int = 20
+WORKER_STATUS_OFFSET: int = 24
+WORKER_ERROR_OFFSET: int = 28
+WORKER_FREE_VRAM_OFFSET: int = 32
+WORKER_TOTAL_VRAM_OFFSET: int = 36
+WORKER_NUMA_OFFSET: int = 40
+WORKER_TRITON_RECOMP_OFFSET: int = 44
+WORKER_WATCHED_KERNELS_OFFSET: int = 48
 VEC_ALIGN: int = 256
 PAGE_ALIGN: int = 4096
 ATOMIC_ACQUIRE: int = 2
@@ -249,6 +268,24 @@ def compute_layout_hash(layout: StepPlanLayout, result_slot_stride: int) -> int:
         STEP_HEADER_BYTES,
         STEP_RESULT_HEADER_BYTES,
         SEQ_STEP_OUTPUT_BYTES,
+        SUPERBLOCK_ABORT_OFFSET,
+        WORKER_STATES_OFFSET,
+        STEP_FLAG_DECODE_ONLY,
+        MAX_DECODE_GRAPH_SEQS,
+        SUPERBLOCK_TOTAL_BYTES_OFFSET,
+        SUPERBLOCK_PLAN_OFFSETS_OFFSET,
+        SUPERBLOCK_PLAN_STRIDE_OFFSET,
+        SUPERBLOCK_RESULT_OFFSETS_OFFSET,
+        SUPERBLOCK_RESULT_STRIDE_OFFSET,
+        SUPERBLOCK_LAYOUT_HASH_OFFSET,
+        SUPERBLOCK_MAX_DECODE_GRAPH_SEQS_OFFSET,
+        WORKER_HEARTBEAT_OFFSET,
+        WORKER_STATUS_OFFSET,
+        WORKER_NUMA_OFFSET,
+        WORKER_TRITON_RECOMP_OFFSET,
+        WORKER_WATCHED_KERNELS_OFFSET,
+        STEP_HEADER_FLAGS_OFFSET,
+        SEQ_OUTPUT_LOGPROBS_OFFSET,
         layout.total_slot_bytes,
         layout.header_offset,
         layout.token_ids_offset,
@@ -419,13 +456,19 @@ class ShmBridge:
             page_block_tokens=values[7],
             spec_verify_width=values[8],
         )
-        total_shm_bytes = struct.unpack_from("<Q", prefix, 48)[0]
-        plan_slot_offsets = struct.unpack_from("<2Q", prefix, 56)
-        plan_slot_stride = struct.unpack_from("<Q", prefix, 72)[0]
-        result_slot_offsets = struct.unpack_from("<2Q", prefix, 80)
-        result_slot_stride = struct.unpack_from("<Q", prefix, 96)[0]
-        layout_hash = struct.unpack_from("<Q", prefix, 104)[0]
-        max_decode_graph_seqs = struct.unpack_from("<I", prefix, 116)[0]
+        total_shm_bytes = struct.unpack_from("<Q", prefix, SUPERBLOCK_TOTAL_BYTES_OFFSET)[0]
+        plan_slot_offsets = struct.unpack_from("<2Q", prefix, SUPERBLOCK_PLAN_OFFSETS_OFFSET)
+        plan_slot_stride = struct.unpack_from("<Q", prefix, SUPERBLOCK_PLAN_STRIDE_OFFSET)[0]
+        result_slot_offsets = struct.unpack_from("<2Q", prefix, SUPERBLOCK_RESULT_OFFSETS_OFFSET)
+        result_slot_stride = struct.unpack_from("<Q", prefix, SUPERBLOCK_RESULT_STRIDE_OFFSET)[0]
+        layout_hash = struct.unpack_from("<Q", prefix, SUPERBLOCK_LAYOUT_HASH_OFFSET)[0]
+        max_decode_graph_seqs = struct.unpack_from(
+            "<I", prefix, SUPERBLOCK_MAX_DECODE_GRAPH_SEQS_OFFSET
+        )[0]
+        if max_decode_graph_seqs == 0 or max_decode_graph_seqs > MAX_DECODE_GRAPH_SEQS:
+            raise RuntimeError(
+                f"SHM max_decode_graph_seqs={max_decode_graph_seqs} outside [1, {MAX_DECODE_GRAPH_SEQS}]"
+            )
         return ShmSuperblock(
             magic=magic,
             protocol_version=protocol_version,
@@ -479,7 +522,7 @@ class ShmBridge:
 
     def touch_heartbeat(self, rank: int) -> None:
         base = WORKER_STATES_OFFSET + rank * WORKER_STATE_BYTES
-        self.store_u64(base + 8, time.monotonic_ns())
+        self.store_u64(base + WORKER_HEARTBEAT_OFFSET, time.monotonic_ns())
 
     def write_worker_state(
         self,
@@ -497,16 +540,16 @@ class ShmBridge:
     ) -> None:
         base = WORKER_STATES_OFFSET + rank * WORKER_STATE_BYTES
         self.store_u64(base, ready_step_id)
-        self.store_u64(base + 8, time.monotonic_ns())
-        self.store_u32(base + 16, os.getpid())
-        self.store_u32(base + 20, device_sm_arch)
-        self.store_u32(base + 28, error_code)
-        self.store_u32(base + 32, free_vram_mb)
-        self.store_u32(base + 36, total_vram_mb)
-        self.store_i32(base + 40, numa_node)
-        self.store_u32(base + 44, triton_recompilations)
-        self.store_u32(base + 48, watched_kernels)
-        self.store_u32(base + 24, status_code)
+        self.store_u64(base + WORKER_HEARTBEAT_OFFSET, time.monotonic_ns())
+        self.store_u32(base + WORKER_PID_OFFSET, os.getpid())
+        self.store_u32(base + WORKER_SM_ARCH_OFFSET, device_sm_arch)
+        self.store_u32(base + WORKER_ERROR_OFFSET, error_code)
+        self.store_u32(base + WORKER_FREE_VRAM_OFFSET, free_vram_mb)
+        self.store_u32(base + WORKER_TOTAL_VRAM_OFFSET, total_vram_mb)
+        self.store_i32(base + WORKER_NUMA_OFFSET, numa_node)
+        self.store_u32(base + WORKER_TRITON_RECOMP_OFFSET, triton_recompilations)
+        self.store_u32(base + WORKER_WATCHED_KERNELS_OFFSET, watched_kernels)
+        self.store_u32(base + WORKER_STATUS_OFFSET, status_code)
 
     def array(self, *, offset: int, count: int, dtype: np.dtype) -> np.ndarray:
         return np.frombuffer(self._mapping, dtype=dtype, count=count, offset=offset)

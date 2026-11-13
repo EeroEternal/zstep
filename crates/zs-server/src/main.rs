@@ -55,9 +55,13 @@ struct GreedyReferenceCase {
     expected_greedy_token_ids: Vec<i32>,
     #[serde(default)]
     top2_steps: Vec<VllmTop2Step>,
+    #[serde(default)]
+    require_exact: bool,
+    #[serde(default)]
+    max_mismatch_margin: Option<f32>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ZstepTop2StepReport {
     top1_token: i32,
     top1_logit: f32,
@@ -78,7 +82,7 @@ impl From<StepTop2Logits> for ZstepTop2StepReport {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct FirstMismatchDiagnostics {
     token_index: usize,
     prefix_identical_at_step: bool,
@@ -88,7 +92,7 @@ struct FirstMismatchDiagnostics {
     zstep_top2: ZstepTop2StepReport,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ModePairMismatchDiagnostics {
     token_index: usize,
     prefix_identical_at_step: bool,
@@ -98,7 +102,7 @@ struct ModePairMismatchDiagnostics {
     right_top2: ZstepTop2StepReport,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct GreedyMatchReport {
     exact_prefix_match_tokens: usize,
     total_tokens: usize,
@@ -111,7 +115,7 @@ struct GreedyMatchReport {
     first_mismatch_diagnostics: Option<FirstMismatchDiagnostics>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct GreedyCaseParityReport {
     name: String,
     prompt_token_ids: Vec<i32>,
@@ -131,7 +135,7 @@ struct GreedyCaseParityReport {
     batched_vs_chunked_first_mismatch: Option<ModePairMismatchDiagnostics>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ScheduleReport {
     prefill_steps: u64,
     decode_steps: u64,
@@ -152,7 +156,7 @@ impl From<&GenerationScheduleStats> for ScheduleReport {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct GreedyParityReport {
     git_sha: String,
     vllm_version: String,
@@ -184,6 +188,8 @@ Usage: zstep --mode-b [OPTIONS]\n\
   --verify-greedy-json PATH  Multi-case vLLM greedy reference JSON\n\
   --verify-output-json PATH  Write measured single/batched/chunked parity report\n\
   --require-exact-greedy BOOL Fail with non-zero exit if any token differs (default: false)\n\
+  --require-exact-cases LIST Comma-separated case names that must match 100% (optional)\n\
+  --max-greedy-mismatch-margin FLOAT Fail if any mismatch Top1-Top2 margin exceeds FLOAT (optional)\n\
   --bench-tiers SPEC         Semicolon-separated tiers `label:conc:prompts:in_len:out_len`\n\
   --warmup-prompts N         Warm up 512->64 prompts at concurrency 16 (default: 16)\n\
   --repeats N                Interleaved repeat count across all tiers (default: 3)\n\
@@ -219,6 +225,8 @@ struct Arguments {
     verify_greedy_json: Option<PathBuf>,
     verify_output_json: Option<PathBuf>,
     require_exact_greedy: bool,
+    require_exact_cases: Vec<String>,
+    max_greedy_mismatch_margin: Option<f32>,
     bench_tiers: Vec<BenchmarkTierSpec>,
     warmup_prompts: usize,
     repeats: usize,
@@ -257,6 +265,8 @@ impl Default for Arguments {
             verify_greedy_json: None,
             verify_output_json: None,
             require_exact_greedy: false,
+            require_exact_cases: Vec::new(),
+            max_greedy_mismatch_margin: None,
             bench_tiers: Vec::new(),
             warmup_prompts: 16,
             repeats: 3,
@@ -385,28 +395,7 @@ fn mode_pair_mismatch(
 }
 
 fn current_git_sha() -> Result<String, Box<dyn std::error::Error>> {
-    let sha = match std::env::var("ZSTEP_GIT_SHA") {
-        Ok(sha) => sha,
-        Err(std::env::VarError::NotPresent) => {
-            let git_dir = PathBuf::from(".git");
-            let head = std::fs::read_to_string(git_dir.join("HEAD"))?;
-            let head = head.trim();
-            match head.strip_prefix("ref: ") {
-                Some(reference) => std::fs::read_to_string(git_dir.join(reference))?,
-                None => head.to_owned(),
-            }
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let sha = sha.trim();
-    if sha.len() != 40
-        || !sha
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return Err("invalid Git SHA provenance".into());
-    }
-    Ok(sha.to_owned())
+    zs_wire::resolve_git_sha(false).map_err(Into::into)
 }
 
 fn run_greedy_verification(
@@ -600,9 +589,17 @@ fn is_deepseek_v41_model_dir(model_dir: Option<&PathBuf>) -> bool {
         .is_ok_and(|probe| probe.model_type == "deepseek_v41")
 }
 
+#[derive(Debug, Default)]
+struct GreedyGatePolicy<'a> {
+    require_exact_all: bool,
+    require_exact_cases: &'a [String],
+    max_mismatch_margin: Option<f32>,
+    reference_cases: &'a [GreedyReferenceCase],
+}
+
 fn validate_greedy_report_gate(
     report: &GreedyParityReport,
-    require_exact: bool,
+    policy: &GreedyGatePolicy<'_>,
 ) -> Result<(), String> {
     if let Some(recomp) = report.triton_recompilations
         && recomp > 0
@@ -611,19 +608,46 @@ fn validate_greedy_report_gate(
             "unexpected runtime Triton JIT recompilations detected: {recomp}"
         ));
     }
-    if require_exact && !report.all_matched {
+    if policy.require_exact_all && !report.all_matched {
         return Err(
             "greedy parity report had token mismatches (--require-exact-greedy=true)".to_owned(),
         );
     }
-    const MAX_BF16_ULP_TIE_MARGIN: f32 = 0.25;
+    for required_name in policy.require_exact_cases {
+        let Some(case) = report.cases.iter().find(|c| &c.name == required_name) else {
+            return Err(format!(
+                "--require-exact-cases specified unknown case `{required_name}`"
+            ));
+        };
+        if !case.all_matched {
+            return Err(format!(
+                "case `{required_name}` had token mismatches (--require-exact-cases)"
+            ));
+        }
+    }
     for case in &report.cases {
+        let ref_case = policy
+            .reference_cases
+            .iter()
+            .find(|rc| rc.name == case.name);
+        if ref_case.is_some_and(|rc| rc.require_exact) && !case.all_matched {
+            return Err(format!(
+                "case `{}` had token mismatches (reference require_exact=true)",
+                case.name
+            ));
+        }
+        let margin_limit = policy
+            .max_mismatch_margin
+            .or_else(|| ref_case.and_then(|rc| rc.max_mismatch_margin));
+        let Some(max_margin) = margin_limit else {
+            continue;
+        };
         if let Some(diag) = &case.single_match.first_mismatch_diagnostics
-            && diag.zstep_top2.top1_minus_top2_margin > MAX_BF16_ULP_TIE_MARGIN
+            && diag.zstep_top2.top1_minus_top2_margin > max_margin
         {
             return Err(format!(
-                "case `{}` diverged from reference at token {} with non-ULP margin {:.4}",
-                case.name, diag.token_index, diag.zstep_top2.top1_minus_top2_margin
+                "case `{}` diverged from reference at token {} with margin {:.4} > {:.4}",
+                case.name, diag.token_index, diag.zstep_top2.top1_minus_top2_margin, max_margin
             ));
         }
         for pair in [
@@ -637,10 +661,15 @@ fn validate_greedy_report_gate(
                 .left_top2
                 .top1_minus_top2_margin
                 .max(pair.right_top2.top1_minus_top2_margin);
-            if max_pair_margin > MAX_BF16_ULP_TIE_MARGIN {
+            if max_pair_margin > max_margin {
                 return Err(format!(
-                    "case `{}` diverged between {} and {} at token {} with non-ULP margin {:.4}",
-                    case.name, pair.left_mode, pair.right_mode, pair.token_index, max_pair_margin
+                    "case `{}` diverged between {} and {} at token {} with margin {:.4} > {:.4}",
+                    case.name,
+                    pair.left_mode,
+                    pair.right_mode,
+                    pair.token_index,
+                    max_pair_margin,
+                    max_margin
                 ));
             }
         }
@@ -743,7 +772,15 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             encoded.push('\n');
             std::fs::write(&output_path, encoded)?;
             println!("VERIFY_GREEDY_REPORT={}", output_path.display());
-            validate_greedy_report_gate(&report, args.require_exact_greedy)?;
+            validate_greedy_report_gate(
+                &report,
+                &GreedyGatePolicy {
+                    require_exact_all: args.require_exact_greedy,
+                    require_exact_cases: &args.require_exact_cases,
+                    max_mismatch_margin: args.max_greedy_mismatch_margin,
+                    reference_cases: &reference.cases,
+                },
+            )?;
             return Ok(());
         }
 
@@ -886,6 +923,31 @@ fn parse_arguments(raw: &[String]) -> Result<Arguments, String> {
                         ));
                     }
                 };
+            }
+            "--require-exact-cases" => {
+                let names: Vec<String> = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if names.is_empty() {
+                    return Err("--require-exact-cases requires at least one case name".to_owned());
+                }
+                args.require_exact_cases = names;
+            }
+            "--max-greedy-mismatch-margin" => {
+                let parsed = value.parse::<f32>().map_err(|_| {
+                    format!(
+                        "--max-greedy-mismatch-margin expects a non-negative float, got {value}"
+                    )
+                })?;
+                if !parsed.is_finite() || parsed < 0.0 {
+                    return Err(format!(
+                        "--max-greedy-mismatch-margin must be finite and >= 0.0, got {value}"
+                    ));
+                }
+                args.max_greedy_mismatch_margin = Some(parsed);
             }
             "--bench-tiers" => args.bench_tiers = parse_bench_tiers(value)?,
             "--warmup-prompts" => args.warmup_prompts = parse_number(option, value)?,
@@ -1137,5 +1199,63 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn greedy_gate_matches_archived_phase2_phase3_and_phase36_reports() {
+        let bench_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/benchmarks");
+        let load_report = |filename: &str| -> GreedyParityReport {
+            let bytes = std::fs::read(bench_dir.join(filename)).expect(filename);
+            serde_json::from_slice(&bytes).expect("valid GreedyParityReport JSON")
+        };
+
+        let phase2 = load_report("phase2_greedy_parity_report.json");
+        let phase3 = load_report("phase3_greedy_parity_report.json");
+        let phase36 = load_report("phase36_b12x_greedy_parity_report.json");
+        let prime_only = vec!["prime_squares_table".to_owned()];
+
+        for report in [&phase2, &phase3, &phase36] {
+            // 1) Default documented invocation (`rc = 0`): enforces zero Triton recompilations.
+            assert!(validate_greedy_report_gate(report, &GreedyGatePolicy::default()).is_ok());
+
+            // 2) Case-scoped exact parity (`--require-exact-cases prime_squares_table`, `rc = 0`).
+            assert!(
+                validate_greedy_report_gate(
+                    report,
+                    &GreedyGatePolicy {
+                        require_exact_cases: &prime_only,
+                        ..GreedyGatePolicy::default()
+                    },
+                )
+                .is_ok()
+            );
+
+            // 3) Full `--require-exact-greedy true` fails (`rc = 1`) when `all_matched == false`.
+            assert!(
+                validate_greedy_report_gate(
+                    report,
+                    &GreedyGatePolicy {
+                        require_exact_all: true,
+                        ..GreedyGatePolicy::default()
+                    },
+                )
+                .is_err()
+            );
+        }
+
+        // 4) Strict BF16 ULP tie gate (`--max-greedy-mismatch-margin 0.25`):
+        //    passes (`rc = 0`) on Phase 2 BF16 (`<= 0.25`), fails (`rc = 1`) on Phase 3 / 3.6 MXFP8/MXFP4.
+        let ulp_gate = GreedyGatePolicy {
+            max_mismatch_margin: Some(0.25),
+            ..GreedyGatePolicy::default()
+        };
+        assert!(validate_greedy_report_gate(&phase2, &ulp_gate).is_ok());
+        assert!(validate_greedy_report_gate(&phase3, &ulp_gate).is_err());
+        assert!(validate_greedy_report_gate(&phase36, &ulp_gate).is_err());
+
+        // 5) Runtime Triton recompilation is unconditionally fatal (`rc = 1`).
+        let mut recomp_report = phase2;
+        recomp_report.triton_recompilations = Some(1);
+        assert!(validate_greedy_report_gate(&recomp_report, &GreedyGatePolicy::default()).is_err());
     }
 }

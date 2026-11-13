@@ -11,11 +11,12 @@ Topology:  4-NUMA PCIe Gen5 ([0,0,0,1,2,2,2,3]), no NVLink, can_device_access_pe
 Model:     Qwen/Qwen3.5-35B-A3B, BF16, TP=8
 Baseline:  vLLM 0.33.0, BF16, TP=8, --no-enable-prefix-caching, isolated per-(round,tier) seeds, degraded NCCL SHM
 
-[Host B — Phase 3 / 3.5]
+[Host B — Phase 3 / 3.5 / 3.6]
 GPU:       8 × NVIDIA RTX 6000D (sm_120, 156 SMs, 85,651 MiB GDDR7 per GPU, Driver 595.99.02)
 Topology:  2-NUMA PCIe Gen5 ([0,0,0,0,1,1,1,1]), no NVLink, can_device_access_peer == 0 (CNS)
 Model:     DeepSeek-V4.1-Flash (1017, 475.25 GiB MXFP8/MXFP4/BF16, engram cpu_offload=false), TP=8
 Baseline:  vllm/vllm-openai:v0.31.0, TP=8, --no-enable-prefix-caching, isolated per-(round,tier) seeds, NCCL_P2P_DISABLE=1, NCCL_P2P_LEVEL=LOC, symmetric SM120 64-tok SWA shim
+b12x 3.6:  vllm/vllm-openai:v0.31.0 + read-only mount of `flashinfer/experimental/b12x` from `https://github.com/local-inference-lab/flashinfer.git` tag `flashinfer-cu134-sm120-beta-79819b112f8bda7d09709c24bb31de16d7ce59c6` (`79819b112f8bda7d09709c24bb31de16d7ce59c6`), `ZSTEP_REQUIRE_B12X=1`, `B12X_W4A8_TINY_DECODE=0`
 ```
 
 所有跨卡结论严格限定于对应无 P2P PCIe 拓扑，不外推到 NVLink 或 PCIe P2P。表中 `std` 是三轮重复测量的**总体标准差**；完整 `mean/std/min/max` 以 JSON 为准。吞吐“持平”规则为：相对差 `<3%`，或均值差 `<=2×sqrt(zstep_std²+vllm_std²)`；`n=3` 的持平不是严格等价证明。
@@ -145,23 +146,36 @@ Phase 2 双端 Top-2 贪心审计（[`phase2_greedy_parity_report.json`](phase2_
 
 Phase 1 8-GPU 200 步控制面实测：Rust 下一拍准备 **`4.690 µs/step`**（累计 `938 µs`，199 步重叠），占 GPU 平均步 `2,832.10 µs` 的 **`0.166%`**，`overlap_speedup = 1.000269×`。
 
-## 6. 复现命令
+## 6. 复现命令（支持含 `.git` 或无 `.git` 的 `git archive` 源码树）
 
 ```bash
 cargo build --release -p zs-server
+# 若在无 .git 的 git archive 目录运行且需精确记录 Git SHA，可传入 export ZSTEP_GIT_SHA=<40-hex-sha>；
+# 未设置时 BenchmarkProvenance 与 GreedyParityReport 自动回退编译期 SHA 或 "unknown"，不会因缺少 .git 报错。
 
-# Phase 3.5: DeepSeek-V4.1-Flash TP=8 (8 × RTX 6000D, inside vllm/vllm-openai:v0.31.0)
+# ── Phase 3.6 (+ b12x): DeepSeek-V4.1-Flash TP=8 (8 × RTX 6000D) ──────────────────────
+# 0) 拉取公开 SM120 b12x overlay（精确锁定 commit 79819b112f8bda7d09709c24bb31de16d7ce59c6）
+git clone --depth 1 --branch flashinfer-cu134-sm120-beta-79819b112f8bda7d09709c24bb31de16d7ce59c6 \
+  https://github.com/local-inference-lab/flashinfer.git /tmp/fi-b12x
+
+# 在容器启动时挂载 `-v /tmp/fi-b12x/flashinfer/experimental/b12x:/usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x:ro`
 export ZSTEP_DSV41_MODEL_DIR=/models/DeepSeek-V4.1-Flash
 export OMP_NUM_THREADS=1 NCCL_P2P_DISABLE=1 NCCL_P2P_LEVEL=LOC
+export ZSTEP_REQUIRE_B12X=1 B12X_W4A8_TINY_DECODE=0   # Phase 3.5 对照组改为 ZSTEP_ENABLE_B12X=0
 
 # 1) 贪心对齐审计（全局 Top-2 Logits）+ 5-kernel 零重编译检查
+#    门禁退出码约定：
+#    - 默认（或带 `--require-exact-cases prime_squares_table`）：校验 TRITON_RECOMPILATIONS=0 且结构化算术表 128/128 全匹配，预期 rc=0
+#    - `--max-greedy-mismatch-margin 0.25`：纯 BF16 窄裕度门禁（Phase 2 Qwen3.5 预期 rc=0；Phase 3/3.6 MXFP8/MXFP4 预期 rc=1）
+#    - `--require-exact-greedy true`：要求全部开放式续写 100% 逐位一致（`all_matched=false` 时预期 rc=1）
 ./target/release/zstep --mode-b --world-size 8 \
   --python /usr/bin/python3 --worker-root ./worker \
   --model-dir "$ZSTEP_DSV41_MODEL_DIR" --allreduce-blocks 8 \
   --num-kv-pages 2560 --max-seqs 16 --max-step-tokens 4096 --max-decoder-rows 4096 \
   --max-pages-per-seq 256 --ready-timeout-secs 900 --step-timeout-secs 180 \
   --verify-greedy-json docs/benchmarks/phase3_vllm_greedy_reference.json \
-  --verify-output-json docs/benchmarks/phase3_greedy_parity_report.json
+  --verify-output-json docs/benchmarks/phase36_b12x_greedy_parity_report.json \
+  --require-exact-cases prime_squares_table
 
 # 2) Warm n=3 六档交错主基准（无前缀缓存，独立种子，顺风车混合步 3072）
 ./target/release/zstep --mode-b --world-size 8 \
@@ -172,9 +186,9 @@ export OMP_NUM_THREADS=1 NCCL_P2P_DISABLE=1 NCCL_P2P_LEVEL=LOC
   --ready-timeout-secs 900 --step-timeout-secs 180 \
   --warmup-prompts 16 --repeats 3 \
   --bench-tiers "in512_c1:1:8:512:256;in512_c16:16:48:512:256;in512_c128:128:256:512:256;in1024_c1:1:20:1024:256;in1024_c32:32:200:1024:256;in1024_c128:128:400:1024:256" \
-  --metrics-output docs/benchmarks/phase3_zstep_dsv41_tp8_6tier.json
+  --metrics-output docs/benchmarks/phase36_zstep_b12x_dsv41_tp8_6tier.json
 
-# Phase 2: Qwen3.5-35B-A3B TP=8 (8 × RTX 5090, inside vllm/vllm-openai:v0.33.0)
+# ── Phase 2: Qwen3.5-35B-A3B TP=8 (8 × RTX 5090, inside vllm/vllm-openai:v0.33.0) ────
 export ZSTEP_QWEN35_MODEL_DIR=/path/to/Qwen3.5-35B-A3B
 python3 worker/tests/phase2/collect_vllm_reference.py --mode all --repeats 3 --seed 20261111
 ./target/release/zstep --mode-b --world-size 8 \

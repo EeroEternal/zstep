@@ -47,7 +47,19 @@ fn typed_views_publish_and_creator_unlinks_on_drop() {
         let mut arena = SharedMemoryArena::create(&name, layout.total_bytes).expect("create arena");
         arena.initialize(&layout).expect("initialize arena");
         assert!(object_path.exists());
-        assert_eq!(arena.superblock().expect("superblock").world_size, 1);
+        let sb = arena.superblock().expect("superblock");
+        assert_eq!(sb.world_size, 1);
+        assert_eq!(sb.max_decode_graph_seqs, 128);
+        assert_eq!(
+            &arena.bytes()[112..116],
+            &128u32.to_le_bytes(),
+            "max_decode_graph_seqs must live at superblock offset 112"
+        );
+        assert_eq!(
+            &arena.bytes()[116..120],
+            &0u32.to_le_bytes(),
+            "_pad_u32 at superblock offset 116 must remain zero"
+        );
         {
             let mut plan = arena.plan_slot_mut(&layout, 1).expect("mutable plan");
             *plan.header_mut().expect("plan header") = StepHeader {
@@ -204,7 +216,7 @@ fn cross_language_golden_layout_and_hash_parity() {
             ],
             total_slot_bytes: 274432,
             result_slot_stride: 16384,
-            layout_hash: 0x8fb1_c3eb_1bb6_51f2,
+            layout_hash: 0xd000_ab37_2247_b76e,
         },
         GoldenCase {
             name: "qwen35_tp8_vram32g",
@@ -215,7 +227,7 @@ fn cross_language_golden_layout_and_hash_parity() {
             ],
             total_slot_bytes: 2375680,
             result_slot_stride: 16384,
-            layout_hash: 0x2f05_c2f2_82af_2be1,
+            layout_hash: 0x27f4_269c_276d_a805,
         },
         GoldenCase {
             name: "odd_prime_bounds",
@@ -233,7 +245,7 @@ fn cross_language_golden_layout_and_hash_parity() {
             ],
             total_slot_bytes: 4096,
             result_slot_stride: 4096,
-            layout_hash: 0x495b_5357_99c7_2054,
+            layout_hash: 0x587d_9ad2_0b4f_0bd8,
         },
     ];
 

@@ -24,10 +24,41 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import struct
+
 import pytest
 
 from zstep_worker.shm_bridge import (
     MAX_DECODE_GRAPH_SEQS,
+    SEQ_OUTPUT_LOGPROBS_OFFSET,
+    SEQ_STEP_OUTPUT_BYTES,
+    SHM_SUPERBLOCK_REGION_BYTES,
+    SHM_SUPERBLOCK_STRUCT_BYTES,
+    STEP_HEADER_BYTES,
+    STEP_HEADER_FLAGS_OFFSET,
+    STEP_RESULT_HEADER_BYTES,
+    SUPERBLOCK_LAYOUT_HASH_OFFSET,
+    SUPERBLOCK_MAX_DECODE_GRAPH_SEQS_OFFSET,
+    SUPERBLOCK_PLAN_OFFSETS_OFFSET,
+    SUPERBLOCK_PLAN_STRIDE_OFFSET,
+    SUPERBLOCK_RESULT_OFFSETS_OFFSET,
+    SUPERBLOCK_RESULT_STRIDE_OFFSET,
+    SUPERBLOCK_TOTAL_BYTES_OFFSET,
+    WORKER_ERROR_OFFSET,
+    WORKER_FREE_VRAM_OFFSET,
+    WORKER_HEARTBEAT_OFFSET,
+    WORKER_NUMA_OFFSET,
+    WORKER_PID_OFFSET,
+    WORKER_SM_ARCH_OFFSET,
+    WORKER_STATE_BYTES,
+    WORKER_STATES_REGION_BYTES,
+    WORKER_STATUS_OFFSET,
+    WORKER_TOTAL_VRAM_OFFSET,
+    WORKER_TRITON_RECOMP_OFFSET,
+    WORKER_WATCHED_KERNELS_OFFSET,
+    ZSTEP_PROTOCOL_VERSION,
+    ZSTEP_SHM_MAGIC,
+    ShmBridge,
     ShmGeometry,
     StepPlanLayout,
     compute_layout_hash,
@@ -111,7 +142,46 @@ def test_step_plan_layout_invariants_and_vram_derivation() -> None:
 
 def test_cross_language_golden_layout_and_hash_parity() -> None:
     golden_path = Path(__file__).resolve().parent / "fixtures" / "shm_layout_golden.json"
-    cases = json.loads(golden_path.read_text(encoding="utf-8"))
+    golden = json.loads(golden_path.read_text(encoding="utf-8"))
+    assert golden["protocol_version"] == ZSTEP_PROTOCOL_VERSION
+
+    pod = golden["pod_offsets"]
+    sb = pod["ShmSuperblock"]
+    assert sb["total_shm_bytes"] == SUPERBLOCK_TOTAL_BYTES_OFFSET
+    assert sb["plan_slot_offsets"] == SUPERBLOCK_PLAN_OFFSETS_OFFSET
+    assert sb["plan_slot_stride"] == SUPERBLOCK_PLAN_STRIDE_OFFSET
+    assert sb["result_slot_offsets"] == SUPERBLOCK_RESULT_OFFSETS_OFFSET
+    assert sb["result_slot_stride"] == SUPERBLOCK_RESULT_STRIDE_OFFSET
+    assert sb["layout_hash"] == SUPERBLOCK_LAYOUT_HASH_OFFSET
+    assert sb["max_decode_graph_seqs"] == SUPERBLOCK_MAX_DECODE_GRAPH_SEQS_OFFSET == 112
+    assert sb["_pad_u32"] == 116
+    assert sb["_sizeof"] == SHM_SUPERBLOCK_STRUCT_BYTES
+
+    ws = pod["WorkerSlotState"]
+    assert ws["heartbeat_ns"] == WORKER_HEARTBEAT_OFFSET
+    assert ws["worker_pid"] == WORKER_PID_OFFSET
+    assert ws["device_sm_arch"] == WORKER_SM_ARCH_OFFSET
+    assert ws["status_code"] == WORKER_STATUS_OFFSET
+    assert ws["error_code"] == WORKER_ERROR_OFFSET
+    assert ws["free_vram_mb"] == WORKER_FREE_VRAM_OFFSET
+    assert ws["total_vram_mb"] == WORKER_TOTAL_VRAM_OFFSET
+    assert ws["numa_node"] == WORKER_NUMA_OFFSET
+    assert ws["triton_recompilations"] == WORKER_TRITON_RECOMP_OFFSET
+    assert ws["watched_kernels"] == WORKER_WATCHED_KERNELS_OFFSET
+    assert ws["_sizeof"] == WORKER_STATE_BYTES
+
+    sh = pod["StepHeader"]
+    assert sh["flags"] == STEP_HEADER_FLAGS_OFFSET
+    assert sh["_sizeof"] == STEP_HEADER_BYTES
+
+    srh = pod["StepResultHeader"]
+    assert srh["_sizeof"] == STEP_RESULT_HEADER_BYTES
+
+    sso = pod["SeqStepOutput"]
+    assert sso["accepted_logprobs_bits"] == SEQ_OUTPUT_LOGPROBS_OFFSET
+    assert sso["_sizeof"] == SEQ_STEP_OUTPUT_BYTES
+
+    cases = golden["cases"]
     assert len(cases) >= 3
     for case in cases:
         g = case["geometry"]
@@ -156,6 +226,84 @@ def test_cross_language_golden_layout_and_hash_parity() -> None:
         )
 
 
+def test_superblock_binary_roundtrip_and_pad_isolation() -> None:
+    """Regression test: offset 112 (`max_decode_graph_seqs`) must never read `_pad_u32` (116)."""
+    golden_path = Path(__file__).resolve().parent / "fixtures" / "shm_layout_golden.json"
+    sb_offsets = json.loads(golden_path.read_text(encoding="utf-8"))["pod_offsets"][
+        "ShmSuperblock"
+    ]
+    geom = ShmGeometry(
+        world_size=8,
+        max_seqs=128,
+        max_step_tokens=4096,
+        max_decoder_rows=4096,
+        max_pages_per_seq=256,
+        page_block_tokens=128,
+        spec_verify_width=6,
+    )
+    layout = StepPlanLayout.compute(geom)
+    result_stride = compute_result_slot_stride(geom.max_seqs)
+    layout_hash = compute_layout_hash(layout, result_stride)
+    plans_base = SHM_SUPERBLOCK_REGION_BYTES + WORKER_STATES_REGION_BYTES
+    results_base = plans_base + 2 * layout.total_slot_bytes
+    total_bytes = results_base + 2 * result_stride
+
+    buf = bytearray(SHM_SUPERBLOCK_REGION_BYTES)
+    struct.pack_into("<Q", buf, sb_offsets["magic"], ZSTEP_SHM_MAGIC)
+    struct.pack_into("<I", buf, sb_offsets["protocol_version"], ZSTEP_PROTOCOL_VERSION)
+    struct.pack_into("<I", buf, sb_offsets["world_size"], geom.world_size)
+    struct.pack_into("<I", buf, sb_offsets["max_seqs"], geom.max_seqs)
+    struct.pack_into("<I", buf, sb_offsets["max_step_tokens"], geom.max_step_tokens)
+    struct.pack_into("<I", buf, sb_offsets["max_decoder_rows"], geom.max_decoder_rows)
+    struct.pack_into("<I", buf, sb_offsets["max_pages_per_seq"], geom.max_pages_per_seq)
+    struct.pack_into("<I", buf, sb_offsets["page_block_tokens"], geom.page_block_tokens)
+    struct.pack_into("<I", buf, sb_offsets["spec_verify_width"], geom.spec_verify_width)
+    struct.pack_into("<I", buf, sb_offsets["master_pid"], 424242)
+    # Poison implicit C alignment hole [44..48] and `_pad_u32` [116..120] + `_reserved` [120..128]
+    struct.pack_into("<I", buf, 44, 777777)
+    struct.pack_into("<Q", buf, sb_offsets["total_shm_bytes"], total_bytes)
+    struct.pack_into(
+        "<2Q",
+        buf,
+        sb_offsets["plan_slot_offsets"],
+        plans_base,
+        plans_base + layout.total_slot_bytes,
+    )
+    struct.pack_into("<Q", buf, sb_offsets["plan_slot_stride"], layout.total_slot_bytes)
+    struct.pack_into(
+        "<2Q",
+        buf,
+        sb_offsets["result_slot_offsets"],
+        results_base,
+        results_base + result_stride,
+    )
+    struct.pack_into("<Q", buf, sb_offsets["result_slot_stride"], result_stride)
+    struct.pack_into("<Q", buf, sb_offsets["layout_hash"], layout_hash)
+    struct.pack_into("<I", buf, sb_offsets["max_decode_graph_seqs"], 128)
+    struct.pack_into("<I", buf, sb_offsets["_pad_u32"], 999)
+    struct.pack_into("<Q", buf, sb_offsets["_reserved"], 0xDEAD_BEEF_CAFE_BABE)
+
+    parsed = ShmBridge._parse_superblock(bytes(buf))
+    assert parsed.magic == ZSTEP_SHM_MAGIC
+    assert parsed.protocol_version == ZSTEP_PROTOCOL_VERSION
+    assert parsed.geometry == geom
+    assert parsed.master_pid == 424242
+    assert parsed.total_shm_bytes == total_bytes
+    assert parsed.plan_slot_offsets == (plans_base, plans_base + layout.total_slot_bytes)
+    assert parsed.plan_slot_stride == layout.total_slot_bytes
+    assert parsed.result_slot_offsets == (results_base, results_base + result_stride)
+    assert parsed.result_slot_stride == result_stride
+    assert parsed.layout_hash == layout_hash
+    assert parsed.max_decode_graph_seqs == 128
+
+    # Corrupting `max_decode_graph_seqs` at offset 112 (`0` or `999`) must fail loudly.
+    for bad_max in (0, 999):
+        bad_buf = bytearray(buf)
+        struct.pack_into("<I", bad_buf, sb_offsets["max_decode_graph_seqs"], bad_max)
+        with pytest.raises(RuntimeError, match="max_decode_graph_seqs"):
+            ShmBridge._parse_superblock(bytes(bad_buf))
+
+
 def test_select_decode_bucket_never_clamps_overflow() -> None:
     assert MAX_DECODE_GRAPH_SEQS == 128
     assert select_decode_bucket(1, 128) == 1
@@ -172,5 +320,6 @@ def test_select_decode_bucket_never_clamps_overflow() -> None:
 if __name__ == "__main__":
     test_step_plan_layout_invariants_and_vram_derivation()
     test_cross_language_golden_layout_and_hash_parity()
+    test_superblock_binary_roundtrip_and_pad_isolation()
     test_select_decode_bucket_never_clamps_overflow()
-    print("Python <-> Rust StepPlanLayout invariants, golden hash, and bucket bounds OK")
+    print("Python <-> Rust StepPlanLayout invariants, golden hash, and superblock bounds OK")

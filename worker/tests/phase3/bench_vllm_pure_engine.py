@@ -33,7 +33,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 import importlib.metadata
 import json
 import math
@@ -433,7 +433,7 @@ async def _run_benchmarks(args: argparse.Namespace) -> None:
                 "world_size": args.tp_size,
                 "suite": suite_name,
                 "init_wall_ms": init_wall_ms,
-                "collection_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "collection_timestamp_utc": datetime.now(UTC).isoformat(),
                 "engine_config": {
                     "tensor_parallel_size": args.tp_size,
                     "dtype": "bfloat16",

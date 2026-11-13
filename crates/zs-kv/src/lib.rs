@@ -235,13 +235,12 @@ mod tests {
         assert_ne!(handle_a.compressor_slot_id(), handle_b.compressor_slot_id());
     }
 
-    /// Witness of the current contract clash, not the desired end state.
-    /// An exact block-aligned hit keeps `replay_mask = 0` on the last token
-    /// (a GlobalAndIndex write) while that token's page stays shared with the
-    /// live owner of the cached block. A private page id without a byte copy
-    /// would drop the other rows of that block, so this is not "fixed" here.
+    /// An exact block-aligned Radix prefix hit (`matched_tokens == prompt_len`) must replay only
+    /// the trailing `min(matched_tokens, swa_window)` tokens with `replay_mask = 1` (rebuilding
+    /// private `SwaWindow` + `CompressorTail` and computing next-token logits at `prompt_len - 1`)
+    /// while performing **zero** `replay_mask = 0` writes to any shared `GlobalAndIndex` page.
     #[test]
-    fn shared_exact_prefix_schedules_global_write_on_aliased_page() {
+    fn shared_exact_prefix_performs_zero_writes_on_aliased_pages() {
         let manager = KvCacheManager::new(16, 8, 4, 64, 128, 4).expect("valid manager");
         let prompt: Vec<i32> = (0..256).collect();
         let mut first = manager.admit_request(&prompt).expect("admit first");
@@ -251,7 +250,7 @@ mod tests {
         let pages = repeat.global_page_table();
         assert_eq!(
             pages, shared,
-            "exact hit currently aliases every cached page"
+            "exact hit shares all 4 immutable Radix GlobalAndIndex pages"
         );
         let block_tokens = 64usize;
         let mut aliased_writes = 0usize;
@@ -265,7 +264,15 @@ mod tests {
                 aliased_writes += 1;
             }
         }
-        assert_eq!(aliased_writes, 1);
+        assert_eq!(
+            aliased_writes, 0,
+            "shared Radix pages must never be scheduled with replay_mask = 0"
+        );
+        assert_eq!(
+            repeat.schedule().scheduled_positions.last().copied(),
+            Some(255),
+            "final prompt token must still execute to produce next-token logits"
+        );
     }
 
     #[test]
@@ -320,21 +327,24 @@ mod tests {
     }
 
     #[test]
-    fn exact_block_aligned_full_prefix_hit_keeps_final_token_fresh() {
+    fn exact_block_aligned_full_prefix_hit_replays_swa_tail_for_final_logits() {
         let manager = KvCacheManager::new(16, 8, 4, 64, 128, 4).expect("valid manager");
         let prompt: Vec<i32> = (0..256).collect();
         {
             let mut first = manager.admit_request(&prompt).expect("admit first");
             assert_eq!(first.commit_completed_blocks(&prompt).expect("commit"), 4);
         }
-        // Re-sending the exact 256-token prompt matches 256 tokens in the Radix tree,
-        // clamps effective_matched to 255 -> skips 127, replays 128, keeps final token fresh!
+        // Re-sending the exact 256-token prompt matches all 256 tokens in the Radix tree:
+        // skips 128, replays the trailing 128 tokens (`128..256`) with `replay_mask = 1`
+        // so `pos = 255` produces next-token logits without writing shared GlobalAndIndex pages.
         let repeat = manager.admit_request(&prompt).expect("admit repeat");
-        assert_eq!(repeat.schedule().skipped_tokens, 127);
+        assert_eq!(repeat.schedule().skipped_tokens, 128);
         assert_eq!(repeat.schedule().replay_tokens, 128);
-        assert_eq!(repeat.schedule().fresh_tokens, 1);
-        assert_eq!(repeat.schedule().scheduled_tokens.len(), 129);
-        assert_eq!(*repeat.schedule().replay_mask.last().expect("nonempty"), 0);
+        assert_eq!(repeat.schedule().fresh_tokens, 0);
+        assert_eq!(repeat.schedule().scheduled_tokens.len(), 128);
+        assert_eq!(repeat.schedule().scheduled_positions[0], 128);
+        assert_eq!(repeat.schedule().scheduled_positions[127], 255);
+        assert_eq!(repeat.schedule().replay_mask, vec![1u8; 128]);
     }
 
     #[test]

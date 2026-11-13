@@ -27,9 +27,9 @@ import json
 import multiprocessing as mp
 import os
 from pathlib import Path
+from collections.abc import Callable
 import subprocess
 import tempfile
-from typing import Callable
 import uuid
 
 import torch
@@ -408,22 +408,18 @@ def _worker(
 
 
 def _read_git_sha(repo_root: Path) -> str:
-    git_dir = repo_root / ".git"
-    head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
-    if not head.startswith("ref: "):
-        return head
-    ref = head.removeprefix("ref: ")
-    ref_path = git_dir / ref
-    if ref_path.is_file():
-        return ref_path.read_text(encoding="utf-8").strip()
-    packed_refs = (git_dir / "packed-refs").read_text(encoding="utf-8").splitlines()
-    for line in packed_refs:
-        if line.startswith("#") or line.startswith("^"):
-            continue
-        sha, packed_ref = line.split(" ", 1)
-        if packed_ref == ref:
-            return sha
-    raise RuntimeError(f"Unable to resolve git ref {ref}")
+    env_sha = os.environ.get("ZSTEP_GIT_SHA", "").strip()
+    if env_sha:
+        return env_sha
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            text=True,
+            timeout=5,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 def run_phase2_allreduce_suite(*, output: Path | None) -> dict[str, object]:

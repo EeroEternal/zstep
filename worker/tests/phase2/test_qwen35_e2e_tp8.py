@@ -114,7 +114,7 @@ def test_qwen35_35b_a3b_mode_b_tp8_greedy_parity() -> None:
         assert not Path(f"/dev/shm/{shm_name}{suffix}").exists()
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert re.fullmatch(r"[0-9a-f]{40}", report["git_sha"])
+    assert report["git_sha"] == "unknown" or re.fullmatch(r"[0-9a-f]{40}", report["git_sha"])
     assert report["max_prefill_chunk"] == 24
     assert len(report["cases"]) == 5
     assert report["cases"][1]["total_tokens"] == 128

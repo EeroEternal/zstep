@@ -1,95 +1,164 @@
-[
-  {
-    "name": "dsv41_tp8_default",
-    "geometry": {
-      "world_size": 8,
-      "max_seqs": 128,
-      "max_step_tokens": 4096,
-      "max_decoder_rows": 4096,
-      "max_pages_per_seq": 256,
-      "page_block_tokens": 128,
-      "spec_verify_width": 1
+{
+  "protocol_version": 3,
+  "pod_offsets": {
+    "ShmSuperblock": {
+      "magic": 0,
+      "protocol_version": 8,
+      "world_size": 12,
+      "max_seqs": 16,
+      "max_step_tokens": 20,
+      "max_decoder_rows": 24,
+      "max_pages_per_seq": 28,
+      "page_block_tokens": 32,
+      "spec_verify_width": 36,
+      "master_pid": 40,
+      "total_shm_bytes": 48,
+      "plan_slot_offsets": 56,
+      "plan_slot_stride": 72,
+      "result_slot_offsets": 80,
+      "result_slot_stride": 96,
+      "layout_hash": 104,
+      "max_decode_graph_seqs": 112,
+      "_pad_u32": 116,
+      "_reserved": 120,
+      "_sizeof": 128
     },
-    "expected": {
-      "header_offset": 0,
-      "token_ids_offset": 256,
-      "positions_offset": 16640,
-      "req_slot_ids_offset": 33024,
-      "replay_mask_offset": 49408,
-      "engram_prev_window_offset": 53504,
-      "narrow_keep_indices_offset": 102656,
-      "sample_row_indices_offset": 119040,
-      "seq_lens_offset": 135424,
-      "query_start_loc_offset": 135936,
-      "global_kv_page_table_offset": 136704,
-      "swa_page_table_offset": 267776,
-      "compressor_slot_ids_offset": 269824,
-      "temperatures_offset": 270336,
-      "total_slot_bytes": 274432,
-      "result_slot_stride": 16384,
-      "layout_hash_hex": "0x8fb1c3eb1bb651f2"
+    "WorkerSlotState": {
+      "ready_step_id": 0,
+      "heartbeat_ns": 8,
+      "worker_pid": 16,
+      "device_sm_arch": 20,
+      "status_code": 24,
+      "error_code": 28,
+      "free_vram_mb": 32,
+      "total_vram_mb": 36,
+      "numa_node": 40,
+      "triton_recompilations": 44,
+      "watched_kernels": 48,
+      "_sizeof": 64
+    },
+    "StepHeader": {
+      "step_id": 0,
+      "opcode": 8,
+      "num_seqs": 12,
+      "num_encoder_tokens": 16,
+      "encoder_graph_bucket": 20,
+      "num_decoder_rows": 24,
+      "decoder_graph_bucket": 28,
+      "num_sample_rows": 32,
+      "is_dspark_verify": 36,
+      "flags": 40,
+      "_sizeof": 64
+    },
+    "StepResultHeader": {
+      "completed_step_id": 0,
+      "gpu_exec_us": 8,
+      "status_code": 12,
+      "num_seq_results": 16,
+      "_sizeof": 64
+    },
+    "SeqStepOutput": {
+      "req_slot": 0,
+      "num_accepted": 4,
+      "accepted_tokens": 8,
+      "next_draft_tokens": 40,
+      "accepted_logprobs_bits": 72,
+      "_sizeof": 104
     }
   },
-  {
-    "name": "qwen35_tp8_vram32g",
-    "geometry": {
-      "world_size": 8,
-      "max_seqs": 128,
-      "max_step_tokens": 8192,
-      "max_decoder_rows": 8192,
-      "max_pages_per_seq": 4096,
-      "page_block_tokens": 64,
-      "spec_verify_width": 4
+  "cases": [
+    {
+      "name": "dsv41_tp8_default",
+      "geometry": {
+        "world_size": 8,
+        "max_seqs": 128,
+        "max_step_tokens": 4096,
+        "max_decoder_rows": 4096,
+        "max_pages_per_seq": 256,
+        "page_block_tokens": 128,
+        "spec_verify_width": 1
+      },
+      "expected": {
+        "header_offset": 0,
+        "token_ids_offset": 256,
+        "positions_offset": 16640,
+        "req_slot_ids_offset": 33024,
+        "replay_mask_offset": 49408,
+        "engram_prev_window_offset": 53504,
+        "narrow_keep_indices_offset": 102656,
+        "sample_row_indices_offset": 119040,
+        "seq_lens_offset": 135424,
+        "query_start_loc_offset": 135936,
+        "global_kv_page_table_offset": 136704,
+        "swa_page_table_offset": 267776,
+        "compressor_slot_ids_offset": 269824,
+        "temperatures_offset": 270336,
+        "total_slot_bytes": 274432,
+        "result_slot_stride": 16384,
+        "layout_hash_hex": "0xd000ab372247b76e"
+      }
     },
-    "expected": {
-      "header_offset": 0,
-      "token_ids_offset": 256,
-      "positions_offset": 33024,
-      "req_slot_ids_offset": 65792,
-      "replay_mask_offset": 98560,
-      "engram_prev_window_offset": 106752,
-      "narrow_keep_indices_offset": 205056,
-      "sample_row_indices_offset": 237824,
-      "seq_lens_offset": 270592,
-      "query_start_loc_offset": 271104,
-      "global_kv_page_table_offset": 271872,
-      "swa_page_table_offset": 2369024,
-      "compressor_slot_ids_offset": 2371072,
-      "temperatures_offset": 2371584,
-      "total_slot_bytes": 2375680,
-      "result_slot_stride": 16384,
-      "layout_hash_hex": "0x2f05c2f282af2be1"
-    }
-  },
-  {
-    "name": "odd_prime_bounds",
-    "geometry": {
-      "world_size": 1,
-      "max_seqs": 3,
-      "max_step_tokens": 19,
-      "max_decoder_rows": 7,
-      "max_pages_per_seq": 11,
-      "page_block_tokens": 64,
-      "spec_verify_width": 1
+    {
+      "name": "qwen35_tp8_vram32g",
+      "geometry": {
+        "world_size": 8,
+        "max_seqs": 128,
+        "max_step_tokens": 8192,
+        "max_decoder_rows": 8192,
+        "max_pages_per_seq": 4096,
+        "page_block_tokens": 64,
+        "spec_verify_width": 4
+      },
+      "expected": {
+        "header_offset": 0,
+        "token_ids_offset": 256,
+        "positions_offset": 33024,
+        "req_slot_ids_offset": 65792,
+        "replay_mask_offset": 98560,
+        "engram_prev_window_offset": 106752,
+        "narrow_keep_indices_offset": 205056,
+        "sample_row_indices_offset": 237824,
+        "seq_lens_offset": 270592,
+        "query_start_loc_offset": 271104,
+        "global_kv_page_table_offset": 271872,
+        "swa_page_table_offset": 2369024,
+        "compressor_slot_ids_offset": 2371072,
+        "temperatures_offset": 2371584,
+        "total_slot_bytes": 2375680,
+        "result_slot_stride": 16384,
+        "layout_hash_hex": "0x27f4269c276da805"
+      }
     },
-    "expected": {
-      "header_offset": 0,
-      "token_ids_offset": 256,
-      "positions_offset": 512,
-      "req_slot_ids_offset": 768,
-      "replay_mask_offset": 1024,
-      "engram_prev_window_offset": 1280,
-      "narrow_keep_indices_offset": 1536,
-      "sample_row_indices_offset": 1792,
-      "seq_lens_offset": 2048,
-      "query_start_loc_offset": 2304,
-      "global_kv_page_table_offset": 2560,
-      "swa_page_table_offset": 2816,
-      "compressor_slot_ids_offset": 3072,
-      "temperatures_offset": 3328,
-      "total_slot_bytes": 4096,
-      "result_slot_stride": 4096,
-      "layout_hash_hex": "0x495b535799c72054"
+    {
+      "name": "odd_prime_bounds",
+      "geometry": {
+        "world_size": 1,
+        "max_seqs": 3,
+        "max_step_tokens": 19,
+        "max_decoder_rows": 7,
+        "max_pages_per_seq": 11,
+        "page_block_tokens": 64,
+        "spec_verify_width": 1
+      },
+      "expected": {
+        "header_offset": 0,
+        "token_ids_offset": 256,
+        "positions_offset": 512,
+        "req_slot_ids_offset": 768,
+        "replay_mask_offset": 1024,
+        "engram_prev_window_offset": 1280,
+        "narrow_keep_indices_offset": 1536,
+        "sample_row_indices_offset": 1792,
+        "seq_lens_offset": 2048,
+        "query_start_loc_offset": 2304,
+        "global_kv_page_table_offset": 2560,
+        "swa_page_table_offset": 2816,
+        "compressor_slot_ids_offset": 3072,
+        "temperatures_offset": 3328,
+        "total_slot_bytes": 4096,
+        "result_slot_stride": 4096,
+        "layout_hash_hex": "0x587d9ad20b4f0bd8"
+      }
     }
-  }
-]
+  ]
+}

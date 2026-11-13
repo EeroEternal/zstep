@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 /// ASCII `"ZSTEP_V1"` in little-endian (`0x5A53_5445_505F_5631`).
 pub const ZSTEP_SHM_MAGIC: u64 = 0x5A53_5445_505F_5631;
 /// Wire ABI version. Must match exactly between master and GPU workers.
-pub const ZSTEP_PROTOCOL_VERSION: u32 = 2;
+pub const ZSTEP_PROTOCOL_VERSION: u32 = 3;
 /// Maximum GPU workers supported per single-node shared-memory segment.
 pub const MAX_WORKERS: usize = 8;
 /// Token ID sentinel indicating the GPU worker should self-bootstrap the token
@@ -333,6 +333,24 @@ impl StepPlanLayout {
             std::mem::size_of::<StepHeader>() as u64,
             std::mem::size_of::<StepResultHeader>() as u64,
             std::mem::size_of::<SeqStepOutput>() as u64,
+            SUPERBLOCK_ABORT_OFFSET as u64,
+            WORKER_STATES_OFFSET as u64,
+            STEP_FLAG_DECODE_ONLY as u64,
+            MAX_DECODE_GRAPH_SEQS as u64,
+            std::mem::offset_of!(ShmSuperblock, total_shm_bytes) as u64,
+            std::mem::offset_of!(ShmSuperblock, plan_slot_offsets) as u64,
+            std::mem::offset_of!(ShmSuperblock, plan_slot_stride) as u64,
+            std::mem::offset_of!(ShmSuperblock, result_slot_offsets) as u64,
+            std::mem::offset_of!(ShmSuperblock, result_slot_stride) as u64,
+            std::mem::offset_of!(ShmSuperblock, layout_hash) as u64,
+            std::mem::offset_of!(ShmSuperblock, max_decode_graph_seqs) as u64,
+            std::mem::offset_of!(WorkerSlotState, heartbeat_ns) as u64,
+            std::mem::offset_of!(WorkerSlotState, status_code) as u64,
+            std::mem::offset_of!(WorkerSlotState, numa_node) as u64,
+            std::mem::offset_of!(WorkerSlotState, triton_recompilations) as u64,
+            std::mem::offset_of!(WorkerSlotState, watched_kernels) as u64,
+            std::mem::offset_of!(StepHeader, flags) as u64,
+            std::mem::offset_of!(SeqStepOutput, accepted_logprobs_bits) as u64,
             self.total_slot_bytes as u64,
             self.header_offset as u64,
             self.token_ids_offset as u64,
@@ -388,6 +406,115 @@ pub struct SeqStepOutput {
     pub accepted_logprobs_bits: [u32; 8],
 }
 
+/// Optional Git SHA embedded at `cargo build` time when built from a Git checkout or with
+/// `ZSTEP_GIT_SHA` set. Absent (`None`) when built from a `git archive` / sdist tree.
+pub const BUILD_GIT_SHA: Option<&str> = option_env!("ZSTEP_BUILD_GIT_SHA");
+
+fn normalize_git_sha(raw: &str, min_len: usize, short: bool) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.len() < min_len
+        || trimmed.len() > 40
+        || !trimmed.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(format!("invalid Git SHA provenance `{trimmed}`"));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if short {
+        Ok(lower[..7].to_owned())
+    } else {
+        Ok(lower)
+    }
+}
+
+fn read_git_dir_sha(repo_dir: &std::path::Path) -> Option<String> {
+    let dot_git = repo_dir.join(".git");
+    let git_dir = if dot_git.is_file() {
+        let content = std::fs::read_to_string(&dot_git).ok()?;
+        let rel = content.trim().strip_prefix("gitdir:")?.trim();
+        let path = std::path::Path::new(rel);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            repo_dir.join(path)
+        }
+    } else if dot_git.is_dir() {
+        dot_git
+    } else {
+        return None;
+    };
+
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let raw_sha = if let Some(reference) = head.strip_prefix("ref: ") {
+        let ref_path = git_dir.join(reference);
+        if let Ok(contents) = std::fs::read_to_string(ref_path) {
+            contents
+        } else {
+            let packed = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
+            packed
+                .lines()
+                .filter(|line| !line.starts_with('#') && !line.starts_with('^'))
+                .find_map(|line| {
+                    let (sha, packed_ref) = line.split_once(' ')?;
+                    (packed_ref.trim() == reference).then(|| sha.to_owned())
+                })?
+        }
+    } else {
+        head.to_owned()
+    };
+    normalize_git_sha(&raw_sha, 7, false).ok()
+}
+
+/// Pure helper resolving Git provenance in `working_dir` with explicit overrides so tests can
+/// exercise `git archive` / sdist directories deterministically without mutating process env.
+pub fn resolve_git_revision_in(
+    working_dir: &std::path::Path,
+    env_override: Option<&str>,
+    build_fallback: Option<&str>,
+    short: bool,
+) -> Result<String, String> {
+    if let Some(raw_env) = env_override {
+        let min_len = if short { 7 } else { 40 };
+        return normalize_git_sha(raw_env, min_len, short);
+    }
+
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(working_dir)
+        .output()
+        && output.status.success()
+        && let Ok(stdout) = String::from_utf8(output.stdout)
+        && let Ok(parsed) = normalize_git_sha(&stdout, 7, short)
+    {
+        return Ok(parsed);
+    }
+
+    if let Some(file_sha) = read_git_dir_sha(working_dir) {
+        return normalize_git_sha(&file_sha, 7, short);
+    }
+
+    if let Some(build_sha) = build_fallback
+        && let Ok(parsed) = normalize_git_sha(build_sha, 7, short)
+    {
+        return Ok(parsed);
+    }
+
+    Ok("unknown".to_owned())
+}
+
+/// Resolve the current Git commit SHA (`short = true` -> 7-char prefix, `short = false` -> 40-char
+/// full SHA) from `ZSTEP_GIT_SHA`, `git rev-parse HEAD`, `.git/HEAD`, compile-time
+/// [`BUILD_GIT_SHA`], or `"unknown"` when running from a `git archive` / sdist source tree.
+pub fn resolve_git_sha(short: bool) -> Result<String, String> {
+    let env_val = match std::env::var("ZSTEP_GIT_SHA") {
+        Ok(val) if !val.trim().is_empty() => Some(val),
+        Ok(_) | Err(std::env::VarError::NotPresent) => None,
+        Err(err) => return Err(format!("invalid ZSTEP_GIT_SHA environment variable: {err}")),
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    resolve_git_revision_in(&cwd, env_val.as_deref(), BUILD_GIT_SHA, short)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +529,112 @@ mod tests {
         assert_eq!(std::mem::size_of::<StepHeader>(), 64);
         assert_eq!(std::mem::align_of::<StepResultHeader>(), 64);
         assert_eq!(std::mem::size_of::<StepResultHeader>(), 64);
+        assert_eq!(std::mem::size_of::<SeqStepOutput>(), 104);
+    }
+
+    #[test]
+    fn pod_field_offsets_match_wire_spec() {
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, magic), 0);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, protocol_version), 8);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, world_size), 12);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, max_seqs), 16);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, max_step_tokens), 20);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, max_decoder_rows), 24);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, max_pages_per_seq), 28);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, page_block_tokens), 32);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, spec_verify_width), 36);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, master_pid), 40);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, total_shm_bytes), 48);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, plan_slot_offsets), 56);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, plan_slot_stride), 72);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, result_slot_offsets), 80);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, result_slot_stride), 96);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, layout_hash), 104);
+        assert_eq!(
+            std::mem::offset_of!(ShmSuperblock, max_decode_graph_seqs),
+            112
+        );
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, _pad_u32), 116);
+        assert_eq!(std::mem::offset_of!(ShmSuperblock, _reserved), 120);
+
+        assert_eq!(std::mem::offset_of!(WorkerSlotState, ready_step_id), 0);
+        assert_eq!(std::mem::offset_of!(WorkerSlotState, heartbeat_ns), 8);
+        assert_eq!(std::mem::offset_of!(WorkerSlotState, worker_pid), 16);
+        assert_eq!(std::mem::offset_of!(WorkerSlotState, device_sm_arch), 20);
+        assert_eq!(std::mem::offset_of!(WorkerSlotState, status_code), 24);
+        assert_eq!(std::mem::offset_of!(WorkerSlotState, error_code), 28);
+        assert_eq!(std::mem::offset_of!(WorkerSlotState, free_vram_mb), 32);
+        assert_eq!(std::mem::offset_of!(WorkerSlotState, total_vram_mb), 36);
+        assert_eq!(std::mem::offset_of!(WorkerSlotState, numa_node), 40);
+        assert_eq!(
+            std::mem::offset_of!(WorkerSlotState, triton_recompilations),
+            44
+        );
+        assert_eq!(std::mem::offset_of!(WorkerSlotState, watched_kernels), 48);
+
+        assert_eq!(std::mem::offset_of!(StepHeader, step_id), 0);
+        assert_eq!(std::mem::offset_of!(StepHeader, opcode), 8);
+        assert_eq!(std::mem::offset_of!(StepHeader, num_seqs), 12);
+        assert_eq!(std::mem::offset_of!(StepHeader, num_encoder_tokens), 16);
+        assert_eq!(std::mem::offset_of!(StepHeader, encoder_graph_bucket), 20);
+        assert_eq!(std::mem::offset_of!(StepHeader, num_decoder_rows), 24);
+        assert_eq!(std::mem::offset_of!(StepHeader, decoder_graph_bucket), 28);
+        assert_eq!(std::mem::offset_of!(StepHeader, num_sample_rows), 32);
+        assert_eq!(std::mem::offset_of!(StepHeader, is_dspark_verify), 36);
+        assert_eq!(std::mem::offset_of!(StepHeader, flags), 40);
+
+        assert_eq!(std::mem::offset_of!(StepResultHeader, completed_step_id), 0);
+        assert_eq!(std::mem::offset_of!(StepResultHeader, gpu_exec_us), 8);
+        assert_eq!(std::mem::offset_of!(StepResultHeader, status_code), 12);
+        assert_eq!(std::mem::offset_of!(StepResultHeader, num_seq_results), 16);
+
+        assert_eq!(std::mem::offset_of!(SeqStepOutput, req_slot), 0);
+        assert_eq!(std::mem::offset_of!(SeqStepOutput, num_accepted), 4);
+        assert_eq!(std::mem::offset_of!(SeqStepOutput, accepted_tokens), 8);
+        assert_eq!(std::mem::offset_of!(SeqStepOutput, next_draft_tokens), 40);
+        assert_eq!(
+            std::mem::offset_of!(SeqStepOutput, accepted_logprobs_bits),
+            72
+        );
+    }
+
+    #[test]
+    fn git_provenance_resolves_without_dot_git_directory() {
+        let isolated = std::env::temp_dir().join(format!("zstep_gitless_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&isolated);
+        std::fs::create_dir_all(&isolated).expect("create temp dir");
+
+        // 1) Pure `git archive` / sdist tree (no `.git`, no `ZSTEP_GIT_SHA`, no build SHA):
+        assert_eq!(
+            resolve_git_revision_in(&isolated, None, None, true).expect("short fallback"),
+            "unknown"
+        );
+        assert_eq!(
+            resolve_git_revision_in(&isolated, None, None, false).expect("full fallback"),
+            "unknown"
+        );
+
+        // 2) `ZSTEP_GIT_SHA` override works in a git-less directory:
+        let sample_sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            resolve_git_revision_in(&isolated, Some(sample_sha), None, true).expect("env short"),
+            "0123456"
+        );
+        assert_eq!(
+            resolve_git_revision_in(&isolated, Some(sample_sha), None, false).expect("env full"),
+            sample_sha
+        );
+
+        // 3) Malformed `ZSTEP_GIT_SHA` still fails loudly:
+        assert!(resolve_git_revision_in(&isolated, Some("not-hex!"), None, false).is_err());
+
+        // 4) Compile-time `BUILD_GIT_SHA` rescues binary copied outside `.git`:
+        assert_eq!(
+            resolve_git_revision_in(&isolated, None, Some(sample_sha), true).expect("build short"),
+            "0123456"
+        );
+
+        let _ = std::fs::remove_dir_all(&isolated);
     }
 
     #[test]

@@ -607,14 +607,15 @@ impl KvCacheManager {
         let total_blocks = prompt_tokens.len().div_ceil(self.block_tokens as usize);
         let uncached_blocks = total_blocks.saturating_sub(matched_blocks);
 
-        // Ensure at least 1 fresh token is executed to produce next-token logits when the entire
-        // prompt is an exact multiple of `block_tokens` and matched 100% in the Radix tree.
+        // When the entire prompt is an exact multiple of `block_tokens` and matched 100% in the
+        // Radix tree (`matched_tokens_raw == prompt_tokens.len()`), `swa_window >= 1` guarantees
+        // `replay_tokens = matched_tokens_raw.min(swa_window) >= 1` ending at `prompt_len - 1`,
+        // so next-token logits and private SWA/Compressor state are produced with `replay_mask = 1`
+        // without ever overwriting any shared `GlobalAndIndex` Radix page (`fresh_tokens = 0`).
         let matched_tokens_raw = radix_lease.matched_tokens();
-        let effective_matched =
-            matched_tokens_raw.min(prompt_tokens.len().saturating_sub(1) as u32);
         let (skipped_tokens, replay_tokens) =
-            plan_bounded_replay(effective_matched, self.swa_window);
-        let fresh_tokens = prompt_tokens.len() as u32 - effective_matched;
+            plan_bounded_replay(matched_tokens_raw, self.swa_window);
+        let fresh_tokens = prompt_tokens.len() as u32 - matched_tokens_raw;
 
         let tail_lease = if uncached_blocks > 0 {
             Some(allocate_with_eviction(

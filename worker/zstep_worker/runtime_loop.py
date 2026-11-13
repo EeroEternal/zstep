@@ -40,19 +40,19 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
-from zstep_worker.kernels_sm120.moe_router import (  # noqa: E402
+from zstep_worker.kernels_sm120.moe_router import (
     dsv41_sqrt_softplus_topk,
     dsv41_sqrt_softplus_topk_kernel,
 )
-from zstep_worker.kernels_sm120.norm_quant import (  # noqa: E402
+from zstep_worker.kernels_sm120.norm_quant import (
     rmsnorm_quantize_mxfp8_group32,
     rmsnorm_quantize_mxfp8_group32_kernel,
 )
-from zstep_worker.numa_pin import (  # noqa: E402
+from zstep_worker.numa_pin import (
     DeviceNumaTopology,
     pin_process_to_device_numa,
 )
-from zstep_worker.shm_bridge import (  # noqa: E402
+from zstep_worker.shm_bridge import (
     SeqResult,
     ShmBridge,
     StepHeader,

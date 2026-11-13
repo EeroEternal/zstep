@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 import importlib.metadata
 import json
 import os
@@ -255,9 +255,9 @@ def capture_hardware() -> dict[str, Any]:
     for line in output.stdout.splitlines():
         if not line.strip():
             continue
-        name, driver, graphics, memory, memory_total = [
+        name, driver, graphics, memory, memory_total = (
             field.strip() for field in line.split(",")
-        ]
+        )
         rows.append(
             {
                 "name": name,
@@ -282,19 +282,23 @@ def capture_hardware() -> dict[str, Any]:
 
 def current_git_sha() -> str:
     environment_sha = os.environ.get("ZSTEP_GIT_SHA")
-    if environment_sha is not None:
-        sha = environment_sha.strip()
-    else:
-        git_dir = Path(__file__).resolve().parents[3] / ".git"
-        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
-        if head.startswith("ref: "):
-            head = (git_dir / head.removeprefix("ref: ")).read_text(
-                encoding="utf-8"
-            ).strip()
-        sha = head
-    if len(sha) != 40 or any(character not in "0123456789abcdef" for character in sha):
-        raise RuntimeError(f"invalid Git SHA provenance: {sha}")
-    return sha
+    if environment_sha is not None and environment_sha.strip():
+        sha = environment_sha.strip().lower()
+        if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
+            raise RuntimeError(f"invalid Git SHA provenance: {sha}")
+        return sha
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[3],
+            text=True,
+            timeout=5,
+        ).strip().lower()
+        if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha):
+            return sha
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "unknown"
 
 
 def common_provenance(args: argparse.Namespace) -> dict[str, Any]:
@@ -309,7 +313,7 @@ def common_provenance(args: argparse.Namespace) -> dict[str, Any]:
         "engram_memory": args.engram_memory,
         "seed": args.seed,
         "git_sha": current_git_sha(),
-        "collection_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "collection_timestamp_utc": datetime.now(UTC).isoformat(),
         "serve_args": serve_arguments(args),
         "serve_env": {
             "NCCL_P2P_DISABLE": "1",

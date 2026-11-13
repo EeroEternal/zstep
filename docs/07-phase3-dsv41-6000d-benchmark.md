@@ -68,9 +68,9 @@ GPU 4, 5, 6, 7 -> Socket 1 PCIe Gen5 -> NUMA 1
 
 | 检查项 | 覆盖内容 | 实测结果 |
 | :--- | :--- | :--- |
-| `cargo fmt --check` + `clippy -D warnings` + `cargo test --workspace` | `zs-wire` 布局与容量派生、`zs-shm` RAII、`zs-kv`、`zs-scheduler` 混合批调度 / 重叠解码 Engram 3-token 滑窗修订 / Top-2 审计、`zs-server` | **32 passed, 0 warnings** |
-| [`test_shm_layout_parity.py`](../worker/tests/test_shm_layout_parity.py) + `ruff check` | Python `ctypes` 视图与 Rust `#[repr(C)]` 结构体字节偏移逐项对齐、静态代码规范 | **1 passed, 0 lint errors** |
-| `--verify-greedy-json`（`DeepSeek-V4.1-Flash` `TP=8`） | 8 卡真权重对 5 个无缓存 `vLLM 0.31.0` 贪心参考序列执行单序列、5 序列批处理与 `--max-prefill-chunk 24` 顺风车混合步；核对全局 Top-2 裕度、Triton 零重编译与 `/dev/shm` RAII | **`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=5`**，`SHM_CLEAN`；**高约束结构化任务 `128/128` 100% 精确一致，低裕度 ULP 边界分歧如实保留** |
+| `cargo fmt --check` + `clippy -D warnings` + `cargo test --workspace` | `zs-wire` 全字段偏移与无 `.git` provenance、`zs-shm` RAII、`zs-kv`（含整块前缀零写别名页校验）、`zs-scheduler` 混合批调度 / 看门狗 / Top-2 审计、`zs-server` 贪心门禁 | **41 passed, 0 warnings** |
+| [`test_shm_layout_parity.py`](../worker/tests/test_shm_layout_parity.py) + `ruff check worker/` | Python 视图与 Rust `#[repr(C)]` 全结构体字节偏移（含 `ShmSuperblock` `112 vs 116` 哨兵回归测试）、仓库根 [`ruff.toml`](../ruff.toml) 锁定静态规则 | **4 passed, 0 lint errors** |
+| `--verify-greedy-json`（`DeepSeek-V4.1-Flash` `TP=8`） | 8 卡真权重对 5 个无缓存 `vLLM 0.31.0` 贪心参考序列执行单序列、5 序列批处理与 `--max-prefill-chunk 24` 顺风车混合步；默认门禁校验 `TRITON_RECOMPILATIONS=0`（`rc=0`），`--require-exact-cases prime_squares_table` 强制锁定结构化算术表 `128/128` 100% 一致（`rc=0`；全量严格门禁 `--require-exact-greedy true` 或 `--max-greedy-mismatch-margin 0.25` 返回 `rc=1`） | **`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=5`**，`SHM_CLEAN`；**高约束结构化任务 `128/128` 100% 精确一致，低裕度边界分歧如实保留** |
 
 ### 3.1 五条 Prompt（Single / Batched / Mixed-Chunked）全局 Top-2 贪心对齐报告
 
@@ -140,7 +140,9 @@ GPU 4, 5, 6, 7 -> Socket 1 PCIe Gen5 -> NUMA 1
 
 ## 6. Phase 3.6：选择性 `b12x` SM120 计算算子集成与纯引擎同口径四方对标
 
-### 6.1 `b12x_dsv41.py` 选择性算子替换策略
+### 6.1 `b12x_dsv41.py` 选择性算子替换策略与容器 Overlay Provenance
+
+> **`b12x` 运行环境与复现 Provenance**：官方基础镜像 `vllm/vllm-openai:v0.31.0` 仅包含 `vllm.utils.b12x` 桩模块，不包含 `flashinfer/experimental/b12x` 本体。Phase 3.6 实测在 `vllm/vllm-openai:v0.31.0` 基础上只读挂载公开仓库 [`local-inference-lab/flashinfer`](https://github.com/local-inference-lab/flashinfer) 的标签 **`flashinfer-cu134-sm120-beta-79819b112f8bda7d09709c24bb31de16d7ce59c6`**（commit `79819b112f8bda7d09709c24bb31de16d7ce59c6`）下的 `flashinfer/experimental/b12x -> /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x:ro`，并设置 `ZSTEP_REQUIRE_B12X=1`（缺失 `b12x` 时立即报错退出，拒绝静默回退 `b12x=off`）与 `B12X_W4A8_TINY_DECODE=0`（完整挂载命令见 [`docs/benchmarks/README.md`](benchmarks/README.md) 第 6 节）。
 
 基于单算子同环境微基准（保留 `zstep` `shm_v5` / `NCCL_LOC` 通信层以及 `vLLM 0.31.0` 的 `mhc_shifted_post_pre`、`GateLinear`、`ParallelLMHead` 与 `FlashInfer` 稀疏 MLA/SWA 注意力），[`b12x_dsv41.py`](../worker/zstep_worker/kernels_sm120/b12x_dsv41.py) 仅替换两类在 `sm_120` 上具显著硬件优势的计算算子：
 
