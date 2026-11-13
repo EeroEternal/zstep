@@ -1,6 +1,6 @@
 # `zstep` Master Benchmark Ledger (`sm_120` Non-P2P PCIe: `8×32 GB` & `8×85.6 GB`)
 
-本目录归档 Phase 0（`sm_120` 算子与 PCIe AllReduce）、Phase 1（Mode B Rust 控制面与双缓冲调度）、Phase 2（`8 × RTX 5090 32 GB` 上 `Qwen/Qwen3.5-35B-A3B` 无 APC 真权重 serving 与 `vLLM 0.33.0` 对标）及 **Phase 3 / 3.5（`8 × RTX 6000D 85.6 GB` 上 `DeepSeek-V4.1-Flash` `TP=8` 无 APC 真权重 serving 与 `vLLM 0.31.0` 对标）** 的实测 JSON。所有主结果均为 **warm、单配置、无前缀缓存（`--no-enable-prefix-caching`）、按 `(round, tier)` 独立种子、round-major 交错、`n=3`**；旧单轮与消融数据只作历史记录，不与主表混用。
+本目录归档 Phase 0（`sm_120` 算子与 PCIe AllReduce）、Phase 1（Mode B Rust 控制面与双缓冲调度）、Phase 2（`8 × RTX 5090 32 GB` 上 `Qwen/Qwen3.5-35B-A3B` 无 APC 真权重 serving 与 `vLLM 0.33.0` 对标）及 **Phase 3 / 3.5 / 3.6 / 3.7（`8 × RTX 6000D 85.6 GB` 上 `DeepSeek-V4.1-Flash` `TP=8` 无 APC 真权重 serving、`b12x` `156-SM` 优化与 `vLLM 0.31.0` 对标）** 的实测 JSON。所有主结果均为 **warm、单配置、无前缀缓存（`--no-enable-prefix-caching`）、按 `(round, tier)` 独立种子、round-major 交错、`n=3`**；旧单轮与消融数据只作历史记录，不与主表混用。
 
 ## 1. 硬件、软件与统计边界
 
@@ -11,19 +11,19 @@ Topology:  4-NUMA PCIe Gen5 ([0,0,0,1,2,2,2,3]), no NVLink, can_device_access_pe
 Model:     Qwen/Qwen3.5-35B-A3B, BF16, TP=8
 Baseline:  vLLM 0.33.0, BF16, TP=8, --no-enable-prefix-caching, isolated per-(round,tier) seeds, degraded NCCL SHM
 
-[Host B — Phase 3 / 3.5 / 3.6]
+[Host B — Phase 3 / 3.5 / 3.6 / 3.7]
 GPU:       8 × NVIDIA RTX 6000D (sm_120, 156 SMs, 85,651 MiB GDDR7 per GPU, Driver 595.99.02)
 Topology:  2-NUMA PCIe Gen5 ([0,0,0,0,1,1,1,1]), no NVLink, can_device_access_peer == 0 (CNS)
 Model:     DeepSeek-V4.1-Flash (1017, 475.25 GiB MXFP8/MXFP4/BF16, engram cpu_offload=false), TP=8
 Baseline:  vllm/vllm-openai:v0.31.0, TP=8, --no-enable-prefix-caching, isolated per-(round,tier) seeds, NCCL_P2P_DISABLE=1, NCCL_P2P_LEVEL=LOC, symmetric SM120 64-tok SWA shim
-b12x 3.6:  vllm/vllm-openai:v0.31.0 + read-only mount of `flashinfer/experimental/b12x` from `https://github.com/local-inference-lab/flashinfer.git` tag `flashinfer-cu134-sm120-beta-79819b112f8bda7d09709c24bb31de16d7ce59c6` (`79819b112f8bda7d09709c24bb31de16d7ce59c6`), `ZSTEP_REQUIRE_B12X=1`, `B12X_W4A8_TINY_DECODE=0`
+b12x 3.6/3.7: vllm/vllm-openai:v0.31.0 + read-only mount of `flashinfer/experimental/b12x` from `https://github.com/local-inference-lab/flashinfer.git` tag `flashinfer-cu134-sm120-beta-79819b112f8bda7d09709c24bb31de16d7ce59c6` (`79819b112f8bda7d09709c24bb31de16d7ce59c6`), `ZSTEP_REQUIRE_B12X=1`, `B12X_W4A8_TINY_DECODE=0` (Phase 3.7 `main` commit `d497e85`, PR `#11`)
 ```
 
 所有跨卡结论严格限定于对应无 P2P PCIe 拓扑，不外推到 NVLink 或 PCIe P2P。表中 `std` 是三轮重复测量的**总体标准差**；完整 `mean/std/min/max` 以 JSON 为准。吞吐“持平”规则为：相对差 `<3%`，或均值差 `<=2×sqrt(zstep_std²+vllm_std²)`；`n=3` 的持平不是严格等价证明。
 
 ## 2. 归档文件总览
 
-共有 **30 份主 JSON + 19 份 vLLM 逐轮/warmup 原始 JSON = 49 份 JSON**。
+共有 **31 份主 JSON + 19 份 vLLM 逐轮/warmup 原始 JSON = 50 份 JSON**。
 
 | 阶段 | 文件 | 内容 |
 | :--- | :--- | :--- |
@@ -55,26 +55,29 @@ b12x 3.6:  vllm/vllm-openai:v0.31.0 + read-only mount of `flashinfer/experimenta
 | Phase 3.6 | [`phase36_vllm_pure_dsv41_tp8_in512_out128.json`](phase36_vllm_pure_dsv41_tp8_in512_out128.json) | `vLLM 0.31.0` 进程内纯引擎（`AsyncLLMEngine` + `TokensPrompt` + `detokenize=False`，无 HTTP/分词/SSE）`512->128` 四档同口径基线 `n=3` |
 | Phase 3.6 | [`phase36_vllm_pure_dsv41_tp8_6tier.json`](phase36_vllm_pure_dsv41_tp8_6tier.json) | `vLLM 0.31.0` 进程内纯引擎（无 HTTP/分词/SSE）六档交错同口径基线 `n=3` |
 | Phase 3.6 | [`phase36_b12x_greedy_parity_report.json`](phase36_b12x_greedy_parity_report.json) | `zstep + b12x` 单序列/批处理/Mixed-Chunked 全局 Top-2 贪心审计（`prime_squares_table` `128/128` 100% 匹配，零重编译） |
-| Phase 3.7 | [`phase37_zstep_b12x_dsv41_tp8_in512_out128.json`](phase37_zstep_b12x_dsv41_tp8_in512_out128.json) | **Phase 3.7 套件一主结果**：`156-SM` `PreparationSession` 常驻 + 210 层 Block32 FP8 + 零校验快速绑定 `512->128` 四档 `n=3` |
-| Phase 3.7 | [`phase37_zstep_b12x_dsv41_tp8_6tier.json`](phase37_zstep_b12x_dsv41_tp8_6tier.json) | **Phase 3.7 套件二主结果**：`zstep 3.7 + b12x` 六档交错无缓存独立种子 `n=3`（峰值 `1,730.74 tok/s` 输出 / `5,955.36 tok/s` 总吞吐） |
-| Phase 3.7 | [`phase37_b12x_greedy_parity_report.json`](phase37_b12x_greedy_parity_report.json) | `zstep 3.7 + b12x`（`moe=40, lin=210/6, unprepared_warnings=0`）全局 Top-2 贪心审计（`prime_squares_table` `128/128` 100% 匹配，零重编译） |
+| Phase 3.7 | [`phase37_6000d_operator_audit.json`](phase37_6000d_operator_audit.json) | `RTX 6000D` (`156-SM`, `d497e85`) 单算子微基准与数值审计：`PreparationSession` 生命周期、7 形状 Block32 FP8、`B12X_W4A8_TINY_DECODE=1` 失真证明（`cos_sim=0.870..0.879`）、`o_proj` / `LMHead` / `mHC` |
+| Phase 3.7 | [`phase37_zstep_b12x_dsv41_tp8_in512_out128.json`](phase37_zstep_b12x_dsv41_tp8_in512_out128.json) | **Phase 3.7 套件一主结果**（`git_commit=d497e85`）：`156-SM` `PreparationSession` 常驻 + 210 层 Block32 FP8 + 零校验快速绑定 `512->128` 四档 `n=3` |
+| Phase 3.7 | [`phase37_zstep_b12x_dsv41_tp8_6tier.json`](phase37_zstep_b12x_dsv41_tp8_6tier.json) | **Phase 3.7 套件二主结果**（`git_commit=d497e85`）：`zstep 3.7 + b12x` 六档交错无缓存独立种子 `n=3`（峰值 `1,717.41 tok/s` 输出 / `5,945.57 tok/s` 总吞吐） |
+| Phase 3.7 | [`phase37_b12x_greedy_parity_report.json`](phase37_b12x_greedy_parity_report.json) | `zstep 3.7 + b12x`（`git_sha=d497e85...`，`moe=40, lin=210/6, unprepared_warnings=0`）全局 Top-2 贪心审计（`prime_squares_table` `128/128` 100% 匹配，零重编译） |
 
 ---
 
-## 2.9 Phase 3.7（`156-SM` `PreparationSession` 常驻 + 210 层 Block32 FP8 + Fast-Bind）最新主结果（`8 × RTX 6000D`, Warm `n=3`）
+## 2.9 Phase 3.7（`main` `d497e85`：`156-SM` `PreparationSession` 常驻 + 210 层 Block32 FP8 + Fast-Bind）最新主结果（`8 × RTX 6000D`, Warm `n=3`）
+
+> 归档自未修改的 `main` `d497e85`（PR `#11`）源码树；`num_kv_pages=2560` 下稳态显存占用 **`84,937..84,959 / 85,651 MiB = 99.2%`（每卡余量 `< 0.7 GiB`）**。按 `<3%` 持平规则，`c=1` 三档输出吞吐相对 Phase 3.6 均为**持平**（单流确定性收益为 `Median TTFT` 全线缩短 `-15.41..-18.71 ms`），而相对 `vLLM` 纯引擎同口径基线**全部 `10 / 10` 档显著胜出（`+14.44% .. +52.48%`）**。
 
 | 套件 / 档位 | `vLLM` 纯引擎 (`tok/s`) | `zstep` 3.6 (`tok/s`) | **`zstep` 3.7 (`tok/s`)** | 3.7 vs 3.6 / vs `vLLM` 纯引擎 | Mean TPOT `vPure` / **`z3.7`** (`ms`) | Med TTFT `vPure` / `z3.6` / **`z3.7`** (`ms`) | P99 ITL `vPure` / **`z3.7`** (`ms`) |
 | :--- | ---: | ---: | ---: | :--- | :---: | :---: | :---: |
-| Suite 1 `c1` | `83.59 ± 0.01` | `95.85 ± 0.65` | **`95.42 ± 0.25`** | `-0.45%` / **`+14.15%`** | `10.94` / **`9.22`** | `141.37` / `185.21` / **`169.96`** | `11.39` / **`9.47`** |
-| Suite 1 `c8` | `348.18 ± 8.30` | `441.70 ± 1.60` | **`444.99 ± 1.04`** | **`+0.74%`** / **`+27.80%`** | `19.02` / **`14.13`** | `590.28` / `510.32` / **`506.60`** | `18.80` / **`14.59`** |
-| Suite 1 `c16` | `492.61 ± 2.27` | `612.24 ± 2.13` | **`631.52 ± 3.87`** | **`+3.15%`** / **`+28.20%`** | `25.63` / **`21.71`** | `1,084.36` / `386.49` / **`381.72`** | **`25.97`** / `323.84` |
-| Suite 1 `c32` | `617.07 ± 1.10` | `800.74 ± 1.01` | **`819.52 ± 3.64`** | **`+2.35%`** / **`+32.81%`** | `41.13` / **`34.26`** | `1,430.66` / `387.05` / **`382.13`** | **`86.20`** / `381.88` |
-| Suite 2 `in512_c1` | `87.06 ± 0.01` | `103.99 ± 1.10` | **`104.26 ± 1.93`** | `+0.26%` / **`+19.76%`** | `10.97` / **`8.96`** | `141.86` / `184.93` / **`171.96`** | `11.41` / **`9.27`** |
-| Suite 2 `in512_c16` | `555.89 ± 1.34` | `727.06 ± 1.62` | **`751.59 ± 1.28`** | **`+3.37%`** / **`+35.20%`** | `25.32` / **`19.31`** | `1,086.45` / `386.86` / **`381.75`** | `26.12` / **`18.35`** |
-| Suite 2 `in512_c128` | `1,126.34 ± 1.87` | `1,686.53 ± 7.96` | **`1,730.74 ± 12.02`** | **`+2.62%`** / **`+53.66%`** | `99.30` / **`63.92`** | `3,066.32` / `779.52` / **`768.49`** | `1,021.41` / **`384.14`** |
-| Suite 2 `in1024_c1` | `84.57 ± 0.00` | `102.27 ± 0.18` | **`101.47 ± 1.35`** | `-0.78%` / **`+19.98%`** | `11.17` / **`9.21`** | `177.89` / `191.20` / **`174.92`** | `11.56` / **`9.53`** |
-| Suite 2 `in1024_c32` | `605.12 ± 1.35` | `778.39 ± 4.56` | **`796.69 ± 1.53`** | **`+2.35%`** / **`+31.66%`** | `42.27` / **`35.63`** | `2,127.63` / `391.62` / **`386.78`** | **`296.51`** / `386.62` |
-| Suite 2 `in1024_c128` | `866.25 ± 1.06` | `1,169.71 ± 1.06` | **`1,191.07 ± 3.50`** | **`+1.83%`** / **`+37.50%`** | `122.27` / **`90.62`** | `3,107.53` / `787.39` / **`776.78`** | `1,035.90` / **`389.00`** |
+| Suite 1 `c1` | `83.59 ± 0.01` | `95.85 ± 0.65` | **`95.66 ± 0.20`** | `-0.20%`（持平） / **`+14.44%`** | `10.94` / **`9.20`** | `141.37` / `185.21` / **`169.42`** | `11.39` / **`9.43`** |
+| Suite 1 `c8` | `348.18 ± 8.30` | `441.70 ± 1.60` | **`446.37 ± 1.62`** | `+1.06%`（持平） / **`+28.20%`** | `19.02` / **`14.07`** | `590.28` / `510.32` / **`506.43`** | `18.80` / **`14.62`** |
+| Suite 1 `c16` | `492.61 ± 2.27` | `612.24 ± 2.13` | **`631.57 ± 0.97`** | **`+3.16%`** / **`+28.21%`** | `25.63` / **`21.71`** | `1,084.36` / `386.49` / **`381.68`** | **`25.97`** / `323.60` |
+| Suite 1 `c32` | `617.07 ± 1.10` | `800.74 ± 1.01` | **`820.22 ± 1.82`** | `+2.43%` / **`+32.92%`** | `41.13` / **`34.23`** | `1,430.66` / `387.05` / **`382.36`** | **`86.20`** / `382.07` |
+| Suite 2 `in512_c1` | `87.06 ± 0.01` | `103.99 ± 1.10` | **`101.61 ± 0.11`** | `-2.29%`（持平） / **`+16.71%`** | `10.97` / **`9.21`** | `141.86` / `184.93` / **`169.52`** | `11.41` / **`9.46`** |
+| Suite 2 `in512_c16` | `555.89 ± 1.34` | `727.06 ± 1.62` | **`741.71 ± 5.61`** | `+2.01%` / **`+33.43%`** | `25.32` / **`19.59`** | `1,086.45` / `386.86` / **`382.22`** | `26.12` / **`18.91`** |
+| Suite 2 `in512_c128` | `1,126.34 ± 1.87` | `1,686.53 ± 7.96` | **`1,717.41 ± 4.17`** | `+1.83%` / **`+52.48%`** | `99.30` / **`64.47`** | `3,066.32` / `779.52` / **`769.26`** | `1,021.41` / **`384.61`** |
+| Suite 2 `in1024_c1` | `84.57 ± 0.00` | `102.27 ± 0.18` | **`99.33 ± 0.04`** | `-2.87%`（持平） / **`+17.46%`** | `11.17` / **`9.43`** | `177.89` / `191.20` / **`172.49`** | `11.56` / **`9.68`** |
+| Suite 2 `in1024_c32` | `605.12 ± 1.35` | `778.39 ± 4.56` | **`796.36 ± 0.84`** | `+2.31%` / **`+31.60%`** | `42.27` / **`35.66`** | `2,127.63` / `391.62` / **`386.97`** | **`296.51`** / `386.76` |
+| Suite 2 `in1024_c128` | `866.25 ± 1.06` | `1,169.71 ± 1.06` | **`1,189.11 ± 2.74`** | `+1.66%` / **`+37.27%`** | `122.27` / **`90.83`** | `3,107.53` / `787.39` / **`777.10`** | `1,035.90` / **`389.31`** |
 
 ---
 
@@ -173,7 +176,7 @@ cargo build --release -p zs-server
 # 若在无 .git 的 git archive 目录运行且需精确记录 Git SHA，可传入 export ZSTEP_GIT_SHA=<40-hex-sha>；
 # 未设置时 BenchmarkProvenance 与 GreedyParityReport 自动回退编译期 SHA 或 "unknown"，不会因缺少 .git 报错。
 
-# ── Phase 3.6 (+ b12x): DeepSeek-V4.1-Flash TP=8 (8 × RTX 6000D) ──────────────────────
+# ── Phase 3.6 / 3.7 (+ b12x): DeepSeek-V4.1-Flash TP=8 (8 × RTX 6000D) ────────────────
 # 0) 拉取公开 SM120 b12x overlay（精确锁定 commit 79819b112f8bda7d09709c24bb31de16d7ce59c6）
 git clone --depth 1 --branch flashinfer-cu134-sm120-beta-79819b112f8bda7d09709c24bb31de16d7ce59c6 \
   https://github.com/local-inference-lab/flashinfer.git /tmp/fi-b12x
@@ -183,10 +186,14 @@ export ZSTEP_DSV41_MODEL_DIR=/models/DeepSeek-V4.1-Flash
 export OMP_NUM_THREADS=1 NCCL_P2P_DISABLE=1 NCCL_P2P_LEVEL=LOC
 export ZSTEP_REQUIRE_B12X=1 B12X_W4A8_TINY_DECODE=0   # Phase 3.5 对照组改为 ZSTEP_ENABLE_B12X=0
 
+# 0b) 156-SM 单算子微基准与数值审计（单卡 GPU 0 即可运行）
+CUDA_VISIBLE_DEVICES=0 python3 worker/tests/phase3/bench_sm120_dsv41_operators.py \
+  --output docs/benchmarks/phase37_6000d_operator_audit.json
+
 # 1) 贪心对齐审计（全局 Top-2 Logits）+ 5-kernel 零重编译检查
 #    门禁退出码约定：
 #    - 默认（或带 `--require-exact-cases prime_squares_table`）：校验 TRITON_RECOMPILATIONS=0 且结构化算术表 128/128 全匹配，预期 rc=0
-#    - `--max-greedy-mismatch-margin 0.25`：纯 BF16 窄裕度门禁（Phase 2 Qwen3.5 预期 rc=0；Phase 3/3.6 MXFP8/MXFP4 预期 rc=1）
+#    - `--max-greedy-mismatch-margin 0.25`：纯 BF16 窄裕度门禁（Phase 2 Qwen3.5 预期 rc=0；Phase 3/3.6/3.7 MXFP8/MXFP4 预期 rc=1）
 #    - `--require-exact-greedy true`：要求全部开放式续写 100% 逐位一致（`all_matched=false` 时预期 rc=1）
 ./target/release/zstep --mode-b --world-size 8 \
   --python /usr/bin/python3 --worker-root ./worker \
@@ -194,10 +201,12 @@ export ZSTEP_REQUIRE_B12X=1 B12X_W4A8_TINY_DECODE=0   # Phase 3.5 对照组改�
   --num-kv-pages 2560 --max-seqs 16 --max-step-tokens 4096 --max-decoder-rows 4096 \
   --max-pages-per-seq 256 --ready-timeout-secs 900 --step-timeout-secs 180 \
   --verify-greedy-json docs/benchmarks/phase3_vllm_greedy_reference.json \
-  --verify-output-json docs/benchmarks/phase36_b12x_greedy_parity_report.json \
+  --verify-output-json docs/benchmarks/phase37_b12x_greedy_parity_report.json \
   --require-exact-cases prime_squares_table
 
 # 2) Warm n=3 六档交错主基准（无前缀缓存，独立种子，顺风车混合步 3072）
+#    注：`--num-kv-pages 2560` 在 RTX 6000D (85,651 MiB) 上稳态占用 84,937..84,959 MiB (99.2%)；
+#    长期在线 HTTP 服务建议按需下调至 `--num-kv-pages 2048..2304` 预留 ~2.5..5.0 GiB/卡动态缓冲。
 ./target/release/zstep --mode-b --world-size 8 \
   --python /usr/bin/python3 --worker-root ./worker \
   --model-dir "$ZSTEP_DSV41_MODEL_DIR" --allreduce-blocks 8 \
@@ -206,7 +215,7 @@ export ZSTEP_REQUIRE_B12X=1 B12X_W4A8_TINY_DECODE=0   # Phase 3.5 对照组改�
   --ready-timeout-secs 900 --step-timeout-secs 180 \
   --warmup-prompts 16 --repeats 3 \
   --bench-tiers "in512_c1:1:8:512:256;in512_c16:16:48:512:256;in512_c128:128:256:512:256;in1024_c1:1:20:1024:256;in1024_c32:32:200:1024:256;in1024_c128:128:400:1024:256" \
-  --metrics-output docs/benchmarks/phase36_zstep_b12x_dsv41_tp8_6tier.json
+  --metrics-output docs/benchmarks/phase37_zstep_b12x_dsv41_tp8_6tier.json
 
 # ── Phase 2: Qwen3.5-35B-A3B TP=8 (8 × RTX 5090, inside vllm/vllm-openai:v0.33.0) ────
 export ZSTEP_QWEN35_MODEL_DIR=/path/to/Qwen3.5-35B-A3B
