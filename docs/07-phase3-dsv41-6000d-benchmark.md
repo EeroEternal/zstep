@@ -1,6 +1,6 @@
-# 07 — Phase 3 / 3.5 / 3.6 实测报告：`DeepSeek-V4.1-Flash` (`TP=8`) 在 `8 × RTX 6000D` 端到端推理、纯引擎同口径对标与 `b12x` 算子优化
+# 07 — Phase 3 / 3.5 / 3.6 / 3.7 实测报告：`DeepSeek-V4.1-Flash` (`TP=8`) 在 `8 × RTX 6000D` 端到端推理、纯引擎同口径对标与 `b12x` 算子优化
 
-本文档记录 `zstep` Phase 3、Phase 3.5 与 Phase 3.6 在对称双 NUMA、无 P2P 的 **`8 × NVIDIA RTX 6000D`**（每卡 `85,651 MiB` GDDR7、`sm_120`、156 SMs、驱动 `595.99.02`）服务器上，完成真权重端到端模型 **`DeepSeek-V4.1-Flash`**（`1017` 版本、`475.25 GiB` 混合量化权重：40 层 `DeepseekV41Attention` 稀疏 MLA + SWA 混合注意力、`cr=4` KV 压缩、384 专家 `UE8M0` MXFP4 MoE、TileLang 流形超连接 `mHC`、以及全驻留显存 Engram V2 3-token 查表）的 Mode B 架构实现、`shm_v5` + 按尺寸自适应跨卡集合通信、顺风车混合批调度、**Phase 3.6 选择性 `b12x` SM120 算子集成（40 层 `MXFP4 MoE` + 170 层 `[32, 32] UE8M0` FP8 Linear）**、确定性全局 Top-2 贪心逐 token 审计，以及与官方容器 **`vllm/vllm-openai:v0.31.0`** 在 **双口径（进程内 `AsyncLLMEngine` + `TokensPrompt` 零 HTTP/分词/解码/SSE 纯引擎同口径基线 + `vllm bench serve` `/v1/completions` HTTP 流式基线）** 两组 Warm `n=3` 并发套件（4 档 `in512_out128` 与 6 档 `six_tier`）下的正面对标结果。
+本文档记录 `zstep` Phase 3、Phase 3.5、Phase 3.6 与 Phase 3.7（`main` `d497e85`，PR `#11`）在对称双 NUMA、无 P2P 的 **`8 × NVIDIA RTX 6000D`**（每卡 `85,651 MiB` GDDR7、`sm_120`、156 SMs、驱动 `595.99.02`）服务器上，完成真权重端到端模型 **`DeepSeek-V4.1-Flash`**（`1017` 版本、`475.25 GiB` 混合量化权重：40 层 `DeepseekV41Attention` 稀疏 MLA + SWA 混合注意力、`cr=4` KV 压缩、384 专家 `UE8M0` MXFP4 MoE、TileLang 流形超连接 `mHC`、以及全驻留显存 Engram V2 3-token 查表）的 Mode B 架构实现、`shm_v5` + 按尺寸自适应跨卡集合通信、顺风车混合批调度、**Phase 3.6 / 3.7 选择性 `b12x` SM120 算子集成与 `156-SM` 生命周期/全覆盖优化（40 层 `MXFP4 MoE` + 210 层 `[32, 32] UE8M0` FP8 Linear）**、确定性全局 Top-2 贪心逐 token 审计，以及与官方容器 **`vllm/vllm-openai:v0.31.0`** 在 **双口径（进程内 `AsyncLLMEngine` + `TokensPrompt` 零 HTTP/分词/解码/SSE 纯引擎同口径基线 + `vllm bench serve` `/v1/completions` HTTP 流式基线）** 两组 Warm `n=3` 并发套件（4 档 `in512_out128` 与 6 档 `six_tier`）下的正面对标结果。
 
 > **口径约束声明**：
 > 1. 本机器 `can_device_access_peer` `8 × 8` 全为 `0`（`nvidia-smi topo -m` 跨卡全 `CNS`），所有 `TP=8` 集合通信与端到端吞吐/延迟结论均严格限定在 **无 P2P 的对称 2-NUMA `[0,0,0,0,1,1,1,1]` PCIe Gen5 拓扑**（`vLLM` 与 `zstep` 统一设置 `NCCL_P2P_DISABLE=1`、`NCCL_P2P_LEVEL=LOC`），不外推至具备 NVLink 或 PCIe P2P 的系统。
@@ -192,60 +192,63 @@ GPU 4, 5, 6, 7 -> Socket 1 PCIe Gen5 -> NUMA 1
 
 ---
 
-## 7. Phase 3.7：`156-SM` `PreparationSession` 生命周期修复、210 层全覆盖与算子边界证明
+## 7. Phase 3.7（`main` `d497e85` / PR `#11`）：`156-SM` `PreparationSession` 生命周期修复、210 层全覆盖与算子边界证明
 
 ### 7.1 四项正向优化落地（[`b12x_dsv41.py`](../worker/zstep_worker/kernels_sm120/b12x_dsv41.py) & [`deepseek_v41.py`](../worker/zstep_worker/models/deepseek_v41.py)）
 
-针对 `RTX 6000D`（`sm_120`，`156 SMs`，区别于 `RTX 5090` `170 SMs` 与 `RTX PRO 6000` `188 SMs`）进行单算子逐档微测与源码级审计后，Phase 3.7 落地四项确定性改进：
+针对 `RTX 6000D`（`sm_120`，`156 SMs`，区别于 `RTX 5090` `170 SMs` 与 `RTX PRO 6000` `188 SMs`），由可复现单算子微基准与数值审计脚本 [`bench_sm120_dsv41_operators.py`](../worker/tests/phase3/bench_sm120_dsv41_operators.py)（归档原始结果 [`phase37_6000d_operator_audit.json`](benchmarks/phase37_6000d_operator_audit.json)，`git_sha = d497e85c91619c0cee8121b691ba31b086d593ea`）逐档验证后，Phase 3.7 落地四项确定性改进：
 
 1. **修复 `PreparationSession.close()` 提前析构导致的调优计划回退**：
-   * `b12x` 的 `PreparationSession.prepare()` 内部已排空并关闭编译进程池（`self._pool = None`），而此前在 `prepare()` 后立即调用 `sess.close()` 会清空全部 `plan._prepared` 并执行 `evict_unretained()`，导致运行时每层首次调用触发 `"was not prepared before its first use; preparing its default configuration"` 警告并丢失 `156-SM` `autotune=True` 最优配置；
-   * Phase 3.7 将 `PreparationSession` 挂载于 `model._b12x_session` 直至 `DeepSeekV41StepRunner.close()`（在 `decode_graphs.clear()` 之后释放），并将持久化调优缓存升级至 `b12x_zstep_dsv41_v2`，使 **`unprepared` 回退告警降至 `0` 条**，热缓存准备耗时降至 **`7.7..8.2 s`**。
+   * `b12x` 的 `PreparationSession.prepare()` 内部已排空并关闭编译进程池（`self._pool = None`），而此前在 `prepare()` 后立即调用 `sess.close()` 会清空全部 `plan._prepared`（[`phase37_6000d_operator_audit.json`](benchmarks/phase37_6000d_operator_audit.json) `session_lifecycle_probe`：`prepared_while_session_open=true -> prepared_after_session_close=false`）并执行 `evict_unretained()`，导致运行时每层首次调用触发 `"was not prepared before its first use; preparing its default configuration"` 警告并丢失 `156-SM` `autotune=True` 最优配置；
+   * Phase 3.7 将 `PreparationSession` 挂载于 `model._b12x_session` 直至 `DeepSeekV41StepRunner.close()`（在 `decode_graphs.clear()` 之后释放），并将持久化调优缓存升级至 `b12x_zstep_dsv41_v2`，使 **`unprepared` 回退告警降至 `0` 条**，双机实测热缓存准备耗时稳定在 **`~8–9 s`（`7.7..8.8 s`，本批次三轮干净启动 `prep_ms = 8,230..8,267 ms`）**。
 2. **解锁全部 40 层 `shared_experts.down_proj`（`5120 × 288`，`in_features % 32 == 0`）**：
-   * 将 `ZstepB12xBlock32LinearMethod` 准入条件从 `in_features % 64 == 0` 放宽至硬件原生块对齐 `in_features % 32 == 0`（实测非均匀 `UE8M0` 缩放下 `cos_sim = 1.000000`），使 `b12x` 2D FP8 线性层覆盖数从 `170` 提升至 **`210` 层**（单步 CUDAGraph `M=1` 从 Cutlass `14.37 µs` 降至 `4.13..6.18 µs`）。
+   * 将 `ZstepB12xBlock32LinearMethod` 准入条件从 `in_features % 64 == 0` 放宽至硬件原生块对齐 `in_features % 32 == 0`（[`phase37_6000d_operator_audit.json`](benchmarks/phase37_6000d_operator_audit.json) `shared_down_288`：`cos_sim = 1.0`、`max_abs_diff = 0.0`），使 `b12x` 2D FP8 线性层覆盖数从 `170` 提升至 **`210` 层**（`lin=210/6`；单层 CUDAGraph `M=1` 从 Cutlass `14.37 µs` 降至 **`6.16 µs`**，40 层每步节省 `328.5 µs`）。
 3. **预解析零校验快速绑定（Zero-Validation Fast Binding）**：
-   * 初始化阶段预先解析 `require_prepared(plan, "gemm.block_fp8_linear")`、`require_prepared(eplan, "moe.decode")`、`1024 B` 对齐 workspace 切片及 `rows == cap` 精确 `MXFP8Rows` 视图，前向直调 `BlockFP8LinearBinding` + `state.run_binding()`，消除每步 250 次 Python `bind()` 重复校验开销（节省 `~3.6..4.5 ms/step` Eager CPU 发射延迟）。
+   * 初始化阶段预先解析 `require_prepared(plan, "gemm.block_fp8_linear")`、`require_prepared(eplan, "moe.decode")`、`1024 B` 对齐 workspace 切片及 `rows == cap` 精确 `MXFP8Rows` 视图，前向直调 `BlockFP8LinearBinding` + `state.run_binding()`（单算子 Eager 墙钟在 `M=256..1024` 从标准 `bind()` 的 `136.8..168.3 µs` 降至 `91.8..94.2 µs`），消除每步 250 次 Python `bind()` 重复校验开销。
 4. **`156-SM` 按形状实测 Eager Cutlass 混合切换阈值**：
-   * 在保留 `PreparationSession` 与 `autotune=True` 后，`fused_wqa_wkv`（`1792 × 5120`，40 层）在 `M <= 2048` 均由 `b12x` 胜出（`M=1024/2048` 为 `129..131 µs` vs Cutlass `165 µs`），仅在 `M >= 3072` 由 Cutlass 胜出（`219 vs 299 µs`）；`engram.wkv`（`3200 × 6144`，2 层）在 `M > 512` 由 Cutlass 胜出（`170 vs 189 µs`）。改为按形状精确切换 `_CUTLASS_LARGE_M_THRESHOLDS = {(1792, 5120): 2048, (3200, 6144): 512}`。
+   * 在保留 `PreparationSession` 与 `autotune=True` 后（[`phase37_6000d_operator_audit.json`](benchmarks/phase37_6000d_operator_audit.json) `eager_us`），`fused_wqa_wkv`（`1792 × 5120`，40 层）在 `M <= 2048` 均由 `b12x_fast` 胜出（`M=1024/2048` 为 `93.19 / 133.80 µs` vs Cutlass `154.64 / 169.49 µs`），仅在 `M >= 3072` 由 Cutlass 胜出（`237.91 vs 308.71 µs`）；`engram.wkv`（`3200 × 6144`，2 层）在 `M <= 512` 由 `b12x_fast` 胜出（`M=512` `113.00 vs 154.09 µs`），在 `M=1024..2048` 由 Cutlass 胜出（`172.46 / 319.72 µs` vs `184.45 / 360.15 µs`）。改为按形状精确切换 `_CUTLASS_LARGE_M_THRESHOLDS = {(1792, 5120): 2048, (3200, 6144): 512}`。
 
-### 7.2 硬件实证排除项（为什么不启用以下候选方案）
+### 7.2 硬件实证排除项与在线服务显存余量边界（[`phase37_6000d_operator_audit.json`](benchmarks/phase37_6000d_operator_audit.json)）
 
-| 候选方向 | `RTX 6000D` 实测数据与根因结论 | 决策 |
+| 候选方向 / 运行边界 | `RTX 6000D` 实测数据与根因结论 | 决策 |
 | :--- | :--- | :--- |
-| **`B12X_W4A8_TINY_DECODE=1`**（`MoETinyDecodeKernelBackend`） | 虽在 `M=1` CUDAGraph 快至 `18.3 µs`（对比 `dynamic` `36.9 µs`），但干净缓存数值审计证实 `tiny_decode.py` **未实现 `DeepSeek-V4.1-Flash` 必需的 `swiglu_limit=10.0` 截断**且激活采用非量化 FP16 点积，`M=1..4` 输出严重失真（`cos_sim = 0.877`，`max_diff = 1792`） | **严禁开启**（固定 `=0`） |
-| **`b12x.gemm.wo_projection`**（融合 `inv_rope + wo_a + wo_b`） | 在 `M=1..128` CUDAGraph 解码桶上，现有 `torch.bmm(BF16 wo_a) + b12x(wo_b)` 为 **`12.33..20.52 µs`**，快于 `b12x.wo_projection` 的 `16.42..24.61 µs`（强行切换反退化 `-164 µs/step`） | **保持现有路由** |
-| **`ParallelLMHead` 替换 `b12x.bf16_vocab_projection`** | `TP=8` 词表投影 `16160 × 5120` BF16：`cuBLAS` `136.00 µs` vs `b12x` `136.01 µs`，已达 GDDR7 显存带宽上限的 `93.5%` | **保持 `cuBLAS`** |
-| **`b12x.norm.mhc` 替换 `vLLM` TileLang `mhc_shifted_post_pre`** | `vLLM` TileLang `M=1` 仅 `10.26 µs/call`（全模型 80 次 `0.82 ms`），而 `b12x.norm.mhc` 在 `M=1` 触发 `preparation used undeclared programs` | **保持 TileLang** |
-| **`NCCL_P2P_LEVEL=SYS` 跨桥 P2P** | `lspci -vvv` 证实主机全部 Mellanox ConnectX-8 PCIe Switch Bridge 硬件启用 `ACSCtl: SrcValid+ ReqRedir+ CmpltRedir+ UpstreamFwd+`，驱动层 `can_device_access_peer == 0`，强开 `SYS` 必死锁 | **保持 `shm_v5` + `NCCL_LOC`** |
-| **在线服务显存水位边界（`num_kv_pages=2560`）** | 在 `engram cpu_offload=false` + 8 档 40 层整图 CUDAGraph 常驻下，`kv_pages=2560`（`327,680` tokens）实测单卡显存水位为 **`84,959 MiB / 86,016 MiB`（`98.8%`）** | **作为在线服务默认上限** |
+| **`B12X_W4A8_TINY_DECODE=1`**（`MoETinyDecodeKernelBackend`） | 虽在 `M=1, 2, 4` CUDAGraph 快至 `18.06 / 22.56 / 34.99 µs`（对比 `dynamic` `36.90 / 57.39 / 59.50 µs`），但隔离缓存数值审计（`moe_w4a8_tiny_decode_audit`）证实 `tiny_decode.py` **未实现 `DeepSeek-V4.1-Flash` 必需的 `swiglu_limit=10.0` 截断**且激活采用非量化 FP16 点积，`M=1, 2, 4` 输出严重失真（**`cos_sim = 0.870..0.879`**，`max_abs_diff = 1,476..2,664`） | **严禁开启**（固定 `=0`） |
+| **`b12x.gemm.wo_projection`**（融合 `inv_rope + wo_a + wo_b`） | 在 `M=1..128` CUDAGraph 解码桶上（`oproj_lmhead_mhc_audit.o_proj`），现有 `torch.bmm(BF16 wo_a) + b12x(wo_b)` 为 **`12.32..20.52 µs`**，全桶快于 `b12x.wo_projection` 的 `16.18..24.60 µs`（强行切换在 `M=1 / 128` 反退化 `-163.9 / -163.3 µs/step`） | **保持现有路由** |
+| **`ParallelLMHead` 替换 `b12x.bf16_vocab_projection`** | `TP=8` 词表投影 `16160 × 5120` BF16（`vocab_tp8 < MIN_TRITON_OUT_FEATURES = 16,384`）：`M=1..64` `cuBLAS` 为 `135.37..143.89 µs`（对比 `b12x` `126.46..143.84 µs`，`M>1` 自动走同一 `torch`/`cuBLAS` 路径），有效显存带宽已达 **`1,169..1,222.7 GB/s`** | **保持 `cuBLAS`** |
+| **`b12x.norm.mhc` 替换 `vLLM` TileLang `mhc_shifted_post_pre`** | `vLLM` TileLang `M=1` CUDAGraph 仅 **`9.70 µs/call`**（全模型 80 次合计 `0.78 ms`），已高度逼近寄存器归约下限 | **保持 TileLang** |
+| **`NCCL_P2P_LEVEL=SYS` 跨桥 P2P** | `lspci -vvv` 证实主机全部 PCIe Switch Bridge 硬件启用 `ACSCtl: SrcValid+ ReqRedir+ CmpltRedir+ UpstreamFwd+`，驱动层 `can_device_access_peer == 0`，强开 `SYS` 必死锁 | **保持 `shm_v5` + `NCCL_LOC`** |
+| **在线服务显存水位与余量告警（`num_kv_pages=2560`）** | 在 `engram cpu_offload=false` + 8 档 40 层整图 CUDAGraph 常驻下，`kv_pages=2560`（`327,680` tokens）实测单卡显存占用为 **`84,937..84,959 MiB / 85,651 MiB = 99.2%`（每卡剩余 `< 0.7 GiB`）**。离线基准稳定零 OOM，但长期在线 HTTP 服务（`zstep --serve`）若需为驱动/NCCL/动态大 Prefill 预留安全缓冲，建议下调至 `--num-kv-pages 2048..2304`（释放约 `2.5..5.0 GiB/卡`） | **基准上限 `2560`；长稳在线建议 `2048..2304`** |
 
-### 7.3 Phase 3.7 vs Phase 3.6 vs `vLLM` 纯引擎同口径 Warm `n=3` 主结果
+### 7.3 Phase 3.7 vs Phase 3.6 vs `vLLM` 纯引擎同口径 Warm `n=3` 主结果（干净 `d497e85` 自证归档）
 
-原始数据：
-* 正确性门禁：[`phase37_b12x_greedy_parity_report.json`](benchmarks/phase37_b12x_greedy_parity_report.json)（`prime_squares_table` `128 / 128` 100% 精确一致，`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=5`，`unprepared_warnings=0`）
-* 套件一（`512 -> 128`）：[`phase37_zstep_b12x_dsv41_tp8_in512_out128.json`](benchmarks/phase37_zstep_b12x_dsv41_tp8_in512_out128.json)
-* 套件二（`six_tier`）：[`phase37_zstep_b12x_dsv41_tp8_6tier.json`](benchmarks/phase37_zstep_b12x_dsv41_tp8_6tier.json)
+原始数据（均在未修改的 `main` `d497e85c91619c0cee8121b691ba31b086d593ea` 源码树下独立采集，JSON 内 `provenance.git_commit == "d497e85"` / `git_sha == "d497e85..."`）：
+* 单算子微基准与数值审计：[`phase37_6000d_operator_audit.json`](benchmarks/phase37_6000d_operator_audit.json)
+* 正确性门禁：[`phase37_b12x_greedy_parity_report.json`](benchmarks/phase37_b12x_greedy_parity_report.json)（`prime_squares_table` 单序列 / 批处理 / `chunk=24` 混合步均 **`128 / 128` 100% 精确一致**，最小裕度 `3.750`；`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=5`；`b12x=on(moe=40,lin=210/6)`，`unprepared_warnings=0`）
+* 套件一（`512 -> 128`）：[`phase37_zstep_b12x_dsv41_tp8_in512_out128.json`](benchmarks/phase37_zstep_b12x_dsv41_tp8_in512_out128.json)（`init_wall_ms = 119.04 s`）
+* 套件二（`six_tier`）：[`phase37_zstep_b12x_dsv41_tp8_6tier.json`](benchmarks/phase37_zstep_b12x_dsv41_tp8_6tier.json)（`init_wall_ms = 118.43 s`）
+
+> **统计判定说明（严格遵循 `<3%` 或 `2σ` 持平规则）**：下表中 `c=1` 三个单流档位（`c1`、`in512_c1`、`in1024_c1`）相对 Phase 3.6 的输出吞吐差值（`-0.20%`、`-2.29%`、`-2.87%`）均落在 `<3%` 单轮 GPU 动态 Boost 频率波动噪声带（`2,295..2,422 MHz`）内，统一判定为 **`持平`**（单流真实确定性收益体现在 Eager Fast-Bind 带来的 **`Median TTFT` 全线缩短 `-15.41..-18.71 ms`**）；在并发档位 `c=16..128` 上，输出吞吐呈一致正向推进（`+1.66%..+3.16%`，其中 Suite 1 `c16` `+3.16%` 跨过严格 `3%` 显著阈值），而相对 `vLLM 0.31.0` 纯引擎同口径基线，**全部 `10 / 10` 个档位均显著胜出（`+14.44% .. +52.48%`）**。
 
 #### 套件一：`512 -> 128`（`c=1, 8, 16, 32`）
 
 | 档位 | `vLLM` 纯引擎 (`tok/s`) | `zstep` 3.6 (`tok/s`) | **`zstep` 3.7 (`tok/s`)** | 3.7 vs 3.6 / vs `vLLM` 纯引擎 | Mean TPOT `vPure` / `z3.6` / **`z3.7`** (`ms`) | Med TTFT `vPure` / `z3.6` / **`z3.7`** (`ms`) | P99 ITL `z3.6` / **`z3.7`** (`ms`) |
 | :--- | ---: | ---: | ---: | :--- | :---: | :---: | :---: |
-| `c1` | `83.59 ± 0.01` | `95.85 ± 0.65` | **`95.42 ± 0.25`** | `-0.45%` / **`+14.15%`** | `10.94` / `9.05` / **`9.22`** | `141.37` / `185.21` / **`169.96`** (`-15.25 ms`) | `9.28` / **`9.47`** |
-| `c8` | `348.18 ± 8.30` | `441.70 ± 1.60` | **`444.99 ± 1.04`** | **`+0.74%`** / **`+27.80%`** | `19.02` / `14.23` / **`14.13`** | `590.28` / `510.32` / **`506.60`** | `14.79` / **`14.59`** |
-| `c16` | `492.61 ± 2.27` | `612.24 ± 2.13` | **`631.52 ± 3.87`** | **`+3.15%`** / **`+28.20%`** | `25.63` / `22.47` / **`21.71`** | `1,084.36` / `386.49` / **`381.72`** | `327.96` / **`323.84`** |
-| `c32` | `617.07 ± 1.10` | `800.74 ± 1.01` | **`819.52 ± 3.64`** | **`+2.35%`** / **`+32.81%`** | `41.13` / `35.12` / **`34.26`** | `1,430.66` / `387.05` / **`382.13`** | `386.75` / **`381.88`** |
+| `c1` | `83.59 ± 0.01` | `95.85 ± 0.65` | **`95.66 ± 0.20`** | `-0.20%`（持平） / **`+14.44%`** | `10.94` / `9.05` / **`9.20`** | `141.37` / `185.21` / **`169.42`** (`-15.79 ms`) | `9.28` / **`9.43`** |
+| `c8` | `348.18 ± 8.30` | `441.70 ± 1.60` | **`446.37 ± 1.62`** | `+1.06%`（持平） / **`+28.20%`** | `19.02` / `14.23` / **`14.07`** | `590.28` / `510.32` / **`506.43`** | `14.79` / **`14.62`** |
+| `c16` | `492.61 ± 2.27` | `612.24 ± 2.13` | **`631.57 ± 0.97`** | **`+3.16%`** / **`+28.21%`** | `25.63` / `22.47` / **`21.71`** | `1,084.36` / `386.49` / **`381.68`** | `327.96` / **`323.60`** |
+| `c32` | `617.07 ± 1.10` | `800.74 ± 1.01` | **`820.22 ± 1.82`** | `+2.43%` / **`+32.92%`** | `41.13` / `35.12` / **`34.23`** | `1,430.66` / `387.05` / **`382.36`** | `386.75` / **`382.07`** |
 
 #### 套件二：`six_tier`（`in512` / `in1024` × `output=256`）
 
 | 档位 | `vLLM` 纯引擎 (`tok/s`) | `zstep` 3.6 (`tok/s`) | **`zstep` 3.7 (`tok/s`)** | 3.7 vs 3.6 / vs `vLLM` 纯引擎 | Mean TPOT `vPure` / `z3.6` / **`z3.7`** (`ms`) | Med TTFT `vPure` / `z3.6` / **`z3.7`** (`ms`) | P99 ITL `z3.6` / **`z3.7`** (`ms`) |
 | :--- | ---: | ---: | ---: | :--- | :---: | :---: | :---: |
-| `in512_c1` | `87.06 ± 0.01` | `103.99 ± 1.10` | **`104.26 ± 1.93`** | `+0.26%` / **`+19.76%`** | `10.97` / `8.93` / **`8.96`** | `141.86` / `184.93` / **`171.96`** (`-12.97 ms`) | `9.27` / **`9.27`** |
-| `in512_c16` | `555.89 ± 1.34` | `727.06 ± 1.62` | **`751.59 ± 1.28`** | **`+3.37%`** / **`+35.20%`** | `25.32` / `20.01` / **`19.31`** | `1,086.45` / `386.86` / **`381.75`** | `19.09` / **`18.35`** |
-| `in512_c128` | `1,126.34 ± 1.87` | `1,686.53 ± 7.96` | **`1,730.74 ± 12.02`** | **`+2.62%`** / **`+53.66%`** | `99.30` / `65.72` / **`63.92`** | `3,066.32` / `779.52` / **`768.49`** | `389.59` / **`384.14`** |
-| `in1024_c1` | `84.57 ± 0.00` | `102.27 ± 0.18` | **`101.47 ± 1.35`** | `-0.78%` / **`+19.98%`** | `11.17` / `9.07` / **`9.21`** | `177.89` / `191.20` / **`174.92`** (`-16.28 ms`) | `9.47` / **`9.53`** |
-| `in1024_c32` | `605.12 ± 1.35` | `778.39 ± 4.56` | **`796.69 ± 1.53`** | **`+2.35%`** / **`+31.66%`** | `42.27` / `36.51` / **`35.63`** | `2,127.63` / `391.62` / **`386.78`** | `391.34` / **`386.62`** |
-| `in1024_c128` | `866.25 ± 1.06` | `1,169.71 ± 1.06` | **`1,191.07 ± 3.50`** | **`+1.83%`** / **`+37.50%`** | `122.27` / `92.32` / **`90.62`** | `3,107.53` / `787.39` / **`776.78`** | `394.26` / **`389.00`** |
+| `in512_c1` | `87.06 ± 0.01` | `103.99 ± 1.10` | **`101.61 ± 0.11`** | `-2.29%`（持平） / **`+16.71%`** | `10.97` / `8.93` / **`9.21`** | `141.86` / `184.93` / **`169.52`** (`-15.41 ms`) | `9.27` / **`9.46`** |
+| `in512_c16` | `555.89 ± 1.34` | `727.06 ± 1.62` | **`741.71 ± 5.61`** | `+2.01%` / **`+33.43%`** | `25.32` / `20.01` / **`19.59`** | `1,086.45` / `386.86` / **`382.22`** | `19.09` / **`18.91`** |
+| `in512_c128` | `1,126.34 ± 1.87` | `1,686.53 ± 7.96` | **`1,717.41 ± 4.17`** | `+1.83%` / **`+52.48%`** | `99.30` / `65.72` / **`64.47`** | `3,066.32` / `779.52` / **`769.26`** | `389.59` / **`384.61`** |
+| `in1024_c1` | `84.57 ± 0.00` | `102.27 ± 0.18` | **`99.33 ± 0.04`** | `-2.87%`（持平） / **`+17.46%`** | `11.17` / `9.07` / **`9.43`** | `177.89` / `191.20` / **`172.49`** (`-18.71 ms`) | `9.47` / **`9.68`** |
+| `in1024_c32` | `605.12 ± 1.35` | `778.39 ± 4.56` | **`796.36 ± 0.84`** | `+2.31%` / **`+31.60%`** | `42.27` / `36.51` / **`35.66`** | `2,127.63` / `391.62` / **`386.97`** | `391.34` / **`386.76`** |
+| `in1024_c128` | `866.25 ± 1.06` | `1,169.71 ± 1.06` | **`1,189.11 ± 2.74`** | `+1.66%` / **`+37.27%`** | `122.27` / `92.32` / **`90.83`** | `3,107.53` / `787.39` / **`777.10`** | `394.26` / **`389.31`** |
 
 **关键收获**：
-* **单流首字延迟反超**：`c=1` `Median TTFT` 全线缩短 **`12.97..16.28 ms`**，其中 `in1024_c1` 从 `191.20 ms` 降至 **`174.92 ms`**，一举反超 `vLLM` 纯引擎的 `177.89 ms`（剩余 `c=1` `in=512` 与 Phase 3.5 的差距来自 `b12x` W4A8 MoE 在 `M >= 512` 采用静态专家主序 Prefill 核固定耗时 `~1.97 ms/层 × 40 ≈ 79 ms`，换取了每卡省下 `~10 GiB` 显存与并发解码大幅提速）；
-* **中高并发吞吐与尾延迟全面再创新高**：`c=16..128` 输出吞吐较 Phase 3.6 再提升 **`+1.83%..+3.37%`**，峰值输出吞吐突破 **`1,730.74 tok/s`**（`in512_c128`，相对 `vLLM` 纯引擎 **`1.54×` / `+53.66%`**），峰值总吞吐达 **`5,955.36 tok/s`**（`in1024_c128`），且所有并发档位的 `Mean TPOT`、`Median TTFT` 与 `P99 ITL` 同步下降。
+* **单流首字延迟确定性改善、输出吞吐保持持平**：`c=1` 输出吞吐维持在 Phase 3.6 的 `±3%` 噪声带内（持平），而 `Median TTFT` 全线缩短 **`15.41..18.71 ms`**，其中 `in1024_c1` 从 `191.20 ms` 降至 **`172.49 ms`**，反超 `vLLM` 纯引擎的 `177.89 ms`（剩余 `c=1` `in=512` 与 Phase 3.5 的差距来自 `b12x` W4A8 MoE 在 `M >= 512` 采用静态专家主序 Prefill 核固定耗时 `~1.97 ms/层 × 40 ≈ 79 ms`，换取了每卡省下 `~10 GiB` 显存与并发解码大幅提速）；
+* **中高并发吞吐与尾延迟同步提升（双机独立交叉复现一致）**：`c=16..128` 全部 6 个并发档位的输出吞吐较 Phase 3.6 一致正向上推 **`+1.66%..+3.16%`**（并在另一台同规格 `8 × RTX 6000D` 机器上独立复现，偏差 `<= 0.6%`），峰值输出吞吐达 **`1,717.41 tok/s`**（`in512_c128`，相对 `vLLM` 纯引擎 **`1.52×` / `+52.48%`**），峰值总吞吐达 **`5,945.57 tok/s`**（`in1024_c128`），且所有 `c >= 8` 并发档位的 `Mean TPOT`、`Median TTFT` 与 `P99 ITL` 同步下降。

@@ -1,0 +1,731 @@
+{
+  "provenance": {
+    "device_name": "NVIDIA RTX 6000D",
+    "compute_capability": "12.0",
+    "multi_processor_count": 156,
+    "torch_total_memory_mib": 85042.12,
+    "torch_version": "2.13.0+cu130",
+    "git_sha": "d497e85c91619c0cee8121b691ba31b086d593ea",
+    "nvidia_driver_version": "595.99.02",
+    "nvidia_smi_memory_total_mib": 85651
+  },
+  "block32_fp8_and_session": {
+    "session_lifecycle_probe": {
+      "prepared_while_session_open": true,
+      "prepared_after_session_close": false
+    },
+    "shapes": {
+      "fused_wqa_wkv": {
+        "out_features": 1792,
+        "in_features": 5120,
+        "layers": 40,
+        "cg_us": {
+          "1": {
+            "b12x_us": 10.27,
+            "cutlass_us": 40.8,
+            "saved_step_us": 1221.1
+          },
+          "8": {
+            "b12x_us": 10.26,
+            "cutlass_us": 38.95,
+            "saved_step_us": 1147.6
+          },
+          "32": {
+            "b12x_us": 10.86,
+            "cutlass_us": 18.48,
+            "saved_step_us": 304.7
+          },
+          "64": {
+            "b12x_us": 13.24,
+            "cutlass_us": 18.47,
+            "saved_step_us": 209.0
+          },
+          "128": {
+            "b12x_us": 16.92,
+            "cutlass_us": 18.48,
+            "saved_step_us": 62.5
+          }
+        },
+        "eager_us": {
+          "256": {
+            "b12x_fast_wall_us": 93.67,
+            "b12x_std_bind_wall_us": 138.75,
+            "b12x_gpu_us": 93.28,
+            "cutlass_wall_us": 154.36,
+            "cutlass_gpu_us": 153.61,
+            "winner": "b12x_fast"
+          },
+          "512": {
+            "b12x_fast_wall_us": 92.65,
+            "b12x_std_bind_wall_us": 137.94,
+            "b12x_gpu_us": 92.24,
+            "cutlass_wall_us": 158.39,
+            "cutlass_gpu_us": 157.79,
+            "winner": "b12x_fast"
+          },
+          "1024": {
+            "b12x_fast_wall_us": 93.19,
+            "b12x_std_bind_wall_us": 168.3,
+            "b12x_gpu_us": 92.75,
+            "cutlass_wall_us": 154.64,
+            "cutlass_gpu_us": 154.11,
+            "winner": "b12x_fast"
+          },
+          "2048": {
+            "b12x_fast_wall_us": 133.8,
+            "b12x_std_bind_wall_us": 142.19,
+            "b12x_gpu_us": 133.35,
+            "cutlass_wall_us": 169.49,
+            "cutlass_gpu_us": 168.94,
+            "winner": "b12x_fast"
+          },
+          "3072": {
+            "b12x_fast_wall_us": 308.71,
+            "b12x_std_bind_wall_us": 261.32,
+            "b12x_gpu_us": 308.27,
+            "cutlass_wall_us": 237.91,
+            "cutlass_gpu_us": 237.33,
+            "winner": "cutlass"
+          }
+        },
+        "parity_m256": {
+          "cos_sim": 1.0,
+          "max_abs_diff": 0.0
+        }
+      },
+      "wq_b": {
+        "out_features": 4096,
+        "in_features": 1280,
+        "layers": 32,
+        "cg_us": {
+          "1": {
+            "b12x_us": 6.19,
+            "cutlass_us": 26.64,
+            "saved_step_us": 654.4
+          },
+          "8": {
+            "b12x_us": 6.18,
+            "cutlass_us": 24.61,
+            "saved_step_us": 589.9
+          },
+          "32": {
+            "b12x_us": 6.18,
+            "cutlass_us": 22.57,
+            "saved_step_us": 524.5
+          },
+          "64": {
+            "b12x_us": 8.23,
+            "cutlass_us": 18.47,
+            "saved_step_us": 327.8
+          },
+          "128": {
+            "b12x_us": 10.26,
+            "cutlass_us": 10.65,
+            "saved_step_us": 12.6
+          }
+        },
+        "eager_us": {
+          "256": {
+            "b12x_fast_wall_us": 92.28,
+            "b12x_std_bind_wall_us": 136.95,
+            "b12x_gpu_us": 91.82,
+            "cutlass_wall_us": 156.33,
+            "cutlass_gpu_us": 155.57,
+            "winner": "b12x_fast"
+          },
+          "512": {
+            "b12x_fast_wall_us": 92.07,
+            "b12x_std_bind_wall_us": 137.25,
+            "b12x_gpu_us": 91.6,
+            "cutlass_wall_us": 151.37,
+            "cutlass_gpu_us": 150.63,
+            "winner": "b12x_fast"
+          },
+          "1024": {
+            "b12x_fast_wall_us": 92.53,
+            "b12x_std_bind_wall_us": 137.66,
+            "b12x_gpu_us": 92.13,
+            "cutlass_wall_us": 149.86,
+            "cutlass_gpu_us": 149.3,
+            "winner": "b12x_fast"
+          },
+          "2048": {
+            "b12x_fast_wall_us": 97.87,
+            "b12x_std_bind_wall_us": 137.08,
+            "b12x_gpu_us": 97.45,
+            "cutlass_wall_us": 171.01,
+            "cutlass_gpu_us": 170.26,
+            "winner": "b12x_fast"
+          },
+          "3072": {
+            "b12x_fast_wall_us": 136.3,
+            "b12x_std_bind_wall_us": 138.72,
+            "b12x_gpu_us": 135.84,
+            "cutlass_wall_us": 163.64,
+            "cutlass_gpu_us": 163.14,
+            "winner": "b12x_fast"
+          }
+        },
+        "parity_m256": {
+          "cos_sim": 1.0,
+          "max_abs_diff": 0.0
+        }
+      },
+      "indexer_wq_b": {
+        "out_features": 512,
+        "in_features": 1280,
+        "layers": 8,
+        "cg_us": {
+          "1": {
+            "b12x_us": 6.17,
+            "cutlass_us": 8.21,
+            "saved_step_us": 16.3
+          },
+          "8": {
+            "b12x_us": 6.17,
+            "cutlass_us": 8.23,
+            "saved_step_us": 16.5
+          },
+          "32": {
+            "b12x_us": 6.18,
+            "cutlass_us": 8.23,
+            "saved_step_us": 16.4
+          },
+          "64": {
+            "b12x_us": 6.18,
+            "cutlass_us": 8.23,
+            "saved_step_us": 16.4
+          },
+          "128": {
+            "b12x_us": 6.18,
+            "cutlass_us": 8.23,
+            "saved_step_us": 16.4
+          }
+        },
+        "eager_us": {
+          "256": {
+            "b12x_fast_wall_us": 93.76,
+            "b12x_std_bind_wall_us": 139.03,
+            "b12x_gpu_us": 93.28,
+            "cutlass_wall_us": 152.99,
+            "cutlass_gpu_us": 152.25,
+            "winner": "b12x_fast"
+          },
+          "512": {
+            "b12x_fast_wall_us": 91.79,
+            "b12x_std_bind_wall_us": 136.85,
+            "b12x_gpu_us": 91.29,
+            "cutlass_wall_us": 155.52,
+            "cutlass_gpu_us": 154.74,
+            "winner": "b12x_fast"
+          },
+          "1024": {
+            "b12x_fast_wall_us": 92.02,
+            "b12x_std_bind_wall_us": 137.62,
+            "b12x_gpu_us": 91.52,
+            "cutlass_wall_us": 154.07,
+            "cutlass_gpu_us": 153.29,
+            "winner": "b12x_fast"
+          },
+          "2048": {
+            "b12x_fast_wall_us": 91.51,
+            "b12x_std_bind_wall_us": 136.78,
+            "b12x_gpu_us": 91.02,
+            "cutlass_wall_us": 151.08,
+            "cutlass_gpu_us": 150.33,
+            "winner": "b12x_fast"
+          },
+          "3072": {
+            "b12x_fast_wall_us": 92.83,
+            "b12x_std_bind_wall_us": 137.57,
+            "b12x_gpu_us": 92.29,
+            "cutlass_wall_us": 157.3,
+            "cutlass_gpu_us": 156.54,
+            "winner": "b12x_fast"
+          }
+        },
+        "parity_m256": {
+          "cos_sim": 1.0,
+          "max_abs_diff": 0.0
+        }
+      },
+      "wo_b": {
+        "out_features": 5120,
+        "in_features": 1024,
+        "layers": 40,
+        "cg_us": {
+          "1": {
+            "b12x_us": 6.18,
+            "cutlass_us": 28.69,
+            "saved_step_us": 900.3
+          },
+          "8": {
+            "b12x_us": 6.18,
+            "cutlass_us": 26.66,
+            "saved_step_us": 819.3
+          },
+          "32": {
+            "b12x_us": 6.19,
+            "cutlass_us": 24.61,
+            "saved_step_us": 736.9
+          },
+          "64": {
+            "b12x_us": 10.28,
+            "cutlass_us": 20.52,
+            "saved_step_us": 409.7
+          },
+          "128": {
+            "b12x_us": 10.25,
+            "cutlass_us": 14.36,
+            "saved_step_us": 164.2
+          }
+        },
+        "eager_us": {
+          "256": {
+            "b12x_fast_wall_us": 93.54,
+            "b12x_std_bind_wall_us": 139.16,
+            "b12x_gpu_us": 93.06,
+            "cutlass_wall_us": 154.01,
+            "cutlass_gpu_us": 153.23,
+            "winner": "b12x_fast"
+          },
+          "512": {
+            "b12x_fast_wall_us": 94.19,
+            "b12x_std_bind_wall_us": 138.82,
+            "b12x_gpu_us": 93.75,
+            "cutlass_wall_us": 157.65,
+            "cutlass_gpu_us": 156.87,
+            "winner": "b12x_fast"
+          },
+          "1024": {
+            "b12x_fast_wall_us": 92.57,
+            "b12x_std_bind_wall_us": 136.86,
+            "b12x_gpu_us": 92.16,
+            "cutlass_wall_us": 153.59,
+            "cutlass_gpu_us": 153.06,
+            "winner": "b12x_fast"
+          },
+          "2048": {
+            "b12x_fast_wall_us": 98.9,
+            "b12x_std_bind_wall_us": 137.76,
+            "b12x_gpu_us": 98.47,
+            "cutlass_wall_us": 154.11,
+            "cutlass_gpu_us": 153.51,
+            "winner": "b12x_fast"
+          },
+          "3072": {
+            "b12x_fast_wall_us": 143.3,
+            "b12x_std_bind_wall_us": 138.98,
+            "b12x_gpu_us": 142.85,
+            "cutlass_wall_us": 168.23,
+            "cutlass_gpu_us": 167.69,
+            "winner": "b12x_fast"
+          }
+        },
+        "parity_m256": {
+          "cos_sim": 1.0,
+          "max_abs_diff": 0.0
+        }
+      },
+      "shared_gate_up": {
+        "out_features": 576,
+        "in_features": 5120,
+        "layers": 40,
+        "cg_us": {
+          "1": {
+            "b12x_us": 8.22,
+            "cutlass_us": 18.47,
+            "saved_step_us": 409.7
+          },
+          "8": {
+            "b12x_us": 8.25,
+            "cutlass_us": 16.43,
+            "saved_step_us": 327.1
+          },
+          "32": {
+            "b12x_us": 10.28,
+            "cutlass_us": 16.43,
+            "saved_step_us": 245.9
+          },
+          "64": {
+            "b12x_us": 12.32,
+            "cutlass_us": 16.42,
+            "saved_step_us": 164.0
+          },
+          "128": {
+            "b12x_us": 12.32,
+            "cutlass_us": 16.42,
+            "saved_step_us": 163.9
+          }
+        },
+        "eager_us": {
+          "256": {
+            "b12x_fast_wall_us": 93.79,
+            "b12x_std_bind_wall_us": 138.95,
+            "b12x_gpu_us": 93.3,
+            "cutlass_wall_us": 151.37,
+            "cutlass_gpu_us": 150.6,
+            "winner": "b12x_fast"
+          },
+          "512": {
+            "b12x_fast_wall_us": 93.84,
+            "b12x_std_bind_wall_us": 136.99,
+            "b12x_gpu_us": 93.34,
+            "cutlass_wall_us": 158.96,
+            "cutlass_gpu_us": 158.19,
+            "winner": "b12x_fast"
+          },
+          "1024": {
+            "b12x_fast_wall_us": 93.16,
+            "b12x_std_bind_wall_us": 137.71,
+            "b12x_gpu_us": 92.72,
+            "cutlass_wall_us": 149.75,
+            "cutlass_gpu_us": 148.99,
+            "winner": "b12x_fast"
+          },
+          "2048": {
+            "b12x_fast_wall_us": 92.76,
+            "b12x_std_bind_wall_us": 137.53,
+            "b12x_gpu_us": 92.31,
+            "cutlass_wall_us": 151.98,
+            "cutlass_gpu_us": 151.43,
+            "winner": "b12x_fast"
+          },
+          "3072": {
+            "b12x_fast_wall_us": 93.85,
+            "b12x_std_bind_wall_us": 138.64,
+            "b12x_gpu_us": 93.43,
+            "cutlass_wall_us": 159.36,
+            "cutlass_gpu_us": 158.82,
+            "winner": "b12x_fast"
+          }
+        },
+        "parity_m256": {
+          "cos_sim": 1.0,
+          "max_abs_diff": 0.0
+        }
+      },
+      "shared_down_288": {
+        "out_features": 5120,
+        "in_features": 288,
+        "layers": 40,
+        "cg_us": {
+          "1": {
+            "b12x_us": 6.16,
+            "cutlass_us": 14.37,
+            "saved_step_us": 328.5
+          },
+          "8": {
+            "b12x_us": 6.16,
+            "cutlass_us": 14.36,
+            "saved_step_us": 327.8
+          },
+          "32": {
+            "b12x_us": 6.17,
+            "cutlass_us": 12.33,
+            "saved_step_us": 246.6
+          },
+          "64": {
+            "b12x_us": 6.18,
+            "cutlass_us": 12.32,
+            "saved_step_us": 245.6
+          },
+          "128": {
+            "b12x_us": 8.21,
+            "cutlass_us": 8.88,
+            "saved_step_us": 26.9
+          }
+        },
+        "eager_us": {
+          "256": {
+            "b12x_fast_wall_us": 93.83,
+            "b12x_std_bind_wall_us": 137.75,
+            "b12x_gpu_us": 93.35,
+            "cutlass_wall_us": 150.38,
+            "cutlass_gpu_us": 149.58,
+            "winner": "b12x_fast"
+          },
+          "512": {
+            "b12x_fast_wall_us": 93.94,
+            "b12x_std_bind_wall_us": 136.9,
+            "b12x_gpu_us": 93.44,
+            "cutlass_wall_us": 156.13,
+            "cutlass_gpu_us": 155.38,
+            "winner": "b12x_fast"
+          },
+          "1024": {
+            "b12x_fast_wall_us": 93.09,
+            "b12x_std_bind_wall_us": 137.43,
+            "b12x_gpu_us": 92.58,
+            "cutlass_wall_us": 151.3,
+            "cutlass_gpu_us": 150.57,
+            "winner": "b12x_fast"
+          },
+          "2048": {
+            "b12x_fast_wall_us": 92.91,
+            "b12x_std_bind_wall_us": 136.16,
+            "b12x_gpu_us": 92.49,
+            "cutlass_wall_us": 157.62,
+            "cutlass_gpu_us": 156.89,
+            "winner": "b12x_fast"
+          },
+          "3072": {
+            "b12x_fast_wall_us": 92.55,
+            "b12x_std_bind_wall_us": 135.87,
+            "b12x_gpu_us": 92.13,
+            "cutlass_wall_us": 151.51,
+            "cutlass_gpu_us": 150.99,
+            "winner": "b12x_fast"
+          }
+        },
+        "parity_m256": {
+          "cos_sim": 1.0,
+          "max_abs_diff": 0.0
+        }
+      },
+      "engram_wkv": {
+        "out_features": 3200,
+        "in_features": 6144,
+        "layers": 2,
+        "cg_us": {
+          "1": {
+            "b12x_us": 12.84,
+            "cutlass_us": 83.67,
+            "saved_step_us": 141.7
+          },
+          "8": {
+            "b12x_us": 18.46,
+            "cutlass_us": 73.83,
+            "saved_step_us": 110.7
+          },
+          "32": {
+            "b12x_us": 16.4,
+            "cutlass_us": 29.25,
+            "saved_step_us": 25.7
+          },
+          "64": {
+            "b12x_us": 18.13,
+            "cutlass_us": 30.96,
+            "saved_step_us": 25.6
+          },
+          "128": {
+            "b12x_us": 22.57,
+            "cutlass_us": 29.66,
+            "saved_step_us": 14.2
+          }
+        },
+        "eager_us": {
+          "256": {
+            "b12x_fast_wall_us": 94.0,
+            "b12x_std_bind_wall_us": 138.61,
+            "b12x_gpu_us": 93.61,
+            "cutlass_wall_us": 150.16,
+            "cutlass_gpu_us": 149.59,
+            "winner": "b12x_fast"
+          },
+          "512": {
+            "b12x_fast_wall_us": 113.0,
+            "b12x_std_bind_wall_us": 138.81,
+            "b12x_gpu_us": 112.58,
+            "cutlass_wall_us": 154.09,
+            "cutlass_gpu_us": 153.45,
+            "winner": "b12x_fast"
+          },
+          "1024": {
+            "b12x_fast_wall_us": 184.45,
+            "b12x_std_bind_wall_us": 186.25,
+            "b12x_gpu_us": 184.0,
+            "cutlass_wall_us": 172.46,
+            "cutlass_gpu_us": 171.92,
+            "winner": "cutlass"
+          },
+          "2048": {
+            "b12x_fast_wall_us": 360.15,
+            "b12x_std_bind_wall_us": 353.44,
+            "b12x_gpu_us": 359.69,
+            "cutlass_wall_us": 319.72,
+            "cutlass_gpu_us": 319.19,
+            "winner": "cutlass"
+          },
+          "3072": {
+            "b12x_fast_wall_us": 458.68,
+            "b12x_std_bind_wall_us": 439.93,
+            "b12x_gpu_us": 458.2,
+            "cutlass_wall_us": 498.75,
+            "cutlass_gpu_us": 498.14,
+            "winner": "b12x_fast"
+          }
+        },
+        "parity_m256": {
+          "cos_sim": 1.0,
+          "max_abs_diff": 0.0
+        }
+      }
+    }
+  },
+  "moe_w4a8_tiny_decode_audit": {
+    "swiglu_limit": 10.0,
+    "selected_backends": {
+      "tiny_0": {
+        "1": "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='direct', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+        "2": "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='direct', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+        "4": "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='direct', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+        "8": "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+      },
+      "tiny_1": {
+        "1": "MoeDecodeConfig(backend='micro', route_planner='internal', max_active_clusters=None, dynamic_tile_m=None, dynamic_route_mode=None, w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+        "2": "MoeDecodeConfig(backend='micro', route_planner='internal', max_active_clusters=None, dynamic_tile_m=None, dynamic_route_mode=None, w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+        "4": "MoeDecodeConfig(backend='micro', route_planner='internal', max_active_clusters=None, dynamic_tile_m=None, dynamic_route_mode=None, w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)",
+        "8": "MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=16, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None)"
+      }
+    },
+    "cg_us": {
+      "tiny_0": {
+        "1": 36.9,
+        "2": 57.39,
+        "4": 59.5,
+        "8": 141.79,
+        "16": 280.87,
+        "32": 512.92
+      },
+      "tiny_1": {
+        "1": 18.06,
+        "2": 22.56,
+        "4": 34.99,
+        "8": 143.25,
+        "16": 280.96,
+        "32": 512.45
+      }
+    },
+    "parity_tiny1_vs_tiny0": {
+      "1": {
+        "cos_sim": 0.878349,
+        "max_abs_diff": 1476.0,
+        "rel_l2": 1.617665
+      },
+      "2": {
+        "cos_sim": 0.870351,
+        "max_abs_diff": 2664.0,
+        "rel_l2": 1.813398
+      },
+      "3": {
+        "cos_sim": 0.999994,
+        "max_abs_diff": 8.0,
+        "rel_l2": 0.003513
+      },
+      "4": {
+        "cos_sim": 0.87908,
+        "max_abs_diff": 2132.0,
+        "rel_l2": 1.568026
+      }
+    }
+  },
+  "oproj_lmhead_mhc_audit": {
+    "o_proj": {
+      "parity": {
+        "1": {
+          "fused_vs_cur_cos": 0.999093,
+          "2step_vs_cur_cos": 0.999132
+        },
+        "16": {
+          "fused_vs_cur_cos": 0.999182,
+          "2step_vs_cur_cos": 0.999187
+        }
+      },
+      "cg_us": {
+        "1": {
+          "cur_bf16_bmm_plus_b12x_wob_us": 12.32,
+          "2step_b12x_us": 12.32,
+          "b12x_wo_projection_us": 16.42,
+          "delta_step_40layers_us": -163.9
+        },
+        "4": {
+          "cur_bf16_bmm_plus_b12x_wob_us": 14.46,
+          "2step_b12x_us": 12.32,
+          "b12x_wo_projection_us": 18.47,
+          "delta_step_40layers_us": -160.5
+        },
+        "8": {
+          "cur_bf16_bmm_plus_b12x_wob_us": 14.36,
+          "2step_b12x_us": 12.33,
+          "b12x_wo_projection_us": 18.47,
+          "delta_step_40layers_us": -164.7
+        },
+        "16": {
+          "cur_bf16_bmm_plus_b12x_wob_us": 14.38,
+          "2step_b12x_us": 14.38,
+          "b12x_wo_projection_us": 16.18,
+          "delta_step_40layers_us": -72.0
+        },
+        "32": {
+          "cur_bf16_bmm_plus_b12x_wob_us": 14.36,
+          "2step_b12x_us": 14.43,
+          "b12x_wo_projection_us": 18.47,
+          "delta_step_40layers_us": -164.1
+        },
+        "64": {
+          "cur_bf16_bmm_plus_b12x_wob_us": 18.47,
+          "2step_b12x_us": 20.48,
+          "b12x_wo_projection_us": 18.82,
+          "delta_step_40layers_us": -14.1
+        },
+        "128": {
+          "cur_bf16_bmm_plus_b12x_wob_us": 20.52,
+          "2step_b12x_us": 20.52,
+          "b12x_wo_projection_us": 24.6,
+          "delta_step_40layers_us": -163.3
+        }
+      }
+    },
+    "parallel_lm_head_tp8": {
+      "1": {
+        "cublas_us": 135.37,
+        "b12x_vocab_proj_us": 126.46,
+        "cublas_effective_bw_gbps": 1222.7
+      },
+      "8": {
+        "cublas_us": 139.57,
+        "b12x_vocab_proj_us": 139.72,
+        "cublas_effective_bw_gbps": 1188.1
+      },
+      "32": {
+        "cublas_us": 142.65,
+        "b12x_vocab_proj_us": 142.6,
+        "cublas_effective_bw_gbps": 1169.6
+      },
+      "64": {
+        "cublas_us": 143.89,
+        "b12x_vocab_proj_us": 143.84,
+        "cublas_effective_bw_gbps": 1169.0
+      },
+      "128": {
+        "cublas_us": 236.03,
+        "b12x_vocab_proj_us": 221.93,
+        "cublas_effective_bw_gbps": 724.2
+      }
+    },
+    "mhc": {
+      "vllm_tilelang_cg": {
+        "1": {
+          "vllm_tilelang_per_call_us": 9.7,
+          "vllm_tilelang_80calls_us": 776.4
+        },
+        "8": {
+          "vllm_tilelang_per_call_us": 12.32,
+          "vllm_tilelang_80calls_us": 985.9
+        },
+        "32": {
+          "vllm_tilelang_per_call_us": 21.18,
+          "vllm_tilelang_80calls_us": 1694.3
+        },
+        "128": {
+          "vllm_tilelang_per_call_us": 22.58,
+          "vllm_tilelang_80calls_us": 1806.2
+        }
+      },
+      "b12x_norm_mhc_m1_probe": {
+        "plan_error": "TypeError: B12XMHCScratchCaps.__init__() got an unexpected keyword argument 'hc_mult'"
+      }
+    }
+  }
+}
