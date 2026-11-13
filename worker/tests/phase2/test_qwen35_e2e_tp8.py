@@ -108,7 +108,7 @@ def test_qwen35_35b_a3b_mode_b_tp8_greedy_parity() -> None:
     marker = re.search(r"TRITON_RECOMPILATIONS=(\d+) WATCHED_KERNELS=(\d+)", proc.stdout)
     assert marker is not None, f"Missing Triton audit marker:\n{proc.stdout}\n{proc.stderr}"
     assert marker.group(1) == "0"
-    assert marker.group(2) == "17"
+    assert marker.group(2) == "20"
 
     for suffix in ("", "_ar", "_ar_argmax"):
         assert not Path(f"/dev/shm/{shm_name}{suffix}").exists()

@@ -470,6 +470,9 @@ class RuntimeLoop:
                     ("moe_gate_up", qwen35_ops._fused_moe_gate_up_silu_kernel),
                     ("moe_down", qwen35_ops._fused_moe_down_kernel),
                     ("moe_combine", qwen35_ops._moe_combine_top8_and_shared_kernel),
+                    ("moe_gate_up_gemv", qwen35_ops._moe_gate_up_silu_gemv_kernel),
+                    ("moe_down_combine_gemv", qwen35_ops._moe_down_combine_gemv_kernel),
+                    ("skinny_linear", qwen35_ops._skinny_linear_kernel),
                 ]
             )
 
