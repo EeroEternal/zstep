@@ -13,7 +13,7 @@ Baseline:  vLLM 0.33.0, BF16, TP=8, --no-enable-prefix-caching, isolated per-(ro
 
 [Host B — Phase 3 / 3.5 / 3.6 / 3.7]
 GPU:       8 × NVIDIA RTX 6000D (sm_120, 156 SMs, 85,651 MiB GDDR7 per GPU, Driver 595.99.02)
-Topology:  2-NUMA PCIe Gen5 ([0,0,0,0,1,1,1,1]), no NVLink, can_device_access_peer == 0 (CNS)
+Topology:  2-NUMA PCIe Gen5 ([0,0,0,0,1,1,1,1]), no NVLink, 20 × Mellanox CX-8 PCIe bridge ports (`15b3:197c`, `ACSCtl=0x001d`, SM BAR MMIO P2P unsupported -> CNS host-DRAM path)
 Model:     DeepSeek-V4.1-Flash (1017, 475.25 GiB MXFP8/MXFP4/BF16, engram cpu_offload=false), TP=8
 Baseline:  vllm/vllm-openai:v0.31.0, TP=8, --no-enable-prefix-caching, isolated per-(round,tier) seeds, NCCL_P2P_DISABLE=1, NCCL_P2P_LEVEL=LOC, symmetric SM120 64-tok SWA shim
 b12x 3.6/3.7: vllm/vllm-openai:v0.31.0 + read-only mount of `flashinfer/experimental/b12x` from `https://github.com/local-inference-lab/flashinfer.git` tag `flashinfer-cu134-sm120-beta-79819b112f8bda7d09709c24bb31de16d7ce59c6` (`79819b112f8bda7d09709c24bb31de16d7ce59c6`), `ZSTEP_REQUIRE_B12X=1`, `B12X_W4A8_TINY_DECODE=0` (Phase 3.7 `main` commit `d497e85`, PR `#11`)
@@ -23,7 +23,7 @@ b12x 3.6/3.7: vllm/vllm-openai:v0.31.0 + read-only mount of `flashinfer/experime
 
 ## 2. 归档文件总览
 
-共有 **31 份主 JSON + 19 份 vLLM 逐轮/warmup 原始 JSON = 50 份 JSON**。
+共有 **32 份主 JSON + 19 份 vLLM 逐轮/warmup 原始 JSON = 51 份 JSON**。
 
 | 阶段 | 文件 | 内容 |
 | :--- | :--- | :--- |
@@ -59,6 +59,7 @@ b12x 3.6/3.7: vllm/vllm-openai:v0.31.0 + read-only mount of `flashinfer/experime
 | Phase 3.7 | [`phase37_zstep_b12x_dsv41_tp8_in512_out128.json`](phase37_zstep_b12x_dsv41_tp8_in512_out128.json) | **Phase 3.7 套件一主结果**（`git_commit=d497e85`）：`156-SM` `PreparationSession` 常驻 + 210 层 Block32 FP8 + 零校验快速绑定 `512->128` 四档 `n=3` |
 | Phase 3.7 | [`phase37_zstep_b12x_dsv41_tp8_6tier.json`](phase37_zstep_b12x_dsv41_tp8_6tier.json) | **Phase 3.7 套件二主结果**（`git_commit=d497e85`）：`zstep 3.7 + b12x` 六档交错无缓存独立种子 `n=3`（峰值 `1,717.41 tok/s` 输出 / `5,945.57 tok/s` 总吞吐） |
 | Phase 3.7 | [`phase37_b12x_greedy_parity_report.json`](phase37_b12x_greedy_parity_report.json) | `zstep 3.7 + b12x`（`git_sha=d497e85...`，`moe=40, lin=210/6, unprepared_warnings=0`）全局 Top-2 贪心审计（`prime_squares_table` `128/128` 100% 匹配，零重编译） |
+| Phase 3.7 | [`phase37_6000d_comm_audit.json`](phase37_6000d_comm_audit.json) | **`zstep#14` 8 卡通信与 PCIe ACS/CX-8（`15b3:197c`）审计**：`H=2048` / `H=5120` AllReduce 与 `[M, 640]->[M, 5120]` AllGather（`shm_v5_prod` 自适应 `256->512` 线程 + `64 KiB` One-Shot vs 旧基线 / `nodone` / `pkt64` / `NCCL_LOC`）、SM BAR MMIO `UR` 证明与 `DeepSeek-V4.1` Amdahl 消融 |
 
 ---
 
@@ -151,7 +152,7 @@ Phase 2 双端 Top-2 贪心审计（[`phase2_greedy_parity_report.json`](phase2_
 
 ## 5. Phase 2 `H=2048, blocks=8` 全尺寸 AllReduce 与 Phase 1 控制面成本
 
-来源：[`phase2_allreduce_h2048_8gpu.json`](phase2_allreduce_h2048_8gpu.json)、[`phase1_mode_b_1gpu.json`](phase1_mode_b_1gpu.json)、[`phase1_mode_b_8gpu.json`](phase1_mode_b_8gpu.json)。
+来源：[`phase2_allreduce_h2048_8gpu.json`](phase2_allreduce_h2048_8gpu.json)（Phase 2 `Host A` 历史单文件 SHM 基线，`<=16 KiB` One-Shot；当前 `main` 每卡独立 NUMA 页 `shm_v5_prod` + `64 KiB` One-Shot + 自适应 `512` 线程 + 大 `M` `NCCL_LOC` 混合路由在 `8 × RTX 6000D` 上的最新实测见 [`phase37_6000d_comm_audit.json`](phase37_6000d_comm_audit.json)）、[`phase1_mode_b_1gpu.json`](phase1_mode_b_1gpu.json)、[`phase1_mode_b_8gpu.json`](phase1_mode_b_8gpu.json)。
 
 | `M` (`H=2048`) | 载荷 | 算法 | `zstep p50/p95/p99 (µs)` | `NCCL SHM p50/p95/p99 (µs)` | `zstep 80 次 (ms)` |
 | ---: | ---: | :--- | :---: | :---: | ---: |
@@ -189,6 +190,10 @@ export ZSTEP_REQUIRE_B12X=1 B12X_W4A8_TINY_DECODE=0   # Phase 3.5 对照组改�
 # 0b) 156-SM 单算子微基准与数值审计（单卡 GPU 0 即可运行）
 CUDA_VISIBLE_DEVICES=0 python3 worker/tests/phase3/bench_sm120_dsv41_operators.py \
   --output docs/benchmarks/phase37_6000d_operator_audit.json
+
+# 0c) 8 卡 shm_v5 vs NCCL_LOC 全矩阵通信与 PCIe ACS/CX-8 审计（zstep#14）
+python3 worker/tests/phase3/bench_shmv5_nccl_comm_audit.py \
+  --output docs/benchmarks/phase37_6000d_comm_audit.json
 
 # 1) 贪心对齐审计（全局 Top-2 Logits）+ 5-kernel 零重编译检查
 #    门禁退出码约定：

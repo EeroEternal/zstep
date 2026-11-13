@@ -281,7 +281,7 @@ def _run_case(
         "hidden_size": hidden_size,
         "num_blocks": communicator.blocks,
         "num_threads": communicator.threads,
-        "algorithm": "one-shot" if payload_bytes <= 16384 else "two-shot",
+        "algorithm": "one-shot" if payload_bytes <= communicator.one_shot_max_vecs * 16 else "two-shot",
         "payload_bytes": payload_bytes,
         **shm_result,
         **nccl_result,

@@ -216,7 +216,7 @@ GPU 4, 5, 6, 7 -> Socket 1 PCIe Gen5 -> NUMA 1
 | **`b12x.gemm.wo_projection`**（融合 `inv_rope + wo_a + wo_b`） | 在 `M=1..128` CUDAGraph 解码桶上（`oproj_lmhead_mhc_audit.o_proj`），现有 `torch.bmm(BF16 wo_a) + b12x(wo_b)` 为 **`12.32..20.52 µs`**，全桶快于 `b12x.wo_projection` 的 `16.18..24.60 µs`（强行切换在 `M=1 / 128` 反退化 `-163.9 / -163.3 µs/step`） | **保持现有路由** |
 | **`ParallelLMHead` 替换 `b12x.bf16_vocab_projection`** | `TP=8` 词表投影 `16160 × 5120` BF16（`vocab_tp8 < MIN_TRITON_OUT_FEATURES = 16,384`）：`M=1..64` `cuBLAS` 为 `135.37..143.89 µs`（对比 `b12x` `126.46..143.84 µs`，`M>1` 自动走同一 `torch`/`cuBLAS` 路径），有效显存带宽已达 **`1,169..1,222.7 GB/s`** | **保持 `cuBLAS`** |
 | **`b12x.norm.mhc` 替换 `vLLM` TileLang `mhc_shifted_post_pre`** | `vLLM` TileLang `M=1` CUDAGraph 仅 **`9.70 µs/call`**（全模型 80 次合计 `0.78 ms`），已高度逼近寄存器归约下限 | **保持 TileLang** |
-| **`NCCL_P2P_LEVEL=SYS` 跨桥 P2P** | `lspci -vvv` 证实主机全部 PCIe Switch Bridge 硬件启用 `ACSCtl: SrcValid+ ReqRedir+ CmpltRedir+ UpstreamFwd+`，驱动层 `can_device_access_peer == 0`，强开 `SYS` 必死锁 | **保持 `shm_v5` + `NCCL_LOC`** |
+| **绕过 ACS 开启跨桥 PCIe P2P（`NCCL_P2P_LEVEL=SYS/PXB`）** | 工作站版 `RTX 6000D` 驱动层 `can_device_access_peer == 1`（`128 GiB` BAR2），但 20 个 Mellanox CX-8 集成 PCIe 桥下行口（`15b3:197c`）默认开启 `ACSCtl = 0x001d`。实测即使通过 `setpci ECAP_ACS+06.w=0000` 清零全部 20 个端口 ACS 并重载 `nvidia.ko`：Copy Engine DMA（`cudaMemcpyPeer`）虽可在同桥 `PXB` 跑通 `107.9 GB/s`，**但 GPU SM 核直接 BAR MMIO（`ld/st`）在全部 4 组同桥 GPU 对上均触发 PCIe `UR`（读回 `0xFFFFFFFF` 毒值），且多对双向并发 `NCCL` P2P 因二级 PCIe 交换网 + 双路 UPI 信用依赖环死锁**（详见 §8.1 与 [`phase37_6000d_comm_audit.json`](benchmarks/phase37_6000d_comm_audit.json)） | **保持 `shm_v5` + `NCCL_LOC`** |
 | **在线服务显存水位与余量告警（`num_kv_pages=2560`）** | 在 `engram cpu_offload=false` + 8 档 40 层整图 CUDAGraph 常驻下，`kv_pages=2560`（`327,680` tokens）实测单卡显存占用为 **`84,937..84,959 MiB / 85,651 MiB = 99.2%`（每卡剩余 `< 0.7 GiB`）**。离线基准稳定零 OOM，但长期在线 HTTP 服务（`zstep --serve`）若需为驱动/NCCL/动态大 Prefill 预留安全缓冲，建议下调至 `--num-kv-pages 2048..2304`（释放约 `2.5..5.0 GiB/卡`） | **基准上限 `2560`；长稳在线建议 `2048..2304`** |
 
 ### 7.3 Phase 3.7 vs Phase 3.6 vs `vLLM` 纯引擎同口径 Warm `n=3` 主结果（干净 `d497e85` 自证归档）
@@ -252,3 +252,59 @@ GPU 4, 5, 6, 7 -> Socket 1 PCIe Gen5 -> NUMA 1
 **关键收获**：
 * **单流首字延迟确定性改善、输出吞吐保持持平**：`c=1` 输出吞吐维持在 Phase 3.6 的 `±3%` 噪声带内（持平），而 `Median TTFT` 全线缩短 **`15.41..18.71 ms`**，其中 `in1024_c1` 从 `191.20 ms` 降至 **`172.49 ms`**，反超 `vLLM` 纯引擎的 `177.89 ms`（剩余 `c=1` `in=512` 与 Phase 3.5 的差距来自 `b12x` W4A8 MoE 在 `M >= 512` 采用静态专家主序 Prefill 核固定耗时 `~1.97 ms/层 × 40 ≈ 79 ms`，换取了每卡省下 `~10 GiB` 显存与并发解码大幅提速）；
 * **中高并发吞吐与尾延迟同步提升（双机独立交叉复现一致）**：`c=16..128` 全部 6 个并发档位的输出吞吐较 Phase 3.6 一致正向上推 **`+1.66%..+3.16%`**（并在另一台同规格 `8 × RTX 6000D` 机器上独立复现，偏差 `<= 0.6%`），峰值输出吞吐达 **`1,717.41 tok/s`**（`in512_c128`，相对 `vLLM` 纯引擎 **`1.52×` / `+52.48%`**），峰值总吞吐达 **`5,945.57 tok/s`**（`in1024_c128`），且所有 `c >= 8` 并发档位的 `Mean TPOT`、`Median TTFT` 与 `P99 ITL` 同步下降。
+
+---
+
+## 8. `zstep#14` 跨卡通信、Mellanox CX-8 PCIe ACS 审计与 `done-wait` 保留实证（[`phase37_6000d_comm_audit.json`](benchmarks/phase37_6000d_comm_audit.json)）
+
+针对 `zstep#14` 提出的 PCIe ACS 绕过、`shm_v5` 同步精简、自适应线程 / One-Shot 扩容及 `shm_v5 + NCCL_LOC` 混合路由方案，由可复现 8 卡审计脚本 [`bench_shmv5_nccl_comm_audit.py`](../worker/tests/phase3/bench_shmv5_nccl_comm_audit.py) 在 `8 × RTX 6000D` 上完成全矩阵实测与数值对齐（全形状 `0 ULP` 误差），归档于 [`phase37_6000d_comm_audit.json`](benchmarks/phase37_6000d_comm_audit.json)。
+
+### 8.1 Mellanox ConnectX-8（`15b3:197c`）PCIe 桥 ACS 清零与 P2P 硬件根因审计
+
+1. **Linux 内核参数核验**：常见文档提到的 `pcie_acs_override=downstream,multifunction` 是社区树外（out-of-tree VFIO）补丁，主线 Ubuntu `6.8` 内核符号表中不存在该解析器；主线内核对应参数为 `pci=disable_acs_redir=pci:15b3:197c`，运行时也可直接通过 `setpci -s <BDF> ECAP_ACS+06.w=0000` 清零桥端口 `ACSCtl`。
+2. **主板与桥芯片拓扑事实**：8 个主板 Intel Root Port（`8086:352a`）出厂即 `ACSCtl = 0x0000`、IOMMU 未开启（`iommu_groups = 0`）、每张 `RTX 6000D` 已暴露 `128 GiB` BAR2 且工作站驱动 `can_device_access_peer == 1`；开启 `ACSCtl = 0x001d`（`SrcValid+ ReqRedir+ CmpltRedir+ UpstreamFwd+`）的全部是 **20 个 Mellanox ConnectX-8 集成 PCIe Switch 下行口（`15b3:197c`，共 32 个桥 PCI 功能）**。
+3. **清零全部 20 个下行口 `ACSCtl = 0x0000` 并热重载 `nvidia.ko` 后的三维实测**：
+   * **Copy Engine DMA（`cudaMemcpyPeer`）**：同颗 CX-8 桥内 `PXB` 对 `(0,1),(2,3),(4,5),(6,7)` 单向带宽达 **`107.9 GB/s`**（Gen5 x16 线速），跨桥同路 `NODE` 达 **`34.9 GB/s`**，跨双路 UPI `SYS` 达 **`31.1 GB/s`**；
+   * **GPU SM 计算核直接 BAR MMIO（`ld.global` / `st.global`）**：在全部 4 组同桥 `PXB` GPU 对及全部 `ACSCtl` 掩码（`0x0000 / 0x000c / 0x001c / 0x001d`）下均表现为 **`W0R0`（写入为 `0`，读回 `0xFFFFFFFF` PCIe Unsupported Request 毒值）**——CX-8 网卡内置交换结构针对 NIC<->GPU RDMA 大包 DMA 设计，不转发计算核细粒度 peer BAR MMIO 事务，因此基于 SM 直接读写对端 BAR1 的 `NCCL` P2P / `p2p_allreduce` 内核在物理上不可行；
+   * **多对双向并发 `NCCL` P2P**：跨二级 PCIe 桥与双路 UPI 并发双工 BAR1 流量触发 Non-Posted/Posted PCIe 信用依赖环死锁。测试完毕后已将全部 20 个端口恢复出厂 `ACSCtl = 0x001d` 并重载 `nvidia.ko`。
+
+### 8.2 落地生产优化与 `8 × RTX 6000D` 全矩阵微基准（`done-wait` 严格保留）
+
+在不改动 4 槽环形缓冲区入口 `my_done` 等待与出口 `peer_done` 释放写（`done-wait`）的前提下，[`shm_allreduce.py`](../worker/zstep_worker/kernels_sm120/shm_allreduce.py)、[`qwen35_moe.py`](../worker/zstep_worker/models/qwen35_moe.py) 与 [`deepseek_v41.py`](../worker/zstep_worker/models/deepseek_v41.py) 落地三项零风险优化：
+
+1. **无状态自适应线程扩容（`256 -> 512`）+ One-Shot 阈值上调至 `64 KiB`（`DEFAULT_ONE_SHOT_MAX_VECS = 4096`）**：当默认 `threads == 256` 且单 CTA 分片 `vecs_per_cta > 256` 时，发射层自动将 `blockDim.x` 提升至 `512`（`gridDim.x = blocks` 与 `control[0..blocks)` 步进严格不变），彻底消除 `H=5120, M=4 / M=32` 及 `[32, 640] -> [32, 5120]` AllGather 中 `320 > 256` 导致的第二波 64 线程尾延迟空转，并将 `H=2048, M=16`（`64 KiB`）纳入单轮屏障 One-Shot。
+2. **`Qwen35MoeStepRunner` Eager 大 `M` 混合 `NCCL_LOC` 路由**：新增可选 `self.nccl_group`（启动期 1 行预热消除首请求懒加载尖峰），`numel <= 320 * 5120`（`H=2048` 下 `M <= 800`）与全部 CUDAGraph 解码桶走 `shm_v5_prod`，`M >= 1024` Eager Prefill 自动走多 SM `NCCL_LOC`。
+3. **`DeepSeekV41StepRunner` 混合切换点校准**：`ZSTEP_SHM_MAX_AR_NUMEL` 默认收紧至 `320 * 5120`（`H=5120` 下 `M <= 320` 走 `shm_v5_prod`、`M >= 384` Eager 走 `NCCL_LOC`）；`ZSTEP_SHM_MAX_AG_NUMEL` 默认上调至 `1024 * 4096`（覆盖 `M=1..4096` 全部 `[M, 640] -> [M, 5120]` AllGather，避免 `NCCL` `dim=0` 聚合后的额外 `permute().contiguous()` 显存拷贝）。
+
+#### 表 8.2a：`H = 5120`（`DeepSeek-V4.1-Flash`）8 卡 BF16 AllReduce `p50`（`µs`）
+
+| `M` | 载荷 | 算法 / 线程 | CUDAGraph `NCCL_LOC` | CUDAGraph 旧 `shm_v5` (`t=256, 40K`) | **CUDAGraph `shm_v5_prod` (`done-wait` 保留)** | `nodone` 消融 | Eager `NCCL_LOC` | Eager `shm_v5_prod` | **Eager 混合路由选中 (`p50`)** |
+| ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| `1` | `10 KiB` | One-Shot / `256` | `45.74` | `14.84` | **`14.91`** | `12.99` | `48.03` | `17.86` | `shm_v5_prod` (**`17.86`**) |
+| `2` | `20 KiB` | One-Shot / `256` | `47.35` | `15.52` | **`15.67`** | `13.68` | `49.95` | `17.98` | `shm_v5_prod` (**`17.98`**) |
+| `4` | `40 KiB` | One-Shot / **`512`** | `51.17` | `24.58` | **`19.82`** (`-19.4%`) | `17.50` | `52.29` | `22.08` | `shm_v5_prod` (**`22.08`**) |
+| `8` | `80 KiB` | Two-Shot / `512` | `53.40` | `30.83` | **`32.11`** | `29.90` | `54.34` | `34.37` | `shm_v5_prod` (**`34.37`**) |
+| `16` | `160 KiB` | Two-Shot / `512` | `75.02` | `35.80` | **`36.20`** | `33.96` | `76.67` | `38.46` | `shm_v5_prod` (**`38.46`**) |
+| `32` | `320 KiB` | Two-Shot / **`512`** | `114.96` | `60.99` | **`49.33`** (`-19.1%`) | `47.47` | `116.86` | `52.13` | `shm_v5_prod` (**`52.13`**) |
+| `64` | `640 KiB` | Two-Shot / `512` | `224.92` | `93.29` | **`92.11`** | `90.07` | `226.24` | `95.10` | `shm_v5_prod` (**`95.10`**) |
+| `128` | `1.25 MiB` | Two-Shot / `512` | `431.48` | `160.20` | **`157.98`** | `156.31` | `433.09` | `160.35` | `shm_v5_prod` (**`160.35`**) |
+| `256` | `2.50 MiB` | Two-Shot / `512` | `319.15` | `307.30` | **`302.24`** | `300.24` | `321.66` | `304.67` | `shm_v5_prod` (**`304.67`**) |
+| `320` | `3.125 MiB` | Two-Shot / `512` | — | — | — | — | `400.38` | `383.90` | `shm_v5_prod` (**`383.90`**) |
+| `384` | `3.75 MiB` | Two-Shot / `512` | — | — | — | — | `450.46` | `450.11` | `nccl_loc` (**`450.46`**) |
+| `512` | `5.00 MiB` | Two-Shot / `512` | — | — | — | — | **`584.58`** | `594.85` | `nccl_loc` (**`584.58`**) |
+| `1024` | `10.0 MiB` | Two-Shot / `512` | — | — | — | — | **`1,067.81`** | `1,175.04` | `nccl_loc` (**`1,067.81`**) |
+| `2048` | `20.0 MiB` | Two-Shot / `512` | — | — | — | — | **`2,002.78`** | `2,335.30` | `nccl_loc` (**`2,002.78`**) |
+| `4096` | `40.0 MiB` | Two-Shot / `512` | — | — | — | — | **`3,978.82`** | `4,662.85` | `nccl_loc` (**`3,978.82`**) |
+
+#### 表 8.2b：`H = 2048`（`Qwen3.5-35B-A3B`）8 卡 BF16 AllReduce 与 `[M, 640] -> [M, 5120]` AllGather 关键档位 `p50`（`µs`）
+
+* **`H = 2048` AllReduce**：CUDAGraph `M=1, 8, 16, 32, 128, 256` 下 `shm_v5_prod` 为 **`14.50 / 17.30 / 27.09 / 34.56 / 70.82 / 128.69 µs`**，全桶显著快于 `NCCL_LOC`（`29.65 / 34.76 / 36.83 / 55.87 / 174.32 / 342.71 µs`），其中 `M=16`（`64 KiB`）较旧 `40 KiB` 阈值（`30.61 µs`）加速 **`11.5%`**；Eager 模式下 `M=512` 由 `shm_v5_prod` 胜出（**`246.69 vs 285.54 µs`**），`M=1024 / 2048 / 3072 / 4096` 自动切至 `NCCL_LOC`（**`472.19 / 878.75 / 1,248.16 / 1,639.49 µs`** vs `shm_v5_prod` `478.69 / 943.04 / 1,407.55 / 1,874.43 µs`）。
+* **`[M, 640] -> [M, 5120]` AllGather**：CUDAGraph `M=1, 16, 32, 128, 256` 下 `shm_ag_prod` 为 **`15.26 / 16.69 / 19.82 / 58.43 / 109.22 µs`**（对比 `NCCL_LOC` `24.95 / 43.16 / 63.75 / 106.87 / 174.15 µs`，其中 `M=32` 借助自适应 `512` 线程从旧 `25.55 µs` 降至 **`19.82 µs`**，加速 **`22.4%`**）；Eager `M=512..4096` 因原生沿 `dim=-1` 一步写出而无需额外转置拷贝，`shm_ag_prod` 全程领先 `NCCL_LOC`（`M=2048`: **`816.74 vs 1,032.48 µs`**；`M=4096`: **`1,623.84 vs 2,061.66 µs`**）。
+
+### 8.3 为什么保留 `done-wait` 并排除 `64-bit` 自同步包（`pkt64`）：端到端 Amdahl 消融实证
+
+1. **排除 `64-bit` `(epoch32 << 32) | payload32` 自同步包（`pkt64`）**：实测 `pkt64` 虽省去独立到达旗标，但将有效载荷带宽开销放大 **`2×`** 并把 `16 B` `uint4` 合并写拆碎为 `7 × 4` 次跨卡 `8 B` 事务，`H=2048, M=1` CUDAGraph 即退化至 `39.69 µs`（慢于 `shm_v5_prod` `14.50 µs` 达 `2.74×`），`M >= 4` 更因 PCIe 写放大退化至 `656..5,832 µs`。
+2. **保留 `done-wait`（入口 `my_done` 自旋 + 出口 `peer_done` 释放写）的工程决策**：
+   * 从表 8.2a 可见，彻底移除首尾 `done-wait`（`nodone` 消融）在单次 AllReduce 上仅节省 **`~1.7..2.3 µs/call`**（全模型 80 次通信理论上限仅 `~0.14..0.18 ms/step`）；
+   * 在 `DeepSeek-V4.1-Flash (TP=8)` Warm `n=3` 端到端实测消融（[`phase37_6000d_comm_audit.json`](benchmarks/phase37_6000d_comm_audit.json) `dsv41_e2e_amdahl_ablation`，`prime_squares_table` `128/128` 100% 精确一致，`TRITON_RECOMPILATIONS=0`）中，`nodone + 自适应线程` 相对 Phase 3.7 `main` 在 `c=1 / c=8 / c=16 / c=128` 的吞吐变化仅为 **`+0.23% .. +2.36%`**（全部落在 `<3%` GPU Boost 频率正常波动带内），唯有 `c=32` 出现 **`+2.39% .. +3.00%`**（Suite 1 `c32`: `820.22 ± 1.82 -> 844.80 ± 3.07 tok/s`，Suite 2 `in1024_c32`: `796.36 ± 0.84 -> 815.37 ± 3.65 tok/s`）的可复现增益——而这部分增益恰恰来自**已保留落地的自适应 `512` 线程扩容**（`M=32` 单次 AR `-11.66 µs` + AG `-5.73 µs`，每步 80 AR + 40 AG 立省 `~1.16 ms`），而非去掉 `done-wait`；
+   * 保留 `done-wait` 以不到 `<2%` 的端到端理论代价，换取了 **4 槽环形缓冲区对未来多 CUDA Stream（如通信/计算双流重叠、异步投机采样）的无条件防覆盖安全不变量**，彻底杜绝潜在跨拍静默覆盖风险。
