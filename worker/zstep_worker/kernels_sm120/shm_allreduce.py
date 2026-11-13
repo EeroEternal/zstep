@@ -547,6 +547,44 @@ __global__ void host_mapped_two_shot_fused_kernel(
     }
 }
 
+// Issue every peer's 16-byte load before consuming any of them: the loads are volatile asm, so
+// interleaving them with the accumulation would serialize one PCIe round trip per peer.
+__device__ __forceinline__ void load_peer_vecs(
+    uint4 (&vals)[kMaxRanks],
+    const uint4* __restrict__ input_vec,
+    char* const* peer_shm,
+    int slot,
+    int64_t slot_stride_bytes,
+    int64_t idx,
+    int rank,
+    int world_size) {
+    #pragma unroll
+    for (int p = 0; p < kMaxRanks; ++p) {
+        if (p < world_size) {
+            const uint4* p_in = reinterpret_cast<const uint4*>(
+                peer_shm[p] + 131072 + slot * slot_stride_bytes);
+            vals[p] = (p == rank) ? input_vec[idx] : ld_cv_uint4(p_in + idx);
+        }
+    }
+}
+
+__device__ __forceinline__ void accumulate_peer_vecs(
+    float (&acc)[8], const uint4 (&vals)[kMaxRanks], int world_size) {
+    #pragma unroll
+    for (int p = 0; p < kMaxRanks; ++p) {
+        if (p < world_size) {
+            Pack128Bf16 v;
+            v.u4 = vals[p];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 f = __bfloat1622float2(v.pairs[j]);
+                acc[2 * j] += f.x;
+                acc[2 * j + 1] += f.y;
+            }
+        }
+    }
+}
+
 // Per-rank NUMA-local SHM region layout (`shm_v5`):
 // [0 .. 32768):     in_flag[block][peer]   (64B per (block, peer) -> zero false sharing & local-NUMA spin)
 // [32768 .. 65536): red_flag[block][peer]  (64B per (block, peer))
@@ -628,22 +666,10 @@ __global__ void shm_v5_allreduce_kernel(
 
     if (num_vecs <= one_shot_max_vecs) {
         for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
+            uint4 peer_vals[kMaxRanks];
+            load_peer_vecs(peer_vals, input_vec, s_peer_shm, slot, slot_stride_bytes, idx, rank, world_size);
             float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-            #pragma unroll
-            for (int p = 0; p < kMaxRanks; ++p) {
-                if (p < world_size) {
-                    const uint4* p_in = reinterpret_cast<const uint4*>(
-                        s_peer_shm[p] + 131072 + slot * slot_stride_bytes);
-                    Pack128Bf16 v;
-                    v.u4 = (p == rank) ? input_vec[idx] : ld_cv_uint4(p_in + idx);
-                    #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        const float2 f = __bfloat1622float2(v.pairs[j]);
-                        acc[2 * j] += f.x;
-                        acc[2 * j + 1] += f.y;
-                    }
-                }
-            }
+            accumulate_peer_vecs(acc, peer_vals, world_size);
             Pack128Bf16 out;
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -664,22 +690,10 @@ __global__ void shm_v5_allreduce_kernel(
     const int64_t s_end = c_begin + (c_len * (rank + 1)) / world_size;
     uint4* my_red = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes + half_slot);
     for (int64_t idx = s_begin + threadIdx.x; idx < s_end; idx += blockDim.x) {
+        uint4 peer_vals[kMaxRanks];
+        load_peer_vecs(peer_vals, input_vec, s_peer_shm, slot, slot_stride_bytes, idx, rank, world_size);
         float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-        #pragma unroll
-        for (int p = 0; p < kMaxRanks; ++p) {
-            if (p < world_size) {
-                const uint4* p_in = reinterpret_cast<const uint4*>(
-                    s_peer_shm[p] + 131072 + slot * slot_stride_bytes);
-                Pack128Bf16 v;
-                v.u4 = (p == rank) ? input_vec[idx] : ld_cv_uint4(p_in + idx);
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const float2 f = __bfloat1622float2(v.pairs[j]);
-                    acc[2 * j] += f.x;
-                    acc[2 * j + 1] += f.y;
-                }
-            }
-        }
+        accumulate_peer_vecs(acc, peer_vals, world_size);
         Pack128Bf16 out;
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
@@ -706,13 +720,32 @@ __global__ void shm_v5_allreduce_kernel(
     if (s_aborted) {
         return;
     }
-    for (int owner = 0; owner < world_size; ++owner) {
-        const int64_t o_begin = c_begin + (c_len * owner) / world_size;
-        const int64_t o_end = c_begin + (c_len * (owner + 1)) / world_size;
-        const uint4* o_red = reinterpret_cast<const uint4*>(
-            s_peer_shm[owner] + 131072 + slot * slot_stride_bytes + half_slot);
-        for (int64_t idx = o_begin + threadIdx.x; idx < o_end; idx += blockDim.x) {
-            output_vec[idx] = ld_cv_uint4(o_red + idx);
+    // Walk all owners' reduced shards in lockstep so each thread keeps one remote load per
+    // owner in flight instead of paying the PCIe round trip once per owner.
+    const int64_t max_sub_len = (c_len + world_size - 1) / world_size;
+    for (int64_t j = threadIdx.x; j < max_sub_len; j += blockDim.x) {
+        uint4 vals[kMaxRanks];
+        #pragma unroll
+        for (int owner = 0; owner < kMaxRanks; ++owner) {
+            if (owner < world_size) {
+                const int64_t o_begin = c_begin + (c_len * owner) / world_size;
+                const int64_t o_end = c_begin + (c_len * (owner + 1)) / world_size;
+                if (o_begin + j < o_end) {
+                    const uint4* o_red = reinterpret_cast<const uint4*>(
+                        s_peer_shm[owner] + 131072 + slot * slot_stride_bytes + half_slot);
+                    vals[owner] = ld_cv_uint4(o_red + o_begin + j);
+                }
+            }
+        }
+        #pragma unroll
+        for (int owner = 0; owner < kMaxRanks; ++owner) {
+            if (owner < world_size) {
+                const int64_t o_begin = c_begin + (c_len * owner) / world_size;
+                const int64_t o_end = c_begin + (c_len * (owner + 1)) / world_size;
+                if (o_begin + j < o_end) {
+                    output_vec[o_begin + j] = vals[owner];
+                }
+            }
         }
     }
     __syncthreads();
@@ -1161,7 +1194,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v8_ext",
+            name="zstep_shm_allreduce_sm120_v9_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -1316,6 +1349,7 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
         self.blocks: int = blocks
         self.threads: int = threads
         self.one_shot_max_vecs: int = one_shot_max_vecs
+
         self.device: torch.device = device
         self._use_shm_v5: bool = exchange_group is not None
         self._closed: bool = False
