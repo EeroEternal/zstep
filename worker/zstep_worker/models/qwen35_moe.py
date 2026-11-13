@@ -35,6 +35,7 @@ import json
 import mmap
 import os
 from pathlib import Path
+import struct
 from typing import Any
 
 import numpy as np
@@ -55,6 +56,7 @@ from zstep_worker.kernels_sm120.qwen35_ops import (
     zero_centered_rmsnorm,
 )
 from zstep_worker.kernels_sm120.shm_allreduce import (
+    ARGMAX_SHM_ABORT_OFFSET,
     HostMappedShmAllReduce,
     get_host_mapped_allreduce_extension,
 )
@@ -280,9 +282,16 @@ class _Tp8ArgmaxShmChannel:
             stream_handle,
         )
 
-    def close(self) -> None:
+    def signal_abort(self) -> None:
+        mm = getattr(self, "_mapping", None)
+        if mm is not None and not mm.closed and len(mm) >= ARGMAX_SHM_ABORT_OFFSET + 8:
+            struct.pack_into("<Q", mm, ARGMAX_SHM_ABORT_OFFSET, 1)
+
+    def close(self, *, abort: bool = False) -> None:
         if self._closed:
             return
+        if abort:
+            self.signal_abort()
         torch.cuda.synchronize(self.device)
         if self._registered:
             self._ar_ext.unregister_mapped_host(self._host_addr)
