@@ -37,6 +37,8 @@ use zs_wire::{
 const INHERITED_PLAN_FD_BASE: i32 = 100;
 const INHERITED_DONE_FD_BASE: i32 = 200;
 const INHERITED_SHM_FD_BASE: i32 = 300;
+/// Default maximum duration a live worker rank's `heartbeat_ns` may remain frozen mid-step.
+pub const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Explicit Python worker and micro-step / real-model launch parameters.
 #[derive(Debug, Clone)]
@@ -64,6 +66,7 @@ pub struct ModeBConfig {
     pub launch: WorkerLaunchConfig,
     pub ready_timeout: Duration,
     pub step_timeout: Duration,
+    pub heartbeat_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -520,8 +523,21 @@ impl ModeBCoordinator {
     }
 
     fn wait_all(&mut self, step_id: u64, timeout: Duration, initializing: bool) -> Result<()> {
-        let deadline = Instant::now() + timeout;
-        for rank in 0..self.config.geometry.world_size as usize {
+        let start_now = Instant::now();
+        let deadline = start_now + timeout;
+        let stall_limit = self.config.heartbeat_timeout.min(timeout);
+        let world_size = self.config.geometry.world_size as usize;
+        let mut hb_tracker = Vec::with_capacity(world_size);
+        for peer in 0..world_size {
+            let hb = self
+                .arena
+                .worker_state(peer)?
+                .heartbeat_ns
+                .load(Ordering::Acquire);
+            hb_tracker.push((hb, start_now));
+        }
+
+        for rank in 0..world_size {
             loop {
                 let now = Instant::now();
                 if now >= deadline {
@@ -535,6 +551,18 @@ impl ModeBCoordinator {
                     Ok(()) => break,
                     Err(_) => {
                         if let Err(err) = self.workers.check_alive() {
+                            let _ = self.arena.signal_abort();
+                            return Err(err);
+                        }
+                        if let Err(err) = check_peer_states_and_heartbeats(
+                            &self.arena,
+                            world_size,
+                            step_id,
+                            initializing,
+                            stall_limit,
+                            Instant::now(),
+                            &mut hb_tracker,
+                        ) {
                             let _ = self.arena.signal_abort();
                             return Err(err);
                         }
@@ -712,8 +740,48 @@ fn validate_config(config: &ModeBConfig) -> Result<()> {
             "invalid micro-step dimensions".to_owned(),
         ));
     }
-    if config.ready_timeout.is_zero() || config.step_timeout.is_zero() {
+    if config.ready_timeout.is_zero()
+        || config.step_timeout.is_zero()
+        || config.heartbeat_timeout.is_zero()
+    {
         return Err(ModeBError::Protocol("timeouts must be positive".to_owned()));
+    }
+    Ok(())
+}
+
+fn check_peer_states_and_heartbeats(
+    arena: &SharedMemoryArena,
+    world_size: usize,
+    step_id: u64,
+    initializing: bool,
+    stall_limit: Duration,
+    now: Instant,
+    hb_tracker: &mut [(u64, Instant)],
+) -> Result<()> {
+    for (peer, tracker) in hb_tracker.iter_mut().enumerate().take(world_size) {
+        let pstate = arena.worker_state(peer)?;
+        let pstatus = pstate.status_code.load(Ordering::Acquire);
+        let perror = pstate.error_code.load(Ordering::Acquire);
+        if pstatus == WORKER_STATUS_ERROR || perror != 0 {
+            return Err(ModeBError::Protocol(format!(
+                "rank {peer} reported worker error {perror} in phase {step_id}"
+            )));
+        }
+        if !initializing {
+            let cur_hb = pstate.heartbeat_ns.load(Ordering::Acquire);
+            let pready = pstate.ready_step_id.load(Ordering::Acquire);
+            if cur_hb != tracker.0 {
+                *tracker = (cur_hb, now);
+            } else if cur_hb != 0
+                && pready < step_id
+                && now.duration_since(tracker.1) >= stall_limit
+            {
+                let stalled_secs = now.duration_since(tracker.1).as_secs_f64();
+                return Err(ModeBError::Protocol(format!(
+                    "rank {peer} heartbeat stalled for {stalled_secs:.2}s in phase {step_id}"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -742,5 +810,99 @@ mod tests {
         assert_eq!(slot(1), 1);
         assert_eq!(slot(2), 0);
         assert_eq!(slot(3), 1);
+    }
+
+    #[test]
+    fn heartbeat_watchdog_detects_stalled_peer_without_false_positive_on_ready_peer() {
+        let geom = zs_wire::ShmGeometry {
+            world_size: 2,
+            max_seqs: 2,
+            max_step_tokens: 8,
+            max_decoder_rows: 8,
+            max_pages_per_seq: 4,
+            page_block_tokens: 64,
+            spec_verify_width: 1,
+        };
+        let layout = ShmLayout::compute(geom).expect("layout");
+        let name = format!("zstep_hb_test_{}", std::process::id());
+        let mut arena = SharedMemoryArena::create(&name, layout.total_bytes).expect("arena");
+        arena.initialize(&layout).expect("init");
+        arena.unlink_now().expect("unlink");
+
+        let t0 = Instant::now();
+        // Rank 0 finished step 5 (`ready_step_id = 5`); rank 1 is still on step 4 with hb=1000.
+        arena
+            .worker_state(0)
+            .expect("r0")
+            .heartbeat_ns
+            .store(1000, Ordering::Release);
+        arena
+            .worker_state(0)
+            .expect("r0")
+            .ready_step_id
+            .store(5, Ordering::Release);
+        arena
+            .worker_state(1)
+            .expect("r1")
+            .heartbeat_ns
+            .store(2000, Ordering::Release);
+        arena
+            .worker_state(1)
+            .expect("r1")
+            .ready_step_id
+            .store(4, Ordering::Release);
+
+        let mut tracker = vec![(1000u64, t0), (2000u64, t0)];
+        let limit = Duration::from_secs(5);
+
+        // At t0 + 3s, neither rank exceeds the 5s stall limit.
+        assert!(
+            check_peer_states_and_heartbeats(
+                &arena,
+                2,
+                5,
+                false,
+                limit,
+                t0 + Duration::from_secs(3),
+                &mut tracker,
+            )
+            .is_ok()
+        );
+
+        // Rank 1 advances heartbeat at t0 + 4s -> resets timer.
+        arena
+            .worker_state(1)
+            .expect("r1")
+            .heartbeat_ns
+            .store(2500, Ordering::Release);
+        assert!(
+            check_peer_states_and_heartbeats(
+                &arena,
+                2,
+                5,
+                false,
+                limit,
+                t0 + Duration::from_secs(6),
+                &mut tracker,
+            )
+            .is_ok()
+        );
+
+        // Rank 1 freezes after its heartbeat was observed at t0 + 6s -> detected at t0 + 11.5s (5.5s >= 5s),
+        // while rank 0 (`ready_step_id = 5`) is not falsely flagged.
+        let err = check_peer_states_and_heartbeats(
+            &arena,
+            2,
+            5,
+            false,
+            limit,
+            t0 + Duration::from_millis(11_500),
+            &mut tracker,
+        )
+        .expect_err("stalled rank 1 must fail fast");
+        assert!(
+            err.to_string().contains("rank 1 heartbeat stalled"),
+            "unexpected error: {err}"
+        );
     }
 }

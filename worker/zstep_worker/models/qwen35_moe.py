@@ -1189,9 +1189,15 @@ class Qwen35MoeStepRunner:
                 )
         return outputs, gpu_exec_us
 
+    def signal_abort(self) -> None:
+        self.argmax_channel.signal_abort()
+        self.communicator.signal_abort()
+
     def close(self, *, abort: bool = False) -> None:
+        if abort:
+            self.signal_abort()
         self.decode_graphs.clear()
-        self.argmax_channel.close()
-        self.communicator.close()
+        self.argmax_channel.close(abort=abort)
+        self.communicator.close(abort=abort)
         if not abort and dist.is_initialized():
             dist.destroy_process_group()

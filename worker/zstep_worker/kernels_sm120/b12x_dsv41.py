@@ -44,6 +44,7 @@ FlashInfer sparse MLA+SWA untouched:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import math
 import os
 from pathlib import Path
@@ -53,6 +54,8 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+
+_LOG = logging.getLogger(__name__)
 
 _DEFAULT_COMPAT_CANDIDATES: tuple[str, ...] = (
     "/usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/_compat",
@@ -125,7 +128,7 @@ def maybe_enable_b12x_for_dsv41() -> bool:
         from b12x.gemm import block_fp8_linear  # noqa: F401
         from b12x.moe import fused_moe  # noqa: F401
         from b12x.preparation import PreparationSession  # noqa: F401
-    except Exception:
+    except ImportError:
         return False
 
     # Ensure spawn-mode compiler workers launched by `PreparationSession` inherit
@@ -487,7 +490,14 @@ def install_b12x_dsv41_quant_patches() -> bool:
                     raw_scale_u8.view(torch.float8_e8m0fnu),
                     block_size=(32, 32),
                 )
-            except Exception:
+            except (RuntimeError, ValueError, TypeError) as exc:
+                _LOG.warning(
+                    "b12x pack_weight fallback to ModelOpt on %s (%dx%d): %s",
+                    self._layer_prefix,
+                    out_features,
+                    in_features,
+                    exc,
+                )
                 self.kernel = self._orig_kernel
                 super().process_weights_after_loading(layer)
                 return

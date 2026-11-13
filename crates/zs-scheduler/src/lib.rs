@@ -26,12 +26,16 @@
 mod mode_b;
 mod serving;
 
-pub use mode_b::{ModeBConfig, ModeBCoordinator, ModeBError, ModeBMetrics, WorkerLaunchConfig};
+pub use mode_b::{
+    DEFAULT_HEARTBEAT_TIMEOUT, ModeBConfig, ModeBCoordinator, ModeBError, ModeBMetrics,
+    WorkerLaunchConfig,
+};
 pub use serving::{
     AggregateMetric, BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierResult,
-    BenchmarkTierSpec, GenerationScheduleStats, GreedyTop2Batch, ModeBServingEngine,
-    ServingBenchmarkReport, SlotLease, SlotPool, StepTop2Logits, TierAggregateStats,
-    build_deterministic_random_prompts, build_deterministic_random_prompts_seeded,
+    BenchmarkTierSpec, DEFAULT_PREFILL_COALESCE_WAIT_MS, GenerationScheduleStats, GreedyTop2Batch,
+    ModeBServingEngine, ServingBenchmarkReport, SlotLease, SlotPool, StepTop2Logits,
+    TierAggregateStats, build_deterministic_random_prompts,
+    build_deterministic_random_prompts_seeded,
 };
 
 /// Select the smallest captured CUDA Graph bucket `>= active_rows`, or `0` (eager)

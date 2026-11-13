@@ -33,6 +33,7 @@ import ctypes
 import math
 import mmap
 import os
+import struct
 
 import torch
 import torch.distributed as dist
@@ -44,6 +45,8 @@ NUM_RING_SLOTS = 4
 MAX_RANKS = 8
 MAX_BLOCKS = 64
 SHM_V5_HEADER_BYTES = 131072
+SHM_V5_ABORT_OFFSET = 98304
+ARGMAX_SHM_ABORT_OFFSET = 128
 DEFAULT_ONE_SHOT_MAX_VECS = 2560  # Up to 40 KiB (e.g. M <= 4 at H=5120 BF16)
 
 _CPP_SOURCE = r"""
@@ -335,6 +338,10 @@ namespace {
 constexpr int kNumRingSlots = 4;
 constexpr int kMaxRanks = 8;
 constexpr int kOneShotMaxVecsLegacy = 1024;
+constexpr int64_t kShmV5AbortOffset = 98304;
+constexpr int64_t kArgmaxAbortOffset = 128;
+// ~90 seconds at 2.5 GHz boost clock; checked only every 4096 spin iterations.
+constexpr uint64_t kSpinTimeoutCycles = 225000000000ULL;
 
 __device__ __forceinline__ uint64_t sys_load_acquire_u64(const uint64_t* addr) {
     uint64_t val;
@@ -344,6 +351,29 @@ __device__ __forceinline__ uint64_t sys_load_acquire_u64(const uint64_t* addr) {
 
 __device__ __forceinline__ void sys_store_release_u64(uint64_t* addr, uint64_t val) {
     asm volatile("st.global.release.sys.b64 [%0], %1;" :: "l"(addr), "l"(val) : "memory");
+}
+
+__device__ __forceinline__ bool spin_wait_ge_u64(
+    const uint64_t* flag_addr,
+    uint64_t target,
+    const uint64_t* abort_addr) {
+    uint32_t iters = 0;
+    uint64_t start_cycle = 0;
+    while (sys_load_acquire_u64(flag_addr) < target) {
+        __nanosleep(24);
+        if ((++iters & 0xFFFU) == 0U) {
+            if (sys_load_acquire_u64(abort_addr) != 0ULL) {
+                return false;
+            }
+            const uint64_t now = clock64();
+            if (start_cycle == 0ULL) {
+                start_cycle = now;
+            } else if (now - start_cycle > kSpinTimeoutCycles) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 __device__ __forceinline__ uint4 ld_cv_uint4(const uint4* addr) {
@@ -521,6 +551,7 @@ __global__ void host_mapped_two_shot_fused_kernel(
 // [0 .. 32768):     in_flag[block][peer]   (64B per (block, peer) -> zero false sharing & local-NUMA spin)
 // [32768 .. 65536): red_flag[block][peer]  (64B per (block, peer))
 // [65536 .. 98304): done_flag[block][peer] (64B per (block, peer))
+// [98304 .. 98368): abort_flag             (64B cacheline-isolated cluster abort word)
 // [131072 .. ):     4 ring slots * (in_data + red_data)
 __global__ void shm_v5_allreduce_kernel(
     const uint4* __restrict__ input_vec,
@@ -534,6 +565,7 @@ __global__ void shm_v5_allreduce_kernel(
     int one_shot_max_vecs) {
     const int b = blockIdx.x;
     __shared__ uint64_t s_step;
+    __shared__ int s_aborted;
     __shared__ char* s_peer_shm[kMaxRanks];
     if (threadIdx.x < world_size) {
         s_peer_shm[threadIdx.x] = rank_shm[threadIdx.x];
@@ -542,11 +574,13 @@ __global__ void shm_v5_allreduce_kernel(
         const uint64_t ns = control[b] + 1ULL;
         control[b] = ns;
         s_step = ns;
+        s_aborted = 0;
     }
     __syncthreads();
     const uint64_t step = s_step;
     const int slot = static_cast<int>((step - 1ULL) & 3);
     char* my_shm = s_peer_shm[rank];
+    const uint64_t* abort_flag = reinterpret_cast<const uint64_t*>(my_shm + kShmV5AbortOffset);
 
     const int64_t c_begin = (num_vecs * b) / gridDim.x;
     const int64_t c_end = (num_vecs * (b + 1)) / gridDim.x;
@@ -554,17 +588,17 @@ __global__ void shm_v5_allreduce_kernel(
 
     if (step > 4ULL) {
         const uint64_t min_done = step - 4ULL;
-        const int total_flags = static_cast<int>(gridDim.x) * world_size;
-        for (int f = threadIdx.x; f < total_flags; f += blockDim.x) {
-            const int blk = f / world_size;
-            const int peer = f - blk * world_size;
+        if (threadIdx.x < world_size) {
             const uint64_t* my_done = reinterpret_cast<const uint64_t*>(
-                my_shm + 65536 + (blk * 8 + peer) * 64);
-            while (sys_load_acquire_u64(my_done) < min_done) {
-                __nanosleep(24);
+                my_shm + 65536 + (b * 8 + threadIdx.x) * 64);
+            if (!spin_wait_ge_u64(my_done, min_done, abort_flag)) {
+                s_aborted = 1;
             }
         }
         __syncthreads();
+        if (s_aborted) {
+            return;
+        }
     }
 
     const int64_t half_slot = slot_stride_bytes / 2;
@@ -583,11 +617,14 @@ __global__ void shm_v5_allreduce_kernel(
         sys_store_release_u64(peer_in_flag, step);
         const uint64_t* local_in_flag = reinterpret_cast<const uint64_t*>(
             my_shm + (b * 8 + threadIdx.x) * 64);
-        while (sys_load_acquire_u64(local_in_flag) < step) {
-            __nanosleep(24);
+        if (!spin_wait_ge_u64(local_in_flag, step, abort_flag)) {
+            s_aborted = 1;
         }
     }
     __syncthreads();
+    if (s_aborted) {
+        return;
+    }
 
     if (num_vecs <= one_shot_max_vecs) {
         for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
@@ -661,11 +698,14 @@ __global__ void shm_v5_allreduce_kernel(
         sys_store_release_u64(peer_red_flag, step);
         const uint64_t* local_red_flag = reinterpret_cast<const uint64_t*>(
             my_shm + 32768 + (b * 8 + threadIdx.x) * 64);
-        while (sys_load_acquire_u64(local_red_flag) < step) {
-            __nanosleep(24);
+        if (!spin_wait_ge_u64(local_red_flag, step, abort_flag)) {
+            s_aborted = 1;
         }
     }
     __syncthreads();
+    if (s_aborted) {
+        return;
+    }
     for (int owner = 0; owner < world_size; ++owner) {
         const int64_t o_begin = c_begin + (c_len * owner) / world_size;
         const int64_t o_end = c_begin + (c_len * (owner + 1)) / world_size;
@@ -697,6 +737,7 @@ __global__ void shm_v5_allgather_kernel(
     int world_size) {
     const int b = blockIdx.x;
     __shared__ uint64_t s_step;
+    __shared__ int s_aborted;
     __shared__ char* s_peer_shm[kMaxRanks];
     if (threadIdx.x < world_size) {
         s_peer_shm[threadIdx.x] = rank_shm[threadIdx.x];
@@ -705,11 +746,13 @@ __global__ void shm_v5_allgather_kernel(
         const uint64_t ns = control[b] + 1ULL;
         control[b] = ns;
         s_step = ns;
+        s_aborted = 0;
     }
     __syncthreads();
     const uint64_t step = s_step;
     const int slot = static_cast<int>((step - 1ULL) & 3);
     char* my_shm = s_peer_shm[rank];
+    const uint64_t* abort_flag = reinterpret_cast<const uint64_t*>(my_shm + kShmV5AbortOffset);
 
     const int64_t num_in_vecs = outer_rows * vecs_per_row;
     const int64_t c_begin = (num_in_vecs * b) / gridDim.x;
@@ -717,17 +760,17 @@ __global__ void shm_v5_allgather_kernel(
 
     if (step > 4ULL) {
         const uint64_t min_done = step - 4ULL;
-        const int total_flags = static_cast<int>(gridDim.x) * world_size;
-        for (int f = threadIdx.x; f < total_flags; f += blockDim.x) {
-            const int blk = f / world_size;
-            const int peer = f - blk * world_size;
+        if (threadIdx.x < world_size) {
             const uint64_t* my_done = reinterpret_cast<const uint64_t*>(
-                my_shm + 65536 + (blk * 8 + peer) * 64);
-            while (sys_load_acquire_u64(my_done) < min_done) {
-                __nanosleep(24);
+                my_shm + 65536 + (b * 8 + threadIdx.x) * 64);
+            if (!spin_wait_ge_u64(my_done, min_done, abort_flag)) {
+                s_aborted = 1;
             }
         }
         __syncthreads();
+        if (s_aborted) {
+            return;
+        }
     }
 
     uint4* my_in = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes);
@@ -745,11 +788,14 @@ __global__ void shm_v5_allgather_kernel(
         sys_store_release_u64(peer_in_flag, step);
         const uint64_t* local_in_flag = reinterpret_cast<const uint64_t*>(
             my_shm + (b * 8 + threadIdx.x) * 64);
-        while (sys_load_acquire_u64(local_in_flag) < step) {
-            __nanosleep(24);
+        if (!spin_wait_ge_u64(local_in_flag, step, abort_flag)) {
+            s_aborted = 1;
         }
     }
     __syncthreads();
+    if (s_aborted) {
+        return;
+    }
 
     if (outer_rows == 1) {
         for (int p = 0; p < world_size; ++p) {
@@ -965,12 +1011,16 @@ __global__ void tp8_argmax_gather_shm_kernel(
     int vocab_per_rank) {
     uint64_t* ready_flags = reinterpret_cast<uint64_t*>(host_base);
     uint64_t* done_flags = reinterpret_cast<uint64_t*>(host_base + 64);
+    const uint64_t* abort_flag =
+        reinterpret_cast<const uint64_t*>(host_base + kArgmaxAbortOffset);
 
     __shared__ uint64_t s_step;
+    __shared__ int s_aborted;
     if (threadIdx.x == 0) {
         const uint64_t next = step_counter[0] + 1ULL;
         step_counter[0] = next;
         s_step = next;
+        s_aborted = 0;
     }
     __syncthreads();
     const uint64_t step = s_step;
@@ -979,11 +1029,14 @@ __global__ void tp8_argmax_gather_shm_kernel(
     if (step > static_cast<uint64_t>(kNumRingSlots)) {
         const uint64_t min_done = step - static_cast<uint64_t>(kNumRingSlots);
         if (threadIdx.x < world_size) {
-            while (sys_load_acquire_u64(done_flags + threadIdx.x) < min_done) {
-                __nanosleep(32);
+            if (!spin_wait_ge_u64(done_flags + threadIdx.x, min_done, abort_flag)) {
+                s_aborted = 1;
             }
         }
         __syncthreads();
+        if (s_aborted) {
+            return;
+        }
     }
 
     const int64_t pairs_per_rank = max_rows_per_step * 2;
@@ -1008,11 +1061,14 @@ __global__ void tp8_argmax_gather_shm_kernel(
         sys_store_release_u64(ready_flags + rank, step);
     }
     if (threadIdx.x < world_size) {
-        while (sys_load_acquire_u64(ready_flags + threadIdx.x) < step) {
-            __nanosleep(32);
+        if (!spin_wait_ge_u64(ready_flags + threadIdx.x, step, abort_flag)) {
+            s_aborted = 1;
         }
     }
     __syncthreads();
+    if (s_aborted) {
+        return;
+    }
 
     if (rank == 0) {
         for (int64_t r = threadIdx.x; r < num_rows; r += blockDim.x) {
@@ -1100,7 +1156,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v6_ext",
+            name="zstep_shm_allreduce_sm120_v7_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -1201,6 +1257,12 @@ class _PerRankShmRingBase:
         self._rank_shm_ptrs: torch.Tensor = torch.tensor(
             dev_ptrs, dtype=torch.int64, device=device
         )
+
+    def signal_abort(self) -> None:
+        """Set the cacheline-isolated abort flag across all mapped per-rank SHM segments."""
+        for mm in getattr(self, "_per_rank_mappings", ()):
+            if not mm.closed and len(mm) >= SHM_V5_ABORT_OFFSET + 8:
+                struct.pack_into("<Q", mm, SHM_V5_ABORT_OFFSET, 1)
 
     def _close_per_rank_shm(self, extension) -> None:
         for host_addr in self._per_rank_host_addrs:
@@ -1369,10 +1431,12 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
             )
         return output
 
-    def close(self) -> None:
+    def close(self, *, abort: bool = False) -> None:
         """Release CUDA host mapping and POSIX shared memory handle(s)."""
         if self._closed:
             return
+        if abort:
+            self.signal_abort()
         torch.cuda.synchronize(self.device)
         if self._use_shm_v5:
             if self._registered:
@@ -1496,9 +1560,11 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
         )
         return output
 
-    def close(self) -> None:
+    def close(self, *, abort: bool = False) -> None:
         if self._closed:
             return
+        if abort:
+            self.signal_abort()
         torch.cuda.synchronize(self.device)
         if self._registered:
             self._close_per_rank_shm(self._extension)
@@ -1619,9 +1685,16 @@ class HostMappedShmArgmax:
             stream_handle,
         )
 
-    def close(self) -> None:
+    def signal_abort(self) -> None:
+        mm = getattr(self, "_mapping", None)
+        if mm is not None and not mm.closed and len(mm) >= ARGMAX_SHM_ABORT_OFFSET + 8:
+            struct.pack_into("<Q", mm, ARGMAX_SHM_ABORT_OFFSET, 1)
+
+    def close(self, *, abort: bool = False) -> None:
         if self._closed:
             return
+        if abort:
+            self.signal_abort()
         torch.cuda.synchronize(self.device)
         if self._registered:
             self._extension.unregister_mapped_host(self._host_addr)

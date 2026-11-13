@@ -26,9 +26,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use zs_scheduler::{
-    BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierSpec, GenerationScheduleStats,
-    ModeBConfig, ModeBCoordinator, ModeBServingEngine, ServingBenchmarkReport, StepTop2Logits,
-    TierAggregateStats, WorkerLaunchConfig,
+    BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierSpec, DEFAULT_HEARTBEAT_TIMEOUT,
+    GenerationScheduleStats, ModeBConfig, ModeBCoordinator, ModeBServingEngine,
+    ServingBenchmarkReport, StepTop2Logits, TierAggregateStats, WorkerLaunchConfig,
 };
 use zs_wire::{MAX_DECODE_GRAPH_SEQS, ShmGeometry};
 
@@ -200,7 +200,8 @@ Usage: zstep --mode-b [OPTIONS]\n\
   --allreduce-blocks N       SHM AllReduce CUDA blocks (default: 16)\n\
   --allreduce-threads N      SHM AllReduce threads/block (default: 256)\n\
   --ready-timeout-secs N     Initialization timeout (default: 600)\n\
-  --step-timeout-secs N      Per-step timeout (default: 120)\n";
+  --step-timeout-secs N      Per-step timeout (default: 120)\n\
+  --heartbeat-timeout-ms N   Per-worker heartbeat stall timeout (default: 5000)\n";
 
 struct Arguments {
     world_size: u32,
@@ -235,6 +236,7 @@ struct Arguments {
     allreduce_threads: u32,
     ready_timeout_secs: u64,
     step_timeout_secs: u64,
+    heartbeat_timeout_ms: u64,
 }
 
 impl Default for Arguments {
@@ -272,6 +274,7 @@ impl Default for Arguments {
             allreduce_threads: 256,
             ready_timeout_secs: 600,
             step_timeout_secs: 120,
+            heartbeat_timeout_ms: DEFAULT_HEARTBEAT_TIMEOUT.as_millis() as u64,
         }
     }
 }
@@ -704,6 +707,7 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         },
         ready_timeout: Duration::from_secs(args.ready_timeout_secs),
         step_timeout: Duration::from_secs(args.step_timeout_secs),
+        heartbeat_timeout: Duration::from_millis(args.heartbeat_timeout_ms),
     };
 
     if has_model {
@@ -902,6 +906,7 @@ fn parse_arguments(raw: &[String]) -> Result<Arguments, String> {
             "--allreduce-threads" => args.allreduce_threads = parse_number(option, value)?,
             "--ready-timeout-secs" => args.ready_timeout_secs = parse_number(option, value)?,
             "--step-timeout-secs" => args.step_timeout_secs = parse_number(option, value)?,
+            "--heartbeat-timeout-ms" => args.heartbeat_timeout_ms = parse_number(option, value)?,
             _ => return Err(format!("unknown option {option}")),
         }
     }

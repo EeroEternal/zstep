@@ -152,7 +152,7 @@ def _query_nvidia_smi() -> tuple[str, list[int], list[int]]:
             text=True,
             timeout=10,
         )
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return ("unknown", [], [])
     driver = "unknown"
     gfx_clocks: list[int] = []
@@ -176,7 +176,7 @@ def _git_commit() -> str:
             text=True,
             timeout=5,
         ).strip()
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return "unknown"
 
 
@@ -359,7 +359,7 @@ async def _run_benchmarks(args: argparse.Namespace) -> None:
 
     try:
         vllm_version = importlib.metadata.version("vllm")
-    except Exception:
+    except importlib.metadata.PackageNotFoundError:
         vllm_version = "unknown"
 
     try:

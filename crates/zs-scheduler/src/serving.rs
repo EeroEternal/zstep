@@ -123,6 +123,8 @@ pub struct BenchmarkTierSpec {
 }
 
 pub const BENCHMARK_RANDOM_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Default maximum wait (ms) before flushing a non-full prefill batch while decodes are active.
+pub const DEFAULT_PREFILL_COALESCE_WAIT_MS: u64 = 25;
 
 /// Per-step greedy Top-2 logit diagnostics gathered across all TP ranks.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -679,6 +681,7 @@ pub struct ModeBServingEngine {
     init_wall_us: u64,
     worker_numa_nodes: Vec<i32>,
     max_mixed_step_tokens: Option<usize>,
+    max_prefill_coalesce_wait_ms: u64,
     last_generation_schedule: GenerationScheduleStats,
 }
 
@@ -747,6 +750,7 @@ impl ModeBServingEngine {
             init_wall_us,
             worker_numa_nodes,
             max_mixed_step_tokens: None,
+            max_prefill_coalesce_wait_ms: DEFAULT_PREFILL_COALESCE_WAIT_MS,
             last_generation_schedule: GenerationScheduleStats::default(),
         })
     }
@@ -775,6 +779,10 @@ impl ModeBServingEngine {
 
     pub fn set_max_mixed_step_tokens(&mut self, max_mixed_step_tokens: Option<usize>) {
         self.max_mixed_step_tokens = max_mixed_step_tokens.filter(|&cap| cap > 0);
+    }
+
+    pub fn set_max_prefill_coalesce_wait_ms(&mut self, wait_ms: u64) {
+        self.max_prefill_coalesce_wait_ms = wait_ms;
     }
 
     /// Generate exact greedy completions for `prompts` (`target_output_len` new tokens each).
@@ -1074,6 +1082,7 @@ impl ModeBServingEngine {
                         max_prefill_chunk,
                         waiting_permitted,
                         consecutive_prefills,
+                        self.max_prefill_coalesce_wait_ms,
                     );
                     if run_prefill {
                         let continued_chunk = active.iter().any(|seq| {
@@ -1903,6 +1912,7 @@ fn should_schedule_prefill(
     max_prefill_chunk: usize,
     waiting_permitted: &VecDeque<PendingRequest>,
     consecutive_prefills: usize,
+    max_prefill_coalesce_wait_ms: u64,
 ) -> bool {
     if (total_active_count >= max_seqs || waiting_permitted.is_empty()) && !has_partial_prefill {
         return false;
@@ -1925,9 +1935,9 @@ fn should_schedule_prefill(
     if waiting_permitted.len() >= full_prefill_batch.min(free_slots) {
         return true;
     }
-    waiting_permitted
-        .front()
-        .is_some_and(|req| req.permit_time.elapsed().as_millis() >= 25)
+    waiting_permitted.front().is_some_and(|req| {
+        req.permit_time.elapsed().as_millis() >= u128::from(max_prefill_coalesce_wait_ms)
+    })
 }
 
 fn splitmix64(mut x: u64) -> u64 {
@@ -2160,19 +2170,59 @@ mod tests {
             })
             .collect();
         assert!(should_schedule_prefill(
-            1, 1, false, 8, 4096, 2048, &waiting, 0,
+            1,
+            1,
+            false,
+            8,
+            4096,
+            2048,
+            &waiting,
+            0,
+            DEFAULT_PREFILL_COALESCE_WAIT_MS,
         ));
         assert!(!should_schedule_prefill(
-            1, 1, false, 8, 4096, 2048, &waiting, 1,
+            1,
+            1,
+            false,
+            8,
+            4096,
+            2048,
+            &waiting,
+            1,
+            DEFAULT_PREFILL_COALESCE_WAIT_MS,
         ));
         assert!(should_schedule_prefill(
-            1, 2, true, 8, 4096, 2048, &waiting, 0,
+            1,
+            2,
+            true,
+            8,
+            4096,
+            2048,
+            &waiting,
+            0,
+            DEFAULT_PREFILL_COALESCE_WAIT_MS,
         ));
         assert!(!should_schedule_prefill(
-            1, 2, true, 8, 4096, 2048, &waiting, 1,
+            1,
+            2,
+            true,
+            8,
+            4096,
+            2048,
+            &waiting,
+            1,
+            DEFAULT_PREFILL_COALESCE_WAIT_MS,
         ));
         assert!(should_schedule_prefill(
-            0, 1, false, 8, 4096, 2048, &waiting, 4,
+            0,
+            1,
+            false,
+            8,
+            4096,
+            2048,
+            &waiting,
+            4,
+            DEFAULT_PREFILL_COALESCE_WAIT_MS,
         ));
     }
 

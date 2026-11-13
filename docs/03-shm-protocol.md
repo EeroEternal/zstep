@@ -41,7 +41,7 @@ Offset        Size        Alignment   Region Name & Ownership
 ### 1. 全局超级块 `ShmSuperblock`
 启动握手阶段校验，防止 Rust 主控与 Python Worker 版本不一致导致内存错位：
 * `magic: u64` = `0x5A53_5445_505F_5631` (`"ZSTEP_V1"`)
-* `protocol_version: u32` = `1`
+* `protocol_version: u32` = `2`
 * `world_size: u32` = `8`（对应 `8 × RTX 6000D`）
 * `max_seqs: u32`（例如 `64`）
 * `max_step_tokens: u32`（例如 `16384`，单步最大 Chunked Prefill + Decode/Verify 行数）

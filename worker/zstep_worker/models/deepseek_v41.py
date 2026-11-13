@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import dataclasses
+import logging
 import math
 import os
 from pathlib import Path
@@ -60,6 +61,8 @@ from zstep_worker.shm_bridge import (
     StepPlanView,
     select_decode_bucket,
 )
+
+_LOG = logging.getLogger(__name__)
 
 
 def apply_vllm_sm120_dsv41_patches() -> None:
@@ -586,10 +589,10 @@ class DeepSeekV41StepRunner:
                     try:
                         if load_fn(str(p)):
                             loaded_files += 1
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except (OSError, ValueError, RuntimeError) as exc:
+                        _LOG.debug("Skipping FlashInfer autotune cache %s: %s", p, exc)
+        except ImportError:
+            return 0
         return loaded_files
 
     def _install_tp_shm_collectives(self, tp_group: Any) -> None:
@@ -886,12 +889,16 @@ class DeepSeekV41StepRunner:
         # Warm up CuTeDSL & low-latency BF16 router GEMM kernels (`M=1..16`, `(5120, 384)`).
         try:
             _warmup_ll_bf16_router_gemm(self.model)
-        except Exception:
-            pass
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            _LOG.warning(
+                "Optional router BF16 warmup skipped on rank %d: %s", self.rank, exc
+            )
         try:
             cutedsl_warmup()
-        except Exception:
-            pass
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            _LOG.warning(
+                "Optional CuTeDSL warmup skipped on rank %d: %s", self.rank, exc
+            )
 
         # Warm up eager prefill/chunked-extend shapes across all Triton specialization
         # classes (`==1`, `%16 != 0`, `%16 == 0`), multi-seq batches, short contexts,
@@ -1098,8 +1105,12 @@ class DeepSeekV41StepRunner:
                 save_fn = getattr(AutoTuner.get(), "save_configs", None)
                 if callable(save_fn):
                     save_fn(str(zstep_cache))
-            except Exception:
-                pass
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                _LOG.warning(
+                    "Failed to save FlashInfer autotune cache to %s: %s",
+                    zstep_cache,
+                    exc,
+                )
         dist.barrier(group=self.exchange_group)
 
         # Zero all caches before capturing decode CUDAGraphs so Block 0 is clean.
@@ -1521,17 +1532,26 @@ class DeepSeekV41StepRunner:
                 )
         return outputs, gpu_exec_us
 
+    def signal_abort(self) -> None:
+        if self.argmax_channel is not None:
+            self.argmax_channel.signal_abort()
+        if self.shm_ag is not None:
+            self.shm_ag.signal_abort()
+        if self.shm_ar is not None:
+            self.shm_ar.signal_abort()
+
     def _abort_close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        self.signal_abort()
         self.decode_graphs.clear()
         if self.argmax_channel is not None:
-            self.argmax_channel.close()
+            self.argmax_channel.close(abort=True)
         if self.shm_ag is not None:
-            self.shm_ag.close()
+            self.shm_ag.close(abort=True)
         if self.shm_ar is not None:
-            self.shm_ar.close()
+            self.shm_ar.close(abort=True)
         if self._vllm_config_ctx is not None:
             self._vllm_config_ctx.__exit__(None, None, None)
             self._vllm_config_ctx = None

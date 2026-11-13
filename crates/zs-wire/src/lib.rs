@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 /// ASCII `"ZSTEP_V1"` in little-endian (`0x5A53_5445_505F_5631`).
 pub const ZSTEP_SHM_MAGIC: u64 = 0x5A53_5445_505F_5631;
 /// Wire ABI version. Must match exactly between master and GPU workers.
-pub const ZSTEP_PROTOCOL_VERSION: u32 = 1;
+pub const ZSTEP_PROTOCOL_VERSION: u32 = 2;
 /// Maximum GPU workers supported per single-node shared-memory segment.
 pub const MAX_WORKERS: usize = 8;
 /// Token ID sentinel indicating the GPU worker should self-bootstrap the token

@@ -32,6 +32,7 @@ from pathlib import Path
 import select
 import signal
 import struct
+import threading
 import traceback
 from unittest.mock import patch
 
@@ -300,13 +301,19 @@ class MicroStep:
             ).to(self.device)
         return self._forward(token_ids, positions, req_slot_ids, sample_row_indices)
 
+    def signal_abort(self) -> None:
+        if self.communicator is not None:
+            self.communicator.signal_abort()
+
     def close(self, *, abort: bool = False) -> None:
         import torch.distributed as dist
 
+        if abort:
+            self.signal_abort()
         if not abort and self.exchange_group is not None:
             dist.barrier(group=self.exchange_group)
         if self.communicator is not None:
-            self.communicator.close()
+            self.communicator.close(abort=abort)
         if self.exchange_group is not None:
             if not abort:
                 dist.barrier(group=self.exchange_group)
@@ -331,42 +338,74 @@ class RuntimeLoop:
         # Pin host CPU affinity to this rank's PCIe NUMA domain BEFORE touching SHM or CUDA.
         self.numa_topology: DeviceNumaTopology = pin_process_to_device_numa(args.rank)
         self.bridge = ShmBridge(name=args.shm_name, shm_fd=args.shm_fd)
-        self.model_type = _probe_model_type(args.model_dir)
-        if args.model_dir and self.model_type == "deepseek_v41":
-            from zstep_worker.models.deepseek_v41 import DeepSeekV41StepRunner
+        self.runner: object | None = None
+        self._watchdog_stop = threading.Event()
+        self.bridge.touch_heartbeat(args.rank)
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name=f"zstep-watchdog-r{args.rank}",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+        try:
+            self.model_type = _probe_model_type(args.model_dir)
+            if args.model_dir and self.model_type == "deepseek_v41":
+                from zstep_worker.models.deepseek_v41 import DeepSeekV41StepRunner
 
-            self.runner: object = DeepSeekV41StepRunner(
-                model_dir=Path(args.model_dir),
-                rank=args.rank,
-                bridge=self.bridge,
-                dist_init_file=args.dist_init_file,
-                allreduce_name=args.allreduce_name,
-                allreduce_blocks=args.allreduce_blocks,
-                allreduce_threads=args.allreduce_threads,
-                num_kv_pages=args.num_kv_pages,
-            )
-        elif args.model_dir:
-            from zstep_worker.models.qwen35_moe import Qwen35MoeStepRunner
+                self.runner = DeepSeekV41StepRunner(
+                    model_dir=Path(args.model_dir),
+                    rank=args.rank,
+                    bridge=self.bridge,
+                    dist_init_file=args.dist_init_file,
+                    allreduce_name=args.allreduce_name,
+                    allreduce_blocks=args.allreduce_blocks,
+                    allreduce_threads=args.allreduce_threads,
+                    num_kv_pages=args.num_kv_pages,
+                )
+            elif args.model_dir:
+                from zstep_worker.models.qwen35_moe import Qwen35MoeStepRunner
 
-            self.runner = Qwen35MoeStepRunner(
-                model_dir=Path(args.model_dir),
-                rank=args.rank,
-                bridge=self.bridge,
-                dist_init_file=args.dist_init_file,
-                allreduce_name=args.allreduce_name,
-                allreduce_blocks=args.allreduce_blocks,
-                allreduce_threads=args.allreduce_threads,
-                num_kv_pages=args.num_kv_pages,
-            )
-        else:
-            self.runner = MicroStep(args, self.bridge)
-        import torch
+                self.runner = Qwen35MoeStepRunner(
+                    model_dir=Path(args.model_dir),
+                    rank=args.rank,
+                    bridge=self.bridge,
+                    dist_init_file=args.dist_init_file,
+                    allreduce_name=args.allreduce_name,
+                    allreduce_blocks=args.allreduce_blocks,
+                    allreduce_threads=args.allreduce_threads,
+                    num_kv_pages=args.num_kv_pages,
+                )
+            else:
+                self.runner = MicroStep(args, self.bridge)
+            import torch
 
-        free_bytes, total_bytes = torch.cuda.mem_get_info(self.runner.device)
-        self._free_vram_mb: int = free_bytes // (1024 * 1024)
-        self._total_vram_mb: int = total_bytes // (1024 * 1024)
-        self.current_step: int = 0
-        self.last_step: int = 0
+            free_bytes, total_bytes = torch.cuda.mem_get_info(self.runner.device)
+            self._free_vram_mb: int = free_bytes // (1024 * 1024)
+            self._total_vram_mb: int = total_bytes // (1024 * 1024)
+            self.current_step: int = 0
+            self.last_step: int = 0
+        except BaseException:
+            self._stop_watchdog()
+            self.bridge.close()
+            raise
+
+    def _watchdog_loop(self) -> None:
+        while not self._watchdog_stop.wait(0.25):
+            if self.bridge._closed:
+                break
+            self.bridge.touch_heartbeat(self.args.rank)
+            if self.bridge.is_aborted():
+                runner = self.runner
+                if runner is not None:
+                    abort_fn = getattr(runner, "signal_abort", None)
+                    if callable(abort_fn):
+                        abort_fn()
+                break
+
+    def _stop_watchdog(self) -> None:
+        self._watchdog_stop.set()
+        if self._watchdog_thread.is_alive():
+            self._watchdog_thread.join(timeout=2.0)
 
     def _write_state(
         self,
@@ -538,10 +577,12 @@ class RuntimeLoop:
         os.eventfd_write(self.args.done_fd, 1)
 
     def close(self, *, abort: bool = False) -> None:
-        try:
-            self.runner.close(abort=abort)
-        except TypeError:
-            self.runner.close()
+        self._stop_watchdog()
+        if self.runner is not None:
+            try:
+                self.runner.close(abort=abort)
+            except TypeError:
+                self.runner.close()
         self.bridge.close()
         os.close(self.args.plan_fd)
         os.close(self.args.done_fd)
