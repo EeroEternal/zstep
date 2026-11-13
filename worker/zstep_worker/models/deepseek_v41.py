@@ -43,6 +43,7 @@ import torch.distributed as dist
 
 from zstep_worker.kernels_sm120.b12x_dsv41 import (
     B12xPrepareSummary,
+    close_b12x_dsv41_model,
     install_b12x_dsv41_quant_patches,
     prepare_b12x_dsv41_model,
 )
@@ -1546,6 +1547,7 @@ class DeepSeekV41StepRunner:
         self._closed = True
         self.signal_abort()
         self.decode_graphs.clear()
+        close_b12x_dsv41_model(getattr(self, "model", None))
         if self.argmax_channel is not None:
             self.argmax_channel.close(abort=True)
         if self.shm_ag is not None:
@@ -1569,6 +1571,7 @@ class DeepSeekV41StepRunner:
         )
 
         self.decode_graphs.clear()
+        close_b12x_dsv41_model(getattr(self, "model", None))
         if dist.is_initialized() and hasattr(self, "exchange_group"):
             dist.barrier(group=self.exchange_group)
         if self.argmax_channel is not None:

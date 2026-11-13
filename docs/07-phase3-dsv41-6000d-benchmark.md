@@ -189,3 +189,63 @@ GPU 4, 5, 6, 7 -> Socket 1 PCIe Gen5 -> NUMA 1
 2. **两项工程权衡边界透明披露**：
    * **`c=1` Eager Prefill Python `bind()` 开销**：在单流 `c=1` 的非捕获 Eager Prefill 步（`M=512` / `M=1024`）中，每步 210 次 `b12x` Python `bind()` 校验带来约 `20..67 ms` 固定 CPU 发射开销，使 `c=1` `Median TTFT` 为 `184.9..191.2 ms`（高于 Phase 3.5 的 `117.6..171.7 ms`），而解码阶段因 40 层整图 CUDAGraph 零 CPU 开销，`Mean TPOT` 降至 **`8.93..9.07 ms`**（纯解码速率 `110.3..112.0 tok/s`）；在 `c=8..128` 批量步中 GPU 计算完全掩盖 CPU 发射，`Median TTFT` 反而比 Phase 3.5 再快 `24..52 ms`。
    * **`c=16 / c=32` 混合步 `P99 ITL` 与 `TTFT` 的折中**：在短输出 `c16` (`512->128`) 与 `c=32` (`c32`、`in1024_c32`) 档位，`--max-mixed-step-tokens 3072` 用更高的 `P99 ITL`（`327.96..391.34 ms` vs `vLLM` 纯引擎 `25.97..296.51 ms`）换取了 **`2.81×..5.43×` 更低的 `Median TTFT`** 与 **`+24.29%..+29.76%` 更高的吞吐**；而在 `c=1`、`c=8`、`in512_c16` 与 `c=128` 档位，`zstep 3.6 + b12x` 的 `P99 ITL` 同时显著低于 `vLLM`。
+
+---
+
+## 7. Phase 3.7：`156-SM` `PreparationSession` 生命周期修复、210 层全覆盖与算子边界证明
+
+### 7.1 四项正向优化落地（[`b12x_dsv41.py`](../worker/zstep_worker/kernels_sm120/b12x_dsv41.py) & [`deepseek_v41.py`](../worker/zstep_worker/models/deepseek_v41.py)）
+
+针对 `RTX 6000D`（`sm_120`，`156 SMs`，区别于 `RTX 5090` `170 SMs` 与 `RTX PRO 6000` `188 SMs`）进行单算子逐档微测与源码级审计后，Phase 3.7 落地四项确定性改进：
+
+1. **修复 `PreparationSession.close()` 提前析构导致的调优计划回退**：
+   * `b12x` 的 `PreparationSession.prepare()` 内部已排空并关闭编译进程池（`self._pool = None`），而此前在 `prepare()` 后立即调用 `sess.close()` 会清空全部 `plan._prepared` 并执行 `evict_unretained()`，导致运行时每层首次调用触发 `"was not prepared before its first use; preparing its default configuration"` 警告并丢失 `156-SM` `autotune=True` 最优配置；
+   * Phase 3.7 将 `PreparationSession` 挂载于 `model._b12x_session` 直至 `DeepSeekV41StepRunner.close()`（在 `decode_graphs.clear()` 之后释放），并将持久化调优缓存升级至 `b12x_zstep_dsv41_v2`，使 **`unprepared` 回退告警降至 `0` 条**，热缓存准备耗时降至 **`7.7..8.2 s`**。
+2. **解锁全部 40 层 `shared_experts.down_proj`（`5120 × 288`，`in_features % 32 == 0`）**：
+   * 将 `ZstepB12xBlock32LinearMethod` 准入条件从 `in_features % 64 == 0` 放宽至硬件原生块对齐 `in_features % 32 == 0`（实测非均匀 `UE8M0` 缩放下 `cos_sim = 1.000000`），使 `b12x` 2D FP8 线性层覆盖数从 `170` 提升至 **`210` 层**（单步 CUDAGraph `M=1` 从 Cutlass `14.37 µs` 降至 `4.13..6.18 µs`）。
+3. **预解析零校验快速绑定（Zero-Validation Fast Binding）**：
+   * 初始化阶段预先解析 `require_prepared(plan, "gemm.block_fp8_linear")`、`require_prepared(eplan, "moe.decode")`、`1024 B` 对齐 workspace 切片及 `rows == cap` 精确 `MXFP8Rows` 视图，前向直调 `BlockFP8LinearBinding` + `state.run_binding()`，消除每步 250 次 Python `bind()` 重复校验开销（节省 `~3.6..4.5 ms/step` Eager CPU 发射延迟）。
+4. **`156-SM` 按形状实测 Eager Cutlass 混合切换阈值**：
+   * 在保留 `PreparationSession` 与 `autotune=True` 后，`fused_wqa_wkv`（`1792 × 5120`，40 层）在 `M <= 2048` 均由 `b12x` 胜出（`M=1024/2048` 为 `129..131 µs` vs Cutlass `165 µs`），仅在 `M >= 3072` 由 Cutlass 胜出（`219 vs 299 µs`）；`engram.wkv`（`3200 × 6144`，2 层）在 `M > 512` 由 Cutlass 胜出（`170 vs 189 µs`）。改为按形状精确切换 `_CUTLASS_LARGE_M_THRESHOLDS = {(1792, 5120): 2048, (3200, 6144): 512}`。
+
+### 7.2 硬件实证排除项（为什么不启用以下候选方案）
+
+| 候选方向 | `RTX 6000D` 实测数据与根因结论 | 决策 |
+| :--- | :--- | :--- |
+| **`B12X_W4A8_TINY_DECODE=1`**（`MoETinyDecodeKernelBackend`） | 虽在 `M=1` CUDAGraph 快至 `18.3 µs`（对比 `dynamic` `36.9 µs`），但干净缓存数值审计证实 `tiny_decode.py` **未实现 `DeepSeek-V4.1-Flash` 必需的 `swiglu_limit=10.0` 截断**且激活采用非量化 FP16 点积，`M=1..4` 输出严重失真（`cos_sim = 0.877`，`max_diff = 1792`） | **严禁开启**（固定 `=0`） |
+| **`b12x.gemm.wo_projection`**（融合 `inv_rope + wo_a + wo_b`） | 在 `M=1..128` CUDAGraph 解码桶上，现有 `torch.bmm(BF16 wo_a) + b12x(wo_b)` 为 **`12.33..20.52 µs`**，快于 `b12x.wo_projection` 的 `16.42..24.61 µs`（强行切换反退化 `-164 µs/step`） | **保持现有路由** |
+| **`ParallelLMHead` 替换 `b12x.bf16_vocab_projection`** | `TP=8` 词表投影 `16160 × 5120` BF16：`cuBLAS` `136.00 µs` vs `b12x` `136.01 µs`，已达 GDDR7 显存带宽上限的 `93.5%` | **保持 `cuBLAS`** |
+| **`b12x.norm.mhc` 替换 `vLLM` TileLang `mhc_shifted_post_pre`** | `vLLM` TileLang `M=1` 仅 `10.26 µs/call`（全模型 80 次 `0.82 ms`），而 `b12x.norm.mhc` 在 `M=1` 触发 `preparation used undeclared programs` | **保持 TileLang** |
+| **`NCCL_P2P_LEVEL=SYS` 跨桥 P2P** | `lspci -vvv` 证实主机全部 Mellanox ConnectX-8 PCIe Switch Bridge 硬件启用 `ACSCtl: SrcValid+ ReqRedir+ CmpltRedir+ UpstreamFwd+`，驱动层 `can_device_access_peer == 0`，强开 `SYS` 必死锁 | **保持 `shm_v5` + `NCCL_LOC`** |
+| **在线服务显存水位边界（`num_kv_pages=2560`）** | 在 `engram cpu_offload=false` + 8 档 40 层整图 CUDAGraph 常驻下，`kv_pages=2560`（`327,680` tokens）实测单卡显存水位为 **`84,959 MiB / 86,016 MiB`（`98.8%`）** | **作为在线服务默认上限** |
+
+### 7.3 Phase 3.7 vs Phase 3.6 vs `vLLM` 纯引擎同口径 Warm `n=3` 主结果
+
+原始数据：
+* 正确性门禁：[`phase37_b12x_greedy_parity_report.json`](benchmarks/phase37_b12x_greedy_parity_report.json)（`prime_squares_table` `128 / 128` 100% 精确一致，`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=5`，`unprepared_warnings=0`）
+* 套件一（`512 -> 128`）：[`phase37_zstep_b12x_dsv41_tp8_in512_out128.json`](benchmarks/phase37_zstep_b12x_dsv41_tp8_in512_out128.json)
+* 套件二（`six_tier`）：[`phase37_zstep_b12x_dsv41_tp8_6tier.json`](benchmarks/phase37_zstep_b12x_dsv41_tp8_6tier.json)
+
+#### 套件一：`512 -> 128`（`c=1, 8, 16, 32`）
+
+| 档位 | `vLLM` 纯引擎 (`tok/s`) | `zstep` 3.6 (`tok/s`) | **`zstep` 3.7 (`tok/s`)** | 3.7 vs 3.6 / vs `vLLM` 纯引擎 | Mean TPOT `vPure` / `z3.6` / **`z3.7`** (`ms`) | Med TTFT `vPure` / `z3.6` / **`z3.7`** (`ms`) | P99 ITL `z3.6` / **`z3.7`** (`ms`) |
+| :--- | ---: | ---: | ---: | :--- | :---: | :---: | :---: |
+| `c1` | `83.59 ± 0.01` | `95.85 ± 0.65` | **`95.42 ± 0.25`** | `-0.45%` / **`+14.15%`** | `10.94` / `9.05` / **`9.22`** | `141.37` / `185.21` / **`169.96`** (`-15.25 ms`) | `9.28` / **`9.47`** |
+| `c8` | `348.18 ± 8.30` | `441.70 ± 1.60` | **`444.99 ± 1.04`** | **`+0.74%`** / **`+27.80%`** | `19.02` / `14.23` / **`14.13`** | `590.28` / `510.32` / **`506.60`** | `14.79` / **`14.59`** |
+| `c16` | `492.61 ± 2.27` | `612.24 ± 2.13` | **`631.52 ± 3.87`** | **`+3.15%`** / **`+28.20%`** | `25.63` / `22.47` / **`21.71`** | `1,084.36` / `386.49` / **`381.72`** | `327.96` / **`323.84`** |
+| `c32` | `617.07 ± 1.10` | `800.74 ± 1.01` | **`819.52 ± 3.64`** | **`+2.35%`** / **`+32.81%`** | `41.13` / `35.12` / **`34.26`** | `1,430.66` / `387.05` / **`382.13`** | `386.75` / **`381.88`** |
+
+#### 套件二：`six_tier`（`in512` / `in1024` × `output=256`）
+
+| 档位 | `vLLM` 纯引擎 (`tok/s`) | `zstep` 3.6 (`tok/s`) | **`zstep` 3.7 (`tok/s`)** | 3.7 vs 3.6 / vs `vLLM` 纯引擎 | Mean TPOT `vPure` / `z3.6` / **`z3.7`** (`ms`) | Med TTFT `vPure` / `z3.6` / **`z3.7`** (`ms`) | P99 ITL `z3.6` / **`z3.7`** (`ms`) |
+| :--- | ---: | ---: | ---: | :--- | :---: | :---: | :---: |
+| `in512_c1` | `87.06 ± 0.01` | `103.99 ± 1.10` | **`104.26 ± 1.93`** | `+0.26%` / **`+19.76%`** | `10.97` / `8.93` / **`8.96`** | `141.86` / `184.93` / **`171.96`** (`-12.97 ms`) | `9.27` / **`9.27`** |
+| `in512_c16` | `555.89 ± 1.34` | `727.06 ± 1.62` | **`751.59 ± 1.28`** | **`+3.37%`** / **`+35.20%`** | `25.32` / `20.01` / **`19.31`** | `1,086.45` / `386.86` / **`381.75`** | `19.09` / **`18.35`** |
+| `in512_c128` | `1,126.34 ± 1.87` | `1,686.53 ± 7.96` | **`1,730.74 ± 12.02`** | **`+2.62%`** / **`+53.66%`** | `99.30` / `65.72` / **`63.92`** | `3,066.32` / `779.52` / **`768.49`** | `389.59` / **`384.14`** |
+| `in1024_c1` | `84.57 ± 0.00` | `102.27 ± 0.18` | **`101.47 ± 1.35`** | `-0.78%` / **`+19.98%`** | `11.17` / `9.07` / **`9.21`** | `177.89` / `191.20` / **`174.92`** (`-16.28 ms`) | `9.47` / **`9.53`** |
+| `in1024_c32` | `605.12 ± 1.35` | `778.39 ± 4.56` | **`796.69 ± 1.53`** | **`+2.35%`** / **`+31.66%`** | `42.27` / `36.51` / **`35.63`** | `2,127.63` / `391.62` / **`386.78`** | `391.34` / **`386.62`** |
+| `in1024_c128` | `866.25 ± 1.06` | `1,169.71 ± 1.06` | **`1,191.07 ± 3.50`** | **`+1.83%`** / **`+37.50%`** | `122.27` / `92.32` / **`90.62`** | `3,107.53` / `787.39` / **`776.78`** | `394.26` / **`389.00`** |
+
+**关键收获**：
+* **单流首字延迟反超**：`c=1` `Median TTFT` 全线缩短 **`12.97..16.28 ms`**，其中 `in1024_c1` 从 `191.20 ms` 降至 **`174.92 ms`**，一举反超 `vLLM` 纯引擎的 `177.89 ms`（剩余 `c=1` `in=512` 与 Phase 3.5 的差距来自 `b12x` W4A8 MoE 在 `M >= 512` 采用静态专家主序 Prefill 核固定耗时 `~1.97 ms/层 × 40 ≈ 79 ms`，换取了每卡省下 `~10 GiB` 显存与并发解码大幅提速）；
+* **中高并发吞吐与尾延迟全面再创新高**：`c=16..128` 输出吞吐较 Phase 3.6 再提升 **`+1.83%..+3.37%`**，峰值输出吞吐突破 **`1,730.74 tok/s`**（`in512_c128`，相对 `vLLM` 纯引擎 **`1.54×` / `+53.66%`**），峰值总吞吐达 **`5,955.36 tok/s`**（`in1024_c128`），且所有并发档位的 `Mean TPOT`、`Median TTFT` 与 `P99 ITL` 同步下降。
