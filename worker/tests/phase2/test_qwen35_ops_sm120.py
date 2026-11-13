@@ -225,10 +225,10 @@ def test_paged_gqa_large_page_int64_offset() -> None:
     _run_paged_gqa_parity_check(num_pages=530_000)
 
 
-def test_sparse_moe_tp8_matches_reference_formula() -> None:
+@pytest.mark.parametrize("rows", [1, 2, 11])
+def test_sparse_moe_tp8_matches_reference_formula(rows: int) -> None:
     device = torch.device("cuda", 0)
     torch.manual_seed(99)
-    rows = 11
     x = torch.randn((rows, 2048), device=device, dtype=torch.bfloat16) * 0.1
     router_w = torch.randn((256, 2048), device=device, dtype=torch.bfloat16) * 0.1
     sh_gate_w = torch.randn((1, 2048), device=device, dtype=torch.bfloat16) * 0.1
@@ -286,6 +286,35 @@ def test_sparse_moe_tp8_matches_reference_formula() -> None:
         ref[r] = (acc + sh_scale * sh_o.float()).to(torch.bfloat16)
 
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+def test_skinny_linear_matches_reference_without_runtime_recompile() -> None:
+    device = torch.device("cuda", 0)
+    torch.manual_seed(7)
+    weights = [
+        torch.randn((n_out, 2048), device=device, dtype=torch.bfloat16) * 0.05
+        for n_out in (1544, 1536, 392)
+    ]
+
+    def check(rows: int) -> None:
+        x = torch.randn((rows, 2048), device=device, dtype=torch.bfloat16)
+        for w in weights:
+            out = torch.empty((rows, w.shape[0]), device=device, dtype=torch.bfloat16)
+            qwen35_ops.skinny_linear(x, w, out=out)
+            ref = (x.float() @ w.float().t()).to(torch.bfloat16)
+            torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+    # Same row counts the Qwen3.5 runner warms up before runtime enforcement starts.
+    for rows in (1, 5, 16):
+        check(rows)
+    with patch.object(
+        qwen35_ops._skinny_linear_kernel,
+        "_do_compile",
+        wraps=qwen35_ops._skinny_linear_kernel._do_compile,
+    ) as spy:
+        for rows in (2, 3, 4, 8, 13, 15, 16, 17, 64):
+            check(rows)
+        assert spy.call_count == 0
 
 
 def test_local_top2_bf16_and_shm_gather_top2_exact_with_ties() -> None:

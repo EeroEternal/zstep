@@ -1682,6 +1682,163 @@ def _moe_combine_top8_and_shared_kernel(
     tl.store(out_ptr + row * 2048 + cols, total.to(tl.bfloat16))
 
 
+@triton.jit
+def _moe_gate_up_silu_gemv_kernel(
+    x_ptr,
+    w_gate_up_ptr,
+    topk_ids_ptr,
+    moe_inter_ptr,
+    stride_x_row,
+    stride_we,
+    stride_wn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pair = tl.program_id(0).to(tl.int64)
+    n_blk = tl.program_id(1).to(tl.int64)
+    tok = pair // 8
+    expert_id = tl.load(topk_ids_ptr + pair).to(tl.int64)
+    offs_n = n_blk * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Inactive rows carry the sentinel expert id 256 from the router kernel.
+    if expert_id >= 256:
+        tl.store(moe_inter_ptr + pair * 64 + offs_n, tl.zeros([BLOCK_N], dtype=tl.bfloat16))
+        return
+
+    w_expert_base = w_gate_up_ptr + expert_id * stride_we
+    acc_gate = tl.zeros([BLOCK_N, BLOCK_K], dtype=tl.float32)
+    acc_up = tl.zeros([BLOCK_N, BLOCK_K], dtype=tl.float32)
+    for k_off in range(0, 2048, BLOCK_K):
+        offs_k = k_off + tl.arange(0, BLOCK_K)
+        x = tl.load(x_ptr + tok * stride_x_row + offs_k).to(tl.float32)
+        wg = tl.load(w_expert_base + offs_n[:, None] * stride_wn + offs_k[None, :]).to(tl.float32)
+        wu = tl.load(w_expert_base + (64 + offs_n[:, None]) * stride_wn + offs_k[None, :]).to(
+            tl.float32
+        )
+        acc_gate += wg * x[None, :]
+        acc_up += wu * x[None, :]
+    gate = tl.sum(acc_gate, 1)
+    up = tl.sum(acc_up, 1)
+    act = (gate * tl.sigmoid(gate)) * up
+    tl.store(moe_inter_ptr + pair * 64 + offs_n, act.to(tl.bfloat16))
+
+
+@triton.jit
+def _moe_down_combine_gemv_kernel(
+    moe_inter_ptr,
+    w_down_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    shared_out_ptr,
+    shared_gate_scale_ptr,
+    out_ptr,
+    stride_we,
+    stride_wn,
+    num_active_rows,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    n_blk = tl.program_id(1).to(tl.int64)
+    offs_n = n_blk * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    if row >= num_active_rows:
+        tl.store(out_ptr + row * 2048 + offs_n, tl.zeros([BLOCK_N], dtype=tl.bfloat16))
+        return
+
+    offs_k = tl.arange(0, 64)
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for k in tl.static_range(0, 8):
+        pair = row * 8 + k
+        expert_id = tl.load(topk_ids_ptr + pair).to(tl.int64)
+        valid = expert_id < 256
+        safe_expert = tl.where(valid, expert_id, 0)
+        weight = tl.where(valid, tl.load(topk_weights_ptr + pair).to(tl.float32), 0.0)
+        inter = tl.load(moe_inter_ptr + pair * 64 + offs_k).to(tl.float32)
+        wd = tl.load(
+            w_down_ptr + safe_expert * stride_we + offs_n[:, None] * stride_wn + offs_k[None, :]
+        ).to(tl.float32)
+        acc += weight * tl.sum(wd * inter[None, :], 1)
+
+    sh_scale = tl.load(shared_gate_scale_ptr + row).to(tl.float32)
+    sh_val = tl.load(shared_out_ptr + row * 2048 + offs_n).to(tl.float32)
+    tl.store(out_ptr + row * 2048 + offs_n, (acc + sh_scale * sh_val).to(tl.bfloat16))
+
+
+@triton.jit
+def _skinny_linear_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    num_rows,
+    n_out,
+    stride_x_row,
+    stride_w_row,
+    stride_out_row,
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    n_blk = tl.program_id(0).to(tl.int64)
+    offs_m = tl.arange(0, 16)
+    offs_n = n_blk * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < num_rows
+    mask_n = offs_n < n_out
+    acc = tl.zeros([16, BLOCK_N], dtype=tl.float32)
+    for k_off in range(0, K, BLOCK_K):
+        offs_k = k_off + tl.arange(0, BLOCK_K)
+        x_tile = tl.load(
+            x_ptr + offs_m[:, None] * stride_x_row + offs_k[None, :],
+            mask=mask_m[:, None],
+            other=0.0,
+        )
+        w_tile = tl.load(
+            w_ptr + offs_n[:, None] * stride_w_row + offs_k[None, :],
+            mask=mask_n[:, None],
+            other=0.0,
+        )
+        acc += tl.dot(x_tile, tl.trans(w_tile))
+    tl.store(
+        out_ptr + offs_m[:, None] * stride_out_row + offs_n[None, :],
+        acc.to(tl.bfloat16),
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+SKINNY_LINEAR_MAX_ROWS = 16
+MOE_GEMV_MAX_ROWS = 2
+
+
+def skinny_linear(x: torch.Tensor, w: torch.Tensor, *, out: torch.Tensor) -> torch.Tensor:
+    """`out = x @ w.T` for decode-sized row counts (CUDA-Graph-safe).
+
+    On sm_120 cuBLAS routes 2 <= M <= 16 BF16 GEMMs with K=2048 to sm80 wmma 16x16 tiles
+    that run ~2x slower than its own M=1 GEMV; a single 16-row tile keeps these
+    projections memory-bound for those buckets. M=1 stays on the cuBLAS GEMV: it is only
+    slightly slower and keeps single-sequence greedy decoding within the 2-ULP vLLM
+    parity gate of `test_qwen35_e2e_tp8.py`.
+    """
+    rows = x.shape[0]
+    n_out, k = w.shape
+    if rows == 1 or rows > SKINNY_LINEAR_MAX_ROWS or k % 256 != 0:
+        return torch.matmul(x, w.t(), out=out)
+    _skinny_linear_kernel[(triton.cdiv(n_out, 16),)](
+        x,
+        w,
+        out,
+        rows,
+        n_out,
+        x.stride(0),
+        w.stride(0),
+        out.stride(0),
+        K=k,
+        BLOCK_N=16,
+        BLOCK_K=256,
+        num_warps=4,
+        num_stages=3,
+    )
+    return out
+
+
 def max_moe_tiles_for_rows(rows: int) -> int:
     """Deterministic upper bound on non-empty 16-token expert tiles for `rows * 8` pairs."""
     pairs = rows * 8
@@ -1711,7 +1868,11 @@ def sparse_moe_tp8_forward(
 ) -> torch.Tensor:
     """Execute Qwen3_5MoeSparseMoeBlock local TP=8 shard (CUDA-Graph-safe, zero CPU sync)."""
     rows = normed_x.shape[0]
-    torch.matmul(normed_x, w_router_shared_gu.t(), out=router_shared_buf[:rows])
+    # cuBLAS is already near-optimal for this N=392 projection except at M=2.
+    if rows == 2:
+        skinny_linear(normed_x, w_router_shared_gu, out=router_shared_buf[:rows])
+    else:
+        torch.matmul(normed_x, w_router_shared_gu.t(), out=router_shared_buf[:rows])
     _router_softmax256_topk8_and_shared_act_kernel[(rows,)](
         router_shared_buf,
         topk_ids_buf,
@@ -1723,6 +1884,38 @@ def sparse_moe_tp8_forward(
         num_warps=4,
     )
     torch.matmul(shared_inter_buf[:rows], w_shared_down.t(), out=shared_out_buf[:rows])
+
+    if rows <= MOE_GEMV_MAX_ROWS:
+        # With <= 16 routed pairs every 16-row expert tile holds one valid row, so the tiled
+        # path wastes most of each tile and launches too few CTAs; per-pair GEMVs skip the
+        # align pass and fuse down-projection with the top-8 + shared-expert combine.
+        _moe_gate_up_silu_gemv_kernel[(rows * 8, 64 // 4)](
+            normed_x,
+            w_experts_gate_up,
+            topk_ids_buf,
+            moe_inter_buf,
+            normed_x.stride(0),
+            w_experts_gate_up.stride(0),
+            w_experts_gate_up.stride(1),
+            BLOCK_N=4,
+            BLOCK_K=512,
+            num_warps=4,
+        )
+        _moe_down_combine_gemv_kernel[(rows, 2048 // 32)](
+            moe_inter_buf,
+            w_experts_down,
+            topk_ids_buf,
+            topk_weights_buf,
+            shared_out_buf,
+            shared_gate_scale_buf,
+            moe_out_buf,
+            w_experts_down.stride(0),
+            w_experts_down.stride(1),
+            num_active_rows,
+            BLOCK_N=32,
+            num_warps=2,
+        )
+        return moe_out_buf[:rows]
 
     max_tiles = max_moe_tiles_for_rows(rows)
     ext = get_qwen35_cuda_ext()

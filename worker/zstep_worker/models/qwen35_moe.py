@@ -51,6 +51,7 @@ from zstep_worker.kernels_sm120.qwen35_ops import (
     paged_gqa_decode_gated,
     paged_gqa_prefill_varlen_gated,
     qwen35_attn_prologue,
+    skinny_linear,
     sparse_moe_tp8_forward,
     zero_centered_rmsnorm,
 )
@@ -778,7 +779,7 @@ class Qwen35MoeStepRunner:
         for idx, lw in enumerate(self.layers):
             if isinstance(lw, LinearAttnLayerWeights):
                 qkvzba = self.qkvzba_buf[:bucket]
-                torch.matmul(normed, lw.w_qkvzba.t(), out=qkvzba)
+                skinny_linear(normed, lw.w_qkvzba, out=qkvzba)
                 gated = linear_attn_decode_step(
                     qkvzba,
                     self.conv_states[lw.state_layer_idx],
@@ -801,7 +802,7 @@ class Qwen35MoeStepRunner:
                 q_out = self.q_attn_buf[:bucket]
                 gate_out = self.gate_attn_buf[:bucket]
                 attn_out = self.attn_out_buf[:bucket]
-                torch.matmul(normed, lw.w_qkv.t(), out=qkv)
+                skinny_linear(normed, lw.w_qkv, out=qkv)
                 qwen35_attn_prologue(
                     qkv,
                     self.positions_gpu[:bucket],
@@ -910,7 +911,7 @@ class Qwen35MoeStepRunner:
         for idx, lw in enumerate(self.layers):
             if isinstance(lw, LinearAttnLayerWeights):
                 qkvzba = self.qkvzba_buf[:total_tokens]
-                torch.matmul(normed, lw.w_qkvzba.t(), out=qkvzba)
+                skinny_linear(normed, lw.w_qkvzba, out=qkvzba)
                 gated = linear_attn_prefill_varlen(
                     qkvzba,
                     self.conv_states[lw.state_layer_idx],
@@ -934,7 +935,7 @@ class Qwen35MoeStepRunner:
                 q_out = self.q_attn_buf[:total_tokens]
                 gate_out = self.gate_attn_buf[:total_tokens]
                 attn_out = self.attn_out_buf[:total_tokens]
-                torch.matmul(normed, lw.w_qkv.t(), out=qkv)
+                skinny_linear(normed, lw.w_qkv, out=qkv)
                 qwen35_attn_prologue(
                     qkv,
                     self.positions_gpu[:total_tokens],
