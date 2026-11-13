@@ -1,0 +1,95 @@
+[
+  {
+    "name": "dsv41_tp8_default",
+    "geometry": {
+      "world_size": 8,
+      "max_seqs": 128,
+      "max_step_tokens": 4096,
+      "max_decoder_rows": 4096,
+      "max_pages_per_seq": 256,
+      "page_block_tokens": 128,
+      "spec_verify_width": 1
+    },
+    "expected": {
+      "header_offset": 0,
+      "token_ids_offset": 256,
+      "positions_offset": 16640,
+      "req_slot_ids_offset": 33024,
+      "replay_mask_offset": 49408,
+      "engram_prev_window_offset": 53504,
+      "narrow_keep_indices_offset": 102656,
+      "sample_row_indices_offset": 119040,
+      "seq_lens_offset": 135424,
+      "query_start_loc_offset": 135936,
+      "global_kv_page_table_offset": 136704,
+      "swa_page_table_offset": 267776,
+      "compressor_slot_ids_offset": 269824,
+      "temperatures_offset": 270336,
+      "total_slot_bytes": 274432,
+      "result_slot_stride": 16384,
+      "layout_hash_hex": "0x74f0b51b03708051"
+    }
+  },
+  {
+    "name": "qwen35_tp8_vram32g",
+    "geometry": {
+      "world_size": 8,
+      "max_seqs": 128,
+      "max_step_tokens": 8192,
+      "max_decoder_rows": 8192,
+      "max_pages_per_seq": 4096,
+      "page_block_tokens": 64,
+      "spec_verify_width": 4
+    },
+    "expected": {
+      "header_offset": 0,
+      "token_ids_offset": 256,
+      "positions_offset": 33024,
+      "req_slot_ids_offset": 65792,
+      "replay_mask_offset": 98560,
+      "engram_prev_window_offset": 106752,
+      "narrow_keep_indices_offset": 205056,
+      "sample_row_indices_offset": 237824,
+      "seq_lens_offset": 270592,
+      "query_start_loc_offset": 271104,
+      "global_kv_page_table_offset": 271872,
+      "swa_page_table_offset": 2369024,
+      "compressor_slot_ids_offset": 2371072,
+      "temperatures_offset": 2371584,
+      "total_slot_bytes": 2375680,
+      "result_slot_stride": 16384,
+      "layout_hash_hex": "0x85ff75088e325cd2"
+    }
+  },
+  {
+    "name": "odd_prime_bounds",
+    "geometry": {
+      "world_size": 1,
+      "max_seqs": 3,
+      "max_step_tokens": 19,
+      "max_decoder_rows": 7,
+      "max_pages_per_seq": 11,
+      "page_block_tokens": 64,
+      "spec_verify_width": 1
+    },
+    "expected": {
+      "header_offset": 0,
+      "token_ids_offset": 256,
+      "positions_offset": 512,
+      "req_slot_ids_offset": 768,
+      "replay_mask_offset": 1024,
+      "engram_prev_window_offset": 1280,
+      "narrow_keep_indices_offset": 1536,
+      "sample_row_indices_offset": 1792,
+      "seq_lens_offset": 2048,
+      "query_start_loc_offset": 2304,
+      "global_kv_page_table_offset": 2560,
+      "swa_page_table_offset": 2816,
+      "compressor_slot_ids_offset": 3072,
+      "temperatures_offset": 3328,
+      "total_slot_bytes": 4096,
+      "result_slot_stride": 4096,
+      "layout_hash_hex": "0xc582f8c701108dc7"
+    }
+  }
+]

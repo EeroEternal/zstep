@@ -1,6 +1,6 @@
 [package]
 name = "zs-server"
-description = "zstep master control daemon: HTTP server, tokenizer, Engram preprocessor, and SHM event loop"
+description = "zstep Mode B master CLI: continuous-batching scheduler, Top-2 greedy verifier, and benchmark driver"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

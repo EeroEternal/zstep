@@ -554,9 +554,12 @@ __global__ void shm_v5_allreduce_kernel(
 
     if (step > 4ULL) {
         const uint64_t min_done = step - 4ULL;
-        if (threadIdx.x < world_size) {
+        const int total_flags = static_cast<int>(gridDim.x) * world_size;
+        for (int f = threadIdx.x; f < total_flags; f += blockDim.x) {
+            const int blk = f / world_size;
+            const int peer = f - blk * world_size;
             const uint64_t* my_done = reinterpret_cast<const uint64_t*>(
-                my_shm + 65536 + (b * 8 + threadIdx.x) * 64);
+                my_shm + 65536 + (blk * 8 + peer) * 64);
             while (sys_load_acquire_u64(my_done) < min_done) {
                 __nanosleep(24);
             }
@@ -714,9 +717,12 @@ __global__ void shm_v5_allgather_kernel(
 
     if (step > 4ULL) {
         const uint64_t min_done = step - 4ULL;
-        if (threadIdx.x < world_size) {
+        const int total_flags = static_cast<int>(gridDim.x) * world_size;
+        for (int f = threadIdx.x; f < total_flags; f += blockDim.x) {
+            const int blk = f / world_size;
+            const int peer = f - blk * world_size;
             const uint64_t* my_done = reinterpret_cast<const uint64_t*>(
-                my_shm + 65536 + (b * 8 + threadIdx.x) * 64);
+                my_shm + 65536 + (blk * 8 + peer) * 64);
             while (sys_load_acquire_u64(my_done) < min_done) {
                 __nanosleep(24);
             }
@@ -1185,6 +1191,13 @@ class _PerRankShmRingBase:
             dev_ptrs.append(dev_ptr)
 
         dist.barrier(group=exchange_group)
+        # All peers have opened and mmapped every `/dev/shm/<name>_r<peer>`; unlink our
+        # directory entry immediately so kernel tmpfs reclaims pages even on SIGKILL.
+        try:
+            os.unlink(self._own_shm_path)
+        except FileNotFoundError:
+            pass
+        dist.barrier(group=exchange_group)
         self._rank_shm_ptrs: torch.Tensor = torch.tensor(
             dev_ptrs, dtype=torch.int64, device=device
         )
@@ -1324,11 +1337,8 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
             return output
         stream_handle = torch.cuda.current_stream(self.device).cuda_stream
         if self._use_shm_v5:
-            # Dynamic grid tuning: 4 blocks for M <= 4 (<= 40 KiB), up to `self.blocks` for larger M.
-            num_vecs = input.numel() // 8
-            active_blocks = (
-                min(self.blocks, 4) if num_vecs <= self.one_shot_max_vecs else self.blocks
-            )
+            # Keep `gridDim.x == self.blocks` invariant across every payload size so all
+            # per-block ring step counters `control[0..blocks)` stay strictly in lockstep.
             self._extension.launch_shm_v5_allreduce(
                 input,
                 output,
@@ -1337,7 +1347,7 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
                 self.slot_stride_bytes,
                 self.rank,
                 self.world_size,
-                active_blocks,
+                self.blocks,
                 self.threads,
                 self.one_shot_max_vecs,
                 stream_handle,
@@ -1469,7 +1479,6 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
         if inner_elems % 8 != 0:
             raise ValueError(f"inner_elems={inner_elems} must be divisible by 8")
         vecs_per_row = inner_elems // 8
-        active_blocks = min(self.blocks, 4) if outer_rows <= 8 else self.blocks
         stream_handle = torch.cuda.current_stream(self.device).cuda_stream
         self._extension.launch_shm_v5_allgather(
             input,
@@ -1481,7 +1490,7 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
             vecs_per_row,
             self.rank,
             self.world_size,
-            active_blocks,
+            self.blocks,
             self.threads,
             stream_handle,
         )
@@ -1561,7 +1570,12 @@ class HostMappedShmArgmax:
             finally:
                 os.close(fd)
         dist.barrier(group=exchange_group)
-
+        if rank == 0 and self._owns_unlink:
+            try:
+                os.unlink(self._shm_path)
+            except FileNotFoundError:
+                pass
+            self._owns_unlink = False
         self._host_addr: int = ctypes.addressof(ctypes.c_char.from_buffer(self._mapping))
         self._dev_addr: int = self._extension.register_mapped_host(
             self._host_addr, self.total_bytes

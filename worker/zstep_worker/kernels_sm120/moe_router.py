@@ -93,7 +93,12 @@ def dsv41_sqrt_softplus_topk(
     correction_bias: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run fused `sqrt_softplus` Top-K routing for `router_logits` `[M, E]`."""
-    assert router_logits.ndim == 2 and router_logits.is_cuda
+    if router_logits.ndim != 2 or not router_logits.is_cuda:
+        raise ValueError(
+            f"router_logits must be a 2D CUDA tensor, got shape={tuple(router_logits.shape)} device={router_logits.device}"
+        )
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}")
     num_tokens, num_experts = router_logits.shape
     block_e = triton.next_power_of_2(num_experts)
     block_k = triton.next_power_of_2(top_k)

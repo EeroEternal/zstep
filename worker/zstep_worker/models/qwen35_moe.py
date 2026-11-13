@@ -58,9 +58,15 @@ from zstep_worker.kernels_sm120.shm_allreduce import (
     HostMappedShmAllReduce,
     get_host_mapped_allreduce_extension,
 )
-from zstep_worker.shm_bridge import SeqResult, ShmBridge, StepHeader, StepPlanView
-
-DECODE_GRAPH_BUCKETS: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+from zstep_worker.shm_bridge import (
+    DECODE_GRAPH_BUCKETS,
+    STEP_FLAG_DECODE_ONLY,
+    SeqResult,
+    ShmBridge,
+    StepHeader,
+    StepPlanView,
+    select_decode_bucket,
+)
 
 
 @dataclass(frozen=True)
@@ -226,6 +232,12 @@ class _Tp8ArgmaxShmChannel:
             finally:
                 os.close(fd)
         dist.barrier(group=exchange_group)
+        if rank == 0 and self._owns_unlink:
+            try:
+                os.unlink(self._shm_path)
+            except FileNotFoundError:
+                pass
+            self._owns_unlink = False
 
         self._host_addr: int = ctypes.addressof(ctypes.c_char.from_buffer(self._mapping))
         self._dev_addr: int = self._ar_ext.register_mapped_host(
@@ -327,13 +339,6 @@ def _build_rope_caches(
     freqs = torch.outer(positions, inv_freq)
     # Match Qwen3_5MoeTextRotaryEmbedding: cast cos/sin to BF16 before rotation.
     return freqs.cos().to(torch.bfloat16).contiguous(), freqs.sin().to(torch.bfloat16).contiguous()
-
-
-def _select_decode_bucket(num_seqs: int, max_bucket: int) -> int:
-    for b in DECODE_GRAPH_BUCKETS:
-        if b >= num_seqs and b <= max_bucket:
-            return b
-    return max_bucket
 
 
 class Qwen35MoeStepRunner:
@@ -1091,11 +1096,11 @@ class Qwen35MoeStepRunner:
             self.page_table_cpu[:max_slot_end], non_blocking=True
         )
 
-        is_decode = header.flags == 1
+        is_decode = (header.flags & STEP_FLAG_DECODE_ONLY) != 0
 
         self.start_event.record()
         if is_decode:
-            bucket = _select_decode_bucket(num_seqs, self.max_graph_bucket)
+            bucket = select_decode_bucket(num_seqs, self.max_graph_bucket)
             np.copyto(self.token_ids_cpu[:num_seqs].numpy(), tok_np)
             np.copyto(self.positions_cpu[:num_seqs].numpy(), pos_np)
             np.copyto(self.req_slot_ids_cpu[:num_seqs].numpy(), slot_np)
@@ -1184,8 +1189,9 @@ class Qwen35MoeStepRunner:
                 )
         return outputs, gpu_exec_us
 
-    def close(self) -> None:
+    def close(self, *, abort: bool = False) -> None:
+        self.decode_graphs.clear()
         self.argmax_channel.close()
         self.communicator.close()
-        if dist.is_initialized():
+        if not abort and dist.is_initialized():
             dist.destroy_process_group()

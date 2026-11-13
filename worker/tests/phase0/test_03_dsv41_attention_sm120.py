@@ -188,19 +188,20 @@ def _run_attention_case(
             device=device,
         )
         binding = bind_for(state, scratch)
-        run = lambda: state.run(
-            binding,
-            swa_k_cache=swa_cache,
-            indexed_k_cache=indexed_cache,
-            swa_page_size=PAGE_SIZE,
-            indexed_page_size=PAGE_SIZE,
-            sm_scale=SM_SCALE,
-            attn_sink=None,
-            out=output,
-            return_lse=False,
-            lse_scale="base2",
-            cache_format="deepseek_v41",
-        )
+        def run() -> None:
+            state.run(
+                binding,
+                swa_k_cache=swa_cache,
+                indexed_k_cache=indexed_cache,
+                swa_page_size=PAGE_SIZE,
+                indexed_page_size=PAGE_SIZE,
+                sm_scale=SM_SCALE,
+                attn_sink=None,
+                out=output,
+                return_lse=False,
+                lse_scale="base2",
+                cache_format="deepseek_v41",
+            )
         return PreparedCall(run=run, output=output, owners=(scratch, binding))
 
     request = declaration.request(

@@ -137,6 +137,21 @@ pub struct SeqStepOutput {
 1. **发布-订阅内存序（Acquire / Release Ordering）**：
    * Rust 主控写完所有扁平数组后，最后一步使用 `AtomicU64::store(step_id, Ordering::Release)` 写入 `StepHeader.step_id`，随后 `write(plan_efd)`。
    * Python/C Worker 从 `plan_efd` 醒来后，通过 C 扩展或原子读取执行 `Acquire` 栅栏读取 `step_id`，确保所有数组字节对当前 CPU 核及随后的 DMA 引擎完全可见。
-2. **零孤儿进程（`PR_SET_PDEATHSIG`）与看门狗**：
-   * 8 个 Worker 子进程在启动第一行调用 `prctl(PR_SET_PDEATHSIG, SIGTERM)`：一旦 Rust 主控异常退出，内核立即自动回收全部 8 个 GPU 进程，绝不残留僵尸显存占用。
-   * 反之，若任一 Worker 发生 CUDA 异常或超时未响应，主控 `epoll` 监听到 Worker 管道 `EPOLLHUP` 或 `WorkerSlotState[rank].error_code != 0`，立即安全排空所有在途 HTTP 流（返回明确 500 错误），销毁重建 Worker 组，保证网关层永不死锁。
+2. **零孤儿进程（`PR_SET_PDEATHSIG`）、即时 `shm_unlink` 与广播中止（`SUPERBLOCK_ABORT_OFFSET`）**：
+   * 8 个 Worker 子进程启动时设置 `prctl(PR_SET_PDEATHSIG, SIGTERM)` 并安装 `SIGTERM`/`SIGINT` 信号处理器；Rust 主控在全部 8 个 Worker 完成 `mmap` 挂载握手后**立即执行 `SharedMemoryArena::unlink_now()`**（数据面 `shm_v5` AllReduce/AllGather 与 `HostMappedShmArgmax` 同样在 `dist.barrier` 后立即 `os.unlink`），因此即使遭遇 `SIGKILL` 极端断电/强杀，`/dev/shm` 也保持 **0 文件残留**。
+   * `ShmSuperblock` 显式携带 `result_slot_stride`、`layout_hash`（64-bit FNV-1a 全字段偏移摘要）与 `max_decode_graph_seqs = 128`，Python `ShmBridge` 在挂载时逐项强校验；`SUPERBLOCK_ABORT_OFFSET = 128` 提供无锁全局中止位，Worker 通过 `poll(plan_efd, 250ms)` 感知异常并跳过集体通信屏障快速退出。
+   * `WorkerSlotState` 独立字段 `triton_recompilations`（offset `44`）与 `watched_kernels`（offset `48`）按 Rank 汇报 Triton JIT 编译增量，不再复用 `StepResultHeader` 状态位。
+
+---
+
+## 五、 当前已启用字段 vs 后续演进预留字段对照表
+
+为避免前瞻架构设计与当前 Phase 2 / Phase 3.6 实现能力混淆，特明确各协议区段状态：
+
+| 协议字段 / 机制 | 状态 | 当前实现说明 |
+| :--- | :---: | :--- |
+| `ShmSuperblock` (`layout_hash`, `result_slot_stride`, `max_decode_graph_seqs`, `SUPERBLOCK_ABORT_OFFSET`) | **已启用** | Rust/Python 双端强校验 + Golden JSON 跨语言单测锁定 |
+| `StepPlanSlot`：`token_ids`, `positions`, `req_slot_ids`, `sample_row_indices`, `seq_lens`, `query_start_loc`, `global_kv_page_table`（脏行增量同步）, `engram_prev_window` | **已启用** | Phase 2 (`Qwen3.5-35B-A3B`) 与 Phase 3.6 (`DeepSeek-V4.1-Flash` + `b12x`) 生产路径使用 |
+| `SeqStepOutput`：Top-1 / Top-2 token 与原始 BF16 logit 回传 | **已启用** | `accepted_tokens[0]` + `next_draft_tokens[0]` 承载确定性全局 Top-2 贪心审计 |
+| `StepOpcode::WarmupCaptureGraphs` / `ReloadForward`、`ControlPayloadArena` | **预留** | Warmup 与 CUDA Graph 捕获目前在 Worker 初始化阶段直接完成 |
+| `is_dspark_verify`、`narrow_keep_indices`、`replay_mask`、`swa_page_table`、`compressor_slot_ids`、`temperatures`（随机采样） | **预留** | 面向后续 DSpark 投机验证、CED 层间窄化、SWA 前缀重放与非贪心采样预留定长偏移（SWA/Compressor 页映射当前由 `DeepSeekV41StepRunner` 从 `global_kv_page_table` 与 `req_slot_ids` 无损派生） |

@@ -62,6 +62,7 @@ pub struct SharedMemoryArena {
     mapping: Mapping,
     _object: ShmObject,
     name: String,
+    writable: bool,
 }
 
 // The mapping is owned and all mutable slices require `&mut self`.
@@ -103,6 +104,7 @@ impl SharedMemoryArena {
             mapping,
             _object: object,
             name: plain_name,
+            writable: true,
         })
     }
 
@@ -147,11 +149,39 @@ impl SharedMemoryArena {
             mapping,
             _object: object,
             name: plain_name,
+            writable,
         })
+    }
+
+    /// Unlink the POSIX shared-memory entry from `/dev/shm` immediately while keeping
+    /// the open descriptor and `mmap` region alive until every attached process exits.
+    pub fn unlink_now(&mut self) -> Result<()> {
+        if !self._object.unlink_on_drop {
+            return Ok(());
+        }
+        // SAFETY: `posix_name` is a valid NUL-terminated string owned by `self._object`.
+        let rc = unsafe { libc::shm_unlink(self._object.posix_name.as_ptr()) };
+        self._object.unlink_on_drop = false;
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ENOENT) {
+                return Err(ShmError::new("shm_unlink", err));
+            }
+        }
+        Ok(())
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Raw descriptor of the underlying POSIX shared-memory object (for explicit child FD inheritance).
+    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self._object._fd.as_raw_fd()
+    }
+
+    pub fn is_writable(&self) -> bool {
+        self.writable
     }
 
     pub fn len(&self) -> usize {
@@ -168,10 +198,34 @@ impl SharedMemoryArena {
         unsafe { std::slice::from_raw_parts(self.mapping.ptr.as_ptr().cast::<u8>(), self.len()) }
     }
 
+    pub fn try_bytes_mut(&mut self) -> Result<&mut [u8]> {
+        self.checked_writable()?;
+        // SAFETY: `self.writable` was verified (`PROT_WRITE`) and `&mut self` guarantees exclusive
+        // Rust borrow access to the live mapping.
+        Ok(unsafe {
+            std::slice::from_raw_parts_mut(self.mapping.ptr.as_ptr().cast::<u8>(), self.len())
+        })
+    }
+
     pub fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: `&mut self` guarantees exclusive Rust access to the live mapping.
+        assert!(
+            self.writable,
+            "cannot mutably borrow a read-only SharedMemoryArena"
+        );
+        // SAFETY: `self.writable` was asserted (`PROT_WRITE`) and `&mut self` guarantees exclusive
+        // Rust access to the live mapping.
         unsafe {
             std::slice::from_raw_parts_mut(self.mapping.ptr.as_ptr().cast::<u8>(), self.len())
+        }
+    }
+
+    pub(crate) fn checked_writable(&self) -> Result<()> {
+        if self.writable {
+            Ok(())
+        } else {
+            Err(ShmError::invalid_input(
+                "shared-memory mapping was opened read-only",
+            ))
         }
     }
 

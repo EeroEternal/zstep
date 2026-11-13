@@ -31,12 +31,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use zs_kv::{BlockLease, BlockPool, CacheGroupKind};
-use zs_wire::{StepHeader, StepOpcode};
+use zs_wire::{
+    DECODE_GRAPH_BUCKETS, MAX_DECODE_GRAPH_SEQS, STEP_FLAG_DECODE_ONLY, StepHeader, StepOpcode,
+};
 
 use crate::mode_b::{ModeBConfig, ModeBCoordinator, ModeBError, Result};
 use crate::select_graph_bucket;
-
-const DECODE_BUCKETS: [u32; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
 struct SlotPoolInner {
     free_slots: Vec<u32>,
@@ -520,7 +520,26 @@ impl ServingBenchmarkReport {
 }
 
 fn json_string(value: &str) -> String {
-    format!("\"{}\"", value.escape_default())
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn read_git_head_fallback() -> Result<String> {
@@ -575,6 +594,7 @@ impl ActiveSequence {
         max_pages_per_seq: usize,
         kv_pool: &BlockPool,
         shadow_page_table: &mut [i32],
+        dirty_pt_slots: &mut [u128; 2],
     ) -> Result<()> {
         let needed_pages = target_seq_len.div_ceil(page_block_tokens);
         if needed_pages > max_pages_per_seq {
@@ -590,12 +610,16 @@ impl ActiveSequence {
                     kv_pool.available()
                 ))
             })?;
-            let slot_row_base = self.slot_lease.id() as usize * max_pages_per_seq;
+            let slot_id = self.slot_lease.id() as usize;
+            let slot_row_base = slot_id * max_pages_per_seq;
             for &pid in lease.ids() {
                 let page_col = self.page_ids.len();
                 self.page_ids.push(pid);
                 shadow_page_table[slot_row_base + page_col] = pid;
             }
+            let dirty_bit = 1u128 << slot_id;
+            dirty_pt_slots[0] |= dirty_bit;
+            dirty_pt_slots[1] |= dirty_bit;
             self.kv_leases.push(lease);
         }
         Ok(())
@@ -650,6 +674,7 @@ pub struct ModeBServingEngine {
     slot_pool: SlotPool,
     kv_pool: BlockPool,
     shadow_page_table: Vec<i32>,
+    dirty_pt_slots: [u128; 2],
     step_cursor: u64,
     init_wall_us: u64,
     worker_numa_nodes: Vec<i32>,
@@ -662,9 +687,43 @@ enum MixedStepOutcome {
     PureDecodeFallback,
 }
 
+fn validate_serving_max_seqs(max_seqs: u32) -> Result<()> {
+    if max_seqs == 0 || max_seqs > MAX_DECODE_GRAPH_SEQS {
+        return Err(ModeBError::Protocol(format!(
+            "max_seqs={max_seqs} is outside supported decode CUDA Graph range 1..={MAX_DECODE_GRAPH_SEQS}"
+        )));
+    }
+    Ok(())
+}
+
+fn sync_dirty_page_table_rows(
+    plan: &mut zs_shm::StepPlanSlotMut<'_>,
+    step_id: u64,
+    max_pages_per_seq: usize,
+    shadow_page_table: &[i32],
+    dirty_pt_slots: &mut [u128; 2],
+) -> Result<()> {
+    let slot_idx = (step_id & 1) as usize;
+    let mut mask = dirty_pt_slots[slot_idx];
+    if mask == 0 {
+        return Ok(());
+    }
+    let dst_table = plan.global_kv_page_table_mut()?;
+    while mask != 0 {
+        let row = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        let start = row * max_pages_per_seq;
+        let end = start + max_pages_per_seq;
+        dst_table[start..end].copy_from_slice(&shadow_page_table[start..end]);
+    }
+    dirty_pt_slots[slot_idx] = 0;
+    Ok(())
+}
+
 impl ModeBServingEngine {
     pub fn launch(config: ModeBConfig) -> Result<Self> {
         let geometry = config.geometry;
+        validate_serving_max_seqs(geometry.max_seqs)?;
         let num_kv_pages = config.launch.num_kv_pages as usize;
         let dummy_page = config.launch.num_kv_pages as i32;
         let mut coordinator = ModeBCoordinator::launch(config)?;
@@ -672,11 +731,18 @@ impl ModeBServingEngine {
 
         let pt_len = geometry.max_seqs as usize * geometry.max_pages_per_seq as usize;
         let shadow_page_table = vec![dummy_page; pt_len];
+        for slot_step in [0u64, 1u64] {
+            coordinator
+                .plan_slot_mut(slot_step)?
+                .global_kv_page_table_mut()?
+                .fill(dummy_page);
+        }
         Ok(Self {
             coordinator,
             slot_pool: SlotPool::new(geometry.max_seqs),
             kv_pool: BlockPool::new(CacheGroupKind::GlobalAndIndex, num_kv_pages),
             shadow_page_table,
+            dirty_pt_slots: [0, 0],
             step_cursor: 0,
             init_wall_us,
             worker_numa_nodes,
@@ -1172,6 +1238,9 @@ impl ModeBServingEngine {
                     let row_start = freed_slot * max_pages_per_seq;
                     self.shadow_page_table[row_start..row_start + max_pages_per_seq]
                         .fill(dummy_page);
+                    let dirty_bit = 1u128 << freed_slot;
+                    self.dirty_pt_slots[0] |= dirty_bit;
+                    self.dirty_pt_slots[1] |= dirty_bit;
                     if idx < active.len() {
                         let moved_slot = active[idx].slot_lease.id() as usize;
                         slot_to_active[moved_slot] = idx;
@@ -1336,8 +1405,13 @@ impl ModeBServingEngine {
 
         let mut plan = self.coordinator.plan_slot_mut(step_id)?;
         plan.query_start_loc_mut()?[num_seqs] = token_cursor as i32;
-        plan.global_kv_page_table_mut()?
-            .copy_from_slice(&self.shadow_page_table);
+        sync_dirty_page_table_rows(
+            &mut plan,
+            step_id,
+            max_pages_per_seq,
+            &self.shadow_page_table,
+            &mut self.dirty_pt_slots,
+        )?;
         *plan.header_mut()? = StepHeader {
             step_id: AtomicU64::new(0),
             opcode: StepOpcode::NormalStep as u32,
@@ -1397,6 +1471,7 @@ impl ModeBServingEngine {
                 max_pages_per_seq,
                 &self.kv_pool,
                 &mut self.shadow_page_table,
+                &mut self.dirty_pt_slots,
             )?;
         }
 
@@ -1405,7 +1480,11 @@ impl ModeBServingEngine {
         let mut num_sample_rows = 0usize;
 
         if decode_active_count > 0 {
-            let mut plan = self.coordinator.plan_slot_mut(step_id)?;
+            let mut staged_tokens = Vec::with_capacity(decode_active_count);
+            let mut staged_positions = Vec::with_capacity(decode_active_count);
+            let mut staged_slots = Vec::with_capacity(decode_active_count);
+            let mut staged_lookbacks = Vec::with_capacity(decode_active_count * 3);
+            let mut staged_seq_lens = Vec::with_capacity(decode_active_count);
             for seq in active
                 .iter_mut()
                 .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
@@ -1414,18 +1493,33 @@ impl ModeBServingEngine {
                 let lookback = seq.lookback_window(start_pos);
                 let pos = start_pos as i32;
                 let next_len = pos + 1;
-                plan.token_ids_mut()?[num_seqs] = seq.last_token;
-                plan.positions_mut()?[num_seqs] = pos;
-                plan.req_slot_ids_mut()?[num_seqs] = seq.slot_lease.id() as i32;
-                plan.engram_prev_window_mut()?[num_seqs * 3..num_seqs * 3 + 3]
-                    .copy_from_slice(&lookback);
-                plan.sample_row_indices_mut()?[num_sample_rows] = token_cursor as i32;
-                plan.seq_lens_mut()?[num_seqs] = next_len;
-                plan.query_start_loc_mut()?[num_seqs] = token_cursor as i32;
+                staged_tokens.push(seq.last_token);
+                staged_positions.push(pos);
+                staged_slots.push(seq.slot_lease.id() as i32);
+                staged_lookbacks.extend_from_slice(&lookback);
+                staged_seq_lens.push(next_len);
                 seq.current_seq_len = next_len as usize;
                 token_cursor += 1;
                 num_seqs += 1;
                 num_sample_rows += 1;
+            }
+            let mut plan = self.coordinator.plan_slot_mut(step_id)?;
+            plan.token_ids_mut()?[..num_seqs].copy_from_slice(&staged_tokens);
+            plan.positions_mut()?[..num_seqs].copy_from_slice(&staged_positions);
+            plan.req_slot_ids_mut()?[..num_seqs].copy_from_slice(&staged_slots);
+            plan.engram_prev_window_mut()?[..num_seqs * 3].copy_from_slice(&staged_lookbacks);
+            plan.seq_lens_mut()?[..num_seqs].copy_from_slice(&staged_seq_lens);
+            {
+                let sample_rows = plan.sample_row_indices_mut()?;
+                for (row, dst) in sample_rows[..num_sample_rows].iter_mut().enumerate() {
+                    *dst = row as i32;
+                }
+            }
+            {
+                let qsl = plan.query_start_loc_mut()?;
+                for (row, dst) in qsl[..num_seqs].iter_mut().enumerate() {
+                    *dst = row as i32;
+                }
             }
         }
 
@@ -1553,18 +1647,28 @@ impl ModeBServingEngine {
             ));
         }
 
-        let is_pure_decode_fallback = prefill_seqs_staged == 0 && decode_active_count == num_seqs;
-        let bucket = if is_pure_decode_fallback {
-            select_graph_bucket(num_seqs as u32, &DECODE_BUCKETS)
+        let candidate_decode = prefill_seqs_staged == 0 && decode_active_count == num_seqs;
+        let bucket = if candidate_decode {
+            select_graph_bucket(num_seqs as u32, &DECODE_GRAPH_BUCKETS)
         } else {
             0
         };
-        let flags = u32::from(is_pure_decode_fallback);
+        let is_pure_decode_fallback = candidate_decode && bucket > 0;
+        let flags = if is_pure_decode_fallback {
+            STEP_FLAG_DECODE_ONLY
+        } else {
+            0
+        };
 
         let mut plan = self.coordinator.plan_slot_mut(step_id)?;
         plan.query_start_loc_mut()?[num_seqs] = token_cursor as i32;
-        plan.global_kv_page_table_mut()?
-            .copy_from_slice(&self.shadow_page_table);
+        sync_dirty_page_table_rows(
+            &mut plan,
+            step_id,
+            max_pages_per_seq,
+            &self.shadow_page_table,
+            &mut self.dirty_pt_slots,
+        )?;
         *plan.header_mut()? = StepHeader {
             step_id: AtomicU64::new(0),
             opcode: StepOpcode::NormalStep as u32,
@@ -1612,16 +1716,21 @@ impl ModeBServingEngine {
             max_pages_per_seq,
             &self.kv_pool,
             &mut self.shadow_page_table,
+            &mut self.dirty_pt_slots,
         )?;
         let chunk_len = chunk_end - chunk_start;
         let slot_i32 = seq.slot_lease.id() as i32;
         let lookback = seq.lookback_window(chunk_start);
         let mut plan = self.coordinator.plan_slot_mut(step_id)?;
-        for (offset, &tok) in seq.prompt_tokens[chunk_start..chunk_end].iter().enumerate() {
-            plan.token_ids_mut()?[token_cursor + offset] = tok;
-            plan.positions_mut()?[token_cursor + offset] = (chunk_start + offset) as i32;
-            plan.req_slot_ids_mut()?[token_cursor + offset] = slot_i32;
+        plan.token_ids_mut()?[token_cursor..token_cursor + chunk_len]
+            .copy_from_slice(&seq.prompt_tokens[chunk_start..chunk_end]);
+        {
+            let positions = &mut plan.positions_mut()?[token_cursor..token_cursor + chunk_len];
+            for (offset, dst) in positions.iter_mut().enumerate() {
+                *dst = (chunk_start + offset) as i32;
+            }
         }
+        plan.req_slot_ids_mut()?[token_cursor..token_cursor + chunk_len].fill(slot_i32);
         plan.engram_prev_window_mut()?[seq_batch_pos * 3..seq_batch_pos * 3 + 3]
             .copy_from_slice(&lookback);
         plan.query_start_loc_mut()?[seq_batch_pos] = token_cursor as i32;
@@ -1652,6 +1761,13 @@ impl ModeBServingEngine {
             ));
         }
 
+        let bucket = select_graph_bucket(num_seqs as u32, &DECODE_GRAPH_BUCKETS);
+        if bucket == 0 {
+            return Err(ModeBError::Protocol(format!(
+                "decode batch size {num_seqs} exceeds max decode CUDA Graph bucket ({MAX_DECODE_GRAPH_SEQS})"
+            )));
+        }
+
         for seq in active
             .iter_mut()
             .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
@@ -1663,34 +1779,65 @@ impl ModeBServingEngine {
                 max_pages_per_seq,
                 &self.kv_pool,
                 &mut self.shadow_page_table,
+                &mut self.dirty_pt_slots,
             )?;
         }
 
-        let bucket = select_graph_bucket(num_seqs as u32, &DECODE_BUCKETS);
-        let mut plan = self.coordinator.plan_slot_mut(step_id)?;
-        for (row, seq) in active
+        let mut staged_tokens = Vec::with_capacity(if commit_tokens_immediately {
+            num_seqs
+        } else {
+            0
+        });
+        let mut staged_positions = Vec::with_capacity(num_seqs);
+        let mut staged_slots = Vec::with_capacity(num_seqs);
+        let mut staged_lookbacks = Vec::with_capacity(num_seqs * 3);
+        let mut staged_seq_lens = Vec::with_capacity(num_seqs);
+        for seq in active
             .iter_mut()
             .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
-            .enumerate()
         {
             let start_pos = seq.current_seq_len;
             let lookback = seq.lookback_window(start_pos);
             let pos = start_pos as i32;
             let next_len = pos + 1;
             if commit_tokens_immediately {
-                plan.token_ids_mut()?[row] = seq.last_token;
+                staged_tokens.push(seq.last_token);
                 seq.current_seq_len = next_len as usize;
             }
-            plan.positions_mut()?[row] = pos;
-            plan.req_slot_ids_mut()?[row] = seq.slot_lease.id() as i32;
-            plan.engram_prev_window_mut()?[row * 3..row * 3 + 3].copy_from_slice(&lookback);
-            plan.sample_row_indices_mut()?[row] = row as i32;
-            plan.seq_lens_mut()?[row] = next_len;
-            plan.query_start_loc_mut()?[row] = row as i32;
+            staged_positions.push(pos);
+            staged_slots.push(seq.slot_lease.id() as i32);
+            staged_lookbacks.extend_from_slice(&lookback);
+            staged_seq_lens.push(next_len);
         }
-        plan.query_start_loc_mut()?[num_seqs] = num_seqs as i32;
-        plan.global_kv_page_table_mut()?
-            .copy_from_slice(&self.shadow_page_table);
+
+        let mut plan = self.coordinator.plan_slot_mut(step_id)?;
+        if commit_tokens_immediately {
+            plan.token_ids_mut()?[..num_seqs].copy_from_slice(&staged_tokens);
+        }
+        plan.positions_mut()?[..num_seqs].copy_from_slice(&staged_positions);
+        plan.req_slot_ids_mut()?[..num_seqs].copy_from_slice(&staged_slots);
+        plan.engram_prev_window_mut()?[..num_seqs * 3].copy_from_slice(&staged_lookbacks);
+        plan.seq_lens_mut()?[..num_seqs].copy_from_slice(&staged_seq_lens);
+        {
+            let sample_rows = plan.sample_row_indices_mut()?;
+            for (row, dst) in sample_rows[..num_seqs].iter_mut().enumerate() {
+                *dst = row as i32;
+            }
+        }
+        {
+            let qsl = plan.query_start_loc_mut()?;
+            for (row, dst) in qsl[..num_seqs].iter_mut().enumerate() {
+                *dst = row as i32;
+            }
+            qsl[num_seqs] = num_seqs as i32;
+        }
+        sync_dirty_page_table_rows(
+            &mut plan,
+            step_id,
+            max_pages_per_seq,
+            &self.shadow_page_table,
+            &mut self.dirty_pt_slots,
+        )?;
         *plan.header_mut()? = StepHeader {
             step_id: AtomicU64::new(0),
             opcode: StepOpcode::NormalStep as u32,
@@ -1701,7 +1848,7 @@ impl ModeBServingEngine {
             decoder_graph_bucket: bucket,
             num_sample_rows: num_seqs as u32,
             is_dspark_verify: 0,
-            flags: 1,
+            flags: STEP_FLAG_DECODE_ONLY,
             _reserved: [0; 3],
         };
         Ok(())
@@ -1897,28 +2044,50 @@ mod tests {
                 first_token_time: None,
                 last_token_time: None,
             };
-            seq.ensure_kv_pages(17, 16, 4, &kv_pool, &mut shadow_pt)
+            let mut dirty_pt_slots = [0u128; 2];
+            seq.ensure_kv_pages(17, 16, 4, &kv_pool, &mut shadow_pt, &mut dirty_pt_slots)
                 .expect("allocate 2 pages");
             assert_eq!(seq.page_ids.len(), 2);
             assert_eq!(kv_pool.available(), 6);
             assert_eq!(shadow_pt[0], seq.page_ids[0]);
             assert_eq!(shadow_pt[1], seq.page_ids[1]);
+            assert_eq!(dirty_pt_slots, [1, 1]);
 
+            dirty_pt_slots = [0, 0];
             // Growing from 17 -> 32 stays within the existing 2 pages (2 * 16 = 32)
-            seq.ensure_kv_pages(32, 16, 4, &kv_pool, &mut shadow_pt)
+            seq.ensure_kv_pages(32, 16, 4, &kv_pool, &mut shadow_pt, &mut dirty_pt_slots)
                 .expect("still 2 pages");
             assert_eq!(kv_pool.available(), 6);
+            assert_eq!(dirty_pt_slots, [0, 0]);
 
             // Token 33 crosses boundary and allocates page 3
-            seq.ensure_kv_pages(33, 16, 4, &kv_pool, &mut shadow_pt)
+            seq.ensure_kv_pages(33, 16, 4, &kv_pool, &mut shadow_pt, &mut dirty_pt_slots)
                 .expect("allocate 3rd page");
             assert_eq!(seq.page_ids.len(), 3);
             assert_eq!(kv_pool.available(), 5);
+            assert_eq!(dirty_pt_slots, [1, 1]);
         }
 
         // Dropping `seq` releases all 3 KV blocks and the sequence slot
         assert_eq!(kv_pool.available(), 8);
         assert_eq!(slot_pool.available(), 2);
+    }
+
+    #[test]
+    fn max_seqs_above_decode_graph_limit_is_rejected() {
+        assert!(validate_serving_max_seqs(0).is_err());
+        assert!(validate_serving_max_seqs(1).is_ok());
+        assert!(validate_serving_max_seqs(128).is_ok());
+        assert!(validate_serving_max_seqs(129).is_err());
+        assert!(validate_serving_max_seqs(256).is_err());
+    }
+
+    #[test]
+    fn json_string_escapes_rfc8259_and_preserves_utf8() {
+        assert_eq!(
+            json_string("DeepSeek-V4.1 \"中文\" \\ \n\t\x01\x1f"),
+            "\"DeepSeek-V4.1 \\\"中文\\\" \\\\ \\n\\t\\u0001\\u001f\""
+        );
     }
 
     #[test]

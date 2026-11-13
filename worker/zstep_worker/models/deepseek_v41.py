@@ -51,10 +51,15 @@ from zstep_worker.kernels_sm120.shm_allreduce import (
     HostMappedShmArgmax,
     get_host_mapped_allreduce_extension,
 )
-from zstep_worker.shm_bridge import SeqResult, ShmBridge, StepHeader, StepPlanView
-
-DECODE_GRAPH_BUCKETS: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
-STEP_FLAG_DECODE_ONLY: int = 1
+from zstep_worker.shm_bridge import (
+    DECODE_GRAPH_BUCKETS,
+    STEP_FLAG_DECODE_ONLY,
+    SeqResult,
+    ShmBridge,
+    StepHeader,
+    StepPlanView,
+    select_decode_bucket,
+)
 
 
 def apply_vllm_sm120_dsv41_patches() -> None:
@@ -228,13 +233,6 @@ def apply_vllm_sm120_dsv41_patches() -> None:
     idx_builder_cls.__init__ = _patched_idx_builder_init
     idx_builder_cls.build = _patched_idx_builder_build
     install_b12x_dsv41_quant_patches()
-
-
-def _select_decode_bucket(num_seqs: int, max_bucket: int) -> int:
-    for b in DECODE_GRAPH_BUCKETS:
-        if b >= num_seqs and b <= max_bucket:
-            return b
-    return max_bucket
 
 
 @dataclass
@@ -1261,7 +1259,7 @@ class DeepSeekV41StepRunner:
 
         self.start_event.record()
         if is_decode:
-            bucket = _select_decode_bucket(num_seqs, self.max_graph_bucket)
+            bucket = select_decode_bucket(num_seqs, self.max_graph_bucket)
             active_pt = pt_np[slot_np, :] + 1
 
             mla_bt_np = self.mla_bt_cpu[:bucket].numpy()
@@ -1538,7 +1536,10 @@ class DeepSeekV41StepRunner:
             self._vllm_config_ctx.__exit__(None, None, None)
             self._vllm_config_ctx = None
 
-    def close(self) -> None:
+    def close(self, *, abort: bool = False) -> None:
+        if abort:
+            self._abort_close()
+            return
         if self._closed:
             return
         self._closed = True

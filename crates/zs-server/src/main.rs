@@ -18,6 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,7 +30,7 @@ use zs_scheduler::{
     ModeBConfig, ModeBCoordinator, ModeBServingEngine, ServingBenchmarkReport, StepTop2Logits,
     TierAggregateStats, WorkerLaunchConfig,
 };
-use zs_wire::ShmGeometry;
+use zs_wire::{MAX_DECODE_GRAPH_SEQS, ShmGeometry};
 
 #[derive(Debug, Deserialize)]
 struct GreedyReference {
@@ -181,6 +183,7 @@ Usage: zstep --mode-b [OPTIONS]\n\
   --max-new-tokens N         Generated tokens per prompt for --prompt-ids (default: 16)\n\
   --verify-greedy-json PATH  Multi-case vLLM greedy reference JSON\n\
   --verify-output-json PATH  Write measured single/batched/chunked parity report\n\
+  --require-exact-greedy BOOL Fail with non-zero exit if any token differs (default: false)\n\
   --bench-tiers SPEC         Semicolon-separated tiers `label:conc:prompts:in_len:out_len`\n\
   --warmup-prompts N         Warm up 512->64 prompts at concurrency 16 (default: 16)\n\
   --repeats N                Interleaved repeat count across all tiers (default: 3)\n\
@@ -214,6 +217,7 @@ struct Arguments {
     max_new_tokens: usize,
     verify_greedy_json: Option<PathBuf>,
     verify_output_json: Option<PathBuf>,
+    require_exact_greedy: bool,
     bench_tiers: Vec<BenchmarkTierSpec>,
     warmup_prompts: usize,
     repeats: usize,
@@ -250,6 +254,7 @@ impl Default for Arguments {
             max_new_tokens: 16,
             verify_greedy_json: None,
             verify_output_json: None,
+            require_exact_greedy: false,
             bench_tiers: Vec::new(),
             warmup_prompts: 16,
             repeats: 3,
@@ -517,15 +522,36 @@ fn run_greedy_verification(
             chunked,
             chunked_steps,
         );
+        let case_all_matched = single_match.all_matched
+            && batched_match.all_matched
+            && chunked_match.all_matched
+            && single_vs_batched_first_mismatch.is_none()
+            && batched_vs_chunked_first_mismatch.is_none();
+        let exact_prefix_match_tokens = single_match
+            .exact_prefix_match_tokens
+            .min(batched_match.exact_prefix_match_tokens)
+            .min(chunked_match.exact_prefix_match_tokens);
+        let exact_token_match_rate = single_match
+            .exact_token_match_rate
+            .min(batched_match.exact_token_match_rate)
+            .min(chunked_match.exact_token_match_rate);
+        let first_mismatch_token_index = [
+            single_match.first_mismatch_token_index,
+            batched_match.first_mismatch_token_index,
+            chunked_match.first_mismatch_token_index,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         case_reports.push(GreedyCaseParityReport {
             name: case.name.clone(),
             prompt_token_ids: case.prompt_token_ids.clone(),
             expected_greedy_token_ids: case.expected_greedy_token_ids.clone(),
-            exact_prefix_match_tokens: single_match.exact_prefix_match_tokens,
+            exact_prefix_match_tokens,
             total_tokens: single_match.total_tokens,
-            exact_token_match_rate: single_match.exact_token_match_rate,
-            all_matched: single_match.all_matched,
-            first_mismatch_token_index: single_match.first_mismatch_token_index,
+            exact_token_match_rate,
+            all_matched: case_all_matched,
+            first_mismatch_token_index,
             single_generated_token_ids: single.clone(),
             batched_generated_token_ids: batched.clone(),
             chunked_generated_token_ids: chunked.clone(),
@@ -536,7 +562,9 @@ fn run_greedy_verification(
             batched_vs_chunked_first_mismatch,
         });
     }
-    let all_matched = case_reports.iter().all(|case| case.all_matched);
+    let all_matched = batched_vs_single_exact_match
+        && chunked_vs_unchunked_exact_match
+        && case_reports.iter().all(|case| case.all_matched);
     Ok(GreedyParityReport {
         git_sha: current_git_sha()?,
         vllm_version: reference.vllm_version.clone(),
@@ -569,10 +597,64 @@ fn is_deepseek_v41_model_dir(model_dir: Option<&PathBuf>) -> bool {
         .is_ok_and(|probe| probe.model_type == "deepseek_v41")
 }
 
+fn validate_greedy_report_gate(
+    report: &GreedyParityReport,
+    require_exact: bool,
+) -> Result<(), String> {
+    if let Some(recomp) = report.triton_recompilations
+        && recomp > 0
+    {
+        return Err(format!(
+            "unexpected runtime Triton JIT recompilations detected: {recomp}"
+        ));
+    }
+    if require_exact && !report.all_matched {
+        return Err(
+            "greedy parity report had token mismatches (--require-exact-greedy=true)".to_owned(),
+        );
+    }
+    const MAX_BF16_ULP_TIE_MARGIN: f32 = 0.25;
+    for case in &report.cases {
+        if let Some(diag) = &case.single_match.first_mismatch_diagnostics
+            && diag.zstep_top2.top1_minus_top2_margin > MAX_BF16_ULP_TIE_MARGIN
+        {
+            return Err(format!(
+                "case `{}` diverged from reference at token {} with non-ULP margin {:.4}",
+                case.name, diag.token_index, diag.zstep_top2.top1_minus_top2_margin
+            ));
+        }
+        for pair in [
+            case.single_vs_batched_first_mismatch.as_ref(),
+            case.batched_vs_chunked_first_mismatch.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let max_pair_margin = pair
+                .left_top2
+                .top1_minus_top2_margin
+                .max(pair.right_top2.top1_minus_top2_margin);
+            if max_pair_margin > MAX_BF16_ULP_TIE_MARGIN {
+                return Err(format!(
+                    "case `{}` diverged between {} and {} at token {} with non-ULP margin {:.4}",
+                    case.name, pair.left_mode, pair.right_mode, pair.token_index, max_pair_margin
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let has_model = args.model_dir.is_some();
     let is_dsv41 = is_deepseek_v41_model_dir(args.model_dir.as_ref());
     let max_seqs = args.max_seqs.unwrap_or(if has_model { 128 } else { 8 });
+    if max_seqs == 0 || (has_model && max_seqs > MAX_DECODE_GRAPH_SEQS) {
+        return Err(format!(
+            "--max-seqs {max_seqs} is outside supported decode CUDA Graph range 1..={MAX_DECODE_GRAPH_SEQS}"
+        )
+        .into());
+    }
     let max_step_tokens = args
         .max_step_tokens
         .unwrap_or(if has_model { 4096 } else { 192 });
@@ -657,6 +739,7 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             encoded.push('\n');
             std::fs::write(&output_path, encoded)?;
             println!("VERIFY_GREEDY_REPORT={}", output_path.display());
+            validate_greedy_report_gate(&report, args.require_exact_greedy)?;
             return Ok(());
         }
 
@@ -789,6 +872,17 @@ fn parse_arguments(raw: &[String]) -> Result<Arguments, String> {
             "--max-new-tokens" => args.max_new_tokens = parse_number(option, value)?,
             "--verify-greedy-json" => args.verify_greedy_json = Some(PathBuf::from(value)),
             "--verify-output-json" => args.verify_output_json = Some(PathBuf::from(value)),
+            "--require-exact-greedy" => {
+                args.require_exact_greedy = match value.as_str() {
+                    "true" | "1" => true,
+                    "false" | "0" => false,
+                    _ => {
+                        return Err(format!(
+                            "--require-exact-greedy expects true/false/1/0, got {value}"
+                        ));
+                    }
+                };
+            }
             "--bench-tiers" => args.bench_tiers = parse_bench_tiers(value)?,
             "--warmup-prompts" => args.warmup_prompts = parse_number(option, value)?,
             "--repeats" => args.repeats = parse_number(option, value)?,
@@ -829,6 +923,16 @@ fn parse_arguments(raw: &[String]) -> Result<Arguments, String> {
             "greedy verification requires --model-dir and excludes --prompt-ids/--bench-tiers"
                 .to_owned(),
         );
+    }
+    if let Some(ms) = args.max_seqs {
+        if ms == 0 {
+            return Err("--max-seqs must be positive".to_owned());
+        }
+        if args.model_dir.is_some() && ms > MAX_DECODE_GRAPH_SEQS {
+            return Err(format!(
+                "--max-seqs {ms} exceeds maximum supported decode CUDA Graph capacity ({MAX_DECODE_GRAPH_SEQS})"
+            ));
+        }
     }
     Ok(args)
 }
@@ -890,7 +994,11 @@ fn unique_shm_name() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
-    format!("zstep_b_{}_{}", std::process::id(), nanos % 1_000_000_000)
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u128(nanos);
+    hasher.write_u32(std::process::id());
+    let nonce = hasher.finish();
+    format!("zstep_b_{}_{nonce:016x}", std::process::id())
 }
 
 #[cfg(test)]

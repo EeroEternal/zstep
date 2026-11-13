@@ -70,7 +70,7 @@ GPU 4, 5, 6, 7 -> Socket 1 PCIe Gen5 -> NUMA 1
 | :--- | :--- | :--- |
 | `cargo fmt --check` + `clippy -D warnings` + `cargo test --workspace` | `zs-wire` 布局与容量派生、`zs-shm` RAII、`zs-kv`、`zs-scheduler` 混合批调度 / 重叠解码 Engram 3-token 滑窗修订 / Top-2 审计、`zs-server` | **32 passed, 0 warnings** |
 | [`test_shm_layout_parity.py`](../worker/tests/test_shm_layout_parity.py) + `ruff check` | Python `ctypes` 视图与 Rust `#[repr(C)]` 结构体字节偏移逐项对齐、静态代码规范 | **1 passed, 0 lint errors** |
-| `--verify-greedy`（`DeepSeek-V4.1-Flash` `TP=8`） | 8 卡真权重对 5 个无缓存 `vLLM 0.31.0` 贪心参考序列执行单序列、5 序列批处理与 `--max-prefill-chunk 24` 顺风车混合步；核对全局 Top-2 裕度、Triton 零重编译与 `/dev/shm` RAII | **`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=5`**，`SHM_CLEAN`；**高约束结构化任务 `128/128` 100% 精确一致，低裕度 ULP 边界分歧如实保留** |
+| `--verify-greedy-json`（`DeepSeek-V4.1-Flash` `TP=8`） | 8 卡真权重对 5 个无缓存 `vLLM 0.31.0` 贪心参考序列执行单序列、5 序列批处理与 `--max-prefill-chunk 24` 顺风车混合步；核对全局 Top-2 裕度、Triton 零重编译与 `/dev/shm` RAII | **`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=5`**，`SHM_CLEAN`；**高约束结构化任务 `128/128` 100% 精确一致，低裕度 ULP 边界分歧如实保留** |
 
 ### 3.1 五条 Prompt（Single / Batched / Mixed-Chunked）全局 Top-2 贪心对齐报告
 

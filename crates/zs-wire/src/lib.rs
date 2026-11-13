@@ -36,6 +36,8 @@ pub const MAX_WORKERS: usize = 8;
 pub const DEVICE_BOOTSTRAP_TOKEN_ID: i32 = -1;
 /// Reserved bytes at the start of the mapping for [`ShmSuperblock`].
 pub const SHM_SUPERBLOCK_REGION_BYTES: usize = 4096;
+/// Cacheline-aligned Region 0 offset (`0x80`) of the `AtomicU32` cluster abort word.
+pub const SUPERBLOCK_ABORT_OFFSET: usize = 128;
 /// Byte offset of the fixed eight-entry worker status array.
 pub const WORKER_STATES_OFFSET: usize = 4096;
 /// Reserved bytes for the worker status array.
@@ -46,6 +48,13 @@ pub const WORKER_STATUS_READY: u32 = 1;
 pub const WORKER_STATUS_RUNNING: u32 = 2;
 /// Worker stopped because of an exception.
 pub const WORKER_STATUS_ERROR: u32 = 99;
+/// [`StepHeader::flags`] bit indicating all active sequences have `q_len == 1` and
+/// execute through a pre-captured decode CUDA Graph bucket.
+pub const STEP_FLAG_DECODE_ONLY: u32 = 1 << 0;
+/// Canonical CUDA Graph batch buckets for decode-only steps.
+pub const DECODE_GRAPH_BUCKETS: [u32; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+/// Maximum active decode sequences supported by pre-captured decode CUDA Graphs.
+pub const MAX_DECODE_GRAPH_SEQS: u32 = 128;
 
 /// Step operation codes published in [`StepHeader::opcode`].
 #[repr(u32)]
@@ -77,7 +86,11 @@ pub struct ShmSuperblock {
     pub plan_slot_offsets: [u64; 2],
     pub plan_slot_stride: u64,
     pub result_slot_offsets: [u64; 2],
-    pub _reserved: [u64; 4],
+    pub result_slot_stride: u64,
+    pub layout_hash: u64,
+    pub max_decode_graph_seqs: u32,
+    pub _pad_u32: u32,
+    pub _reserved: [u64; 1],
 }
 
 /// Per-worker status block inside Region 1 (`0x0000_1000`).
@@ -96,8 +109,12 @@ pub struct WorkerSlotState {
     /// Host NUMA node (`>= 0`) detected from `/sys/bus/pci/devices/<bdf>/numa_node`
     /// and pinned via `sched_setaffinity`, or `-1` when the platform exposes no NUMA affinity.
     pub numa_node: AtomicI32,
+    /// Unexpected runtime Triton JIT compilations observed before shutdown.
+    pub triton_recompilations: AtomicU32,
+    /// Number of Triton kernels monitored by the runtime compilation spy.
+    pub watched_kernels: AtomicU32,
     pub _pad_u32: u32,
-    pub _pad: [u64; 2],
+    pub _pad: [u64; 1],
 }
 
 /// Header at the start of each double-buffered `StepPlanSlot` (`slot = step_id & 1`).
@@ -283,6 +300,64 @@ impl StepPlanLayout {
             compressor_slot_ids_offset,
             temperatures_offset,
         }
+    }
+
+    /// Page-aligned byte stride of one `StepResultSlot` for `max_seqs`.
+    pub const fn compute_result_slot_stride(max_seqs: u32) -> usize {
+        let payload = std::mem::size_of::<StepResultHeader>()
+            + (max_seqs as usize) * std::mem::size_of::<SeqStepOutput>();
+        align_up(payload, 4096)
+    }
+
+    /// Deterministic 64-bit FNV-1a wire ABI hash over protocol constants, POD struct sizes,
+    /// and all computed plan/result slot offsets so Python workers reject any layout drift.
+    pub const fn layout_hash(&self, result_slot_stride: usize) -> u64 {
+        const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        const fn mix_u64(mut hash: u64, value: u64) -> u64 {
+            let bytes = value.to_le_bytes();
+            let mut idx = 0;
+            while idx < 8 {
+                hash ^= bytes[idx] as u64;
+                hash = hash.wrapping_mul(FNV_PRIME);
+                idx += 1;
+            }
+            hash
+        }
+
+        let words = [
+            ZSTEP_PROTOCOL_VERSION as u64,
+            std::mem::size_of::<ShmSuperblock>() as u64,
+            std::mem::size_of::<WorkerSlotState>() as u64,
+            std::mem::size_of::<StepHeader>() as u64,
+            std::mem::size_of::<StepResultHeader>() as u64,
+            std::mem::size_of::<SeqStepOutput>() as u64,
+            self.total_slot_bytes as u64,
+            self.header_offset as u64,
+            self.token_ids_offset as u64,
+            self.positions_offset as u64,
+            self.req_slot_ids_offset as u64,
+            self.replay_mask_offset as u64,
+            self.engram_prev_window_offset as u64,
+            self.narrow_keep_indices_offset as u64,
+            self.sample_row_indices_offset as u64,
+            self.seq_lens_offset as u64,
+            self.query_start_loc_offset as u64,
+            self.global_kv_page_table_offset as u64,
+            self.swa_page_table_offset as u64,
+            self.compressor_slot_ids_offset as u64,
+            self.temperatures_offset as u64,
+            result_slot_stride as u64,
+        ];
+
+        let mut hash = FNV_OFFSET_BASIS;
+        let mut i = 0;
+        while i < words.len() {
+            hash = mix_u64(hash, words[i]);
+            i += 1;
+        }
+        hash
     }
 }
 

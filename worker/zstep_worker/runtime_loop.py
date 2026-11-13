@@ -29,6 +29,7 @@ from datetime import timedelta
 import gc
 import os
 from pathlib import Path
+import select
 import signal
 import struct
 import traceback
@@ -64,6 +65,22 @@ WORKER_STATUS_RUNNING = 2
 WORKER_STATUS_ERROR = 99
 
 
+class _SignalTermination(BaseException):
+    """Raised on SIGTERM / SIGINT so `finally: runtime.close(abort=True)` runs cleanly."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"received signal {signum}")
+        self.signum = signum
+
+
+def _install_signal_handlers() -> None:
+    def _handler(signum: int, _frame: object) -> None:
+        raise _SignalTermination(signum)
+
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+
+
 def _set_parent_death_signal() -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     pr_set_pdeathsig = 1
@@ -96,9 +113,12 @@ class MicroStep:
     def __init__(self, args: argparse.Namespace, bridge: ShmBridge) -> None:
         import torch
         import torch.distributed as dist
-        from flashinfer.experimental.b12x.gemm import mxfp8_linear
 
+        from zstep_worker.kernels_sm120.b12x_dsv41 import maybe_enable_b12x_for_dsv41
         from zstep_worker.kernels_sm120.shm_allreduce import HostMappedShmAllReduce
+
+        maybe_enable_b12x_for_dsv41()
+        from flashinfer.experimental.b12x.gemm import mxfp8_linear
 
         self.args = args
         self.bridge = bridge
@@ -238,24 +258,25 @@ class MicroStep:
             reduced = gemm_output
 
         outputs: list[SeqResult] = []
-        if self.rank == 0 and sample_row_indices is not None:
+        if self.rank == 0 and sample_row_indices is not None and sample_row_indices.numel() > 0:
             selected = reduced.index_select(0, sample_row_indices)
             token_output = selected.argmax(dim=-1)
             logprob_output = functional.log_softmax(selected.float(), dim=-1).gather(
                 1, token_output.unsqueeze(1)
             )
+            host_slots = req_slot_ids.index_select(0, sample_row_indices).cpu().tolist()
             host_tokens = token_output.cpu().tolist()
             host_logprobs = logprob_output.cpu().tolist()
             outputs = [
                 SeqResult(
-                    req_slot=req_slot,
+                    req_slot=int(req_slot),
                     accepted_token=int(token),
                     accepted_logprob_bits=struct.unpack("<I", struct.pack("<f", logprob[0]))[0],
                     runner_up_token=-1,
                     runner_up_logprob_bits=0,
                 )
                 for req_slot, token, logprob in zip(
-                    range(len(host_tokens)), host_tokens, host_logprobs, strict=True
+                    host_slots, host_tokens, host_logprobs, strict=True
                 )
             ]
         self.end_event.record()
@@ -279,15 +300,16 @@ class MicroStep:
             ).to(self.device)
         return self._forward(token_ids, positions, req_slot_ids, sample_row_indices)
 
-    def close(self) -> None:
+    def close(self, *, abort: bool = False) -> None:
         import torch.distributed as dist
 
-        if self.exchange_group is not None:
+        if not abort and self.exchange_group is not None:
             dist.barrier(group=self.exchange_group)
         if self.communicator is not None:
             self.communicator.close()
         if self.exchange_group is not None:
-            dist.barrier(group=self.exchange_group)
+            if not abort:
+                dist.barrier(group=self.exchange_group)
             dist.destroy_process_group()
             self.exchange_group = None
 
@@ -308,7 +330,7 @@ class RuntimeLoop:
         self.args = args
         # Pin host CPU affinity to this rank's PCIe NUMA domain BEFORE touching SHM or CUDA.
         self.numa_topology: DeviceNumaTopology = pin_process_to_device_numa(args.rank)
-        self.bridge = ShmBridge(name=args.shm_name)
+        self.bridge = ShmBridge(name=args.shm_name, shm_fd=args.shm_fd)
         self.model_type = _probe_model_type(args.model_dir)
         if args.model_dir and self.model_type == "deepseek_v41":
             from zstep_worker.models.deepseek_v41 import DeepSeekV41StepRunner
@@ -346,7 +368,14 @@ class RuntimeLoop:
         self.current_step: int = 0
         self.last_step: int = 0
 
-    def _write_state(self, *, status: int, error_code: int) -> None:
+    def _write_state(
+        self,
+        *,
+        status: int,
+        error_code: int,
+        triton_recompilations: int = 0,
+        watched_kernels: int = 0,
+    ) -> None:
         self.bridge.write_worker_state(
             rank=self.args.rank,
             ready_step_id=self.last_step,
@@ -356,9 +385,21 @@ class RuntimeLoop:
             free_vram_mb=self._free_vram_mb,
             total_vram_mb=self._total_vram_mb,
             numa_node=self.numa_topology.numa_node,
+            triton_recompilations=triton_recompilations,
+            watched_kernels=watched_kernels,
         )
 
-    def run(self) -> None:
+    def _wait_for_plan_signal(self, poller: select.poll) -> None:
+        while True:
+            if self.bridge.is_aborted():
+                raise RuntimeError("master signaled cluster abort in SHM superblock")
+            events = poller.poll(250)
+            if events:
+                os.eventfd_read(self.args.plan_fd)
+                return
+            self.bridge.touch_heartbeat(self.args.rank)
+
+    def run(self) -> int:
         self._write_state(status=WORKER_STATUS_READY, error_code=0)
         os.eventfd_write(self.args.done_fd, 1)
 
@@ -393,6 +434,9 @@ class RuntimeLoop:
                 ]
             )
 
+        poller = select.poll()
+        poller.register(self.args.plan_fd, select.POLLIN)
+
         gc.collect()
         was_gc_enabled = gc.isenabled()
         gc.disable()
@@ -407,8 +451,9 @@ class RuntimeLoop:
                     )
                     for name, kernel in watched_kernels
                 ]
+                watched_count = len(spies)
                 while True:
-                    os.eventfd_read(self.args.plan_fd)
+                    self._wait_for_plan_signal(poller)
                     plan = self.bridge.plan(self.current_step + 1)
                     header = plan.header()
                     expected_step = self.current_step + 1
@@ -417,18 +462,27 @@ class RuntimeLoop:
                             f"expected step {expected_step}, acquired {header.step_id}"
                         )
                     self.current_step = header.step_id
-                    self._write_state(status=WORKER_STATUS_RUNNING, error_code=0)
+                    self._write_state(
+                        status=WORKER_STATUS_RUNNING,
+                        error_code=0,
+                        watched_kernels=watched_count,
+                    )
                     if header.opcode == OPCODE_SHUTDOWN:
                         recompiled_count = sum(spy.call_count for _, spy in spies)
                         if self.args.rank == 0:
                             self.bridge.result(header.step_id).write(
                                 step_id=header.step_id,
-                                gpu_exec_us=len(spies),
-                                status_code=recompiled_count,
+                                gpu_exec_us=0,
+                                status_code=0,
                                 outputs=[],
                             )
                         self.last_step = header.step_id
-                        self._write_state(status=WORKER_STATUS_READY, error_code=0)
+                        self._write_state(
+                            status=WORKER_STATUS_READY,
+                            error_code=0,
+                            triton_recompilations=recompiled_count,
+                            watched_kernels=watched_count,
+                        )
                         os.eventfd_write(self.args.done_fd, 1)
                         break
                     if header.opcode != OPCODE_NORMAL_STEP:
@@ -442,21 +496,29 @@ class RuntimeLoop:
                             outputs=outputs,
                         )
                     self.last_step = header.step_id
-                    self._write_state(status=WORKER_STATUS_READY, error_code=0)
+                    self._write_state(
+                        status=WORKER_STATUS_READY,
+                        error_code=0,
+                        watched_kernels=watched_count,
+                    )
                     os.eventfd_write(self.args.done_fd, 1)
                 recompiled = [
                     f"{name}={spy.call_count}" for name, spy in spies if spy.call_count != 0
                 ]
-                if recompiled:
-                    raise RuntimeError(
-                        "runtime step triggered unexpected Triton JIT recompilation: "
-                        + ", ".join(recompiled)
-                    )
+                recompiled_total = sum(spy.call_count for _, spy in spies)
                 if self.args.rank == 0:
                     print(
-                        f"TRITON_RECOMPILATIONS=0 WATCHED_KERNELS={len(spies)}",
+                        f"TRITON_RECOMPILATIONS={recompiled_total} WATCHED_KERNELS={watched_count}",
                         flush=True,
                     )
+                if recompiled:
+                    print(
+                        f"rank {self.args.rank}: runtime step triggered unexpected Triton JIT "
+                        f"recompilation: {', '.join(recompiled)}",
+                        flush=True,
+                    )
+                    return 1
+                return 0
         finally:
             if was_gc_enabled:
                 gc.enable()
@@ -464,7 +526,7 @@ class RuntimeLoop:
     def report_error(self, error: BaseException) -> None:
         print(f"rank {self.args.rank}: {type(error).__name__}: {error}", flush=True)
         traceback.print_exc()
-        if self.args.rank == 0 and self.current_step > 0:
+        if self.args.rank == 0 and self.current_step > 0 and self.last_step < self.current_step:
             self.bridge.result(self.current_step).write(
                 step_id=self.current_step,
                 gpu_exec_us=0,
@@ -475,8 +537,11 @@ class RuntimeLoop:
         self._write_state(status=WORKER_STATUS_ERROR, error_code=1)
         os.eventfd_write(self.args.done_fd, 1)
 
-    def close(self) -> None:
-        self.runner.close()
+    def close(self, *, abort: bool = False) -> None:
+        try:
+            self.runner.close(abort=abort)
+        except TypeError:
+            self.runner.close()
         self.bridge.close()
         os.close(self.args.plan_fd)
         os.close(self.args.done_fd)
@@ -485,6 +550,7 @@ class RuntimeLoop:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="zstep Mode B sm_120 GPU worker")
     parser.add_argument("--shm-name", required=True)
+    parser.add_argument("--shm-fd", default=-1, type=int)
     parser.add_argument("--rank", required=True, type=int)
     parser.add_argument("--plan-fd", required=True, type=int)
     parser.add_argument("--done-fd", required=True, type=int)
@@ -503,13 +569,19 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     _set_parent_death_signal()
+    _install_signal_handlers()
     args = _parse_args()
     runtime = None
+    aborted = False
     try:
         runtime = RuntimeLoop(args)
-        runtime.run()
-        return 0
+        return runtime.run()
+    except _SignalTermination as sig_exc:
+        aborted = True
+        print(f"rank {args.rank}: {sig_exc}, tearing down cleanly", flush=True)
+        return 1
     except BaseException as error:
+        aborted = True
         if runtime is not None:
             runtime.report_error(error)
         else:
@@ -521,7 +593,7 @@ def main() -> int:
         return 1
     finally:
         if runtime is not None:
-            runtime.close()
+            runtime.close(abort=aborted)
 
 
 if __name__ == "__main__":

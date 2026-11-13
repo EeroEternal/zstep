@@ -29,8 +29,9 @@ memory avoids 30-50% cross-socket interconnect penalties.
 from __future__ import annotations
 
 import ctypes
-import os
+import ctypes.util
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 
@@ -66,8 +67,25 @@ def parse_cpulist(raw: str) -> set[int]:
     return cpus
 
 
+_PINNED_CACHE: dict[tuple[int, int], DeviceNumaTopology] = {}
+
+
+def _load_cudart() -> ctypes.CDLL:
+    candidates: list[str] = ["libcudart.so", "libcudart.so.12", "libcudart.so.13"]
+    found = ctypes.util.find_library("cudart")
+    if found and found not in candidates:
+        candidates.append(found)
+    last_err: OSError | None = None
+    for name in candidates:
+        try:
+            return ctypes.CDLL(name)
+        except OSError as exc:
+            last_err = exc
+    raise RuntimeError(f"failed to load CUDA runtime library from {candidates}: {last_err}")
+
+
 def _query_cuda_pci_bus_id(device_index: int) -> str:
-    cudart = ctypes.CDLL("libcudart.so")
+    cudart = _load_cudart()
     func = cudart.cudaDeviceGetPCIBusId
     func.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
     func.restype = ctypes.c_int
@@ -87,6 +105,10 @@ def _query_cuda_pci_bus_id(device_index: int) -> str:
 
 def pin_process_to_device_numa(device_index: int) -> DeviceNumaTopology:
     """Discover `device_index`'s PCIe NUMA domain and pin the calling process's CPU affinity."""
+    cache_key = (os.getpid(), int(device_index))
+    cached = _PINNED_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     pci_bus_id = _query_cuda_pci_bus_id(device_index)
     sysfs_dir = Path("/sys/bus/pci/devices") / pci_bus_id
     numa_node = -1
@@ -115,9 +137,11 @@ def pin_process_to_device_numa(device_index: int) -> DeviceNumaTopology:
     else:
         pinned = tuple(sorted(allowed_cpus))
 
-    return DeviceNumaTopology(
+    topo = DeviceNumaTopology(
         device_index=device_index,
         pci_bus_id=pci_bus_id,
         numa_node=numa_node,
         pinned_cpus=pinned,
     )
+    _PINNED_CACHE[cache_key] = topo
+    return topo

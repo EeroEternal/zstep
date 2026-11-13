@@ -101,7 +101,7 @@ Both engines run **without prefix caching** (`vLLM 0.33.0` launched with `--no-e
 
 ## Verification and Reproduction
 
-The verification gate passes `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (**29 tests**), `ruff check worker/zstep_worker worker/tests/phase2 worker/tests/phase3`, and GPU pytest (`test_shm_layout_parity.py`, `test_qwen35_ops_sm120.py`, `test_qwen35_e2e_tp8.py`), plus end-to-end Top-2 greedy audits (`TRITON_RECOMPILATIONS=0`) and `/dev/shm` RAII checks on both `8 × RTX 5090` and `8 × RTX 6000D`.
+The verification gate passes `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (**37 tests**), `ruff check worker/zstep_worker worker/tests/phase2 worker/tests/phase3`, and GPU pytest (`test_shm_layout_parity.py`, `test_07_shmv5_alternating_stress_8gpu.py`, `test_qwen35_ops_sm120.py`, `test_qwen35_e2e_tp8.py`), plus end-to-end Top-2 greedy audits (`TRITON_RECOMPILATIONS=0`) and `/dev/shm` RAII checks on both `8 × RTX 5090` and `8 × RTX 6000D`.
 
 Unified reproduction commands and all 41 JSON artifacts are documented in **[`docs/benchmarks/README.md`](docs/benchmarks/README.md)**.
 

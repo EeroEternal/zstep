@@ -22,7 +22,18 @@
 
 from __future__ import annotations
 
-from zstep_worker.shm_bridge import ShmGeometry, StepPlanLayout
+import json
+from pathlib import Path
+import pytest
+
+from zstep_worker.shm_bridge import (
+    MAX_DECODE_GRAPH_SEQS,
+    ShmGeometry,
+    StepPlanLayout,
+    compute_layout_hash,
+    compute_result_slot_stride,
+    select_decode_bucket,
+)
 
 
 def _assert_layout_invariants(geom: ShmGeometry, layout: StepPlanLayout) -> None:
@@ -98,6 +109,68 @@ def test_step_plan_layout_invariants_and_vram_derivation() -> None:
     )
 
 
+def test_cross_language_golden_layout_and_hash_parity() -> None:
+    golden_path = Path(__file__).resolve().parent / "fixtures" / "shm_layout_golden.json"
+    cases = json.loads(golden_path.read_text(encoding="utf-8"))
+    assert len(cases) >= 3
+    for case in cases:
+        g = case["geometry"]
+        geom = ShmGeometry(
+            world_size=g["world_size"],
+            max_seqs=g["max_seqs"],
+            max_step_tokens=g["max_step_tokens"],
+            max_decoder_rows=g["max_decoder_rows"],
+            max_pages_per_seq=g["max_pages_per_seq"],
+            page_block_tokens=g["page_block_tokens"],
+            spec_verify_width=g["spec_verify_width"],
+        )
+        layout = StepPlanLayout.compute(geom)
+        _assert_layout_invariants(geom, layout)
+        exp = case["expected"]
+        for field_name in (
+            "header_offset",
+            "token_ids_offset",
+            "positions_offset",
+            "req_slot_ids_offset",
+            "replay_mask_offset",
+            "engram_prev_window_offset",
+            "narrow_keep_indices_offset",
+            "sample_row_indices_offset",
+            "seq_lens_offset",
+            "query_start_loc_offset",
+            "global_kv_page_table_offset",
+            "swa_page_table_offset",
+            "compressor_slot_ids_offset",
+            "temperatures_offset",
+            "total_slot_bytes",
+        ):
+            actual = getattr(layout, field_name)
+            assert actual == exp[field_name], (
+                f"{case['name']}.{field_name}: python={actual} != golden={exp[field_name]}"
+            )
+        stride = compute_result_slot_stride(geom.max_seqs)
+        assert stride == exp["result_slot_stride"]
+        digest_hex = f"0x{compute_layout_hash(layout, stride):016x}"
+        assert digest_hex == exp["layout_hash_hex"], (
+            f"{case['name']} hash mismatch: {digest_hex} != {exp['layout_hash_hex']}"
+        )
+
+
+def test_select_decode_bucket_never_clamps_overflow() -> None:
+    assert MAX_DECODE_GRAPH_SEQS == 128
+    assert select_decode_bucket(1, 128) == 1
+    assert select_decode_bucket(3, 128) == 4
+    assert select_decode_bucket(65, 128) == 128
+    with pytest.raises(ValueError, match="outside supported CUDA Graph range"):
+        select_decode_bucket(129, 128)
+    with pytest.raises(ValueError, match="outside supported CUDA Graph range"):
+        select_decode_bucket(33, 32)
+    with pytest.raises(ValueError, match="outside supported CUDA Graph range"):
+        select_decode_bucket(0, 128)
+
+
 if __name__ == "__main__":
     test_step_plan_layout_invariants_and_vram_derivation()
-    print("Python <-> Rust StepPlanLayout invariants and VRAM budget derivation OK")
+    test_cross_language_golden_layout_and_hash_parity()
+    test_select_decode_bucket_never_clamps_overflow()
+    print("Python <-> Rust StepPlanLayout invariants, golden hash, and bucket bounds OK")

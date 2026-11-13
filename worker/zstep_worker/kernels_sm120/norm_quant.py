@@ -80,9 +80,11 @@ def rmsnorm_quantize_mxfp8_group32(
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run fused RMSNorm + MXFP8 group-32 quantization on `x` `[M, H]`."""
-    assert x.ndim == 2 and x.is_cuda, "x must be a 2D CUDA tensor"
+    if x.ndim != 2 or not x.is_cuda:
+        raise ValueError(f"x must be a 2D CUDA tensor, got shape={tuple(x.shape)} device={x.device}")
     num_tokens, hidden_size = x.shape
-    assert hidden_size % 32 == 0, "hidden_size must be divisible by 32"
+    if hidden_size % 32 != 0:
+        raise ValueError(f"hidden_size must be divisible by 32, got {hidden_size}")
     num_groups = hidden_size // 32
     block_groups = triton.next_power_of_2(num_groups)
 

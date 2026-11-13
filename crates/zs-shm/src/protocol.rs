@@ -18,12 +18,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use std::sync::atomic::{Ordering, fence};
+use std::sync::atomic::{AtomicU32, Ordering, fence};
 
 use zs_wire::{
-    MAX_WORKERS, SHM_SUPERBLOCK_REGION_BYTES, SeqStepOutput, ShmGeometry, ShmSuperblock,
-    StepHeader, StepPlanLayout, StepResultHeader, WORKER_STATES_OFFSET, WORKER_STATES_REGION_BYTES,
-    WorkerSlotState, ZSTEP_PROTOCOL_VERSION, ZSTEP_SHM_MAGIC,
+    MAX_DECODE_GRAPH_SEQS, MAX_WORKERS, SHM_SUPERBLOCK_REGION_BYTES, SUPERBLOCK_ABORT_OFFSET,
+    SeqStepOutput, ShmGeometry, ShmSuperblock, StepHeader, StepPlanLayout, StepResultHeader,
+    WORKER_STATES_OFFSET, WORKER_STATES_REGION_BYTES, WorkerSlotState, ZSTEP_PROTOCOL_VERSION,
+    ZSTEP_SHM_MAGIC,
 };
 
 use crate::{Result, SharedMemoryArena, ShmError};
@@ -42,6 +43,7 @@ pub struct ShmLayout {
     pub plan_slot_offsets: [usize; 2],
     pub result_slot_offsets: [usize; 2],
     pub result_slot_stride: usize,
+    pub layout_hash: u64,
     pub total_bytes: usize,
 }
 
@@ -81,6 +83,7 @@ impl ShmLayout {
             )
             .ok_or_else(|| ShmError::invalid_input("result size overflow"))?;
         let result_slot_stride = align_up(result_payload, PAGE_ALIGN);
+        let layout_hash = plan.layout_hash(result_slot_stride);
         let second_result = results_offset
             .checked_add(result_slot_stride)
             .ok_or_else(|| ShmError::invalid_input("result offset overflow"))?;
@@ -93,6 +96,7 @@ impl ShmLayout {
             plan_slot_offsets: [plans_offset, second_plan],
             result_slot_offsets: [results_offset, second_result],
             result_slot_stride,
+            layout_hash,
             total_bytes,
         })
     }
@@ -112,7 +116,7 @@ impl SharedMemoryArena {
         if self.len() != layout.total_bytes {
             return Err(ShmError::invalid_input("mapping size differs from layout"));
         }
-        self.bytes_mut().fill(0);
+        self.try_bytes_mut()?.fill(0);
         let superblock = ShmSuperblock {
             magic: ZSTEP_SHM_MAGIC,
             protocol_version: ZSTEP_PROTOCOL_VERSION,
@@ -134,7 +138,11 @@ impl SharedMemoryArena {
                 layout.result_slot_offsets[0] as u64,
                 layout.result_slot_offsets[1] as u64,
             ],
-            _reserved: [layout.result_slot_stride as u64, 0, 0, 0],
+            result_slot_stride: layout.result_slot_stride as u64,
+            layout_hash: layout.layout_hash,
+            max_decode_graph_seqs: MAX_DECODE_GRAPH_SEQS,
+            _pad_u32: 0,
+            _reserved: [0],
         };
         *self.view_mut::<ShmSuperblock>(0)? = superblock;
         Ok(())
@@ -142,6 +150,21 @@ impl SharedMemoryArena {
 
     pub fn superblock(&self) -> Result<&ShmSuperblock> {
         self.view::<ShmSuperblock>(0)
+    }
+
+    /// Atomically broadcast a cluster-wide abort flag in Region 0 cacheline 2 (`0x80`).
+    pub fn signal_abort(&self) -> Result<()> {
+        self.checked_writable()?;
+        self.view::<AtomicU32>(SUPERBLOCK_ABORT_OFFSET)?
+            .store(1, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn is_aborted(&self) -> Result<bool> {
+        Ok(self
+            .view::<AtomicU32>(SUPERBLOCK_ABORT_OFFSET)?
+            .load(Ordering::Acquire)
+            != 0)
     }
 
     pub fn worker_state(&self, rank: usize) -> Result<&WorkerSlotState> {
@@ -158,7 +181,6 @@ impl SharedMemoryArena {
         Ok(StepPlanSlot {
             arena: self,
             base,
-            geometry: layout.geometry,
             layout: layout.plan,
         })
     }
@@ -168,6 +190,7 @@ impl SharedMemoryArena {
         layout: &ShmLayout,
         slot: usize,
     ) -> Result<StepPlanSlotMut<'_>> {
+        self.checked_writable()?;
         let index = ShmLayout::slot_index(slot)?;
         let base = layout.plan_slot_offsets[index];
         self.checked_range(base, layout.plan.total_slot_bytes, 64)?;
@@ -195,6 +218,7 @@ impl SharedMemoryArena {
         layout: &ShmLayout,
         slot: usize,
     ) -> Result<ResultSlotMut<'_>> {
+        self.checked_writable()?;
         let index = ShmLayout::slot_index(slot)?;
         let base = layout.result_slot_offsets[index];
         self.checked_range(base, layout.result_slot_stride, 64)?;
@@ -213,6 +237,7 @@ impl SharedMemoryArena {
     }
 
     fn view_mut<T>(&mut self, offset: usize) -> Result<&mut T> {
+        self.checked_writable()?;
         self.checked_range(offset, size_of::<T>(), std::mem::align_of::<T>())?;
         // SAFETY: the range and alignment were checked and `&mut self` makes this view exclusive.
         Ok(unsafe { &mut *self.pointer(offset).cast::<T>() })
@@ -228,6 +253,7 @@ impl SharedMemoryArena {
     }
 
     fn slice_view_mut<T>(&mut self, offset: usize, len: usize) -> Result<&mut [T]> {
+        self.checked_writable()?;
         let bytes = len
             .checked_mul(size_of::<T>())
             .ok_or_else(|| ShmError::invalid_input("slice byte length overflow"))?;
@@ -241,7 +267,6 @@ impl SharedMemoryArena {
 pub struct StepPlanSlot<'a> {
     arena: &'a SharedMemoryArena,
     base: usize,
-    geometry: ShmGeometry,
     layout: StepPlanLayout,
 }
 
@@ -252,7 +277,6 @@ impl StepPlanSlot<'_> {
 
     /// Acquire the published step and make every preceding payload write visible.
     pub fn published_step_id(&self) -> Result<u64> {
-        let _geometry = self.geometry;
         let step_id = self.header()?.step_id.load(Ordering::Acquire);
         fence(Ordering::Acquire);
         Ok(step_id)

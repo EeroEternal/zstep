@@ -443,7 +443,9 @@ def _run_moe_geometry(
                 ).item()
             )
             assert cos > 0.995, f"{label} cosine similarity too low at M={m}: {cos}"
-            latency_us = _bench_cuda_graph_us(lambda: fused_moe.run(binding=binding))
+            latency_us = _bench_cuda_graph_us(
+                lambda bound=binding: fused_moe.run(binding=bound)
+            )
             unique_experts = int(torch.unique(topk_ids).numel())
             weight_values_per_expert = 3 * HIDDEN_SIZE * intermediate_size
             bytes_moved = (

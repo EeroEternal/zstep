@@ -36,6 +36,7 @@ use zs_wire::{
 
 const INHERITED_PLAN_FD_BASE: i32 = 100;
 const INHERITED_DONE_FD_BASE: i32 = 200;
+const INHERITED_SHM_FD_BASE: i32 = 300;
 
 /// Explicit Python worker and micro-step / real-model launch parameters.
 #[derive(Debug, Clone)]
@@ -264,6 +265,9 @@ impl ModeBCoordinator {
         let layout = ShmLayout::compute(config.geometry)?;
         let mut arena = SharedMemoryArena::create(&config.shm_name, layout.total_bytes)?;
         arena.initialize(&layout)?;
+        // Unlink `/dev/shm/<name>` BEFORE spawning children and pass the live open FD via
+        // `dup2` in `pre_exec`, eliminating even a millisecond-scale SIGKILL leak window.
+        arena.unlink_now()?;
         let plan_events = (0..config.geometry.world_size)
             .map(|_| EventFd::new())
             .collect::<zs_shm::Result<Vec<_>>>()?;
@@ -271,7 +275,13 @@ impl ModeBCoordinator {
             .map(|_| EventFd::new())
             .collect::<zs_shm::Result<Vec<_>>>()?;
         let rendezvous_file = std::env::temp_dir().join(format!("{}_gloo", config.shm_name));
-        let workers = spawn_workers(&config, &plan_events, &done_events, &rendezvous_file)?;
+        let workers = spawn_workers(
+            &config,
+            arena.as_raw_fd(),
+            &plan_events,
+            &done_events,
+            &rendezvous_file,
+        )?;
         Ok(Self {
             workers,
             plan_events,
@@ -287,6 +297,9 @@ impl ModeBCoordinator {
     pub fn run(mut self) -> Result<ModeBMetrics> {
         let init_start = Instant::now();
         self.wait_all(0, self.config.ready_timeout, true)?;
+        // Unlink `/dev/shm/<name>` immediately once every worker has attached so even SIGKILL
+        // leaves zero orphaned POSIX shared-memory objects.
+        self.arena.unlink_now()?;
         let init_wall_us = duration_us(init_start.elapsed());
         let mut worker_numa_nodes = Vec::with_capacity(self.config.geometry.world_size as usize);
         for rank in 0..self.config.geometry.world_size as usize {
@@ -354,7 +367,13 @@ impl ModeBCoordinator {
         }
 
         self.shutdown(self.config.steps + 1)?;
+        let (recompilations, _) = self.read_shutdown_triton_stats()?;
         self.workers.wait()?;
+        if recompilations > 0 {
+            return Err(ModeBError::Protocol(format!(
+                "worker recorded {recompilations} unexpected runtime Triton JIT recompilations"
+            )));
+        }
         metrics.total_wall_us = duration_us(wall_start.elapsed());
         Ok(metrics)
     }
@@ -362,6 +381,7 @@ impl ModeBCoordinator {
     pub(crate) fn wait_workers_ready(&mut self) -> Result<(u64, Vec<i32>)> {
         let init_start = Instant::now();
         self.wait_all(0, self.config.ready_timeout, true)?;
+        self.arena.unlink_now()?;
         let init_wall_us = duration_us(init_start.elapsed());
         let mut worker_numa_nodes = Vec::with_capacity(self.config.geometry.world_size as usize);
         for rank in 0..self.config.geometry.world_size as usize {
@@ -397,18 +417,35 @@ impl ModeBCoordinator {
 
     pub(crate) fn shutdown_and_wait(mut self, step_id: u64) -> Result<()> {
         self.shutdown(step_id)?;
-        self.workers.wait()
+        let (recompilations, _) = self.read_shutdown_triton_stats()?;
+        self.workers.wait()?;
+        if recompilations > 0 {
+            return Err(ModeBError::Protocol(format!(
+                "worker recorded {recompilations} unexpected runtime Triton JIT recompilations"
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn shutdown_and_wait_with_stats(mut self, step_id: u64) -> Result<(u32, u32)> {
         self.shutdown(step_id)?;
-        let (recompilations, watched) = {
-            let result = self.arena.result_slot(&self.layout, slot(step_id))?;
-            let header = result.header()?;
-            (header.status_code, header.gpu_exec_us)
-        };
+        let (recompilations, watched) = self.read_shutdown_triton_stats()?;
         self.workers.wait()?;
         Ok((recompilations, watched))
+    }
+
+    fn read_shutdown_triton_stats(&self) -> Result<(u32, u32)> {
+        let mut max_recompilations = 0u32;
+        let mut watched_kernels = 0u32;
+        for rank in 0..self.config.geometry.world_size as usize {
+            let state = self.arena.worker_state(rank)?;
+            let recomp = state.triton_recompilations.load(Ordering::Acquire);
+            max_recompilations = max_recompilations.max(recomp);
+            if rank == 0 {
+                watched_kernels = state.watched_kernels.load(Ordering::Acquire);
+            }
+        }
+        Ok((max_recompilations, watched_kernels))
     }
 
     fn prepare_step(&mut self, step_id: u64, opcode: StepOpcode) -> Result<()> {
@@ -439,17 +476,36 @@ impl ModeBCoordinator {
             flags: 0,
             _reserved: [0; 3],
         };
-        for row in 0..token_count as usize {
-            plan.token_ids_mut()?[row] = ((step_id as i32 * 131 + row as i32 * 17) % 32_000).abs();
-            plan.positions_mut()?[row] = step_id as i32 - 1;
-            plan.req_slot_ids_mut()?[row] = (row as u32 % num_seqs.max(1)) as i32;
+        let rows = token_count as usize;
+        {
+            let token_ids = plan.token_ids_mut()?;
+            for (row, dst) in token_ids[..rows].iter_mut().enumerate() {
+                *dst = ((step_id as i32 * 131 + row as i32 * 17) % 32_000).abs();
+            }
         }
-        for index in 0..num_seqs as usize {
-            plan.sample_row_indices_mut()?[index] = index as i32;
-            plan.seq_lens_mut()?[index] = step_id as i32;
-            plan.query_start_loc_mut()?[index] = index as i32;
+        plan.positions_mut()?[..rows].fill(step_id as i32 - 1);
+        {
+            let req_slot_ids = plan.req_slot_ids_mut()?;
+            let denom = num_seqs.max(1);
+            for (row, dst) in req_slot_ids[..rows].iter_mut().enumerate() {
+                *dst = (row as u32 % denom) as i32;
+            }
         }
-        plan.query_start_loc_mut()?[num_seqs as usize] = num_seqs as i32;
+        let seqs = num_seqs as usize;
+        {
+            let sample_rows = plan.sample_row_indices_mut()?;
+            for (index, dst) in sample_rows[..seqs].iter_mut().enumerate() {
+                *dst = index as i32;
+            }
+        }
+        plan.seq_lens_mut()?[..seqs].fill(step_id as i32);
+        {
+            let query_start_loc = plan.query_start_loc_mut()?;
+            for (index, dst) in query_start_loc[..seqs].iter_mut().enumerate() {
+                *dst = index as i32;
+            }
+            query_start_loc[seqs] = num_seqs as i32;
+        }
         Ok(())
     }
 
@@ -469,6 +525,7 @@ impl ModeBCoordinator {
             loop {
                 let now = Instant::now();
                 if now >= deadline {
+                    let _ = self.arena.signal_abort();
                     return Err(ModeBError::Protocol(format!(
                         "rank {rank} timed out waiting for phase {step_id}"
                     )));
@@ -477,7 +534,10 @@ impl ModeBCoordinator {
                 match self.done_events[rank].wait_until(slice_end) {
                     Ok(()) => break,
                     Err(_) => {
-                        self.workers.check_alive()?;
+                        if let Err(err) = self.workers.check_alive() {
+                            let _ = self.arena.signal_abort();
+                            return Err(err);
+                        }
                     }
                 }
             }
@@ -486,22 +546,28 @@ impl ModeBCoordinator {
             let status = state.status_code.load(Ordering::Acquire);
             let error_code = state.error_code.load(Ordering::Acquire);
             if status == WORKER_STATUS_ERROR || error_code != 0 {
+                let _ = self.arena.signal_abort();
                 return Err(ModeBError::Protocol(format!(
                     "rank {rank} reported worker error {error_code} in phase {step_id}"
                 )));
             }
+            if !initializing && status == WORKER_STATUS_RUNNING {
+                let _ = self.arena.signal_abort();
+                return Err(ModeBError::Protocol(format!(
+                    "rank {rank} remained running in phase {step_id}"
+                )));
+            }
             if status != WORKER_STATUS_READY {
+                let _ = self.arena.signal_abort();
                 return Err(ModeBError::Protocol(format!(
                     "rank {rank} has unexpected status {status} in phase {step_id}"
                 )));
             }
             if !initializing && state.ready_step_id.load(Ordering::Acquire) != step_id {
+                let _ = self.arena.signal_abort();
                 return Err(ModeBError::Protocol(format!(
                     "rank {rank} completed the wrong step in phase {step_id}"
                 )));
-            }
-            if !initializing && status == WORKER_STATUS_RUNNING {
-                return Err(ModeBError::Protocol("worker remained running".to_owned()));
             }
         }
         Ok(())
@@ -516,12 +582,14 @@ impl ModeBCoordinator {
 
 impl Drop for ModeBCoordinator {
     fn drop(&mut self) {
+        let _ = self.arena.signal_abort();
         let _ = fs::remove_file(&self.rendezvous_file);
     }
 }
 
 fn spawn_workers(
     config: &ModeBConfig,
+    source_shm_fd: i32,
     plan_events: &[EventFd],
     done_events: &[EventFd],
     rendezvous_file: &PathBuf,
@@ -531,6 +599,7 @@ fn spawn_workers(
     for rank in 0..config.geometry.world_size as usize {
         let inherited_plan_fd = INHERITED_PLAN_FD_BASE + rank as i32;
         let inherited_done_fd = INHERITED_DONE_FD_BASE + rank as i32;
+        let inherited_shm_fd = INHERITED_SHM_FD_BASE + rank as i32;
         let source_plan_fd = plan_events[rank].as_raw_fd();
         let source_done_fd = done_events[rank].as_raw_fd();
         let mut command = Command::new(&config.launch.python_executable);
@@ -540,6 +609,8 @@ fn spawn_workers(
             .arg("zstep_worker.runtime_loop")
             .arg("--shm-name")
             .arg(&config.shm_name)
+            .arg("--shm-fd")
+            .arg(inherited_shm_fd.to_string())
             .arg("--rank")
             .arg(rank.to_string())
             .arg("--plan-fd")
@@ -567,8 +638,17 @@ fn spawn_workers(
         if let Some(model_dir) = &config.launch.model_dir {
             command.arg("--model-dir").arg(model_dir);
         }
+        let pythonpath = match std::env::var_os("PYTHONPATH") {
+            Some(existing) if !existing.is_empty() => {
+                let mut joined = config.launch.worker_root.as_os_str().to_os_string();
+                joined.push(":");
+                joined.push(existing);
+                joined
+            }
+            _ => config.launch.worker_root.as_os_str().to_os_string(),
+        };
         command
-            .env("PYTHONPATH", &config.launch.worker_root)
+            .env("PYTHONPATH", pythonpath)
             .env("PYTHONUNBUFFERED", "1")
             .env("OMP_NUM_THREADS", "1")
             .env("MKL_NUM_THREADS", "1")
@@ -579,14 +659,21 @@ fn spawn_workers(
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        // SAFETY: the closure only calls async-signal-safe `dup2`; the targets are disjoint from
-        // normal descriptors and dup2 clears CLOEXEC on exactly the two inherited descriptors.
+        // SAFETY: the closure only calls async-signal-safe `prctl` and `dup2`; the targets are
+        // disjoint from normal descriptors and `dup2` clears CLOEXEC on the inherited descriptors.
         unsafe {
             command.pre_exec(move || {
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                }
                 if libc::dup2(source_plan_fd, inherited_plan_fd) < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 if libc::dup2(source_done_fd, inherited_done_fd) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::dup2(source_shm_fd, inherited_shm_fd) < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())

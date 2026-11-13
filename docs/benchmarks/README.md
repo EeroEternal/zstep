@@ -160,8 +160,8 @@ export OMP_NUM_THREADS=1 NCCL_P2P_DISABLE=1 NCCL_P2P_LEVEL=LOC
   --model-dir "$ZSTEP_DSV41_MODEL_DIR" --allreduce-blocks 8 \
   --num-kv-pages 2560 --max-seqs 16 --max-step-tokens 4096 --max-decoder-rows 4096 \
   --max-pages-per-seq 256 --ready-timeout-secs 900 --step-timeout-secs 180 \
-  --verify-greedy docs/benchmarks/phase3_vllm_greedy_reference.json \
-  --verify-report docs/benchmarks/phase3_greedy_parity_report.json
+  --verify-greedy-json docs/benchmarks/phase3_vllm_greedy_reference.json \
+  --verify-output-json docs/benchmarks/phase3_greedy_parity_report.json
 
 # 2) Warm n=3 六档交错主基准（无前缀缓存，独立种子，顺风车混合步 3072）
 ./target/release/zstep --mode-b --world-size 8 \
@@ -183,7 +183,7 @@ python3 worker/tests/phase2/collect_vllm_reference.py --mode all --repeats 3 --s
   --allreduce-blocks 8 --allreduce-threads 256 --num-kv-pages 65536 \
   --max-seqs 128 --max-step-tokens 4096 --max-decoder-rows 4096 \
   --max-prefill-chunk 2048 --max-pages-per-seq 256 \
-  --warmup-prompts 16 --repeats 3 --bench-seed 20261111 \
+  --warmup-prompts 16 --repeats 3 \
   --bench-tiers "in512_c1:1:8:512:256;in512_c16:16:48:512:256;in512_c128:128:256:512:256;in1024_c1:1:20:1024:256;in1024_c32:32:200:1024:256;in1024_c128:128:400:1024:256" \
   --metrics-output docs/benchmarks/phase2_zstep_qwen35_35b_a3b_tp8.json
 ```

@@ -183,22 +183,23 @@ def _run_mhc_case(*, tokens: int, device: torch.device) -> dict[str, float | int
         binding = state.bind(
             scratch=scratch, tokens=tokens, expected_m=tokens, **outputs
         )
-        run = lambda: _impl._b12x_mhc_post_pre_impl(
-            x,
-            residual,
-            prev_post,
-            prev_comb,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps=rms_eps,
-            hc_eps=hc_eps,
-            sinkhorn_iters=SINKHORN_ITERS,
-            norm_weight=None,
-            norm_eps=0.0,
-            binding=binding,
-            _state=state,
-        )
+        def run() -> None:
+            _impl._b12x_mhc_post_pre_impl(
+                x,
+                residual,
+                prev_post,
+                prev_comb,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps=rms_eps,
+                hc_eps=hc_eps,
+                sinkhorn_iters=SINKHORN_ITERS,
+                norm_weight=None,
+                norm_eps=0.0,
+                binding=binding,
+                _state=state,
+            )
         return PreparedCall(run=run, owners=(scratch, binding, outputs))
 
     request = declaration.request(
