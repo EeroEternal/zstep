@@ -251,6 +251,22 @@ __device__ __forceinline__ uint64_t sys_ld_acq_u64(const uint64_t* addr) {
     return val;
 }
 
+// Returns false if the host raised `abort_flag` before `*flag_addr >= target`. The abort word
+// is polled only every 4096 iterations so the fast path adds no extra PCIe loads.
+__device__ __forceinline__ bool spin_wait_ge_or_abort_u64(
+    const uint64_t* flag_addr,
+    uint64_t target,
+    const uint64_t* abort_flag) {
+    uint32_t iters = 0;
+    while (sys_ld_acq_u64(flag_addr) < target) {
+        __nanosleep(32);
+        if ((++iters & 0xFFFU) == 0U && sys_ld_acq_u64(abort_flag) != 0ULL) {
+            return false;
+        }
+    }
+    return true;
+}
+
 __device__ __forceinline__ void sys_st_rel_u64(uint64_t* addr, uint64_t val) {
     asm volatile("st.global.release.sys.b64 [%0], %1;" :: "l"(addr), "l"(val) : "memory");
 }
@@ -341,15 +357,19 @@ __global__ void tp8_argmax_gather_shm_kernel(
     // Layout in SHM:
     // [0 .. 64):    ready_flags[8] (uint64_t)
     // [64 .. 128):  done_flags[8]  (uint64_t)
+    // [128 .. 136): abort_flag     (uint64_t, set by the host on cluster abort)
     // [256 .. ):    4 slots * 8 ranks * (max_rows_per_step * 2) * sizeof(ValIdxPair)
     uint64_t* ready_flags = reinterpret_cast<uint64_t*>(host_base);
     uint64_t* done_flags = reinterpret_cast<uint64_t*>(host_base + 64);
+    const uint64_t* abort_flag = reinterpret_cast<const uint64_t*>(host_base + 128);
 
     __shared__ uint64_t s_step;
+    __shared__ int s_aborted;
     if (threadIdx.x == 0) {
         const uint64_t next = step_counter[0] + 1ULL;
         step_counter[0] = next;
         s_step = next;
+        s_aborted = 0;
     }
     __syncthreads();
     const uint64_t step = s_step;
@@ -358,11 +378,14 @@ __global__ void tp8_argmax_gather_shm_kernel(
     if (step > kSlots) {
         const uint64_t min_done = step - kSlots;
         if (threadIdx.x < world_size) {
-            while (sys_ld_acq_u64(done_flags + threadIdx.x) < min_done) {
-                __nanosleep(32);
+            if (!spin_wait_ge_or_abort_u64(done_flags + threadIdx.x, min_done, abort_flag)) {
+                s_aborted = 1;
             }
         }
         __syncthreads();
+        if (s_aborted) {
+            return;
+        }
     }
 
     const int64_t pairs_per_rank = max_rows_per_step * 2;
@@ -387,11 +410,14 @@ __global__ void tp8_argmax_gather_shm_kernel(
         sys_st_rel_u64(ready_flags + rank, step);
     }
     if (threadIdx.x < world_size) {
-        while (sys_ld_acq_u64(ready_flags + threadIdx.x) < step) {
-            __nanosleep(32);
+        if (!spin_wait_ge_or_abort_u64(ready_flags + threadIdx.x, step, abort_flag)) {
+            s_aborted = 1;
         }
     }
     __syncthreads();
+    if (s_aborted) {
+        return;
+    }
 
     if (rank == 0) {
         for (int64_t r = threadIdx.x; r < num_rows; r += blockDim.x) {
@@ -494,7 +520,7 @@ def get_qwen35_cuda_ext():
     if _QWEN35_EXT is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _QWEN35_EXT = load_inline(
-            name="zstep_qwen35_ops_sm120_v4_ext",
+            name="zstep_qwen35_ops_sm120_v5_ext",
             cpp_sources=[_MOE_ALIGN_CPP],
             cuda_sources=[_MOE_ALIGN_CUDA],
             functions=[
