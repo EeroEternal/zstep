@@ -603,14 +603,15 @@ class DeepSeekV41StepRunner:
         shm_ar = self.shm_ar
         shm_ag = self.shm_ag
         runner = self
-        # Route M <= 256 (<= 4 MiB AR / <= 2 MiB AG) and 100% of CUDAGraph captures
-        # through `shm_v5`; route larger eager prefill/mixed payloads (M > 256) to
-        # multi-SM `NCCL_LOC` (`orig_ar` / `orig_ag`) to saturate dual-socket DRAM/UPI.
+        # Route M <= 320 (<= 3.125 MiB AR at H=5120) and M <= 6553 (<= 8 MiB AG input
+        # at H_in=640, covering M=1..4096 where 1-shot native-`dim` `shm_ag` avoids
+        # NCCL's `dim=0` + `permute().contiguous()` copy) plus 100% of CUDAGraph
+        # captures through `shm_v5`; route larger eager AR payloads to `NCCL_LOC`.
         shm_max_ar_numel = int(
-            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(256 * 8192))
+            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(320 * 5120))
         )
         shm_max_ag_numel = int(
-            os.environ.get("ZSTEP_SHM_MAX_AG_NUMEL", str(256 * 4096))
+            os.environ.get("ZSTEP_SHM_MAX_AG_NUMEL", str(1024 * 4096))
         )
 
         tp_group.use_custom_op_call = False

@@ -389,6 +389,9 @@ class Qwen35MoeStepRunner:
         self.num_kv_pages: int = num_kv_pages
         self.dummy_page: int = num_kv_pages
 
+        os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+        os.environ.setdefault("NCCL_P2P_LEVEL", "LOC")
+        os.environ.setdefault("NCCL_IB_DISABLE", "1")
         dist.init_process_group(
             backend="gloo",
             init_method=f"file://{dist_init_file}",
@@ -397,6 +400,19 @@ class Qwen35MoeStepRunner:
             timeout=timedelta(seconds=300),
         )
         self.exchange_group = dist.group.WORLD
+        enable_nccl_prefill = os.environ.get("ZSTEP_QWEN_ENABLE_NCCL_PREFILL", "1") != "0"
+        self.nccl_group: dist.ProcessGroup | None = (
+            dist.new_group(backend="nccl")
+            if (enable_nccl_prefill and dist.is_nccl_available())
+            else None
+        )
+        # Route M <= 800 (<= 3.125 MiB at H=2048) and 100% of CUDAGraph captures
+        # through `shm_v5`; route larger eager prefill chunks (M >= 1024) to `NCCL_LOC`.
+        self.shm_max_ar_numel: int = int(
+            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(320 * 5120))
+        )
+        self.shm_ar_calls: int = 0
+        self.nccl_eager_large_calls: int = 0
         self.communicator: HostMappedShmAllReduce = HostMappedShmAllReduce(
             name=allreduce_name,
             rank=rank,
@@ -894,6 +910,20 @@ class Qwen35MoeStepRunner:
             vocab_per_rank=self.vocab_per_rank,
         )
 
+    def _all_reduce_prefill(self, input_: torch.Tensor, *, output: torch.Tensor) -> None:
+        if (
+            self.nccl_group is not None
+            and not torch.cuda.is_current_stream_capturing()
+            and input_.numel() > self.shm_max_ar_numel
+        ):
+            if output.data_ptr() != input_.data_ptr():
+                output.copy_(input_)
+            dist.all_reduce(output, group=self.nccl_group)
+            self.nccl_eager_large_calls += 1
+            return
+        self.communicator.all_reduce(input_, output=output)
+        self.shm_ar_calls += 1
+
     def _run_prefill_varlen_forward(
         self,
         *,
@@ -976,7 +1006,7 @@ class Qwen35MoeStepRunner:
                 )
                 torch.matmul(attn_out, lw.w_o_proj.t(), out=proj_local)
 
-            self.communicator.all_reduce(proj_local, output=reduced)
+            self._all_reduce_prefill(proj_local, output=reduced)
             fused_add_zero_centered_rmsnorm(
                 reduced, hidden, lw.post_attn_norm_w, normed_out=normed, eps=eps
             )
@@ -1001,7 +1031,7 @@ class Qwen35MoeStepRunner:
                 moe_out_buf=self.moe_out_buf,
                 num_active_rows=total_tokens,
             )
-            self.communicator.all_reduce(moe_local, output=reduced)
+            self._all_reduce_prefill(moe_local, output=reduced)
             if idx + 1 < len(self.layers):
                 fused_add_zero_centered_rmsnorm(
                     reduced,
@@ -1051,6 +1081,12 @@ class Qwen35MoeStepRunner:
                 num_sample_rows=1,
                 max_q_len=warm_tokens,
             )
+            torch.cuda.synchronize(self.device)
+            dist.barrier(group=self.exchange_group)
+
+        if self.nccl_group is not None:
+            self.reduced_buf[:1].zero_()
+            dist.all_reduce(self.reduced_buf[:1], group=self.nccl_group)
             torch.cuda.synchronize(self.device)
             dist.barrier(group=self.exchange_group)
 
@@ -1209,5 +1245,6 @@ class Qwen35MoeStepRunner:
         self.decode_graphs.clear()
         self.argmax_channel.close(abort=abort)
         self.communicator.close(abort=abort)
+        self.nccl_group = None
         if not abort and dist.is_initialized():
             dist.destroy_process_group()

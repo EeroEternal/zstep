@@ -47,7 +47,7 @@ MAX_BLOCKS = 64
 SHM_V5_HEADER_BYTES = 131072
 SHM_V5_ABORT_OFFSET = 98304
 ARGMAX_SHM_ABORT_OFFSET = 128
-DEFAULT_ONE_SHOT_MAX_VECS = 2560  # Up to 40 KiB (e.g. M <= 4 at H=5120 BF16)
+DEFAULT_ONE_SHOT_MAX_VECS = 4096  # Up to 64 KiB (e.g. M <= 16 at H=2048 or M <= 6 at H=5120 BF16)
 
 _CPP_SOURCE = r"""
 #include <torch/extension.h>
@@ -888,7 +888,9 @@ void launch_shm_v5_allreduce_cuda(
     int one_shot_max_vecs,
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    shm_v5_allreduce_kernel<<<blocks, threads, 0, stream>>>(
+    const int64_t vecs_per_cta = (num_vecs + blocks - 1) / blocks;
+    const int launch_threads = (threads == 256 && vecs_per_cta > 256) ? 512 : threads;
+    shm_v5_allreduce_kernel<<<blocks, launch_threads, 0, stream>>>(
         reinterpret_cast<const uint4*>(input_ptr),
         reinterpret_cast<uint4*>(output_ptr),
         control_ptr,
@@ -915,7 +917,10 @@ void launch_shm_v5_allgather_cuda(
     int threads,
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    shm_v5_allgather_kernel<<<blocks, threads, 0, stream>>>(
+    const int64_t num_in_vecs = outer_rows * vecs_per_row;
+    const int64_t vecs_per_cta = (num_in_vecs + blocks - 1) / blocks;
+    const int launch_threads = (threads == 256 && vecs_per_cta > 256) ? 512 : threads;
+    shm_v5_allgather_kernel<<<blocks, launch_threads, 0, stream>>>(
         reinterpret_cast<const uint4*>(input_ptr),
         reinterpret_cast<uint4*>(output_ptr),
         control_ptr,
@@ -1156,7 +1161,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v7_ext",
+            name="zstep_shm_allreduce_sm120_v8_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
