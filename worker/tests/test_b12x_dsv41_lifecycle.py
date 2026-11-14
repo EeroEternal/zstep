@@ -17,10 +17,12 @@ from zstep_worker.kernels_sm120.b12x_dsv41 import (  # noqa: E402
     B12xPrepareSummary,
     _CUTLASS_LARGE_M_THRESHOLDS,
     _compute_b12x_source_fingerprint,
+    _prepare_sm12x_mega_gate,
     _slice_arena_for_specs,
     _specs_nbytes,
     close_b12x_dsv41_model,
     is_sm120_dsa_decode_available,
+    maybe_enable_b12x_for_dsv41,
 )
 
 
@@ -124,8 +126,58 @@ def test_sm120_summary_defaults_and_env_gating(monkeypatch: pytest.MonkeyPatch) 
     assert summary.mega_gate_min_tokens == 0
     assert summary.dsa_decode_enabled is False
 
+    monkeypatch.delenv("ZSTEP_REQUIRE_SM120_EXP", raising=False)
     monkeypatch.setenv("ZSTEP_ENABLE_SM120_DSA_DECODE", "0")
     assert is_sm120_dsa_decode_available() is False
+
+
+def test_require_sm120_exp_rejects_silent_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZSTEP_REQUIRE_SM120_EXP", "1")
+
+    monkeypatch.setenv("ZSTEP_ENABLE_SM120_DSA_DECODE", "0")
+    with pytest.raises(RuntimeError, match="ZSTEP_REQUIRE_SM120_EXP=1"):
+        is_sm120_dsa_decode_available()
+    monkeypatch.delenv("ZSTEP_ENABLE_SM120_DSA_DECODE", raising=False)
+
+    monkeypatch.setenv("ZSTEP_ENABLE_SM12X_MEGA_GATE", "0")
+    with pytest.raises(RuntimeError, match="ZSTEP_REQUIRE_SM120_EXP=1"):
+        _prepare_sm12x_mega_gate(
+            torch.nn.Linear(4, 4),
+            rank=0,
+            device=torch.device("cpu"),
+            max_tokens=128,
+            exchange_group=None,
+        )
+    monkeypatch.delenv("ZSTEP_ENABLE_SM12X_MEGA_GATE", raising=False)
+
+    monkeypatch.setenv("ZSTEP_ENABLE_B12X", "0")
+    with pytest.raises(RuntimeError, match="ZSTEP_REQUIRE_B12X=1"):
+        maybe_enable_b12x_for_dsv41()
+    monkeypatch.delenv("ZSTEP_ENABLE_B12X", raising=False)
+
+    # Even with flags enabled, missing overlay packages must fail loudly rather than returning False/0.
+    saved = {
+        k: sys.modules.pop(k)
+        for k in list(sys.modules)
+        if k == "flashinfer.experimental.sm120_dsa_indexer._api"
+        or k.startswith("flashinfer.experimental.sm120_dsa_indexer")
+        or k.startswith("flashinfer.experimental.sm12x_mega_gate")
+    }
+    monkeypatch.setitem(sys.modules, "flashinfer.experimental.sm120_dsa_indexer._api", None)
+    monkeypatch.setitem(sys.modules, "flashinfer.experimental.sm12x_mega_gate.heuristics", None)
+    try:
+        with pytest.raises(RuntimeError, match="ZSTEP_REQUIRE_SM120_EXP=1"):
+            is_sm120_dsa_decode_available()
+        with pytest.raises(RuntimeError, match="ZSTEP_REQUIRE_SM120_EXP=1"):
+            _prepare_sm12x_mega_gate(
+                torch.nn.Linear(4, 4),
+                rank=0,
+                device=torch.device("cpu"),
+                max_tokens=128,
+                exchange_group=None,
+            )
+    finally:
+        sys.modules.update(saved)
 
 
 def test_b12x_source_fingerprint_changes_with_source(
