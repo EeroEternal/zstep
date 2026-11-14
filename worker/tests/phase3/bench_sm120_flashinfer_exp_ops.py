@@ -4,14 +4,17 @@
 # ruff: noqa: B023
 """Route B Step 2: Single-GPU (RTX 6000D, 156 SMs, sm_120) A/B Microbenchmark & Parity Suite.
 
-Supports two modes via `--mode`:
+Supports three modes via `--mode` (`default="new_ops"`):
   - `b12x_only`: Benchmarks `b12x.moe.fused_moe` and `b12x.gemm.block_fp8_linear`
     (run once against `b12x-overlay@79819b11` and once against `flashinfer-exp@ae58183f`).
   - `new_ops`: Benchmarks & checks numerical parity of:
       1. Model config & vLLM 0.31.0 `DeepSeekV4MoE` / `SharedFusedMoE` router details
       2. `sm12x_mega_gate` vs `GateLinear + fused_topk_bias` (standalone & chained with RMSNorm + b12x MoE)
-      3. `prepare_sm120_paged_mqa_logits` vs `deep_gemm.fp8_fp4_paged_mqa_logits` (single layer & full 8-layer step)
+      3. `prepare_sm120_paged_mqa_logits` (optional; omitted in bundled overlay) vs `deep_gemm.fp8_fp4_paged_mqa_logits`
       4. `sm120_dsa_indexer` (`dsa_indexer_det_topk` paged CUDAGraph & ragged Prefill) vs vLLM `SparseAttnIndexer`
+  - `all`: Runs both `b12x_only` and `new_ops` sequentially.
+
+Pass `--output /path/to/results.json` to serialize structured JSON results.
 """
 
 from __future__ import annotations
@@ -82,7 +85,7 @@ def bench_eager(fn, warmup: int = 15, iters: int = 60) -> tuple[float, float]:
     return statistics.median(samples_us), statistics.mean(samples_us)
 
 
-def run_b12x_bench(tag: str, cache_dir: str) -> None:
+def run_b12x_bench(tag: str, cache_dir: str) -> dict:
     os.environ["B12X_W4A8_TINY_DECODE"] = "0"
     compat = "/usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/_compat"
     if os.path.isdir(compat) and compat not in sys.path:
@@ -196,6 +199,13 @@ def run_b12x_bench(tag: str, cache_dir: str) -> None:
 
     moe_state = require_prepared(eplan, "moe.decode")
     moe_scr = tuple(torch.empty(s.shape, dtype=s.dtype, device=dev) for s in eplan.scratch_specs())
+    b12x_results: dict = {
+        "tag": tag,
+        "gpu_name": props.name,
+        "sm_count": props.multi_processor_count,
+        "moe_fused_us": {},
+        "block_fp8_linear_us": {},
+    }
 
     print(f"\n--- b12x.moe.fused_moe ({tag}) ---")
     for m in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 3072):
@@ -210,12 +220,19 @@ def run_b12x_bench(tag: str, cache_dir: str) -> None:
         else:
             med, avg = bench_eager(b.run)
             mode_s = "Eager"
+        b12x_results["moe_fused_us"][f"M={m}"] = {
+            "mode": mode_s,
+            "median_us": round(med, 2),
+            "mean_us": round(avg, 2),
+        }
         print(f"MoE M={m:4d} [{mode_s:5s}]: median={med:7.2f} us  mean={avg:7.2f} us")
 
     print(f"\n--- b12x.gemm.block_fp8_linear ({tag}) ---")
     for out_f, in_f in lin_shapes:
         pw = packed_weights[(out_f, in_f)]
         row_parts = []
+        shape_key = f"{out_f}x{in_f}"
+        b12x_results["block_fp8_linear_us"][shape_key] = {}
         for m in lin_caps:
             p = lin_plans[(out_f, in_f, m)]
             st = require_prepared(p, "gemm.block_fp8_linear")
@@ -227,13 +244,15 @@ def run_b12x_bench(tag: str, cache_dir: str) -> None:
                 med, _ = bench_cudagraph(lambda _st=st, _b=b: _st.run_binding(_b))
             else:
                 med, _ = bench_eager(lambda _st=st, _b=b: _st.run_binding(_b))
+            b12x_results["block_fp8_linear_us"][shape_key][f"M={m}"] = round(med, 2)
             row_parts.append(f"M={m}:{med:.2f}us")
         print(f"FP8 {out_f:4d}x{in_f:4d}: " + " | ".join(row_parts))
 
     sess.close()
+    return b12x_results
 
 
-def run_new_ops_bench() -> None:
+def run_new_ops_bench() -> dict:
     compat = "/usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/_compat"
     if os.path.isdir(compat) and compat not in sys.path:
         sys.path.insert(0, compat)
@@ -243,6 +262,17 @@ def run_new_ops_bench() -> None:
     dev = torch.device("cuda", 0)
     props = torch.cuda.get_device_properties(dev)
     print(f"=== [new_ops] GPU={props.name} SMs={props.multi_processor_count} ===")
+    new_ops_results: dict = {
+        "gpu_name": props.name,
+        "sm_count": props.multi_processor_count,
+        "mega_gate_parity": {},
+        "mega_gate_standalone_us": {},
+        "mega_gate_chained_us": {},
+        "sm120_paged_mqa_logits": {"available": False},
+        "decode_dsa_parity": {},
+        "decode_dsa_cudagraph_us": {},
+        "prefill_ragged_dsa_us": {},
+    }
 
     # 0. Inspect model checkpoint config & vLLM router / SharedFusedMoE behavior
     model_dir_env = os.environ.get("ZSTEP_DSV41_MODEL_DIR", "/models/DeepSeek-V4.1-Flash")
@@ -308,6 +338,8 @@ def run_new_ops_bench() -> None:
     from flashinfer.mega_gate import prepare_mega_gate
     from vllm.model_executor.layers.layernorm import RMSNorm
 
+    from vllm.v1.worker.workspace import init_workspace_manager
+
     vcfg_ctx = set_current_vllm_config(VllmConfig())
     vcfg_ctx.__enter__()
     init_distributed_environment(
@@ -317,6 +349,7 @@ def run_new_ops_bench() -> None:
         local_rank=0,
     )
     initialize_model_parallel(1, 1)
+    init_workspace_manager(dev)
 
     torch.manual_seed(1234)
     H, E, top_k = 5120, 384, 6
@@ -371,6 +404,12 @@ def run_new_ops_bench() -> None:
             if matched_rows.any()
             else float("nan")
         )
+        new_ops_results["mega_gate_parity"][f"M={m_chk}"] = {
+            "exact_top6_rows_pct": round(exact_row_match, 2),
+            "slot_overlap_pct": round(slot_overlap, 2),
+            "max_weight_diff": None if not matched_rows.any() else float(max_w_diff),
+            "route": str(plan_chk.route["kernel"]),
+        }
         print(
             f"  [Parity M={m_chk:4d}] exact_top6_rows={exact_row_match:6.2f}% "
             f"slot_overlap={slot_overlap:6.2f}% max_weight_diff={max_w_diff:.3e} route={plan_chk.route['kernel']}"
@@ -419,6 +458,13 @@ def run_new_ops_bench() -> None:
             m_cast, _ = bench_eager(_run_mg_cast)
             mode_s = "Eager"
         saved_40 = (v_med - m_cast) * 40.0
+        new_ops_results["mega_gate_standalone_us"][f"M={m}"] = {
+            "mode": mode_s,
+            "vllm_us": round(v_med, 2),
+            "mega_raw_us": round(m_raw, 2),
+            "mega_i32_us": round(m_cast, 2),
+            "saved_40layers_us": round(saved_40, 2),
+        }
         print(
             f"  M={m:4d} [{mode_s:5s}]: vLLM={v_med:6.2f}us | mega_raw={m_raw:6.2f}us | "
             f"mega+i32={m_cast:6.2f}us | speedup={v_med/m_cast:4.2f}x | 40-layer save={saved_40:+7.1f}us"
@@ -535,6 +581,12 @@ def run_new_ops_bench() -> None:
         c_vllm, _ = bench_cudagraph(_chain_vllm)
         c_pdl, _ = bench_cudagraph(_chain_mega_vllm_norm)
         c_nopdl, _ = bench_cudagraph(_chain_mega_nopdl)
+        new_ops_results["mega_gate_chained_us"][f"M={m}"] = {
+            "vllm_us": round(c_vllm, 2),
+            "mega_pdl_us": round(c_pdl, 2),
+            "mega_nopdl_us": round(c_nopdl, 2),
+            "delta_40layers_us": round((c_vllm - c_pdl) * 40.0, 2),
+        }
         print(
             f"  Chain M={m:3d}: vLLM={c_vllm:6.2f}us | mega(pdl=1)={c_pdl:6.2f}us | "
             f"mega(pdl=0)={c_nopdl:6.2f}us | 40-layer delta={(c_vllm - c_pdl)*40:+7.1f}us"
@@ -550,8 +602,24 @@ def run_new_ops_bench() -> None:
 
     from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits, get_paged_mqa_logits_metadata
     from vllm.model_executor.layers.indexer_topk import get_indexer_topk
-    from flashinfer.sm120_paged_mqa_logits import prepare_sm120_paged_mqa_logits
     from flashinfer.dsa_indexer import dsa_indexer_det_topk
+
+    try:
+        from flashinfer.sm120_paged_mqa_logits import prepare_sm120_paged_mqa_logits
+
+        has_sm120_paged_mqa = True
+        new_ops_results["sm120_paged_mqa_logits"] = {"available": True}
+    except ImportError:
+        prepare_sm120_paged_mqa_logits = None
+        has_sm120_paged_mqa = False
+        new_ops_results["sm120_paged_mqa_logits"] = {
+            "available": False,
+            "reason": "omitted from bundled overlay (rejected standalone 2-launch op)",
+        }
+        print(
+            "  [Info] `flashinfer.sm120_paged_mqa_logits` not mounted "
+            "(omitted from bundled overlay; running DeepGEMM vs Fused `sm120_dsa_indexer`)"
+        )
 
     num_sms = props.multi_processor_count
     topk_fn = get_indexer_topk("auto")
@@ -581,32 +649,45 @@ def run_new_ops_bench() -> None:
         topk_dg = torch.full((b_chk, 512), -1, dtype=torch.int32, device=dev)
         topk_fn(dg_logits, ctx_t, 1, topk_dg, 512, max_ctx)
 
-        fi_plan = prepare_sm120_paged_mqa_logits(q_chk, kv_cache_4d, w_chk, ctx_t, bt_t, max_ctx)
-        fi_logits = fi_plan.run()
-        topk_fi = torch.full((b_chk, 512), -1, dtype=torch.int32, device=dev)
-        topk_fn(fi_logits, ctx_t, 1, topk_fi, 512, max_ctx)
-
         topk_dsa = torch.empty((b_chk, 512), dtype=torch.int32, device=dev)
         dsa_indexer_det_topk(
             q_chk, kv_cache_4d, w_chk, None, None,
             block_table=bt_t, context_lens=ctx_t, top_k=512,
             indices=topk_dsa, return_scores=False, backend="sm120",
         )
-        torch.cuda.synchronize()
-
-        valid_diff = (dg_logits[:, :ctx_chk] - fi_logits[:, :ctx_chk]).abs().max().item()
-        ov_fi = sum(len(set(topk_dg[r].tolist()) & set(topk_fi[r].tolist())) for r in range(b_chk)) / (b_chk * 512) * 100.0
         ov_dsa = sum(len(set(topk_dg[r].tolist()) & set(topk_dsa[r].tolist())) for r in range(b_chk)) / (b_chk * 512) * 100.0
-        print(
-            f"  [Decode Parity B={b_chk:2d} ctx={ctx_chk:4d}] logits_max_diff={valid_diff:.3e} | "
-            f"top512 overlap: sm120_mqa={ov_fi:6.2f}% sm120_dsa={ov_dsa:6.2f}% route={fi_plan.route}"
-        )
+        parity_entry: dict = {"sm120_dsa_top512_overlap_pct": round(ov_dsa, 2)}
+
+        if has_sm120_paged_mqa and prepare_sm120_paged_mqa_logits is not None:
+            fi_plan = prepare_sm120_paged_mqa_logits(q_chk, kv_cache_4d, w_chk, ctx_t, bt_t, max_ctx)
+            fi_logits = fi_plan.run()
+            topk_fi = torch.full((b_chk, 512), -1, dtype=torch.int32, device=dev)
+            topk_fn(fi_logits, ctx_t, 1, topk_fi, 512, max_ctx)
+            torch.cuda.synchronize()
+            valid_diff = (dg_logits[:, :ctx_chk] - fi_logits[:, :ctx_chk]).abs().max().item()
+            ov_fi = sum(len(set(topk_dg[r].tolist()) & set(topk_fi[r].tolist())) for r in range(b_chk)) / (b_chk * 512) * 100.0
+            parity_entry["logits_max_diff"] = float(valid_diff)
+            parity_entry["sm120_mqa_top512_overlap_pct"] = round(ov_fi, 2)
+            parity_entry["sm120_mqa_route"] = str(fi_plan.route)
+            print(
+                f"  [Decode Parity B={b_chk:2d} ctx={ctx_chk:4d}] logits_max_diff={valid_diff:.3e} | "
+                f"top512 overlap: sm120_mqa={ov_fi:6.2f}% sm120_dsa={ov_dsa:6.2f}% route={fi_plan.route}"
+            )
+        else:
+            torch.cuda.synchronize()
+            print(
+                f"  [Decode Parity B={b_chk:2d} ctx={ctx_chk:4d}] "
+                f"top512 overlap: sm120_dsa={ov_dsa:6.2f}% (sm120_mqa=skipped)"
+            )
+        new_ops_results["decode_dsa_parity"][f"B={b_chk}_ctx={ctx_chk}"] = parity_entry
 
     # CUDAGraph Decode Latency across B and ctx_len (max_ctx = 16384 for cr=2, 32768 for cr=1)
     print("\n  [Decode CUDAGraph Single-Layer Latency: max_ctx=16384 (cr=2) / 32768 (cr=1)]")
     for ctx_len in (640, 1280, 4096, 16384):
         max_ctx = 32768
         max_blks = max_ctx // page_kv
+        ctx_key = f"ctx={ctx_len}"
+        new_ops_results["decode_dsa_cudagraph_us"][ctx_key] = {}
         print(f"\n  >> ctx_len = {ctx_len} (max_model_len={max_ctx}):")
         for b in (1, 2, 8, 16, 32, 64, 128):
             q_b = (torch.randn(b, 1, 32, 128, device=dev, dtype=torch.bfloat16) * 0.5).to(torch.float8_e4m3fn).contiguous()
@@ -615,8 +696,6 @@ def run_new_ops_bench() -> None:
             bt_b = (torch.arange(b * max_blks, dtype=torch.int32, device=dev) % num_pages).view(b, max_blks).contiguous()
 
             dg_meta = get_paged_mqa_logits_metadata(ctx_b, page_kv, num_sms)
-            fi_plan_none = prepare_sm120_paged_mqa_logits(q_b, kv_cache_4d, w_b, ctx_b, bt_b, max_ctx, max_context_hint=None)
-            fi_plan_hint = prepare_sm120_paged_mqa_logits(q_b, kv_cache_4d, w_b, ctx_b, bt_b, max_ctx, max_context_hint=16384)
             out_topk = torch.empty((b, 512), dtype=torch.int32, device=dev)
 
             # Warm up dsa_indexer_det_topk paged outside capture (allocates internal scratch)
@@ -627,22 +706,13 @@ def run_new_ops_bench() -> None:
             )
             torch.cuda.synchronize()
 
-            # 1) Pure logits: DeepGEMM vs SM120 Paged MQA (hint=None & hint=16384)
             dg_log_us, _ = bench_cudagraph(
                 lambda: fp8_fp4_paged_mqa_logits((q_b, None), kv_cache_4d, w_b, ctx_b, bt_b, dg_meta, max_model_len=max_ctx, clean_logits=False)
             )
-            fi_log_us, _ = bench_cudagraph(fi_plan_none.run)
-            fi_hint_us, _ = bench_cudagraph(fi_plan_hint.run)
 
-            # 2) Non-candidate layer full op (clear -1 + logits + get_indexer_topk) vs sm120_dsa_indexer
             def _vllm_full_layer():
                 out_topk.fill_(-1)
                 lg = fp8_fp4_paged_mqa_logits((q_b, None), kv_cache_4d, w_b, ctx_b, bt_b, dg_meta, max_model_len=max_ctx, clean_logits=False)
-                topk_fn(lg, ctx_b, 1, out_topk, 512, max_ctx)
-
-            def _fi_mqa_full_layer():
-                out_topk.fill_(-1)
-                lg = fi_plan_none.run()
                 topk_fn(lg, ctx_b, 1, out_topk, 512, max_ctx)
 
             def _dsa_fused_layer():
@@ -653,13 +723,38 @@ def run_new_ops_bench() -> None:
                 )
 
             v_full_us, _ = bench_cudagraph(_vllm_full_layer)
-            m_full_us, _ = bench_cudagraph(_fi_mqa_full_layer)
             dsa_us, _ = bench_cudagraph(_dsa_fused_layer)
+            b_entry: dict = {
+                "deepgemm_logits_us": round(dg_log_us, 2),
+                "vllm_full_us": round(v_full_us, 2),
+                "fused_dsa_us": round(dsa_us, 2),
+            }
 
-            print(
-                f"    B={b:3d} | Logits: DG={dg_log_us:6.2f}us FI={fi_log_us:6.2f}us FI(16k)={fi_hint_us:6.2f}us | "
-                f"Full(Logits+Top512): vLLM={v_full_us:6.2f}us FI+Topk={m_full_us:6.2f}us FusedDSA={dsa_us:6.2f}us"
-            )
+            if has_sm120_paged_mqa and prepare_sm120_paged_mqa_logits is not None:
+                fi_plan_none = prepare_sm120_paged_mqa_logits(q_b, kv_cache_4d, w_b, ctx_b, bt_b, max_ctx, max_context_hint=None)
+                fi_plan_hint = prepare_sm120_paged_mqa_logits(q_b, kv_cache_4d, w_b, ctx_b, bt_b, max_ctx, max_context_hint=16384)
+                fi_log_us, _ = bench_cudagraph(fi_plan_none.run)
+                fi_hint_us, _ = bench_cudagraph(fi_plan_hint.run)
+
+                def _fi_mqa_full_layer():
+                    out_topk.fill_(-1)
+                    lg = fi_plan_none.run()
+                    topk_fn(lg, ctx_b, 1, out_topk, 512, max_ctx)
+
+                m_full_us, _ = bench_cudagraph(_fi_mqa_full_layer)
+                b_entry["fi_mqa_logits_us"] = round(fi_log_us, 2)
+                b_entry["fi_mqa_hint16k_us"] = round(fi_hint_us, 2)
+                b_entry["fi_mqa_full_us"] = round(m_full_us, 2)
+                print(
+                    f"    B={b:3d} | Logits: DG={dg_log_us:6.2f}us FI={fi_log_us:6.2f}us FI(16k)={fi_hint_us:6.2f}us | "
+                    f"Full(Logits+Top512): vLLM={v_full_us:6.2f}us FI+Topk={m_full_us:6.2f}us FusedDSA={dsa_us:6.2f}us"
+                )
+            else:
+                print(
+                    f"    B={b:3d} | Logits: DG={dg_log_us:6.2f}us | "
+                    f"Full(Logits+Top512): vLLM={v_full_us:6.2f}us FusedDSA={dsa_us:6.2f}us"
+                )
+            new_ops_results["decode_dsa_cudagraph_us"][ctx_key][f"B={b}"] = b_entry
 
     # =========================================================================
     # 3. Prefill Ragged DSA Indexer (`sm120_dsa_indexer` vs `fp8_fp4_mqa_logits + top_k_per_row_prefill`)
@@ -739,6 +834,12 @@ def run_new_ops_bench() -> None:
 
         v_us, _ = bench_eager(_prefill_vllm)
         d_us, _ = bench_eager(_prefill_dsa)
+        new_ops_results["prefill_ragged_dsa_us"][desc] = {
+            "vllm_us": round(v_us, 1),
+            "sm120_dsa_us": round(d_us, 1),
+            "speedup": round(v_us / d_us, 2),
+            "overlap_pct": round(ov_pct, 2),
+        }
         print(
             f"  {desc:15s}: vLLM={v_us:7.1f}us | sm120_dsa={d_us:7.1f}us | "
             f"speedup={v_us/d_us:4.2f}x | overlap={ov_pct:6.2f}%"
@@ -747,18 +848,28 @@ def run_new_ops_bench() -> None:
     destroy_model_parallel()
     destroy_distributed_environment()
     vcfg_ctx.__exit__(None, None, None)
+    return new_ops_results
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("b12x_only", "new_ops"), required=True)
+    parser.add_argument("--mode", choices=("all", "b12x_only", "new_ops"), default="new_ops")
     parser.add_argument("--tag", default="default")
     parser.add_argument("--cache-dir", default="/fi-cache/b12x_bench")
+    parser.add_argument("--output", default=None)
     args = parser.parse_args()
-    if args.mode == "b12x_only":
-        run_b12x_bench(args.tag, args.cache_dir)
-    else:
-        run_new_ops_bench()
+
+    payload: dict = {"mode": args.mode}
+    if args.mode in ("all", "b12x_only"):
+        payload["b12x_only"] = run_b12x_bench(args.tag, args.cache_dir)
+    if args.mode in ("all", "new_ops"):
+        payload["new_ops"] = run_new_ops_bench()
+
+    if args.output:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        print(f"\nWrote JSON results to {out_path}")
 
 
 if __name__ == "__main__":

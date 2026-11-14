@@ -34,35 +34,58 @@ if [[ "${ACTUAL_SHA256}" != "${EXPECTED_SHA256}" ]]; then
   exit 1
 fi
 
+SUBPATHS=(
+  "experimental/b12x"
+  "experimental/sm120_dsa_indexer"
+  "experimental/sm12x_mega_gate"
+  "jit/core.py"
+  "jit/cpp_ext.py"
+  "jit/cute_dsl_core.py"
+  "jit/_cute_dsl_source.py"
+  "jit/_cuda_architecture.py"
+  "jit/env.py"
+  "cute_dsl"
+  "mega_gate.py"
+  "dsa_indexer.py"
+  "api_logging.py"
+  "data/csrc/tvm_ffi_utils.h"
+  "data/csrc/cake_device_helpers"
+  "data/csrc/experimental/cake_host_common.cuh"
+)
+COMPAT_PATHS=(
+  "experimental/b12x/_compat/b12x"
+  "experimental/b12x/_compat/_flashinfer_filelock.py"
+)
+
 STAMP_FILE="${OVERLAY_DIR}/.sha256"
+NEED_EXTRACT=0
 if [[ ! -f "${STAMP_FILE}" ]] || [[ "$(cat "${STAMP_FILE}")" != "${EXPECTED_SHA256}" ]]; then
-  rm -rf "${OVERLAY_DIR}/flashinfer"
+  NEED_EXTRACT=1
+else
+  for rel in "${SUBPATHS[@]}" "${COMPAT_PATHS[@]}"; do
+    if [[ ! -e "${OVERLAY_DIR}/flashinfer/${rel}" ]]; then
+      NEED_EXTRACT=1
+      break
+    fi
+  done
+fi
+
+if [[ "${NEED_EXTRACT}" -eq 1 ]]; then
+  rm -rf "${OVERLAY_DIR}/flashinfer" "${STAMP_FILE}"
   mkdir -p "${OVERLAY_DIR}"
   tar -xJf "${ARCHIVE}" -C "${OVERLAY_DIR}"
+  for rel in "${SUBPATHS[@]}" "${COMPAT_PATHS[@]}"; do
+    if [[ ! -e "${OVERLAY_DIR}/flashinfer/${rel}" ]]; then
+      echo "ERROR: extracted overlay missing expected path flashinfer/${rel}" >&2
+      exit 1
+    fi
+  done
   printf '%s\n' "${EXPECTED_SHA256}" > "${STAMP_FILE}"
 fi
 mkdir -p "${OVERLAY_DIR}/fi-jit-cache"
 
 if [[ "${PRINT_DOCKER_ARGS}" -eq 1 ]]; then
   OVERLAY_ABS="$(cd "${OVERLAY_DIR}" && pwd)"
-  SUBPATHS=(
-    "experimental/b12x"
-    "experimental/sm120_dsa_indexer"
-    "experimental/sm12x_mega_gate"
-    "jit/core.py"
-    "jit/cpp_ext.py"
-    "jit/cute_dsl_core.py"
-    "jit/_cute_dsl_source.py"
-    "jit/_cuda_architecture.py"
-    "jit/env.py"
-    "cute_dsl"
-    "mega_gate.py"
-    "dsa_indexer.py"
-    "api_logging.py"
-    "data/csrc/tvm_ffi_utils.h"
-    "data/csrc/cake_device_helpers"
-    "data/csrc/experimental/cake_host_common.cuh"
-  )
   ARGS=("-v" "${OVERLAY_ABS}/fi-jit-cache:/fi-cache")
   for rel in "${SUBPATHS[@]}"; do
     ARGS+=("-v" "${OVERLAY_ABS}/flashinfer/${rel}:${DIST_FLASHINFER}/${rel}:ro")

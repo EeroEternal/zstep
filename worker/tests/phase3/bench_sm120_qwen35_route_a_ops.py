@@ -36,6 +36,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.utils.cpp_extension import load_inline
+import triton
+import triton.language as tl
 
 # ---------------------------------------------------------------------------
 # Inline CUDA C++ Prototype Extension for Route A (A1 + A2)
@@ -44,6 +46,20 @@ from torch.utils.cpp_extension import load_inline
 _ROUTE_A_CPP = r"""
 #include <torch/extension.h>
 #include <cstdint>
+
+void launch_shm_v5_ar_legacy_interleaved_cuda(
+    const void* input_ptr,
+    void* output_ptr,
+    uint64_t* control_ptr,
+    const std::uintptr_t* rank_shm_dev_ptrs,
+    int64_t slot_stride_bytes,
+    int64_t num_vecs,
+    int rank,
+    int world_size,
+    int blocks,
+    int threads,
+    int one_shot_max_vecs,
+    std::uintptr_t stream_handle);
 
 void launch_shm_v5_ar_batchload_cuda(
     const void* input_ptr,
@@ -148,6 +164,33 @@ void launch_gdn_prefill_vk_cuda(
     int total_rows,
     float eps,
     std::uintptr_t stream_handle);
+
+void launch_shm_v5_ar_legacy_interleaved(
+    torch::Tensor input,
+    torch::Tensor output,
+    torch::Tensor control,
+    torch::Tensor rank_shm_ptrs_u64,
+    int64_t slot_stride_bytes,
+    int64_t rank,
+    int64_t world_size,
+    int64_t blocks,
+    int64_t threads,
+    int64_t one_shot_max_vecs,
+    std::uintptr_t stream_handle) {
+    launch_shm_v5_ar_legacy_interleaved_cuda(
+        input.data_ptr(),
+        output.data_ptr(),
+        reinterpret_cast<uint64_t*>(control.data_ptr<int64_t>()),
+        reinterpret_cast<const std::uintptr_t*>(rank_shm_ptrs_u64.data_ptr<int64_t>()),
+        slot_stride_bytes,
+        input.numel() / 8,
+        static_cast<int>(rank),
+        static_cast<int>(world_size),
+        static_cast<int>(blocks),
+        static_cast<int>(threads),
+        static_cast<int>(one_shot_max_vecs),
+        stream_handle);
+}
 
 void launch_shm_v5_ar_batchload(
     torch::Tensor input,
@@ -451,6 +494,180 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
         val += __shfl_xor_sync(0xFFFFFFFFU, val, mask);
     }
     return val;
+}
+
+// ---------------------------------------------------------------------------
+// A1-0: Historical pre-PR-#20 (`893495c`) interleaved-load `shm_v5_allreduce_kernel`
+//       Kept inline so `"base_2op"` remains a true A/B baseline on post-#20 HEAD.
+// ---------------------------------------------------------------------------
+__global__ void shm_v5_ar_legacy_interleaved_kernel(
+    const uint4* __restrict__ input_vec,
+    uint4* __restrict__ output_vec,
+    uint64_t* __restrict__ control,
+    char* const* __restrict__ rank_shm,
+    int64_t slot_stride_bytes,
+    int64_t num_vecs,
+    int rank,
+    int world_size,
+    int one_shot_max_vecs) {
+    const int b = blockIdx.x;
+    __shared__ uint64_t s_step;
+    __shared__ int s_aborted;
+    __shared__ char* s_peer_shm[kMaxRanks];
+    if (threadIdx.x < world_size) {
+        s_peer_shm[threadIdx.x] = rank_shm[threadIdx.x];
+    }
+    if (threadIdx.x == 0) {
+        const uint64_t ns = control[b] + 1ULL;
+        control[b] = ns;
+        s_step = ns;
+        s_aborted = 0;
+    }
+    __syncthreads();
+    const uint64_t step = s_step;
+    const int slot = static_cast<int>((step - 1ULL) & 3);
+    char* my_shm = s_peer_shm[rank];
+    const uint64_t* abort_flag = reinterpret_cast<const uint64_t*>(my_shm + kShmV5AbortOffset);
+
+    const int64_t c_begin = (num_vecs * b) / gridDim.x;
+    const int64_t c_end = (num_vecs * (b + 1)) / gridDim.x;
+    const int64_t c_len = c_end - c_begin;
+
+    if (step > 4ULL) {
+        const uint64_t min_done = step - 4ULL;
+        if (threadIdx.x < world_size) {
+            const uint64_t* my_done = reinterpret_cast<const uint64_t*>(
+                my_shm + 65536 + (b * 8 + rank) * 64);
+            if (!spin_wait_ge_u64(my_done, min_done, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+    }
+
+    const int64_t half_slot = slot_stride_bytes / 2;
+    uint4* my_in = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes);
+    for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
+        st_wt_uint4(my_in + idx, input_vec[idx]);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (threadIdx.x < world_size) {
+        uint64_t* peer_in_flag = reinterpret_cast<uint64_t*>(
+            s_peer_shm[threadIdx.x] + (b * 8 + rank) * 64);
+        sys_store_release_u64(peer_in_flag, step);
+        const uint64_t* local_in_flag = reinterpret_cast<const uint64_t*>(
+            my_shm + (b * 8 + threadIdx.x) * 64);
+        if (!spin_wait_ge_u64(local_in_flag, step, abort_flag)) {
+            s_aborted = 1;
+        }
+    }
+    __syncthreads();
+    if (s_aborted) {
+        return;
+    }
+
+    if (num_vecs <= one_shot_max_vecs) {
+        for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
+            float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
+            for (int p = 0; p < kMaxRanks; ++p) {
+                if (p < world_size) {
+                    const uint4* p_in = reinterpret_cast<const uint4*>(
+                        s_peer_shm[p] + 131072 + slot * slot_stride_bytes);
+                    Pack128Bf16 v;
+                    v.u4 = (p == rank) ? input_vec[idx] : ld_cv_uint4(p_in + idx);
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float2 f = __bfloat1622float2(v.pairs[j]);
+                        acc[2 * j] += f.x;
+                        acc[2 * j + 1] += f.y;
+                    }
+                }
+            }
+            Pack128Bf16 out;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                out.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+            }
+            output_vec[idx] = out.u4;
+        }
+        __syncthreads();
+        if (threadIdx.x < world_size) {
+            uint64_t* peer_done = reinterpret_cast<uint64_t*>(
+                s_peer_shm[threadIdx.x] + 65536 + (b * 8 + rank) * 64);
+            sys_store_release_u64(peer_done, step);
+        }
+        return;
+    }
+
+    const int64_t s_begin = c_begin + (c_len * rank) / world_size;
+    const int64_t s_end = c_begin + (c_len * (rank + 1)) / world_size;
+    uint4* my_red = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes + half_slot);
+    for (int64_t idx = s_begin + threadIdx.x; idx < s_end; idx += blockDim.x) {
+        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        #pragma unroll
+        for (int p = 0; p < kMaxRanks; ++p) {
+            if (p < world_size) {
+                const uint4* p_in = reinterpret_cast<const uint4*>(
+                    s_peer_shm[p] + 131072 + slot * slot_stride_bytes);
+                Pack128Bf16 v;
+                v.u4 = (p == rank) ? input_vec[idx] : ld_cv_uint4(p_in + idx);
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __bfloat1622float2(v.pairs[j]);
+                    acc[2 * j] += f.x;
+                    acc[2 * j + 1] += f.y;
+                }
+            }
+        }
+        Pack128Bf16 out;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            out.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+        }
+        st_wt_uint4(my_red + idx, out.u4);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (threadIdx.x < world_size) {
+        uint64_t* peer_red_flag = reinterpret_cast<uint64_t*>(
+            s_peer_shm[threadIdx.x] + 32768 + (b * 8 + rank) * 64);
+        sys_store_release_u64(peer_red_flag, step);
+        const uint64_t* local_red_flag = reinterpret_cast<const uint64_t*>(
+            my_shm + 32768 + (b * 8 + threadIdx.x) * 64);
+        if (!spin_wait_ge_u64(local_red_flag, step, abort_flag)) {
+            s_aborted = 1;
+        }
+    }
+    __syncthreads();
+    if (s_aborted) {
+        return;
+    }
+    for (int owner = 0; owner < world_size; ++owner) {
+        const int64_t o_begin = c_begin + (c_len * owner) / world_size;
+        const int64_t o_end = c_begin + (c_len * (owner + 1)) / world_size;
+        const uint4* o_red = reinterpret_cast<const uint4*>(
+            s_peer_shm[owner] + 131072 + slot * slot_stride_bytes + half_slot);
+        for (int64_t idx = o_begin + threadIdx.x; idx < o_end; idx += blockDim.x) {
+            output_vec[idx] = ld_cv_uint4(o_red + idx);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < world_size) {
+        uint64_t* peer_done = reinterpret_cast<uint64_t*>(
+            s_peer_shm[threadIdx.x] + 65536 + (b * 8 + rank) * 64);
+        sys_store_release_u64(peer_done, step);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2223,6 +2440,35 @@ __global__ __cluster_dims__(8, 1, 1) __launch_bounds__(256, 1) void shm_v5_ar_ad
 
 }  // namespace
 
+void launch_shm_v5_ar_legacy_interleaved_cuda(
+    const void* input_ptr,
+    void* output_ptr,
+    uint64_t* control_ptr,
+    const std::uintptr_t* rank_shm_dev_ptrs,
+    int64_t slot_stride_bytes,
+    int64_t num_vecs,
+    int rank,
+    int world_size,
+    int blocks,
+    int threads,
+    int one_shot_max_vecs,
+    std::uintptr_t stream_handle) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    const int64_t vecs_per_cta = (num_vecs + blocks - 1) / blocks;
+    const int launch_threads = (threads == 256 && vecs_per_cta > 256) ? 512 : threads;
+    shm_v5_ar_legacy_interleaved_kernel<<<blocks, launch_threads, 0, stream>>>(
+        reinterpret_cast<const uint4*>(input_ptr),
+        reinterpret_cast<uint4*>(output_ptr),
+        control_ptr,
+        reinterpret_cast<char* const*>(rank_shm_dev_ptrs),
+        slot_stride_bytes,
+        num_vecs,
+        rank,
+        world_size,
+        one_shot_max_vecs);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_shm_v5_ar_batchload_cuda(
     const void* input_ptr,
     void* output_ptr,
@@ -2607,10 +2853,11 @@ def _get_ext():
     global _EXT
     if _EXT is None:
         _EXT = load_inline(
-            name="zstep_route_a_bench_v6",
+            name="zstep_route_a_bench_v7",
             cpp_sources=[_ROUTE_A_CPP],
             cuda_sources=[_ROUTE_A_CUDA],
             functions=[
+                "launch_shm_v5_ar_legacy_interleaved",
                 "launch_shm_v5_ar_batchload",
                 "launch_shm_v5_ar_add_rmsnorm",
                 "launch_gdn_decode_fused_vk",
@@ -2756,8 +3003,20 @@ def _a1_worker(rank: int, world_size: int, port: int, shm_prefix: str, out_json_
 
                 stream_ptr = int(torch.cuda.current_stream(device).cuda_stream)
 
-                # Baseline 2-op
-                comm.all_reduce(inp, output=ar_tmp)
+                # Baseline 2-op (historical pre-PR-#20 interleaved-load `shm_v5_allreduce`)
+                ext.launch_shm_v5_ar_legacy_interleaved(
+                    inp,
+                    ar_tmp,
+                    comm.control,
+                    comm._rank_shm_ptrs,
+                    comm.slot_stride_bytes,
+                    rank,
+                    world_size,
+                    comm.blocks,
+                    comm.threads,
+                    comm.one_shot_max_vecs,
+                    stream_ptr,
+                )
                 _run_epilogue_2op(ar_tmp, res_base, weight, out_base, H)
 
                 # Batched-load 2-op
@@ -2882,7 +3141,11 @@ def _a1_worker(rank: int, world_size: int, port: int, shm_prefix: str, out_json_
                             s_ptr = int(g_stream.cuda_stream)
                             for _ in range(3):
                                 if mode_name == "base_2op":
-                                    comm.all_reduce(inp, output=ar_tmp)
+                                    ext.launch_shm_v5_ar_legacy_interleaved(
+                                        inp, ar_tmp, comm.control, comm._rank_shm_ptrs,
+                                        comm.slot_stride_bytes, rank, world_size, comm.blocks,
+                                        comm.threads, comm.one_shot_max_vecs, s_ptr,
+                                    )
                                     _run_epilogue_2op_fast(ar_tmp, res, weight, out, H)
                                 elif mode_name == "batchload_2op":
                                     ext.launch_shm_v5_ar_batchload(
@@ -2911,7 +3174,11 @@ def _a1_worker(rank: int, world_size: int, port: int, shm_prefix: str, out_json_
                             s_ptr = int(g_stream.cuda_stream)
                             for _ in range(n_ops_in_graph):
                                 if mode_name == "base_2op":
-                                    comm.all_reduce(inp, output=ar_tmp)
+                                    ext.launch_shm_v5_ar_legacy_interleaved(
+                                        inp, ar_tmp, comm.control, comm._rank_shm_ptrs,
+                                        comm.slot_stride_bytes, rank, world_size, comm.blocks,
+                                        comm.threads, comm.one_shot_max_vecs, s_ptr,
+                                    )
                                     _run_epilogue_2op_fast(ar_tmp, res, weight, out, H)
                                 elif mode_name == "batchload_2op":
                                     ext.launch_shm_v5_ar_batchload(
@@ -2945,7 +3212,11 @@ def _a1_worker(rank: int, world_size: int, port: int, shm_prefix: str, out_json_
                         def _eager_step():
                             for _ in range(4):
                                 if mode_name == "base_2op":
-                                    comm.all_reduce(inp, output=ar_tmp)
+                                    ext.launch_shm_v5_ar_legacy_interleaved(
+                                        inp, ar_tmp, comm.control, comm._rank_shm_ptrs,
+                                        comm.slot_stride_bytes, rank, world_size, comm.blocks,
+                                        comm.threads, comm.one_shot_max_vecs, s_ptr,
+                                    )
                                     _run_epilogue_2op_fast(ar_tmp, res, weight, out, H)
                                 elif mode_name == "batchload_2op":
                                     ext.launch_shm_v5_ar_batchload(
@@ -3001,6 +3272,154 @@ def run_part_a1() -> dict:
 # ===========================================================================
 
 
+@triton.jit
+def _legacy_gated_delta_decode_kv_kernel(
+    qkv_conv_ptr,
+    qkvzba_ptr,
+    a_log_ptr,
+    dt_bias_ptr,
+    ssm_state_ptr,
+    positions_ptr,
+    req_slot_ids_ptr,
+    attn_out_ptr,
+    stride_qkvzba_row,
+    stride_ssm_slot,
+    stride_ssm_head,
+    num_active_rows,
+    BLOCK_V: tl.constexpr,
+):
+    """Historical pre-PR-#20 (`893495c`) `[K=128, V=128]` Triton decode recurrence."""
+    row = tl.program_id(0).to(tl.int64)
+    hv_tile = tl.program_id(1).to(tl.int64)
+    v_head = hv_tile // (128 // BLOCK_V)
+    v_blk = hv_tile % (128 // BLOCK_V)
+    k_head = v_head // 2
+
+    offs_k = tl.arange(0, 128)
+    offs_v = v_blk * BLOCK_V + tl.arange(0, BLOCK_V)
+
+    if row >= num_active_rows:
+        tl.store(
+            attn_out_ptr + row * 512 + v_head * 128 + offs_v,
+            tl.zeros([BLOCK_V], dtype=tl.bfloat16),
+        )
+        return
+
+    slot = tl.load(req_slot_ids_ptr + row).to(tl.int64)
+    pos = tl.load(positions_ptr + row).to(tl.int32)
+
+    q = tl.load(qkv_conv_ptr + row * 1024 + k_head * 128 + offs_k).to(tl.float32)
+    k = tl.load(qkv_conv_ptr + row * 1024 + 256 + k_head * 128 + offs_k).to(tl.float32)
+    v = tl.load(qkv_conv_ptr + row * 1024 + 512 + v_head * 128 + offs_v).to(tl.float32)
+
+    q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1.0e-6) * 0.08838834764831845
+    k = k * tl.rsqrt(tl.sum(k * k, axis=0) + 1.0e-6)
+
+    b_raw = tl.load(qkvzba_ptr + row * stride_qkvzba_row + 1536 + v_head).to(tl.float32)
+    a_raw = tl.load(qkvzba_ptr + row * stride_qkvzba_row + 1540 + v_head).to(tl.float32)
+    a_log = tl.load(a_log_ptr + v_head).to(tl.float32)
+    dt_bias = tl.load(dt_bias_ptr + v_head).to(tl.float32)
+
+    beta = tl.sigmoid(b_raw)
+    sp_in = a_raw + dt_bias
+    softplus = tl.where(sp_in > 20.0, sp_in, tl.log(1.0 + tl.exp(sp_in)))
+    decay = tl.exp(-tl.exp(a_log) * softplus)
+
+    ssm_ptrs = (
+        ssm_state_ptr
+        + slot * stride_ssm_slot
+        + v_head * stride_ssm_head
+        + offs_k[:, None] * 128
+        + offs_v[None, :]
+    )
+    if pos == 0:
+        state = tl.zeros([128, BLOCK_V], dtype=tl.float32)
+    else:
+        state = tl.load(ssm_ptrs)
+
+    state = state * decay
+    kv_mem = tl.sum(state * k[:, None], axis=0)
+    delta = (v - kv_mem) * beta
+    state = state + k[:, None] * delta[None, :]
+    out_v = tl.sum(state * q[:, None], axis=0)
+
+    tl.store(ssm_ptrs, state)
+    tl.store(attn_out_ptr + row * 512 + v_head * 128 + offs_v, out_v.to(tl.bfloat16))
+
+
+@triton.jit
+def _legacy_gated_delta_prefill_varlen_kv_kernel(
+    qkv_conv_ptr,
+    qkvzba_ptr,
+    a_log_ptr,
+    dt_bias_ptr,
+    ssm_state_ptr,
+    query_start_loc_ptr,
+    positions_ptr,
+    req_slot_ids_ptr,
+    attn_out_ptr,
+    stride_qkvzba_row,
+    stride_ssm_slot,
+    stride_ssm_head,
+    BLOCK_V: tl.constexpr,
+):
+    """Historical pre-PR-#20 (`893495c`) `[K=128, V=128]` Triton varlen prefill recurrence."""
+    seq_idx = tl.program_id(0).to(tl.int64)
+    hv_tile = tl.program_id(1).to(tl.int64)
+    v_head = hv_tile // (128 // BLOCK_V)
+    v_blk = hv_tile % (128 // BLOCK_V)
+    k_head = v_head // 2
+
+    q_start = tl.load(query_start_loc_ptr + seq_idx).to(tl.int64)
+    q_end = tl.load(query_start_loc_ptr + seq_idx + 1).to(tl.int64)
+    if q_start >= q_end:
+        return
+
+    slot = tl.load(req_slot_ids_ptr + q_start).to(tl.int64)
+    start_pos = tl.load(positions_ptr + q_start).to(tl.int32)
+    offs_k = tl.arange(0, 128)
+    offs_v = v_blk * BLOCK_V + tl.arange(0, BLOCK_V)
+
+    ssm_ptrs = (
+        ssm_state_ptr
+        + slot * stride_ssm_slot
+        + v_head * stride_ssm_head
+        + offs_k[:, None] * 128
+        + offs_v[None, :]
+    )
+    if start_pos == 0:
+        state = tl.zeros([128, BLOCK_V], dtype=tl.float32)
+    else:
+        state = tl.load(ssm_ptrs)
+
+    neg_a = -tl.exp(tl.load(a_log_ptr + v_head).to(tl.float32))
+    dt_bias = tl.load(dt_bias_ptr + v_head).to(tl.float32)
+
+    for row in range(q_start, q_end):
+        q = tl.load(qkv_conv_ptr + row * 1024 + k_head * 128 + offs_k).to(tl.float32)
+        k = tl.load(qkv_conv_ptr + row * 1024 + 256 + k_head * 128 + offs_k).to(tl.float32)
+        v = tl.load(qkv_conv_ptr + row * 1024 + 512 + v_head * 128 + offs_v).to(tl.float32)
+
+        q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1.0e-6) * 0.08838834764831845
+        k = k * tl.rsqrt(tl.sum(k * k, axis=0) + 1.0e-6)
+
+        b_raw = tl.load(qkvzba_ptr + row * stride_qkvzba_row + 1536 + v_head).to(tl.float32)
+        a_raw = tl.load(qkvzba_ptr + row * stride_qkvzba_row + 1540 + v_head).to(tl.float32)
+        beta = tl.sigmoid(b_raw)
+        sp_in = a_raw + dt_bias
+        softplus = tl.where(sp_in > 20.0, sp_in, tl.log(1.0 + tl.exp(sp_in)))
+        decay = tl.exp(neg_a * softplus)
+
+        state = state * decay
+        kv_mem = tl.sum(state * k[:, None], axis=0)
+        delta = (v - kv_mem) * beta
+        state = state + k[:, None] * delta[None, :]
+        out_v = tl.sum(state * q[:, None], axis=0)
+        tl.store(attn_out_ptr + row * 512 + v_head * 128 + offs_v, out_v.to(tl.bfloat16))
+
+    tl.store(ssm_ptrs, state)
+
+
 def _transpose_ssm_kv_to_vk(ssm_kv: torch.Tensor) -> torch.Tensor:
     # ssm_kv: [..., 4, K=128, V=128] -> ssm_vk: [..., 4, V=128, K=128] contiguous
     return ssm_kv.transpose(-1, -2).contiguous()
@@ -3012,11 +3431,129 @@ def run_part_a2() -> dict:
     ext = _get_ext()
 
     from zstep_worker.kernels_sm120.qwen35_ops import (
+        _causal_conv1d_decode_kernel,
         _causal_conv1d_prefill_varlen_kernel,
         _rmsnorm_gated_silu_kernel,
-        linear_attn_decode_step,
-        linear_attn_prefill_varlen,
     )
+
+    def _legacy_triton_gdn_decode_kv(
+        qkvzba: torch.Tensor,
+        *,
+        conv_state: torch.Tensor,
+        conv_weight: torch.Tensor,
+        a_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        ssm_state: torch.Tensor,
+        norm_weight: torch.Tensor,
+        positions: torch.Tensor,
+        req_slot_ids: torch.Tensor,
+        qkv_conv_buf: torch.Tensor,
+        raw_out_buf: torch.Tensor,
+        gated_out_buf: torch.Tensor,
+        num_active_rows: int,
+        eps: float,
+    ) -> torch.Tensor:
+        batch_rows = qkvzba.shape[0]
+        _causal_conv1d_decode_kernel[(batch_rows, 1024 // 128)](
+            qkvzba,
+            conv_state,
+            conv_weight,
+            positions,
+            req_slot_ids,
+            qkv_conv_buf,
+            qkvzba.stride(0),
+            conv_state.stride(0),
+            num_active_rows,
+            BLOCK_C=128,
+            num_warps=4,
+        )
+        _legacy_gated_delta_decode_kv_kernel[(batch_rows, 4 * (128 // 16))](
+            qkv_conv_buf,
+            qkvzba,
+            a_log,
+            dt_bias,
+            ssm_state,
+            positions,
+            req_slot_ids,
+            raw_out_buf,
+            qkvzba.stride(0),
+            ssm_state.stride(0),
+            ssm_state.stride(1),
+            num_active_rows,
+            BLOCK_V=16,
+            num_warps=4,
+        )
+        _rmsnorm_gated_silu_kernel[(batch_rows, 4)](
+            raw_out_buf,
+            qkvzba,
+            norm_weight,
+            gated_out_buf,
+            qkvzba.stride(0),
+            eps,
+            num_active_rows,
+            num_warps=4,
+        )
+        return gated_out_buf
+
+    def _legacy_triton_gdn_prefill_kv(
+        qkvzba: torch.Tensor,
+        *,
+        conv_state: torch.Tensor,
+        conv_weight: torch.Tensor,
+        a_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        ssm_state: torch.Tensor,
+        norm_weight: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+        req_slot_ids: torch.Tensor,
+        qkv_conv_buf: torch.Tensor,
+        raw_out_buf: torch.Tensor,
+        gated_out_buf: torch.Tensor,
+        num_seqs: int,
+        eps: float,
+    ) -> torch.Tensor:
+        total_rows = qkvzba.shape[0]
+        _causal_conv1d_prefill_varlen_kernel[(num_seqs, 1024 // 32)](
+            qkvzba,
+            conv_state,
+            conv_weight,
+            query_start_loc,
+            positions,
+            req_slot_ids,
+            qkv_conv_buf,
+            qkvzba.stride(0),
+            conv_state.stride(0),
+            BLOCK_C=32,
+            num_warps=2,
+        )
+        _legacy_gated_delta_prefill_varlen_kv_kernel[(num_seqs, 4 * (128 // 4))](
+            qkv_conv_buf,
+            qkvzba,
+            a_log,
+            dt_bias,
+            ssm_state,
+            query_start_loc,
+            positions,
+            req_slot_ids,
+            raw_out_buf,
+            qkvzba.stride(0),
+            ssm_state.stride(0),
+            ssm_state.stride(1),
+            BLOCK_V=4,
+            num_warps=2,
+        )
+        _rmsnorm_gated_silu_kernel[(total_rows, 4)](
+            raw_out_buf,
+            qkvzba,
+            norm_weight,
+            gated_out_buf,
+            qkvzba.stride(0),
+            eps,
+            total_rows,
+            num_warps=4,
+        )
+        return gated_out_buf
 
     def _conv1d_prefill_helper(qkvzba_t, conv_st_t, conv_w_t, q_locs_t, pos_t, slots_t, n_s: int, out_buf_t):
         _causal_conv1d_prefill_varlen_kernel[(n_s, 1024 // 32)](
@@ -3125,7 +3662,7 @@ def run_part_a2() -> dict:
         raw_scr = torch.empty((B, 512), device=device, dtype=torch.bfloat16)
         out_ref = torch.empty((B, 512), device=device, dtype=torch.bfloat16)
 
-        linear_attn_decode_step(
+        _legacy_triton_gdn_decode_kv(
             qkvzba,
             conv_state=conv_ref,
             conv_weight=conv_w,
@@ -3202,7 +3739,7 @@ def run_part_a2() -> dict:
         qkv_ref_buf = torch.empty((total_rows, 1024), device=device, dtype=torch.bfloat16)
         raw_ref_buf = torch.empty((total_rows, 512), device=device, dtype=torch.bfloat16)
         out_ref = torch.empty((total_rows, 512), device=device, dtype=torch.bfloat16)
-        linear_attn_prefill_varlen(
+        _legacy_triton_gdn_prefill_kv(
             qkvzba,
             conv_state=conv_ref,
             conv_weight=conv_w,
@@ -3354,7 +3891,7 @@ def run_part_a2() -> dict:
             def _run_30(s_ptr: int):
                 for l_idx in range(n_layers):
                     if var_id < 0:
-                        linear_attn_decode_step(
+                        _legacy_triton_gdn_decode_kv(
                             qkvzba_b,
                             conv_state=conv_states_30[l_idx],
                             conv_weight=conv_ws_30[l_idx],
@@ -3446,7 +3983,7 @@ def run_part_a2() -> dict:
 
         def _pf_triton():
             for l_idx in range(n_layers):
-                linear_attn_prefill_varlen(
+                _legacy_triton_gdn_prefill_kv(
                     qkvzba_p,
                     conv_state=conv_states_30[l_idx],
                     conv_weight=conv_ws_30[l_idx],

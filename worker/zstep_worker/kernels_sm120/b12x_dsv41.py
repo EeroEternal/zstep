@@ -272,9 +272,10 @@ def maybe_enable_b12x_for_dsv41() -> bool:
         msg = (
             "SM120 `b12x` overlay package could not be imported "
             f"(checked ZSTEP_B12X_COMPAT_DIR and {_DEFAULT_COMPAT_CANDIDATES}): {exc}. "
-            "Mount `flashinfer/experimental/b12x` from "
-            "local-inference-lab/flashinfer@79819b112f8bda7d09709c24bb31de16d7ce59c6 "
-            "or set ZSTEP_ENABLE_B12X=0."
+            "Mount the bundled SM120 overlay via "
+            "`./scripts/prepare_sm120_overlay.sh --print-docker-args` "
+            "(`worker/third_party/flashinfer_sm120_overlay_ae58183f.tar.xz`), "
+            "or unset ZSTEP_REQUIRE_B12X / ZSTEP_REQUIRE_SM120_EXP (or set ZSTEP_ENABLE_B12X=0)."
         )
         if require_b12x:
             raise RuntimeError(msg) from exc

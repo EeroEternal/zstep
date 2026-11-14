@@ -600,6 +600,52 @@ def test_runtime_loop_rejects_invalid_overlap_flags(
         shm_path.unlink(missing_ok=True)
 
 
+def test_runtime_loop_missing_torch_guard_allows_fake_runner_and_rejects_real_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    class _NoopRunner:
+        def execute(self, _plan: object, _header: object) -> tuple[list, int]:
+            return [], 1
+
+        def close(self, *, abort: bool = False) -> None:
+            pass
+
+    # Setting a module entry to `None` in `sys.modules` forces Python's import
+    # machinery to raise `ModuleNotFoundError` deterministically even on hosts
+    # where `torch` is installed.
+    monkeypatch.setitem(sys.modules, "zstep_worker.kernels_sm120.moe_router", None)
+
+    # 1. Fake runner (`model_dir == ""`) must degrade cleanly without `torch`.
+    loop_fake, master_fake, plan_fd_fake, done_fd_fake, shm_path_fake = (
+        _make_runtime_loop_fixture(_NoopRunner())
+    )
+    try:
+        _publish_test_step(master_fake, step_id=1, opcode=99, flags=0, num_seqs=0)
+        os.eventfd_write(plan_fd_fake, 1)
+        loop_fake.run()
+        # 1 signal from initial READY handshake + 1 signal from shutdown step 1
+        assert os.eventfd_read(done_fd_fake) == 2
+    finally:
+        master_fake.close()
+        loop_fake.close(abort=True)
+        shm_path_fake.unlink(missing_ok=True)
+
+    # 2. Real model worker (`bool(model_dir) is True`) must re-raise `ModuleNotFoundError` loudly.
+    loop_real, master_real, _plan_fd_real, _done_fd_real, shm_path_real = (
+        _make_runtime_loop_fixture(_NoopRunner())
+    )
+    loop_real.args.model_dir = "/models/nonexistent-test-model"
+    try:
+        with pytest.raises(ModuleNotFoundError):
+            loop_real.run()
+    finally:
+        master_real.close()
+        loop_real.close(abort=True)
+        shm_path_real.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     test_step_plan_layout_invariants_and_vram_derivation()
     test_cross_language_golden_layout_and_hash_parity()

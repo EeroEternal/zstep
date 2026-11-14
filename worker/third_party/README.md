@@ -17,7 +17,8 @@ Unpack & verify SHA256, then pass the mount/strict-enforcement flags directly to
 
 ```bash
 OVERLAY_ARGS="$(./scripts/prepare_sm120_overlay.sh --print-docker-args /tmp/zstep-sm120-overlay)"
-# Mounts only the 16 experimental subpaths into vllm/vllm-openai:v0.31.0 and sets:
+# Mounts only the 18 experimental/compat subpaths (16 flashinfer/... + 2 top-level b12x/_compat)
+# into vllm/vllm-openai:v0.31.0 and sets:
 #   ZSTEP_REQUIRE_B12X=1 ZSTEP_REQUIRE_SM120_EXP=1 B12X_W4A8_TINY_DECODE=0
 ```
 
