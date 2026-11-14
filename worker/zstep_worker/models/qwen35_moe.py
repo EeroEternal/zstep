@@ -480,12 +480,25 @@ class Qwen35MoeStepRunner:
             ms + 1, dtype=torch.int32, device=self.device
         )
         self.sample_rows_gpu: torch.Tensor = torch.zeros(ms, dtype=torch.int64, device=self.device)
-        self.page_table_gpu: torch.Tensor = torch.full(
-            (ms, self.max_pages_per_seq),
-            self.dummy_page,
-            dtype=torch.int32,
-            device=self.device,
+        # Decode inputs and the shared page table live in one packed int32 buffer so a decode
+        # step uploads them with a single H2D copy:
+        # [token_ids | positions | req_slot_ids | seq_lens] (max_graph_bucket each) + page table.
+        self.max_graph_bucket: int = min(self.max_seqs, 128)
+        db = self.max_graph_bucket
+        self._dec_pt_offset: int = 4 * db
+        io_numel = self._dec_pt_offset + ms * self.max_pages_per_seq
+        self.dec_io_gpu: torch.Tensor = torch.zeros(io_numel, dtype=torch.int32, device=self.device)
+        self.dec_io_cpu: torch.Tensor = torch.zeros(io_numel, dtype=torch.int32, pin_memory=True)
+        self.dec_token_ids_gpu: torch.Tensor = self.dec_io_gpu[0:db]
+        self.dec_positions_gpu: torch.Tensor = self.dec_io_gpu[db : 2 * db]
+        self.dec_req_slot_ids_gpu: torch.Tensor = self.dec_io_gpu[2 * db : 3 * db]
+        self.dec_seq_lens_gpu: torch.Tensor = self.dec_io_gpu[3 * db : 4 * db]
+        self.page_table_gpu: torch.Tensor = self.dec_io_gpu[self._dec_pt_offset :].view(
+            ms, self.max_pages_per_seq
         )
+        self.dec_req_slot_ids_gpu.fill_(self.dummy_slot)
+        self.page_table_gpu.fill_(self.dummy_page)
+        self._dec_io_np: np.ndarray = self.dec_io_cpu.numpy()
 
         # Pinned H2D / D2H staging buffers
         self.token_ids_cpu: torch.Tensor = torch.zeros(mt, dtype=torch.int32, pin_memory=True)
@@ -498,14 +511,20 @@ class Qwen35MoeStepRunner:
             ms + 1, dtype=torch.int32, pin_memory=True
         )
         self.sample_rows_cpu: torch.Tensor = torch.zeros(ms, dtype=torch.int64, pin_memory=True)
-        self.page_table_cpu: torch.Tensor = torch.full(
-            (ms, self.max_pages_per_seq),
-            self.dummy_page,
-            dtype=torch.int32,
-            pin_memory=True,
+        self.page_table_cpu: torch.Tensor = self.dec_io_cpu[self._dec_pt_offset :].view(
+            ms, self.max_pages_per_seq
         )
-        self.out_tokens_cpu: torch.Tensor = torch.zeros((ms, 2), dtype=torch.int32, pin_memory=True)
-        self.out_logprobs_cpu: torch.Tensor = torch.zeros((ms, 2), dtype=torch.int32, pin_memory=True)
+        self.page_table_cpu.fill_(self.dummy_page)
+        self._page_table_np: np.ndarray = self.page_table_cpu.numpy()
+        self._token_ids_np: np.ndarray = self.token_ids_cpu.numpy()
+        self._positions_np: np.ndarray = self.positions_cpu.numpy()
+        self._req_slot_ids_np: np.ndarray = self.req_slot_ids_cpu.numpy()
+        self._seq_lens_np: np.ndarray = self.seq_lens_cpu.numpy()
+        self._query_start_loc_np: np.ndarray = self.query_start_loc_cpu.numpy()
+        # Sampled tokens and logprob bits share one buffer so rank 0 needs a single D2H copy.
+        self.out_io_cpu: torch.Tensor = torch.zeros((2, ms, 2), dtype=torch.int32, pin_memory=True)
+        self.out_tokens_cpu: torch.Tensor = self.out_io_cpu[0]
+        self.out_logprobs_cpu: torch.Tensor = self.out_io_cpu[1]
         self.req_slots_sample_cpu: list[int] = [0] * ms
 
         # Activation & scratch workspaces
@@ -609,17 +628,15 @@ class Qwen35MoeStepRunner:
         self.local_max_ids_buf: torch.Tensor = torch.empty(
             (ms, 2), dtype=torch.int32, device=self.device
         )
-        self.out_tokens_gpu: torch.Tensor = torch.zeros(
-            (ms, 2), dtype=torch.int32, device=self.device
+        self.out_io_gpu: torch.Tensor = torch.zeros(
+            (2, ms, 2), dtype=torch.int32, device=self.device
         )
-        self.out_logprobs_gpu: torch.Tensor = torch.zeros(
-            (ms, 2), dtype=torch.int32, device=self.device
-        )
+        self.out_tokens_gpu: torch.Tensor = self.out_io_gpu[0]
+        self.out_logprobs_gpu: torch.Tensor = self.out_io_gpu[1]
 
         self.start_event: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
         self.end_event: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
         self.decode_graphs: dict[int, torch.cuda.CUDAGraph] = {}
-        self.max_graph_bucket: int = min(self.max_seqs, 128)
         self._warmup_and_capture_decode_graphs()
 
     def _load_tp8_weights(self) -> None:
@@ -801,7 +818,7 @@ class Qwen35MoeStepRunner:
         reduced = self.reduced_buf[:bucket]
 
         torch.index_select(
-            self.embed_weight, 0, self.token_ids_gpu[:bucket], out=hidden
+            self.embed_weight, 0, self.dec_token_ids_gpu[:bucket], out=hidden
         )
         zero_centered_rmsnorm(
             hidden, self.layers[0].input_norm_w, out=normed, eps=eps
@@ -819,8 +836,8 @@ class Qwen35MoeStepRunner:
                     lw.dt_bias,
                     self.ssm_states[lw.state_layer_idx],
                     lw.gated_norm_w,
-                    self.positions_gpu[:bucket],
-                    self.req_slot_ids_gpu[:bucket],
+                    self.dec_positions_gpu[:bucket],
+                    self.dec_req_slot_ids_gpu[:bucket],
                     qkv_conv_buf=self.qkv_conv_buf[:bucket],
                     raw_out_buf=self.lin_raw_out_buf[:bucket],
                     gated_out_buf=self.lin_gated_out_buf[:bucket],
@@ -837,8 +854,8 @@ class Qwen35MoeStepRunner:
                 skinny_linear(normed, lw.w_qkv, out=qkv)
                 qwen35_attn_prologue(
                     qkv,
-                    self.positions_gpu[:bucket],
-                    self.req_slot_ids_gpu[:bucket],
+                    self.dec_positions_gpu[:bucket],
+                    self.dec_req_slot_ids_gpu[:bucket],
                     self.page_table_gpu,
                     lw.q_norm_w,
                     lw.k_norm_w,
@@ -856,8 +873,8 @@ class Qwen35MoeStepRunner:
                     self.k_caches[lw.kv_layer_idx],
                     self.v_caches[lw.kv_layer_idx],
                     self.page_table_gpu,
-                    self.seq_lens_gpu[:bucket],
-                    self.req_slot_ids_gpu[:bucket],
+                    self.dec_seq_lens_gpu[:bucket],
+                    self.dec_req_slot_ids_gpu[:bucket],
                     partial_acc=self.partial_acc_buf[:bucket],
                     partial_m=self.partial_m_buf[:bucket],
                     partial_l=self.partial_l_buf[:bucket],
@@ -1190,10 +1207,10 @@ class Qwen35MoeStepRunner:
         graph_pool = torch.cuda.graph_pool_handle()
         capture_stream = torch.cuda.Stream(device=self.device)
         for b in buckets:
-            self.token_ids_gpu[:b].zero_()
-            self.positions_gpu[:b].zero_()
-            self.req_slot_ids_gpu[:b].fill_(self.dummy_slot)
-            self.seq_lens_gpu[:b].zero_()
+            self.dec_token_ids_gpu[:b].zero_()
+            self.dec_positions_gpu[:b].zero_()
+            self.dec_req_slot_ids_gpu[:b].fill_(self.dummy_slot)
+            self.dec_seq_lens_gpu[:b].zero_()
             with torch.cuda.stream(capture_stream):
                 for _ in range(2):
                     self._run_decode_bucket_forward(b)
@@ -1213,6 +1230,12 @@ class Qwen35MoeStepRunner:
         torch.cuda.synchronize(self.device)
         dist.barrier(group=self.exchange_group)
 
+    def _copy_out_io_to_host(self, rows: int) -> None:
+        # out_io is [tokens(ms,2) | logprob_bits(ms,2)]; one contiguous prefix covers
+        # all token rows plus the first `rows` logprob rows.
+        n = self.out_tokens_gpu.numel() + 2 * rows
+        self.out_io_cpu.view(-1)[:n].copy_(self.out_io_gpu.view(-1)[:n], non_blocking=True)
+
     def execute(self, plan: StepPlanView, header: StepHeader) -> tuple[list[SeqResult], int]:
         num_seqs = header.num_seqs
         total_tokens = header.num_encoder_tokens
@@ -1229,46 +1252,39 @@ class Qwen35MoeStepRunner:
         pt_np = plan.global_kv_page_table(max_slot_end)
         sample_rows_np = plan.sample_row_indices(num_sample)
 
-        # Synchronize only active slot range into pinned host staging buffer
-        np.copyto(self.page_table_cpu[:max_slot_end].numpy(), pt_np)
-        self.page_table_gpu[:max_slot_end].copy_(
-            self.page_table_cpu[:max_slot_end], non_blocking=True
-        )
-
         is_decode = (header.flags & STEP_FLAG_DECODE_ONLY) != 0
+        pt_end = max_slot_end * self.max_pages_per_seq
+        np.copyto(self._page_table_np[:max_slot_end], pt_np)
 
         self.start_event.record()
         if is_decode:
             bucket = select_decode_bucket(num_seqs, self.max_graph_bucket)
-            np.copyto(self.token_ids_cpu[:num_seqs].numpy(), tok_np)
-            np.copyto(self.positions_cpu[:num_seqs].numpy(), pos_np)
-            np.copyto(self.req_slot_ids_cpu[:num_seqs].numpy(), slot_np)
-            np.copyto(self.seq_lens_cpu[:num_seqs].numpy(), seq_lens_np)
+            db = self.max_graph_bucket
+            io = self._dec_io_np
+            io[0:num_seqs] = tok_np
+            io[db : db + num_seqs] = pos_np
+            io[2 * db : 2 * db + num_seqs] = slot_np
+            io[3 * db : 3 * db + num_seqs] = seq_lens_np
             if bucket > num_seqs:
-                self.token_ids_cpu[num_seqs:bucket].zero_()
-                self.positions_cpu[num_seqs:bucket].zero_()
-                self.req_slot_ids_cpu[num_seqs:bucket].fill_(self.dummy_slot)
-                self.seq_lens_cpu[num_seqs:bucket].zero_()
-
-            self.token_ids_gpu[:bucket].copy_(self.token_ids_cpu[:bucket], non_blocking=True)
-            self.positions_gpu[:bucket].copy_(self.positions_cpu[:bucket], non_blocking=True)
-            self.req_slot_ids_gpu[:bucket].copy_(self.req_slot_ids_cpu[:bucket], non_blocking=True)
-            self.seq_lens_gpu[:bucket].copy_(self.seq_lens_cpu[:bucket], non_blocking=True)
+                io[num_seqs:bucket] = 0
+                io[db + num_seqs : db + bucket] = 0
+                io[2 * db + num_seqs : 2 * db + bucket] = self.dummy_slot
+                io[3 * db + num_seqs : 3 * db + bucket] = 0
+            io_end = self._dec_pt_offset + pt_end
+            self.dec_io_gpu[:io_end].copy_(self.dec_io_cpu[:io_end], non_blocking=True)
 
             self.decode_graphs[bucket].replay()
             if self.rank == 0:
-                self.out_tokens_cpu[:num_seqs].copy_(
-                    self.out_tokens_gpu[:num_seqs], non_blocking=True
-                )
-                self.out_logprobs_cpu[:num_seqs].copy_(
-                    self.out_logprobs_gpu[:num_seqs], non_blocking=True
-                )
+                self._copy_out_io_to_host(num_seqs)
         else:
-            np.copyto(self.token_ids_cpu[:total_tokens].numpy(), tok_np)
-            np.copyto(self.positions_cpu[:total_tokens].numpy(), pos_np)
-            np.copyto(self.req_slot_ids_cpu[:total_tokens].numpy(), slot_np)
-            np.copyto(self.seq_lens_cpu[:num_seqs].numpy(), seq_lens_np)
-            np.copyto(self.query_start_loc_cpu[: num_seqs + 1].numpy(), q_start_np)
+            self.page_table_gpu[:max_slot_end].copy_(
+                self.page_table_cpu[:max_slot_end], non_blocking=True
+            )
+            np.copyto(self._token_ids_np[:total_tokens], tok_np)
+            np.copyto(self._positions_np[:total_tokens], pos_np)
+            np.copyto(self._req_slot_ids_np[:total_tokens], slot_np)
+            np.copyto(self._seq_lens_np[:num_seqs], seq_lens_np)
+            np.copyto(self._query_start_loc_np[: num_seqs + 1], q_start_np)
             if num_sample > 0:
                 self.sample_rows_cpu[:num_sample].copy_(torch.from_numpy(sample_rows_np.astype(np.int64)))
 
@@ -1299,12 +1315,7 @@ class Qwen35MoeStepRunner:
                 max_q_len=max_q_len,
             )
             if self.rank == 0 and num_sample > 0:
-                self.out_tokens_cpu[:num_sample].copy_(
-                    self.out_tokens_gpu[:num_sample], non_blocking=True
-                )
-                self.out_logprobs_cpu[:num_sample].copy_(
-                    self.out_logprobs_gpu[:num_sample], non_blocking=True
-                )
+                self._copy_out_io_to_host(num_sample)
 
         self.end_event.record()
         self.end_event.synchronize()
