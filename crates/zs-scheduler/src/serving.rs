@@ -556,6 +556,8 @@ struct ActiveSequence {
     generated_tokens: Vec<i32>,
     generated_top2: Vec<StepTop2Logits>,
     target_output_len: usize,
+    /// KV pages promised at admission for the whole request; only part may be allocated yet.
+    reserved_pages: usize,
     permit_time: Instant,
     submit_time: Instant,
     first_token_time: Option<Instant>,
@@ -679,15 +681,92 @@ fn validate_serving_max_seqs(max_seqs: u32) -> Result<()> {
 /// step being planned, given `in_flight` earlier steps whose tokens are not harvested yet.
 fn decode_continues_for_all(
     active: &[ActiveSequence],
-    waiting_permitted: &VecDeque<PendingRequest>,
+    waiting_admissible: bool,
     in_flight: usize,
 ) -> bool {
-    waiting_permitted.is_empty()
+    !waiting_admissible
         && !active.is_empty()
         && active.iter().all(|seq| {
             seq.prefilled_tokens == seq.prompt_tokens.len()
                 && seq.generated_tokens.len() + in_flight + 1 < seq.target_output_len
         })
+}
+
+/// KV pages a request occupies at its longest. The last sampled token is never fed back,
+/// so its KV row is never written.
+fn request_kv_page_demand(
+    prompt_len: usize,
+    target_output_len: usize,
+    page_block_tokens: usize,
+) -> usize {
+    prompt_len
+        .saturating_add(target_output_len.saturating_sub(1))
+        .div_ceil(page_block_tokens)
+}
+
+/// Pages promised to active sequences but not allocated yet.
+fn outstanding_reserved_pages(active: &[ActiveSequence]) -> usize {
+    active
+        .iter()
+        .map(|seq| seq.reserved_pages.saturating_sub(seq.page_ids.len()))
+        .sum()
+}
+
+/// Admit only when the whole request fits next to what earlier admissions were promised,
+/// so a running sequence can never run out of KV pages mid-decode.
+fn kv_demand_fits(kv_available: usize, outstanding_reserved: usize, demand_pages: usize) -> bool {
+    kv_available.saturating_sub(outstanding_reserved) >= demand_pages
+}
+
+fn front_request_admissible_in_pools(
+    active: &[ActiveSequence],
+    waiting_permitted: &VecDeque<PendingRequest>,
+    slot_pool: &SlotPool,
+    kv_pool: &BlockPool,
+    max_seqs: usize,
+    page_block_tokens: usize,
+) -> bool {
+    waiting_permitted.front().is_some_and(|req| {
+        active.len() < max_seqs
+            && slot_pool.available() > 0
+            && kv_demand_fits(
+                kv_pool.available(),
+                outstanding_reserved_pages(active),
+                request_kv_page_demand(
+                    req.prompt_tokens.len(),
+                    req.target_output_len,
+                    page_block_tokens,
+                ),
+            )
+    })
+}
+
+fn validate_request_kv_demand_with_limits(
+    requests: impl Iterator<Item = (usize, usize)>,
+    page_block_tokens: usize,
+    max_pages_per_seq: usize,
+    kv_capacity: usize,
+) -> Result<()> {
+    for (prompt_len, target_output_len) in requests {
+        if prompt_len == 0 {
+            return Err(ModeBError::Protocol(
+                "prompt length must be positive".to_owned(),
+            ));
+        }
+        let Some(max_kv_tokens) = prompt_len.checked_add(target_output_len.saturating_sub(1))
+        else {
+            return Err(ModeBError::Protocol(format!(
+                "request with prompt_len={prompt_len} and output_len={target_output_len} overflows KV token length"
+            )));
+        };
+        let demand = max_kv_tokens.div_ceil(page_block_tokens);
+        if demand > max_pages_per_seq || demand > kv_capacity {
+            return Err(ModeBError::Protocol(format!(
+                "request with prompt_len={prompt_len} and output_len={target_output_len} needs {demand} KV pages, exceeding max_pages_per_seq={max_pages_per_seq} or num_kv_pages={kv_capacity}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn sync_dirty_page_table_rows(
@@ -794,6 +873,40 @@ impl ModeBServingEngine {
     fn or_plan_flags(&mut self, step_id: u64, bits: u32) -> Result<()> {
         self.coordinator.plan_slot_mut(step_id)?.header_mut()?.flags |= bits;
         Ok(())
+    }
+
+    /// Whether the next waiting request can be admitted now (slot and whole-request KV pages).
+    fn front_request_admissible(
+        &self,
+        active: &[ActiveSequence],
+        waiting_permitted: &VecDeque<PendingRequest>,
+        max_seqs: usize,
+        page_block_tokens: usize,
+    ) -> bool {
+        front_request_admissible_in_pools(
+            active,
+            waiting_permitted,
+            &self.slot_pool,
+            &self.kv_pool,
+            max_seqs,
+            page_block_tokens,
+        )
+    }
+
+    /// Reject requests that could never be admitted before any step is published, so the
+    /// engine stays usable instead of failing mid-run.
+    fn validate_request_kv_demand(
+        &self,
+        requests: impl Iterator<Item = (usize, usize)>,
+        page_block_tokens: usize,
+        max_pages_per_seq: usize,
+    ) -> Result<()> {
+        validate_request_kv_demand_with_limits(
+            requests,
+            page_block_tokens,
+            max_pages_per_seq,
+            self.kv_pool.capacity(),
+        )
     }
 
     /// Generate exact greedy completions for `prompts` (`target_output_len` new tokens each).
@@ -1013,13 +1126,25 @@ impl ModeBServingEngine {
                 "serving engine is poisoned after a failed in-flight step".to_owned(),
             ));
         }
-        self.poisoned = true;
         let geometry = self.coordinator.config().geometry;
         let max_seqs = geometry.max_seqs as usize;
         let max_step_tokens = geometry.max_step_tokens as usize;
         let max_prefill_chunk = self.coordinator.config().max_prefill_chunk;
         let page_block_tokens = geometry.page_block_tokens as usize;
         let max_pages_per_seq = geometry.max_pages_per_seq as usize;
+        self.validate_request_kv_demand(
+            waiting_permitted
+                .iter()
+                .map(|req| (req.prompt_tokens.len(), req.target_output_len))
+                .chain(
+                    unpermitted_pool
+                        .iter()
+                        .map(|(_, prompt, target_out, _)| (prompt.len(), *target_out)),
+                ),
+            page_block_tokens,
+            max_pages_per_seq,
+        )?;
+        self.poisoned = true;
 
         let mut active: Vec<ActiveSequence> = Vec::with_capacity(max_seqs.min(concurrency_cap));
         let mut slot_to_active: Vec<usize> = vec![usize::MAX; max_seqs];
@@ -1039,6 +1164,12 @@ impl ModeBServingEngine {
                 *overlapped_out += 1;
                 ready_step
             } else {
+                let waiting_admissible = self.front_request_admissible(
+                    &active,
+                    waiting_permitted,
+                    max_seqs,
+                    page_block_tokens,
+                );
                 self.step_cursor += 1;
                 let sid = self.step_cursor;
                 let decode_active_count = active
@@ -1047,8 +1178,7 @@ impl ModeBServingEngine {
                     .count();
                 let has_partial_prefill = decode_active_count != active.len();
                 if let Some(mixed_cap) = self.max_mixed_step_tokens {
-                    let can_attempt_mixed = has_partial_prefill
-                        || (active.len() < max_seqs && !waiting_permitted.is_empty());
+                    let can_attempt_mixed = has_partial_prefill || waiting_admissible;
                     if can_attempt_mixed {
                         match self.stage_mixed_step(
                             sid,
@@ -1098,17 +1228,18 @@ impl ModeBServingEngine {
                         consecutive_prefills = 0;
                     }
                 } else {
-                    let run_prefill = should_schedule_prefill(
-                        decode_active_count,
-                        active.len(),
-                        has_partial_prefill,
-                        max_seqs,
-                        max_step_tokens,
-                        max_prefill_chunk,
-                        waiting_permitted,
-                        consecutive_prefills,
-                        self.max_prefill_coalesce_wait_ms,
-                    );
+                    let run_prefill = (has_partial_prefill || waiting_admissible)
+                        && should_schedule_prefill(
+                            decode_active_count,
+                            active.len(),
+                            has_partial_prefill,
+                            max_seqs,
+                            max_step_tokens,
+                            max_prefill_chunk,
+                            waiting_permitted,
+                            consecutive_prefills,
+                            self.max_prefill_coalesce_wait_ms,
+                        );
                     if run_prefill {
                         let continued_chunk = active.iter().any(|seq| {
                             seq.prefilled_tokens > 0
@@ -1153,13 +1284,19 @@ impl ModeBServingEngine {
                 }
                 sid
             };
+            let waiting_admissible = self.front_request_admissible(
+                &active,
+                waiting_permitted,
+                max_seqs,
+                page_block_tokens,
+            );
 
             let publish_next = match ahead_promise {
                 Some(promise) => promise,
                 None => {
                     let promise = self.device_token_overlap
                         && self.plan_flags(step_id)? & STEP_FLAG_DECODE_ONLY != 0
-                        && decode_continues_for_all(&active, waiting_permitted, 0);
+                        && decode_continues_for_all(&active, waiting_admissible, 0);
                     if promise {
                         self.or_plan_flags(step_id, STEP_FLAG_NEXT_PREPUBLISHED)?;
                     }
@@ -1183,7 +1320,7 @@ impl ModeBServingEngine {
                     max_pages_per_seq,
                     true,
                 )?;
-                let promise = decode_continues_for_all(&active, waiting_permitted, 1);
+                let promise = decode_continues_for_all(&active, waiting_admissible, 1);
                 let mut flags = STEP_FLAG_DEVICE_TOKENS;
                 if promise {
                     flags |= STEP_FLAG_NEXT_PREPUBLISHED;
@@ -1198,7 +1335,7 @@ impl ModeBServingEngine {
             // sequence still needs >= 2 tokens (so none retires after `step_id`), pre-allocate
             // pages and pre-write `plan_slot(step_id + 1)` while the 8 GPUs execute `step_id`.
             let can_overlap_next = !publish_next
-                && waiting_permitted.is_empty()
+                && !waiting_admissible
                 && !active.is_empty()
                 && active.iter().all(|seq| {
                     seq.prefilled_tokens == seq.prompt_tokens.len()
@@ -1425,8 +1562,15 @@ impl ModeBServingEngine {
             ) else {
                 break;
             };
-            let needed_pages = chunk_end.div_ceil(page_block_tokens);
-            if self.kv_pool.available() < needed_pages || self.slot_pool.available() == 0 {
+            let demand_pages =
+                request_kv_page_demand(prompt_len, front.target_output_len, page_block_tokens);
+            if self.slot_pool.available() == 0
+                || !kv_demand_fits(
+                    self.kv_pool.available(),
+                    outstanding_reserved_pages(active),
+                    demand_pages,
+                )
+            {
                 break;
             }
             let req = waiting_permitted.pop_front().ok_or_else(|| {
@@ -1449,6 +1593,7 @@ impl ModeBServingEngine {
                 generated_tokens: Vec::with_capacity(req.target_output_len),
                 generated_top2: Vec::new(),
                 target_output_len: req.target_output_len,
+                reserved_pages: demand_pages,
                 permit_time: req.permit_time,
                 submit_time: req.submit_time,
                 first_token_time: None,
@@ -1668,8 +1813,15 @@ impl ModeBServingEngine {
             else {
                 break;
             };
-            let needed_pages = chunk_end.div_ceil(page_block_tokens);
-            if self.kv_pool.available() < needed_pages || self.slot_pool.available() == 0 {
+            let demand_pages =
+                request_kv_page_demand(prompt_len, front.target_output_len, page_block_tokens);
+            if self.slot_pool.available() == 0
+                || !kv_demand_fits(
+                    self.kv_pool.available(),
+                    outstanding_reserved_pages(active),
+                    demand_pages,
+                )
+            {
                 break;
             }
             let req = waiting_permitted.pop_front().ok_or_else(|| {
@@ -1692,6 +1844,7 @@ impl ModeBServingEngine {
                 generated_tokens: Vec::with_capacity(req.target_output_len),
                 generated_top2: Vec::new(),
                 target_output_len: req.target_output_len,
+                reserved_pages: demand_pages,
                 permit_time: req.permit_time,
                 submit_time: req.submit_time,
                 first_token_time: None,
@@ -2131,6 +2284,7 @@ mod tests {
                 generated_tokens: Vec::new(),
                 generated_top2: Vec::new(),
                 target_output_len: 10,
+                reserved_pages: 0,
                 permit_time: Instant::now(),
                 submit_time: Instant::now(),
                 first_token_time: None,
@@ -2198,6 +2352,7 @@ mod tests {
             generated_tokens: Vec::new(),
             generated_top2: Vec::new(),
             target_output_len: 4,
+            reserved_pages: 0,
             permit_time: now,
             submit_time: now,
             first_token_time: None,
@@ -2397,6 +2552,7 @@ mod tests {
             generated_tokens: vec![201, 202],
             generated_top2: Vec::new(),
             target_output_len: 8,
+            reserved_pages: 0,
             permit_time: Instant::now(),
             submit_time: Instant::now(),
             first_token_time: None,
@@ -2433,6 +2589,7 @@ mod tests {
                 generated_tokens: vec![99; generated],
                 generated_top2: Vec::new(),
                 target_output_len: target,
+                reserved_pages: 0,
                 permit_time: now,
                 submit_time: now,
                 first_token_time: None,
@@ -2440,30 +2597,196 @@ mod tests {
             }
         };
 
-        let empty_waiting = VecDeque::new();
-        assert!(!decode_continues_for_all(&[], &empty_waiting, 0));
+        assert!(!decode_continues_for_all(&[], false, 0));
 
         // 1 generated out of 4: in_flight=0 -> 1+0+1=2 < 4 (true); in_flight=1 -> 1+1+1=3 < 4 (true);
         // in_flight=2 -> 1+2+1=4 < 4 (false, retires right after planned step).
         let active = vec![make_seq(&slot_pool, 4, 1, 4)];
-        assert!(decode_continues_for_all(&active, &empty_waiting, 0));
-        assert!(decode_continues_for_all(&active, &empty_waiting, 1));
-        assert!(!decode_continues_for_all(&active, &empty_waiting, 2));
+        assert!(decode_continues_for_all(&active, false, 0));
+        assert!(decode_continues_for_all(&active, false, 1));
+        assert!(!decode_continues_for_all(&active, false, 2));
 
-        // Waiting permitted request blocks overlap so prefill interleaving is not starved.
-        let mut non_empty_waiting = VecDeque::new();
-        non_empty_waiting.push_back(PendingRequest {
-            request_id: 1,
-            prompt_tokens: vec![1, 2],
-            target_output_len: 4,
-            permit_time: now,
-            submit_time: now,
-        });
-        assert!(!decode_continues_for_all(&active, &non_empty_waiting, 0));
+        // An admissible waiting request blocks overlap so prefill interleaving is not starved.
+        assert!(!decode_continues_for_all(&active, true, 0));
         drop(active);
 
         // Partial prefill sequence in `active` blocks decode-only pre-publishing.
         let partial = vec![make_seq(&slot_pool, 2, 0, 4)];
-        assert!(!decode_continues_for_all(&partial, &empty_waiting, 0));
+        assert!(!decode_continues_for_all(&partial, false, 0));
+    }
+
+    #[test]
+    fn whole_request_kv_demand_excludes_unwritten_final_token() {
+        // 512 prompt + 256 output: the 256th token is sampled but never written to KV.
+        assert_eq!(request_kv_page_demand(512, 256, 16), 48);
+        assert_eq!(request_kv_page_demand(512, 257, 16), 48);
+        assert_eq!(request_kv_page_demand(512, 258, 16), 49);
+        // Single-token output only needs the prompt pages.
+        assert_eq!(request_kv_page_demand(17, 1, 16), 2);
+        assert_eq!(request_kv_page_demand(16, 1, 16), 1);
+        assert_eq!(request_kv_page_demand(512, 128, 128), 5);
+        // Saturating arithmetic never wraps extreme usize lengths to zero.
+        assert!(request_kv_page_demand(2, usize::MAX, 16) > 0);
+    }
+
+    #[test]
+    fn admission_reserves_whole_request_against_earlier_promises() {
+        let slot_pool = SlotPool::new(2);
+        let kv_pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 10);
+        let mut shadow_pt = vec![-1i32; 2 * 8];
+        let mut dirty = [0u128; 2];
+        let now = Instant::now();
+        // Admitted with a 6-page promise; step through 2 prefill chunks (16 -> 32) then decode.
+        let mut seq = ActiveSequence {
+            request_id: 0,
+            slot_lease: slot_pool.allocate().expect("slot"),
+            kv_leases: Vec::new(),
+            page_ids: Vec::new(),
+            prompt_tokens: vec![1; 32],
+            prefilled_tokens: 16,
+            current_seq_len: 16,
+            last_token: 1,
+            generated_tokens: Vec::new(),
+            generated_top2: Vec::new(),
+            target_output_len: 65,
+            reserved_pages: request_kv_page_demand(32, 65, 16),
+            permit_time: now,
+            submit_time: now,
+            first_token_time: None,
+            last_token_time: None,
+        };
+        assert_eq!(seq.reserved_pages, 6);
+        seq.ensure_kv_pages(16, 16, 8, &kv_pool, &mut shadow_pt, &mut dirty)
+            .expect("first prefill chunk");
+        let mut active = vec![seq];
+        assert_eq!(kv_pool.available(), 9);
+        assert_eq!(outstanding_reserved_pages(&active), 5);
+        assert!(kv_demand_fits(kv_pool.available(), 5, 4));
+        assert!(!kv_demand_fits(kv_pool.available(), 5, 5));
+
+        active[0].prefilled_tokens = 32;
+        active[0].current_seq_len = 32;
+        active[0]
+            .ensure_kv_pages(32, 16, 8, &kv_pool, &mut shadow_pt, &mut dirty)
+            .expect("second prefill chunk");
+        assert_eq!(kv_pool.available(), 8);
+        assert_eq!(outstanding_reserved_pages(&active), 4);
+        // 8 free pages minus 4 promised: a 4-page request fits, a 5-page one waits even
+        // though its first chunk alone would fit.
+        assert!(kv_demand_fits(kv_pool.available(), 4, 4));
+        assert!(!kv_demand_fits(kv_pool.available(), 4, 5));
+
+        // Growing within the promise never changes the unreserved headroom.
+        active[0]
+            .ensure_kv_pages(96, 16, 8, &kv_pool, &mut shadow_pt, &mut dirty)
+            .expect("decode growth inside reservation");
+        assert_eq!(kv_pool.available(), 4);
+        assert_eq!(outstanding_reserved_pages(&active), 0);
+        assert!(kv_demand_fits(kv_pool.available(), 0, 4));
+        drop(active);
+        assert_eq!(kv_pool.available(), 10);
+    }
+
+    #[test]
+    fn validate_request_kv_demand_rejects_empty_overflow_and_over_capacity() {
+        // Exact boundary equality (8 pages == max_pages_per_seq == kv_capacity) is accepted.
+        validate_request_kv_demand_with_limits([(64, 65)].into_iter(), 16, 8, 8)
+            .expect("exact max_pages_per_seq and kv_capacity boundary fits");
+
+        // Demand exceeding max_pages_per_seq is rejected even when kv_capacity is larger.
+        let err_seq = validate_request_kv_demand_with_limits([(64, 66)].into_iter(), 16, 8, 64)
+            .expect_err("exceeds max_pages_per_seq");
+        assert!(err_seq.to_string().contains("max_pages_per_seq=8"));
+
+        // Demand exceeding kv_capacity is rejected even when max_pages_per_seq is larger.
+        let err_cap = validate_request_kv_demand_with_limits([(64, 66)].into_iter(), 16, 64, 8)
+            .expect_err("exceeds num_kv_pages");
+        assert!(err_cap.to_string().contains("num_kv_pages=8"));
+
+        // Empty prompt anywhere in the batch is rejected pre-flight before poisoning the engine.
+        let err_empty =
+            validate_request_kv_demand_with_limits([(16, 4), (0, 4)].into_iter(), 16, 64, 64)
+                .expect_err("empty prompt rejected");
+        assert!(err_empty.to_string().contains("positive"));
+
+        // Overflowing token sum is rejected instead of wrapping in release mode.
+        let err_ovf =
+            validate_request_kv_demand_with_limits([(2, usize::MAX)].into_iter(), 16, 64, 64)
+                .expect_err("usize overflow rejected");
+        assert!(err_ovf.to_string().contains("overflows"));
+    }
+
+    #[test]
+    fn inadmissible_waiting_request_keeps_overlap_open_until_retirement() {
+        let slot_pool = SlotPool::new(2);
+        let kv_pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 8);
+        let mut shadow_pt = vec![-1i32; 2 * 8];
+        let mut dirty = [0u128; 2];
+        let now = Instant::now();
+
+        let mut make_active = |request_id: usize| {
+            let mut seq = ActiveSequence {
+                request_id,
+                slot_lease: slot_pool.allocate().expect("slot"),
+                kv_leases: Vec::new(),
+                page_ids: Vec::new(),
+                prompt_tokens: vec![1; 16],
+                prefilled_tokens: 16,
+                current_seq_len: 16,
+                last_token: 1,
+                generated_tokens: vec![99],
+                generated_top2: Vec::new(),
+                target_output_len: 33, // demand = ceil((16 + 32) / 16) = 3 pages
+                reserved_pages: request_kv_page_demand(16, 33, 16),
+                permit_time: now,
+                submit_time: now,
+                first_token_time: None,
+                last_token_time: None,
+            };
+            seq.ensure_kv_pages(17, 16, 8, &kv_pool, &mut shadow_pt, &mut dirty)
+                .expect("initial kv pages");
+            seq
+        };
+
+        // Active seq 0 promises 3 pages (2 allocated, 1 outstanding); 5 unreserved pages remain.
+        let mut active = vec![make_active(0)];
+        let mut waiting = VecDeque::new();
+        waiting.push_back(PendingRequest {
+            request_id: 1,
+            prompt_tokens: vec![1; 32],
+            target_output_len: 65, // demand = 6 pages > 5 unreserved pages
+            permit_time: now,
+            submit_time: now,
+        });
+
+        // Waiting request cannot fit yet -> waiting_admissible is false -> decode overlap stays on.
+        let admissible_under_pressure =
+            front_request_admissible_in_pools(&active, &waiting, &slot_pool, &kv_pool, 2, 16);
+        assert!(!admissible_under_pressure);
+        assert!(decode_continues_for_all(
+            &active,
+            admissible_under_pressure,
+            0
+        ));
+
+        // Slot exhaustion also keeps waiting_admissible false even when KV pages fit.
+        waiting[0].target_output_len = 17; // demand = ceil((32 + 16) / 16) = 3 pages <= 5
+        active.push(make_active(2)); // consumes the 2nd slot; 8 - 6 = 2 unreserved pages
+        assert_eq!(slot_pool.available(), 0);
+        assert!(!front_request_admissible_in_pools(
+            &active, &waiting, &slot_pool, &kv_pool, 2, 16
+        ));
+
+        // Retiring seq 2 frees both its slot and its 3-page reservation (5 unreserved >= 3 demand),
+        // flipping waiting_admissible to true and halting decode overlap so prefill can interleave.
+        active.pop();
+        let admissible_after_retire =
+            front_request_admissible_in_pools(&active, &waiting, &slot_pool, &kv_pool, 2, 16);
+        assert!(admissible_after_retire);
+        assert!(!decode_continues_for_all(
+            &active,
+            admissible_after_retire,
+            0
+        ));
     }
 }
