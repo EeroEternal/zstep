@@ -699,7 +699,9 @@ fn request_kv_page_demand(
     target_output_len: usize,
     page_block_tokens: usize,
 ) -> usize {
-    (prompt_len + target_output_len.saturating_sub(1)).div_ceil(page_block_tokens)
+    prompt_len
+        .saturating_add(target_output_len.saturating_sub(1))
+        .div_ceil(page_block_tokens)
 }
 
 /// Pages promised to active sequences but not allocated yet.
@@ -714,6 +716,57 @@ fn outstanding_reserved_pages(active: &[ActiveSequence]) -> usize {
 /// so a running sequence can never run out of KV pages mid-decode.
 fn kv_demand_fits(kv_available: usize, outstanding_reserved: usize, demand_pages: usize) -> bool {
     kv_available.saturating_sub(outstanding_reserved) >= demand_pages
+}
+
+fn front_request_admissible_in_pools(
+    active: &[ActiveSequence],
+    waiting_permitted: &VecDeque<PendingRequest>,
+    slot_pool: &SlotPool,
+    kv_pool: &BlockPool,
+    max_seqs: usize,
+    page_block_tokens: usize,
+) -> bool {
+    waiting_permitted.front().is_some_and(|req| {
+        active.len() < max_seqs
+            && slot_pool.available() > 0
+            && kv_demand_fits(
+                kv_pool.available(),
+                outstanding_reserved_pages(active),
+                request_kv_page_demand(
+                    req.prompt_tokens.len(),
+                    req.target_output_len,
+                    page_block_tokens,
+                ),
+            )
+    })
+}
+
+fn validate_request_kv_demand_with_limits(
+    requests: impl Iterator<Item = (usize, usize)>,
+    page_block_tokens: usize,
+    max_pages_per_seq: usize,
+    kv_capacity: usize,
+) -> Result<()> {
+    for (prompt_len, target_output_len) in requests {
+        if prompt_len == 0 {
+            return Err(ModeBError::Protocol(
+                "prompt length must be positive".to_owned(),
+            ));
+        }
+        let Some(max_kv_tokens) = prompt_len.checked_add(target_output_len.saturating_sub(1))
+        else {
+            return Err(ModeBError::Protocol(format!(
+                "request with prompt_len={prompt_len} and output_len={target_output_len} overflows KV token length"
+            )));
+        };
+        let demand = max_kv_tokens.div_ceil(page_block_tokens);
+        if demand > max_pages_per_seq || demand > kv_capacity {
+            return Err(ModeBError::Protocol(format!(
+                "request with prompt_len={prompt_len} and output_len={target_output_len} needs {demand} KV pages, exceeding max_pages_per_seq={max_pages_per_seq} or num_kv_pages={kv_capacity}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn sync_dirty_page_table_rows(
@@ -830,19 +883,14 @@ impl ModeBServingEngine {
         max_seqs: usize,
         page_block_tokens: usize,
     ) -> bool {
-        waiting_permitted.front().is_some_and(|req| {
-            active.len() < max_seqs
-                && self.slot_pool.available() > 0
-                && kv_demand_fits(
-                    self.kv_pool.available(),
-                    outstanding_reserved_pages(active),
-                    request_kv_page_demand(
-                        req.prompt_tokens.len(),
-                        req.target_output_len,
-                        page_block_tokens,
-                    ),
-                )
-        })
+        front_request_admissible_in_pools(
+            active,
+            waiting_permitted,
+            &self.slot_pool,
+            &self.kv_pool,
+            max_seqs,
+            page_block_tokens,
+        )
     }
 
     /// Reject requests that could never be admitted before any step is published, so the
@@ -853,16 +901,12 @@ impl ModeBServingEngine {
         page_block_tokens: usize,
         max_pages_per_seq: usize,
     ) -> Result<()> {
-        let capacity = self.kv_pool.capacity();
-        for (prompt_len, target_output_len) in requests {
-            let demand = request_kv_page_demand(prompt_len, target_output_len, page_block_tokens);
-            if demand > max_pages_per_seq || demand > capacity {
-                return Err(ModeBError::Protocol(format!(
-                    "request with prompt_len={prompt_len} and output_len={target_output_len} needs {demand} KV pages, exceeding max_pages_per_seq={max_pages_per_seq} or num_kv_pages={capacity}"
-                )));
-            }
-        }
-        Ok(())
+        validate_request_kv_demand_with_limits(
+            requests,
+            page_block_tokens,
+            max_pages_per_seq,
+            self.kv_pool.capacity(),
+        )
     }
 
     /// Generate exact greedy completions for `prompts` (`target_output_len` new tokens each).
@@ -1112,12 +1156,6 @@ impl ModeBServingEngine {
 
         while !active.is_empty() || !waiting_permitted.is_empty() || !unpermitted_pool.is_empty() {
             let mut ahead_promise = None;
-            let mut waiting_admissible = self.front_request_admissible(
-                &active,
-                waiting_permitted,
-                max_seqs,
-                page_block_tokens,
-            );
             let step_id = if let Some((ahead_step, promise)) = published_ahead.take() {
                 *overlapped_out += 1;
                 ahead_promise = Some(promise);
@@ -1126,6 +1164,12 @@ impl ModeBServingEngine {
                 *overlapped_out += 1;
                 ready_step
             } else {
+                let waiting_admissible = self.front_request_admissible(
+                    &active,
+                    waiting_permitted,
+                    max_seqs,
+                    page_block_tokens,
+                );
                 self.step_cursor += 1;
                 let sid = self.step_cursor;
                 let decode_active_count = active
@@ -1240,7 +1284,7 @@ impl ModeBServingEngine {
                 }
                 sid
             };
-            waiting_admissible = self.front_request_admissible(
+            let waiting_admissible = self.front_request_admissible(
                 &active,
                 waiting_permitted,
                 max_seqs,
@@ -2581,6 +2625,8 @@ mod tests {
         assert_eq!(request_kv_page_demand(17, 1, 16), 2);
         assert_eq!(request_kv_page_demand(16, 1, 16), 1);
         assert_eq!(request_kv_page_demand(512, 128, 128), 5);
+        // Saturating arithmetic never wraps extreme usize lengths to zero.
+        assert!(request_kv_page_demand(2, usize::MAX, 16) > 0);
     }
 
     #[test]
@@ -2590,15 +2636,15 @@ mod tests {
         let mut shadow_pt = vec![-1i32; 2 * 8];
         let mut dirty = [0u128; 2];
         let now = Instant::now();
-        // Admitted with a 6-page promise; only its 2-page first chunk is allocated so far.
+        // Admitted with a 6-page promise; step through 2 prefill chunks (16 -> 32) then decode.
         let mut seq = ActiveSequence {
             request_id: 0,
             slot_lease: slot_pool.allocate().expect("slot"),
             kv_leases: Vec::new(),
             page_ids: Vec::new(),
             prompt_tokens: vec![1; 32],
-            prefilled_tokens: 32,
-            current_seq_len: 32,
+            prefilled_tokens: 16,
+            current_seq_len: 16,
             last_token: 1,
             generated_tokens: Vec::new(),
             generated_top2: Vec::new(),
@@ -2610,9 +2656,19 @@ mod tests {
             last_token_time: None,
         };
         assert_eq!(seq.reserved_pages, 6);
-        seq.ensure_kv_pages(32, 16, 8, &kv_pool, &mut shadow_pt, &mut dirty)
-            .expect("first chunk");
+        seq.ensure_kv_pages(16, 16, 8, &kv_pool, &mut shadow_pt, &mut dirty)
+            .expect("first prefill chunk");
         let mut active = vec![seq];
+        assert_eq!(kv_pool.available(), 9);
+        assert_eq!(outstanding_reserved_pages(&active), 5);
+        assert!(kv_demand_fits(kv_pool.available(), 5, 4));
+        assert!(!kv_demand_fits(kv_pool.available(), 5, 5));
+
+        active[0].prefilled_tokens = 32;
+        active[0].current_seq_len = 32;
+        active[0]
+            .ensure_kv_pages(32, 16, 8, &kv_pool, &mut shadow_pt, &mut dirty)
+            .expect("second prefill chunk");
         assert_eq!(kv_pool.available(), 8);
         assert_eq!(outstanding_reserved_pages(&active), 4);
         // 8 free pages minus 4 promised: a 4-page request fits, a 5-page one waits even
@@ -2629,5 +2685,108 @@ mod tests {
         assert!(kv_demand_fits(kv_pool.available(), 0, 4));
         drop(active);
         assert_eq!(kv_pool.available(), 10);
+    }
+
+    #[test]
+    fn validate_request_kv_demand_rejects_empty_overflow_and_over_capacity() {
+        // Exact boundary equality (8 pages == max_pages_per_seq == kv_capacity) is accepted.
+        validate_request_kv_demand_with_limits([(64, 65)].into_iter(), 16, 8, 8)
+            .expect("exact max_pages_per_seq and kv_capacity boundary fits");
+
+        // Demand exceeding max_pages_per_seq is rejected even when kv_capacity is larger.
+        let err_seq = validate_request_kv_demand_with_limits([(64, 66)].into_iter(), 16, 8, 64)
+            .expect_err("exceeds max_pages_per_seq");
+        assert!(err_seq.to_string().contains("max_pages_per_seq=8"));
+
+        // Demand exceeding kv_capacity is rejected even when max_pages_per_seq is larger.
+        let err_cap = validate_request_kv_demand_with_limits([(64, 66)].into_iter(), 16, 64, 8)
+            .expect_err("exceeds num_kv_pages");
+        assert!(err_cap.to_string().contains("num_kv_pages=8"));
+
+        // Empty prompt anywhere in the batch is rejected pre-flight before poisoning the engine.
+        let err_empty =
+            validate_request_kv_demand_with_limits([(16, 4), (0, 4)].into_iter(), 16, 64, 64)
+                .expect_err("empty prompt rejected");
+        assert!(err_empty.to_string().contains("positive"));
+
+        // Overflowing token sum is rejected instead of wrapping in release mode.
+        let err_ovf =
+            validate_request_kv_demand_with_limits([(2, usize::MAX)].into_iter(), 16, 64, 64)
+                .expect_err("usize overflow rejected");
+        assert!(err_ovf.to_string().contains("overflows"));
+    }
+
+    #[test]
+    fn inadmissible_waiting_request_keeps_overlap_open_until_retirement() {
+        let slot_pool = SlotPool::new(2);
+        let kv_pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 8);
+        let mut shadow_pt = vec![-1i32; 2 * 8];
+        let mut dirty = [0u128; 2];
+        let now = Instant::now();
+
+        let mut make_active = |request_id: usize| {
+            let mut seq = ActiveSequence {
+                request_id,
+                slot_lease: slot_pool.allocate().expect("slot"),
+                kv_leases: Vec::new(),
+                page_ids: Vec::new(),
+                prompt_tokens: vec![1; 16],
+                prefilled_tokens: 16,
+                current_seq_len: 16,
+                last_token: 1,
+                generated_tokens: vec![99],
+                generated_top2: Vec::new(),
+                target_output_len: 33, // demand = ceil((16 + 32) / 16) = 3 pages
+                reserved_pages: request_kv_page_demand(16, 33, 16),
+                permit_time: now,
+                submit_time: now,
+                first_token_time: None,
+                last_token_time: None,
+            };
+            seq.ensure_kv_pages(17, 16, 8, &kv_pool, &mut shadow_pt, &mut dirty)
+                .expect("initial kv pages");
+            seq
+        };
+
+        // Active seq 0 promises 3 pages (2 allocated, 1 outstanding); 5 unreserved pages remain.
+        let mut active = vec![make_active(0)];
+        let mut waiting = VecDeque::new();
+        waiting.push_back(PendingRequest {
+            request_id: 1,
+            prompt_tokens: vec![1; 32],
+            target_output_len: 65, // demand = 6 pages > 5 unreserved pages
+            permit_time: now,
+            submit_time: now,
+        });
+
+        // Waiting request cannot fit yet -> waiting_admissible is false -> decode overlap stays on.
+        let admissible_under_pressure =
+            front_request_admissible_in_pools(&active, &waiting, &slot_pool, &kv_pool, 2, 16);
+        assert!(!admissible_under_pressure);
+        assert!(decode_continues_for_all(
+            &active,
+            admissible_under_pressure,
+            0
+        ));
+
+        // Slot exhaustion also keeps waiting_admissible false even when KV pages fit.
+        waiting[0].target_output_len = 17; // demand = ceil((32 + 16) / 16) = 3 pages <= 5
+        active.push(make_active(2)); // consumes the 2nd slot; 8 - 6 = 2 unreserved pages
+        assert_eq!(slot_pool.available(), 0);
+        assert!(!front_request_admissible_in_pools(
+            &active, &waiting, &slot_pool, &kv_pool, 2, 16
+        ));
+
+        // Retiring seq 2 frees both its slot and its 3-page reservation (5 unreserved >= 3 demand),
+        // flipping waiting_admissible to true and halting decode overlap so prefill can interleave.
+        active.pop();
+        let admissible_after_retire =
+            front_request_admissible_in_pools(&active, &waiting, &slot_pool, &kv_pool, 2, 16);
+        assert!(admissible_after_retire);
+        assert!(!decode_continues_for_all(
+            &active,
+            admissible_after_retire,
+            0
+        ));
     }
 }
