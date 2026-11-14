@@ -1,6 +1,6 @@
 # 03 — 共享内存 IPC 与同步协议设计 (`zs-wire`)
 
-本文档定义 `zstep` **模式 B（1 个纯 Rust 主控进程 + 8 个 GPU Worker 进程）** 之间的二进制内存布局、同步原语、双缓冲重叠时序与故障安全机制。对应源码位于 `crates/zs-wire` 与 `worker/zstep_worker/shm_bridge.py`。
+本文档定义 `zstep` **单主控共享内存架构（1 个纯 Rust 主控进程 + 8 个 GPU Worker 进程）** 之间的二进制内存布局、同步原语、双缓冲重叠时序与故障安全机制。对应源码位于 `crates/zs-wire` 与 `worker/zstep_worker/shm_bridge.py`。
 
 ---
 

@@ -6,7 +6,7 @@
 
 ---
 
-## 一、 整体拓扑架构（模式 B：单主控 + 8 Worker 共享内存 IPC）
+## 一、 整体拓扑架构（单主控 + 8 Worker 共享内存 IPC）
 
 ```mermaid
 flowchart TD

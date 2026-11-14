@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Zero-copy `#[repr(C)]` shared-memory protocol definitions for Mode B
+//! Zero-copy `#[repr(C)]` shared-memory protocol definitions for `zstep`
 //! (1 pure-Rust Master Control Plane + N GPU Worker processes).
 //!
 //! See `docs/03-shm-protocol.md` for the full memory map and barrier rules.

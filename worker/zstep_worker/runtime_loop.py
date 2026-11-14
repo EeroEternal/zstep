@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Mode B GPU worker driven only by POSIX SHM and inherited eventfds."""
+"""zstep GPU worker driven only by POSIX SHM and inherited eventfds."""
 
 from __future__ import annotations
 
@@ -133,7 +133,7 @@ class MicroStep:
         self.device = torch.device("cuda", self.rank)
         capability = torch.cuda.get_device_capability(self.device)
         if capability != (12, 0):
-            raise RuntimeError(f"Mode B requires sm_120, found {capability}")
+            raise RuntimeError(f"zstep worker requires sm_120, found {capability}")
         if not mxfp8_linear.is_supported(self.device):
             raise RuntimeError("b12x MXFP8 GEMM does not support this device")
 
@@ -659,7 +659,7 @@ class RuntimeLoop:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="zstep Mode B sm_120 GPU worker")
+    parser = argparse.ArgumentParser(description="zstep sm_120 GPU worker")
     parser.add_argument("--shm-name", required=True)
     parser.add_argument("--shm-fd", default=-1, type=int)
     parser.add_argument("--rank", required=True, type=int)

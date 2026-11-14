@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""End-to-end Phase 1 test: Rust `zstep --mode-b` Master <-> Python `sm_120` Workers."""
+"""End-to-end Phase 1 test: Rust `zstep` Master <-> Python `sm_120` Workers."""
 
 from __future__ import annotations
 
@@ -30,14 +30,13 @@ import tempfile
 from pathlib import Path
 
 
-def run_mode_b_e2e(*, zstep_bin: Path, world_size: int, steps: int) -> dict[str, object]:
+def run_coordinator_e2e(*, zstep_bin: Path, world_size: int, steps: int) -> dict[str, object]:
     worker_root = Path(__file__).resolve().parents[1]
-    with tempfile.TemporaryDirectory(prefix="zstep_mode_b_test_") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="zstep_coordinator_test_") as tmp_dir:
         metrics_path = Path(tmp_dir) / "metrics.json"
         shm_name = f"zstep_e2e_{os.getpid()}_{world_size}"
         cmd = [
             str(zstep_bin),
-            "--mode-b",
             "--world-size",
             str(world_size),
             "--steps",
@@ -66,7 +65,7 @@ def run_mode_b_e2e(*, zstep_bin: Path, world_size: int, steps: int) -> dict[str,
         proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
         assert metrics_path.is_file(), f"Missing metrics output; stdout={proc.stdout}"
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-        assert metrics["mode"] == "B"
+        assert metrics["engine"] == "zstep"
         assert metrics["world_size"] == world_size
         assert metrics["steps"] == steps
         assert metrics["accepted_tokens"] > 0
@@ -79,7 +78,7 @@ def run_mode_b_e2e(*, zstep_bin: Path, world_size: int, steps: int) -> dict[str,
 if __name__ == "__main__":
     repo_root = Path(__file__).resolve().parents[2]
     binary = Path(os.environ.get("ZSTEP_BIN", str(repo_root / "target/release/zstep")))
-    m1 = run_mode_b_e2e(zstep_bin=binary, world_size=1, steps=24)
-    print("1-GPU Mode B OK:", json.dumps(m1))
-    m8 = run_mode_b_e2e(zstep_bin=binary, world_size=8, steps=64)
-    print("8-GPU Mode B OK:", json.dumps(m8))
+    m1 = run_coordinator_e2e(zstep_bin=binary, world_size=1, steps=24)
+    print("1-GPU Coordinator OK:", json.dumps(m1))
+    m8 = run_coordinator_e2e(zstep_bin=binary, world_size=8, steps=64)
+    print("8-GPU Coordinator OK:", json.dumps(m8))

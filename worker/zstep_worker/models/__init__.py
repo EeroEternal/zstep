@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Explicit real-weight model runners for zstep Mode B workers."""
+"""Explicit real-weight model runners for zstep GPU workers."""
 
 from __future__ import annotations
 

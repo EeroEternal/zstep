@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Continuous-batching Mode B serving scheduler and multi-tier benchmark harness.
+//! Continuous-batching serving scheduler and multi-tier benchmark harness.
 //!
 //! Owns request slots and physical 16-token KV pages via RAII handles (`SlotLease`,
 //! `zs_kv::BlockLease`) and overlaps next-step decode preparation (`in_flight_depth = 1`)
@@ -36,7 +36,7 @@ use zs_wire::{
     STEP_FLAG_NEXT_PREPUBLISHED, StepHeader, StepOpcode,
 };
 
-use crate::mode_b::{ModeBConfig, ModeBCoordinator, ModeBError, Result};
+use crate::coordinator::{EngineConfig, EngineError, Result, WorkerCoordinator};
 use crate::select_graph_bucket;
 
 struct SlotPoolInner {
@@ -368,7 +368,7 @@ impl BenchmarkProvenance {
         max_step_tokens: u32,
         max_prefill_chunk: usize,
     ) -> Result<Self> {
-        let git_commit = zs_wire::resolve_git_sha(true).map_err(ModeBError::Protocol)?;
+        let git_commit = zs_wire::resolve_git_sha(true).map_err(EngineError::Protocol)?;
 
         let gpu_output = Command::new("nvidia-smi")
             .args([
@@ -377,32 +377,33 @@ impl BenchmarkProvenance {
             ])
             .output()?;
         if !gpu_output.status.success() {
-            return Err(ModeBError::Protocol(
+            return Err(EngineError::Protocol(
                 "nvidia-smi failed while capturing provenance".to_owned(),
             ));
         }
-        let gpu_csv = String::from_utf8(gpu_output.stdout)
-            .map_err(|error| ModeBError::Protocol(format!("invalid nvidia-smi output: {error}")))?;
+        let gpu_csv = String::from_utf8(gpu_output.stdout).map_err(|error| {
+            EngineError::Protocol(format!("invalid nvidia-smi output: {error}"))
+        })?;
         let mut driver_versions = Vec::new();
         let mut gpu_graphics_clocks_mhz = Vec::new();
         let mut gpu_mem_clocks_mhz = Vec::new();
         for line in gpu_csv.lines().filter(|line| !line.trim().is_empty()) {
             let fields: Vec<&str> = line.split(',').map(str::trim).collect();
             if fields.len() != 3 {
-                return Err(ModeBError::Protocol(format!(
+                return Err(EngineError::Protocol(format!(
                     "unexpected nvidia-smi provenance row: {line}"
                 )));
             }
             driver_versions.push(fields[0].to_owned());
             gpu_graphics_clocks_mhz.push(fields[1].parse::<u32>().map_err(|error| {
-                ModeBError::Protocol(format!("invalid graphics clock in `{line}`: {error}"))
+                EngineError::Protocol(format!("invalid graphics clock in `{line}`: {error}"))
             })?);
             gpu_mem_clocks_mhz.push(fields[2].parse::<u32>().map_err(|error| {
-                ModeBError::Protocol(format!("invalid memory clock in `{line}`: {error}"))
+                EngineError::Protocol(format!("invalid memory clock in `{line}`: {error}"))
             })?);
         }
         let nvidia_driver_version = driver_versions.first().cloned().ok_or_else(|| {
-            ModeBError::Protocol("nvidia-smi returned no GPU provenance rows".to_owned())
+            EngineError::Protocol("nvidia-smi returned no GPU provenance rows".to_owned())
         })?;
         Ok(Self {
             git_commit,
@@ -457,7 +458,7 @@ impl BenchmarkProvenance {
     }
 }
 
-/// Complete multi-tier benchmark report produced by [`ModeBServingEngine`].
+/// Complete multi-tier benchmark report produced by [`ServingEngine`].
 #[derive(Debug, Clone)]
 pub struct ServingBenchmarkReport {
     pub model_name: String,
@@ -492,7 +493,7 @@ impl ServingBenchmarkReport {
         format!(
             concat!(
                 "{{\n",
-                "  \"engine\": \"zstep-mode-b\",\n",
+                "  \"engine\": \"zstep\",\n",
                 "  \"model\": {},\n",
                 "  \"world_size\": {},\n",
                 "  \"worker_numa_nodes\": [{}],\n",
@@ -576,14 +577,14 @@ impl ActiveSequence {
     ) -> Result<()> {
         let needed_pages = target_seq_len.div_ceil(page_block_tokens);
         if needed_pages > max_pages_per_seq {
-            return Err(ModeBError::Protocol(format!(
+            return Err(EngineError::Protocol(format!(
                 "sequence length {target_seq_len} exceeds max_pages_per_seq {max_pages_per_seq}"
             )));
         }
         if needed_pages > self.page_ids.len() {
             let delta = needed_pages - self.page_ids.len();
             let lease = kv_pool.allocate(delta).ok_or_else(|| {
-                ModeBError::Protocol(format!(
+                EngineError::Protocol(format!(
                     "KV BlockPool exhausted allocating {delta} pages (free={})",
                     kv_pool.available()
                 ))
@@ -646,9 +647,9 @@ pub struct GenerationScheduleStats {
     pub max_active_sequences: usize,
 }
 
-/// Live Mode B continuous-batching engine keeping the 8 GPU workers warm across runs.
-pub struct ModeBServingEngine {
-    coordinator: ModeBCoordinator,
+/// Live continuous-batching engine keeping the GPU workers warm across runs.
+pub struct ServingEngine {
+    coordinator: WorkerCoordinator,
     slot_pool: SlotPool,
     kv_pool: BlockPool,
     shadow_page_table: Vec<i32>,
@@ -670,7 +671,7 @@ enum MixedStepOutcome {
 
 fn validate_serving_max_seqs(max_seqs: u32) -> Result<()> {
     if max_seqs == 0 || max_seqs > MAX_DECODE_GRAPH_SEQS {
-        return Err(ModeBError::Protocol(format!(
+        return Err(EngineError::Protocol(format!(
             "max_seqs={max_seqs} is outside supported decode CUDA Graph range 1..={MAX_DECODE_GRAPH_SEQS}"
         )));
     }
@@ -749,19 +750,19 @@ fn validate_request_kv_demand_with_limits(
 ) -> Result<()> {
     for (prompt_len, target_output_len) in requests {
         if prompt_len == 0 {
-            return Err(ModeBError::Protocol(
+            return Err(EngineError::Protocol(
                 "prompt length must be positive".to_owned(),
             ));
         }
         let Some(max_kv_tokens) = prompt_len.checked_add(target_output_len.saturating_sub(1))
         else {
-            return Err(ModeBError::Protocol(format!(
+            return Err(EngineError::Protocol(format!(
                 "request with prompt_len={prompt_len} and output_len={target_output_len} overflows KV token length"
             )));
         };
         let demand = max_kv_tokens.div_ceil(page_block_tokens);
         if demand > max_pages_per_seq || demand > kv_capacity {
-            return Err(ModeBError::Protocol(format!(
+            return Err(EngineError::Protocol(format!(
                 "request with prompt_len={prompt_len} and output_len={target_output_len} needs {demand} KV pages, exceeding max_pages_per_seq={max_pages_per_seq} or num_kv_pages={kv_capacity}"
             )));
         }
@@ -793,13 +794,13 @@ fn sync_dirty_page_table_rows(
     Ok(())
 }
 
-impl ModeBServingEngine {
-    pub fn launch(config: ModeBConfig) -> Result<Self> {
+impl ServingEngine {
+    pub fn launch(config: EngineConfig) -> Result<Self> {
         let geometry = config.geometry;
         validate_serving_max_seqs(geometry.max_seqs)?;
         let num_kv_pages = config.launch.num_kv_pages as usize;
         let dummy_page = config.launch.num_kv_pages as i32;
-        let mut coordinator = ModeBCoordinator::launch(config)?;
+        let mut coordinator = WorkerCoordinator::launch(config)?;
         let (init_wall_us, worker_numa_nodes) = coordinator.wait_workers_ready()?;
 
         let pt_len = geometry.max_seqs as usize * geometry.max_pages_per_seq as usize;
@@ -841,7 +842,7 @@ impl ModeBServingEngine {
 
     pub fn set_max_prefill_chunk(&mut self, max_prefill_chunk: usize) -> Result<()> {
         if max_prefill_chunk == 0 {
-            return Err(ModeBError::Protocol(
+            return Err(EngineError::Protocol(
                 "max_prefill_chunk must be positive".to_owned(),
             ));
         }
@@ -947,14 +948,14 @@ impl ModeBServingEngine {
         record_top2: bool,
     ) -> Result<GreedyTop2Batch> {
         if prompts.len() != target_output_lengths.len() {
-            return Err(ModeBError::Protocol(format!(
+            return Err(EngineError::Protocol(format!(
                 "prompt count {} differs from output length count {}",
                 prompts.len(),
                 target_output_lengths.len()
             )));
         }
         if target_output_lengths.contains(&0) {
-            return Err(ModeBError::Protocol(
+            return Err(EngineError::Protocol(
                 "greedy output lengths must be positive".to_owned(),
             ));
         }
@@ -1025,7 +1026,7 @@ impl ModeBServingEngine {
             || spec.input_len == 0
             || spec.output_len == 0
         {
-            return Err(ModeBError::Protocol(
+            return Err(EngineError::Protocol(
                 "benchmark tier dimensions must all be positive".to_owned(),
             ));
         }
@@ -1122,7 +1123,7 @@ impl ModeBServingEngine {
         overlapped_out: &mut u64,
     ) -> Result<()> {
         if self.poisoned {
-            return Err(ModeBError::Protocol(
+            return Err(EngineError::Protocol(
                 "serving engine is poisoned after a failed in-flight step".to_owned(),
             ));
         }
@@ -1362,13 +1363,13 @@ impl ModeBServingEngine {
             let emitted: Vec<(u32, i32, i32, u32, u32)> = {
                 let result = self.coordinator.result_slot(step_id)?;
                 if result.completed_step_id()? != step_id {
-                    return Err(ModeBError::Protocol(format!(
+                    return Err(EngineError::Protocol(format!(
                         "completed_step_id mismatch on step {step_id}"
                     )));
                 }
                 let header = result.header()?;
                 if header.status_code != 0 {
-                    return Err(ModeBError::Protocol(format!(
+                    return Err(EngineError::Protocol(format!(
                         "worker failed step {step_id} with status {}",
                         header.status_code
                     )));
@@ -1550,7 +1551,7 @@ impl ModeBServingEngine {
             };
             let prompt_len = front.prompt_tokens.len();
             if prompt_len == 0 {
-                return Err(ModeBError::Protocol(
+                return Err(EngineError::Protocol(
                     "prompt length must be positive".to_owned(),
                 ));
             }
@@ -1574,10 +1575,10 @@ impl ModeBServingEngine {
                 break;
             }
             let req = waiting_permitted.pop_front().ok_or_else(|| {
-                ModeBError::Protocol("waiting queue unexpectedly empty".to_owned())
+                EngineError::Protocol("waiting queue unexpectedly empty".to_owned())
             })?;
             let slot_lease = self.slot_pool.allocate().ok_or_else(|| {
-                ModeBError::Protocol("SlotPool unexpectedly exhausted".to_owned())
+                EngineError::Protocol("SlotPool unexpectedly exhausted".to_owned())
             })?;
             let slot_id = slot_lease.id() as usize;
             let last_token = *req.prompt_tokens.last().unwrap_or(&0);
@@ -1622,7 +1623,7 @@ impl ModeBServingEngine {
         }
 
         if num_seqs == 0 {
-            return Err(ModeBError::Protocol(
+            return Err(EngineError::Protocol(
                 "prefill step scheduled zero sequences".to_owned(),
             ));
         }
@@ -1800,7 +1801,7 @@ impl ModeBServingEngine {
             };
             let prompt_len = front.prompt_tokens.len();
             if prompt_len == 0 {
-                return Err(ModeBError::Protocol(
+                return Err(EngineError::Protocol(
                     "prompt length must be positive".to_owned(),
                 ));
             }
@@ -1825,10 +1826,10 @@ impl ModeBServingEngine {
                 break;
             }
             let req = waiting_permitted.pop_front().ok_or_else(|| {
-                ModeBError::Protocol("waiting queue unexpectedly empty".to_owned())
+                EngineError::Protocol("waiting queue unexpectedly empty".to_owned())
             })?;
             let slot_lease = self.slot_pool.allocate().ok_or_else(|| {
-                ModeBError::Protocol("SlotPool unexpectedly exhausted".to_owned())
+                EngineError::Protocol("SlotPool unexpectedly exhausted".to_owned())
             })?;
             let slot_id = slot_lease.id() as usize;
             let last_token = *req.prompt_tokens.last().unwrap_or(&0);
@@ -1874,7 +1875,7 @@ impl ModeBServingEngine {
         }
 
         if num_seqs == 0 {
-            return Err(ModeBError::Protocol(
+            return Err(EngineError::Protocol(
                 "mixed step scheduled zero sequences (KV pool or slots exhausted)".to_owned(),
             ));
         }
@@ -1988,14 +1989,14 @@ impl ModeBServingEngine {
             .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
             .count();
         if num_seqs == 0 {
-            return Err(ModeBError::Protocol(
+            return Err(EngineError::Protocol(
                 "decode step scheduled zero prompt-complete sequences".to_owned(),
             ));
         }
 
         let bucket = select_graph_bucket(num_seqs as u32, &DECODE_GRAPH_BUCKETS);
         if bucket == 0 {
-            return Err(ModeBError::Protocol(format!(
+            return Err(EngineError::Protocol(format!(
                 "decode batch size {num_seqs} exceeds max decode CUDA Graph bucket ({MAX_DECODE_GRAPH_SEQS})"
             )));
         }
@@ -2088,7 +2089,7 @@ impl ModeBServingEngine {
 
     pub fn shutdown(mut self) -> Result<()> {
         if self.poisoned {
-            return Err(ModeBError::Protocol(
+            return Err(EngineError::Protocol(
                 "cannot gracefully shut down engine after failed in-flight step; cluster aborted"
                     .to_owned(),
             ));
@@ -2100,7 +2101,7 @@ impl ModeBServingEngine {
 
     pub fn shutdown_with_stats(mut self) -> Result<(u32, u32)> {
         if self.poisoned {
-            return Err(ModeBError::Protocol(
+            return Err(EngineError::Protocol(
                 "cannot gracefully shut down engine after failed in-flight step; cluster aborted"
                     .to_owned(),
             ));

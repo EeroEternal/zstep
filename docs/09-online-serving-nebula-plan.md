@@ -13,7 +13,7 @@
      - 分词与流式停止器：新增 `crates/zs-tokenizer`（或 `crates/zs-server/src/tokenizer.rs`）
      - 常驻在线调度循环：新增 `crates/zs-scheduler/src/serve_loop.rs`
      - HTTP/SSE 与运维探针：新增 `crates/zs-server/src/serve.rs`（子命令 `zs-server serve`）
-   - **严禁重写或扰动** [`worker/zstep_worker/kernels_sm120/`](../worker/zstep_worker/kernels_sm120/)、[`deepseek_v41.py`](../worker/zstep_worker/models/deepseek_v41.py)、[`qwen35_moe.py`](../worker/zstep_worker/models/qwen35_moe.py) 的热路径算子代码（P2 阶段扩展 GPU 采样前保持只读），也**严禁破坏** [`serving.rs`](../crates/zs-scheduler/src/serving.rs) 与 [`main.rs`](../crates/zs-server/src/main.rs) 现有的 `--mode-b --bench-tiers` / `--verify-greedy-json` 离线评测路径。
+   - **严禁重写或扰动** [`worker/zstep_worker/kernels_sm120/`](../worker/zstep_worker/kernels_sm120/)、[`deepseek_v41.py`](../worker/zstep_worker/models/deepseek_v41.py)、[`qwen35_moe.py`](../worker/zstep_worker/models/qwen35_moe.py) 的热路径算子代码（P2 阶段扩展 GPU 采样前保持只读），也**严禁破坏** [`serving.rs`](../crates/zs-scheduler/src/serving.rs) 与 [`main.rs`](../crates/zs-server/src/main.rs) 现有的 `--bench-tiers` / `--verify-greedy-json` 离线评测路径。
 2. **Zone A/B vs Zone C 职责边界**：
    - `zstep` 只做单节点完整 TP 引擎黑盒（HTTP/SSE $\rightarrow$ Tokenizer/状态机/有界队列 $\rightarrow$ `ServeLoop` $\rightarrow$ `SHM + eventfd` $\rightarrow$ 单机 GPU Workers），不在 `zstep` 内造多机网关或跨实例路由。
    - 多副本/多机路由、鉴权、配额、扩缩容与故障摘流全部由上层 **Nebula** 负责。
@@ -76,5 +76,5 @@
 1. **PR-Z1（P0-1 Tokenizer & 流式停止器）**：实现 `zs-tokenizer`，覆盖 HF `tokenizer.json` 加载、`deepseek_v41` 专用 `encode_messages()`、UTF-8 增量解码与跨 chunk `stop` 字符串裁剪；通过固定 Token-ID Trace 黄金对齐单测。
 2. **PR-Z2（P0-2 常驻 `ServeLoop`）**：在 [`crates/zs-scheduler`](../crates/zs-scheduler/) 新增 `serve_loop.rs`，实现动态连续批处理（保留稳态 Decode `in_flight_depth = 1` 与混合步）、安全 Step 边界取消与 Worker 故障传染熔断；单测验证 50% 随机取消下 `SlotPool` 与 `BlockPool` 零泄漏。
 3. **PR-Z3（P0-3 `zs-server serve` HTTP/SSE & 四态探针）**：在 [`crates/zs-server`](../crates/zs-server/) 新增 `serve.rs`，打通 `/v1/models`、`/v1/chat/completions`（流式/非流式）、四态探针、`429` 背压与 `x-nebula-request-id` 追踪。
-4. **PR-Z4（P1 Metrics & `SIGTERM` Drain）**：补齐 `GET /metrics`、`SIGTERM` 优雅排空退出（`/dev/shm` 零残留）及与离线 Mode B 的同 Trace 性能回归核验，随后与 Nebula `Slice N1/N2` 进行多副本真机合龙。
+4. **PR-Z4（P1 Metrics & `SIGTERM` Drain）**：补齐 `GET /metrics`、`SIGTERM` 优雅排空退出（`/dev/shm` 零残留）及与离线引擎的同 Trace 性能回归核验，随后与 Nebula `Slice N1/N2` 进行多副本真机合龙。
 5. **PR-ZN3（P2 采样 + 在线 Radix + Nebula KV 事件）**：扩展 GPU 侧 `temperature/top_p/top_k/seed` 采样；将 [`KvCacheManager`](../crates/zs-kv/src/radix.rs) 接入 `ServeLoop`；按 `NEBULA_KV_HASH_SEED` 实现 16-token `sha256_cbor` 块哈希与 ZMQ `BlockStored`/`BlockRemoved` 事件发布，接通 `nebula-indexd` 跨副本前缀亲和。

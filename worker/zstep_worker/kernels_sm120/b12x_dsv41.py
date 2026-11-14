@@ -20,7 +20,7 @@
 
 """Selective SM120 (`sm_120`) compute integrations for DeepSeek-V4.1-Flash.
 
-Integrates the measured winning SM120 operator families into `zstep`'s Mode B
+Integrates the measured winning SM120 operator families into `zstep`'s
 `DeepSeekV41StepRunner` while keeping `zstep`'s Rust SHM control plane, `shm_v5`
 NUMA-local collectives (`M <= 320` + 100% CUDAGraph), `NCCL_LOC` (`M > 320`),
 and vLLM 0.31.0's `mhc_shifted_post_pre` / `ParallelLMHead` / FlashInfer sparse

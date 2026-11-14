@@ -18,14 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Pure-engine in-process vLLM token-ID benchmark aligned with zstep Mode B metrology.
+"""Pure-engine in-process vLLM token-ID benchmark aligned with zstep metrology.
 
 Eliminates HTTP loopback, FastAPI/Uvicorn, prompt tokenization, incremental
 detokenization, and SSE framing by driving ``vllm.AsyncLLMEngine`` (`AsyncLLM`)
 directly in-process with ``TokensPrompt(prompt_token_ids=...)``,
 ``detokenize=False``, and ``RequestOutputKind.DELTA`` under the exact same
 SplitMix64 prompt token sequences, FIFO concurrency semaphore, warmup schedule,
-and ``(repeat, tier)`` seed isolation as ``ModeBServingEngine::run_benchmark_tier_with_seed``.
+and ``(repeat, tier)`` seed isolation as ``ServingEngine::run_benchmark_tier_with_seed``.
 """
 
 from __future__ import annotations

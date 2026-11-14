@@ -23,20 +23,30 @@
 //! Computes both `encoder_rows` (Layers 0..19) and narrowed `decoder_rows`
 //! (Layers 20..39) plus CUDA Graph bucket targets for all 8 RTX 6000D workers.
 
-mod mode_b;
+mod coordinator;
 mod serving;
 
-pub use mode_b::{
-    DEFAULT_HEARTBEAT_TIMEOUT, ModeBConfig, ModeBCoordinator, ModeBError, ModeBMetrics,
+pub use coordinator::{
+    CoordinatorMetrics, DEFAULT_HEARTBEAT_TIMEOUT, EngineConfig, EngineError, WorkerCoordinator,
     WorkerLaunchConfig,
 };
 pub use serving::{
     AggregateMetric, BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierResult,
     BenchmarkTierSpec, DEFAULT_PREFILL_COALESCE_WAIT_MS, GenerationScheduleStats, GreedyTop2Batch,
-    ModeBServingEngine, ServingBenchmarkReport, SlotLease, SlotPool, StepTop2Logits,
-    TierAggregateStats, build_deterministic_random_prompts,
-    build_deterministic_random_prompts_seeded,
+    ServingBenchmarkReport, ServingEngine, SlotLease, SlotPool, StepTop2Logits, TierAggregateStats,
+    build_deterministic_random_prompts, build_deterministic_random_prompts_seeded,
 };
+
+/// Compatibility alias retained for external branches migrating off legacy `ModeB*` names.
+pub type ModeBConfig = EngineConfig;
+/// Compatibility alias retained for external branches migrating off legacy `ModeB*` names.
+pub type ModeBCoordinator = WorkerCoordinator;
+/// Compatibility alias retained for external branches migrating off legacy `ModeB*` names.
+pub type ModeBError = EngineError;
+/// Compatibility alias retained for external branches migrating off legacy `ModeB*` names.
+pub type ModeBMetrics = CoordinatorMetrics;
+/// Compatibility alias retained for external branches migrating off legacy `ModeB*` names.
+pub type ModeBServingEngine = ServingEngine;
 
 /// Select the smallest captured CUDA Graph bucket `>= active_rows`, or `0` (eager)
 /// if `active_rows` exceeds the largest captured graph bucket.

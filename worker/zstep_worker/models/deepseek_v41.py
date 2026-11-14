@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Explicit Mode B TP=8 SM120 runner for DeepSeek-V4.1-Flash (`deepseek_v41`).
+"""Explicit TP=8 SM120 runner for DeepSeek-V4.1-Flash (`deepseek_v41`).
 
 Integrates zstep's zero-copy POSIX SHM `StepPlan` / `StepResult` protocol, Rust-owned
 128-token KV page tables, exact 3-token Engram lookback windows (`engram_prev_window`),
@@ -281,7 +281,7 @@ class _AttnBuilderGroup:
 
 
 class DeepSeekV41StepRunner:
-    """Explicit Mode B GPU step runner for DeepSeek-V4.1-Flash (`TP=8`, `sm_120`)."""
+    """Explicit GPU step runner for DeepSeek-V4.1-Flash (`TP=8`, `sm_120`)."""
 
     def __init__(
         self,

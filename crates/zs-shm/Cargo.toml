@@ -1,6 +1,6 @@
 [package]
 name = "zs-shm"
-description = "RAII POSIX shared memory and eventfd transport for zstep Mode B"
+description = "RAII POSIX shared memory and eventfd transport for zstep"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

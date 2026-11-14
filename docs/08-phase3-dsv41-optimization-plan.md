@@ -42,7 +42,7 @@ flowchart TD
    * [`worker/tests/phase3/collect_vllm_reference.py`](../worker/tests/phase3/collect_vllm_reference.py) 强制校验 `--no-enable-prefix-caching`，对 Warmup（`base_seed + 900_000`）与每个 `(round_idx, tier_idx)`（`base_seed + round_idx * 1000 + tier_idx`）使用独立确定性种子，并采集 5 条 Prompt 的 Top-5 logprobs。
    * [`shm_allreduce.py`](../worker/zstep_worker/kernels_sm120/shm_allreduce.py)、[`deepseek_v41.py`](../worker/zstep_worker/models/deepseek_v41.py)、[`serving.rs`](../crates/zs-scheduler/src/serving.rs) 与 [`main.rs`](../crates/zs-server/src/main.rs) 端到端打通全局确定性 Top-2 归约与首处分歧步裕度诊断。
 2. **P0-B（顺风车混合批调度 `stage_mixed_step`）**：
-   * [`ModeBServingEngine`](../crates/zs-scheduler/src/serving.rs) 引入 `max_mixed_step_tokens`（`DeepSeek-V4.1-Flash` 默认 **`3072`** tokens）：纯解码稳态继续走 `in_flight_depth=1` 全 40 层单图 CUDA Graph；当存在待推进 Prefill 时，在同一混合步内打包全部在途解码与分块/整条新请求 Prefill。
+   * [`ServingEngine`](../crates/zs-scheduler/src/serving.rs) 引入 `max_mixed_step_tokens`（`DeepSeek-V4.1-Flash` 默认 **`3072`** tokens）：纯解码稳态继续走 `in_flight_depth=1` 全 40 层单图 CUDA Graph；当存在待推进 Prefill 时，在同一混合步内打包全部在途解码与分块/整条新请求 Prefill。
    * [`DeepSeekV41StepRunner.execute`](../worker/zstep_worker/models/deepseek_v41.py) 实现 4 区规范化行排布（`[decode q=1,pos>0 | prefill q=1,pos=0 | prefill q>1,pos>0 | prefill q>1,pos=0]`）与精确 `is_prefilling_cpu` 掩码，并在 `lock_workspace()` 前完成混合形状预热，严守 **`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=5`**。
    * **实测调优发现**：由于 40 层 Eager 步存在固定 Python/CPU 发射开销且 `475 GiB` MoE 权重带宽摊销随批大小单调提升，在 `8 × RTX 6000D` 上实测 `max_mixed_step_tokens = 3072` 显著优于小窗口 `512`（`c=32` 吞吐从 `~505..539 tok/s` 跃升至 **`649.63..663.78 tok/s`**，`c=128` 吞吐从 `~890..1208 tok/s` 跃升至 **`1,002.13..1,372.77 tok/s`**，同时将 `P99 ITL` 从旧分离步的 `645..682 ms` 压低至 `351..420 ms`）。
 3. **P1（无 P2P 双 NUMA 按尺寸自适应集合通信）**：

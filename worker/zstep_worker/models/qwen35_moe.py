@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Explicit TP=8 BF16 runner for Qwen/Qwen3.5-35B-A3B in zstep Mode B.
+"""Explicit TP=8 BF16 runner for Qwen/Qwen3.5-35B-A3B in zstep.
 
 Loads per-rank tensor-parallel weight slices directly from safetensors memory maps,
 manages fixed-slot GatedDeltaNet recurrent/conv states plus Rust-planned 16-token paged
@@ -365,7 +365,7 @@ class _LaunchedStep:
 
 
 class Qwen35MoeStepRunner:
-    """Explicit Mode B GPU step runner for Qwen/Qwen3.5-35B-A3B (`TP=8`, `bfloat16`)."""
+    """Explicit GPU step runner for Qwen/Qwen3.5-35B-A3B (`TP=8`, `bfloat16`)."""
 
     def __init__(
         self,
