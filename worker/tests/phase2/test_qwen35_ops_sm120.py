@@ -67,7 +67,14 @@ def test_zero_centered_rmsnorm_and_no_recompile() -> None:
         assert spy.call_count == 0
 
 
-def test_linear_attn_prefill_matches_decode_recurrence() -> None:
+@pytest.mark.parametrize(
+    "prefill_fused,decode_fused", [("1", "1"), ("0", "0"), ("1", "0"), ("0", "1")]
+)
+def test_linear_attn_prefill_matches_decode_recurrence(
+    monkeypatch: pytest.MonkeyPatch, prefill_fused: str, decode_fused: str
+) -> None:
+    # Mixed rows run prefill and decode on different backends over the same ssm_state, which
+    # only holds if the Triton and SM120 CUDA GDN kernels agree on the [V, K] state layout.
     device = torch.device("cuda", 0)
     torch.manual_seed(1234)
     seq_len = 19
@@ -87,6 +94,7 @@ def test_linear_attn_prefill_matches_decode_recurrence() -> None:
     raw_p = torch.empty((seq_len, 512), device=device, dtype=torch.bfloat16)
     gated_p = torch.empty((seq_len, 512), device=device, dtype=torch.bfloat16)
 
+    monkeypatch.setenv("ZSTEP_QWEN_ENABLE_FUSED_GDN", prefill_fused)
     qwen35_ops.linear_attn_prefill_varlen(
         qkvzba,
         conv_prefill,
@@ -105,6 +113,7 @@ def test_linear_attn_prefill_matches_decode_recurrence() -> None:
         eps=1.0e-6,
     )
 
+    monkeypatch.setenv("ZSTEP_QWEN_ENABLE_FUSED_GDN", decode_fused)
     conv_dec = torch.zeros_like(conv_prefill)
     ssm_dec = torch.zeros_like(ssm_prefill)
     step_outs = []
@@ -430,7 +439,7 @@ def _max_bf16_ulp_diff(a: torch.Tensor, b: torch.Tensor) -> int:
 
 @pytest.mark.parametrize("mode", ["split_3op", "split_2op", "cluster2", "auto"])
 @pytest.mark.parametrize("batch_rows,active_rows", [(1, 1), (8, 8), (16, 13), (64, 61)])
-def test_gdn_vk_decode_modes_zero_ulp_vs_triton_kv(
+def test_gdn_vk_decode_modes_zero_ulp_vs_triton(
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
     batch_rows: int,
@@ -449,11 +458,11 @@ def test_gdn_vk_decode_modes_zero_ulp_vs_triton_kv(
     slots = torch.arange(batch_rows, device=device, dtype=torch.int32)
 
     conv_init = torch.randn((num_slots, 1024, 3), device=device, dtype=torch.bfloat16) * 0.2
-    ssm_kv_init = torch.randn((num_slots, 4, 128, 128), device=device, dtype=torch.float32) * 0.1
+    ssm_init = torch.randn((num_slots, 4, 128, 128), device=device, dtype=torch.float32) * 0.1
 
-    # Reference 1: legacy Triton [K, V] path
+    # Reference 1: legacy Triton path (same [V, K] state layout)
     conv_ref = conv_init.clone()
-    ssm_ref = ssm_kv_init.clone()
+    ssm_ref = ssm_init.clone()
     qkv_conv_ref = torch.empty((batch_rows, 1024), device=device, dtype=torch.bfloat16)
     raw_ref = torch.empty((batch_rows, 512), device=device, dtype=torch.bfloat16)
     gated_ref = torch.full((batch_rows, 512), -99.0, device=device, dtype=torch.bfloat16)
@@ -477,7 +486,7 @@ def test_gdn_vk_decode_modes_zero_ulp_vs_triton_kv(
 
     # Reference 2: SM120 coalesced [V, K] `split_3op` baseline (must be 0-ULP identical across modes)
     conv_3op = conv_init.clone()
-    ssm_3op = ssm_kv_init.transpose(-1, -2).contiguous()
+    ssm_3op = ssm_init.clone()
     gated_3op = torch.full((batch_rows, 512), -99.0, device=device, dtype=torch.bfloat16)
     monkeypatch.setenv("ZSTEP_QWEN_ENABLE_FUSED_GDN", "1")
     monkeypatch.setenv("ZSTEP_QWEN_GDN_DECODE_MODE", "split_3op")
@@ -499,9 +508,9 @@ def test_gdn_vk_decode_modes_zero_ulp_vs_triton_kv(
         qk_norm_buf=torch.empty((batch_rows, 512), device=device, dtype=torch.float32),
     )
 
-    # Candidate: SM120 coalesced [V, K] path under `mode` (`ssm_vk == ssm_kv.transpose(-1, -2)`)
+    # Candidate: SM120 coalesced [V, K] path under `mode`
     conv_vk = conv_init.clone()
-    ssm_vk = ssm_kv_init.transpose(-1, -2).contiguous()
+    ssm_vk = ssm_init.clone()
     qkv_conv_vk = torch.empty((batch_rows, 1024), device=device, dtype=torch.bfloat16)
     qk_norm_vk = torch.empty((batch_rows, 512), device=device, dtype=torch.float32)
     raw_vk = torch.empty((batch_rows, 512), device=device, dtype=torch.bfloat16)
@@ -532,10 +541,10 @@ def test_gdn_vk_decode_modes_zero_ulp_vs_triton_kv(
     if active_rows < batch_rows:
         assert torch.all(gated_vk[active_rows:] == 0)
 
-    # Parity vs legacy Triton [K, V] path (0 ULP on conv_state, <= 1 BF16 ULP on gated_out)
+    # Parity vs legacy Triton path (0 ULP on conv_state, <= 1 BF16 ULP on gated_out)
     assert torch.equal(conv_vk, conv_ref)
     assert _max_bf16_ulp_diff(gated_vk, gated_ref) <= 1
-    torch.testing.assert_close(ssm_vk.transpose(-1, -2), ssm_ref, atol=1.0e-6, rtol=1.0e-6)
+    torch.testing.assert_close(ssm_vk, ssm_ref, atol=1.0e-6, rtol=1.0e-6)
 
 
 def test_gdn_sm120_decode_alignment_and_mode_guards(monkeypatch) -> None:
