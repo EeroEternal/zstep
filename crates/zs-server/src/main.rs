@@ -27,8 +27,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use zs_scheduler::{
     BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierSpec, DEFAULT_HEARTBEAT_TIMEOUT,
-    GenerationScheduleStats, ModeBConfig, ModeBCoordinator, ModeBServingEngine,
-    ServingBenchmarkReport, StepTop2Logits, TierAggregateStats, WorkerLaunchConfig,
+    EngineConfig, GenerationScheduleStats, ServingBenchmarkReport, ServingEngine, StepTop2Logits,
+    TierAggregateStats, WorkerCoordinator, WorkerLaunchConfig,
 };
 use zs_wire::{MAX_DECODE_GRAPH_SEQS, ShmGeometry};
 
@@ -171,8 +171,8 @@ struct GreedyParityReport {
     cases: Vec<GreedyCaseParityReport>,
 }
 
-const USAGE: &str = "zstep Mode B master\n\
-Usage: zstep --mode-b [OPTIONS]\n\
+const USAGE: &str = "zstep master\n\
+Usage: zstep [run] [OPTIONS]\n\
   --world-size N             GPU workers, 1..=8 (default: 8)\n\
   --steps N                  Overlapped micro-steps when --model-dir is omitted (default: 200)\n\
   --token-counts LIST        Runtime rows, comma separated (default: 6,48,192)\n\
@@ -295,21 +295,17 @@ fn main() -> ExitCode {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
-    if raw_args.first().map(String::as_str) != Some("--mode-b") {
-        eprintln!("--mode-b is required\n{USAGE}");
-        return ExitCode::FAILURE;
-    }
-    let args = match parse_arguments(&raw_args[1..]) {
+    let args = match parse_arguments(&raw_args) {
         Ok(args) => args,
         Err(error) => {
             eprintln!("argument error: {error}");
             return ExitCode::FAILURE;
         }
     };
-    match run_mode_b(args) {
+    match run_engine(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Mode B failed: {error}");
+            eprintln!("zstep failed: {error}");
             ExitCode::FAILURE
         }
     }
@@ -399,7 +395,7 @@ fn current_git_sha() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn run_greedy_verification(
-    engine: &mut ModeBServingEngine,
+    engine: &mut ServingEngine,
     reference: &GreedyReference,
     max_prefill_chunk: usize,
 ) -> Result<GreedyParityReport, Box<dyn std::error::Error>> {
@@ -677,7 +673,7 @@ fn validate_greedy_report_gate(
     Ok(())
 }
 
-fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
+fn run_engine(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let has_model = args.model_dir.is_some();
     let is_dsv41 = is_deepseek_v41_model_dir(args.model_dir.as_ref());
     let max_seqs = args.max_seqs.unwrap_or(if has_model { 128 } else { 8 });
@@ -708,7 +704,7 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(if is_dsv41 { 2_560 } else { 49_152 });
 
     let shm_name = args.shm_name.unwrap_or_else(unique_shm_name);
-    let config = ModeBConfig {
+    let config = EngineConfig {
         shm_name,
         geometry: ShmGeometry {
             world_size: args.world_size,
@@ -754,7 +750,7 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             None if is_dsv41 => Some(3072),
             None => None,
         };
-        let mut engine = ModeBServingEngine::launch(config)?;
+        let mut engine = ServingEngine::launch(config)?;
         engine.set_max_mixed_step_tokens(mixed_step_tokens);
         engine.set_device_token_overlap(
             !is_dsv41 && std::env::var("ZSTEP_DECODE_DEVICE_TOKENS").map_or(true, |v| v != "0"),
@@ -882,7 +878,7 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let metrics = ModeBCoordinator::launch(config)?.run()?;
+    let metrics = WorkerCoordinator::launch(config)?.run()?;
     let encoded = metrics.to_json_pretty();
     if let Some(path) = args.metrics_output {
         std::fs::write(path, &encoded)?;
@@ -897,6 +893,13 @@ fn parse_arguments(raw: &[String]) -> Result<Arguments, String> {
     while index < raw.len() {
         let option = raw[index].as_str();
         index += 1;
+        // Accept optional `run` subcommand or legacy `--mode-b` flag for script compatibility.
+        if option == "--mode-b" || (index == 1 && option == "run") {
+            continue;
+        }
+        if !option.starts_with("--") {
+            return Err(format!("unknown option {option}"));
+        }
         let value = raw
             .get(index)
             .ok_or_else(|| format!("{option} requires a value"))?;
@@ -1175,11 +1178,8 @@ mod tests {
     #[test]
     fn greedy_verification_arguments_are_paired_and_model_scoped() {
         let args = |tail: &[&str]| {
-            let raw: Vec<String> = std::iter::once("--mode-b")
-                .chain(tail.iter().copied())
-                .map(str::to_owned)
-                .collect();
-            parse_arguments(&raw[1..])
+            let raw: Vec<String> = tail.iter().copied().map(str::to_owned).collect();
+            parse_arguments(&raw)
         };
         assert!(args(&["--verify-greedy-json", "reference.json"]).is_err());
         assert!(
@@ -1202,6 +1202,31 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn cli_accepts_direct_options_run_subcommand_and_legacy_mode_b_flag() {
+        let parse = |items: &[&str]| {
+            let raw: Vec<String> = items.iter().copied().map(str::to_owned).collect();
+            parse_arguments(&raw).expect("valid CLI arguments")
+        };
+
+        let direct = parse(&["--world-size", "4", "--steps", "32"]);
+        assert_eq!(direct.world_size, 4);
+        assert_eq!(direct.steps, 32);
+
+        let subcmd = parse(&["run", "--world-size", "2", "--steps", "16"]);
+        assert_eq!(subcmd.world_size, 2);
+        assert_eq!(subcmd.steps, 16);
+
+        let legacy = parse(&["--mode-b", "--world-size", "8", "--steps", "64"]);
+        assert_eq!(legacy.world_size, 8);
+        assert_eq!(legacy.steps, 64);
+
+        let err = parse_arguments(&["bogus".to_owned()])
+            .err()
+            .expect("unknown subcommand");
+        assert!(err.contains("unknown option bogus"));
     }
 
     #[test]

@@ -1,9 +1,9 @@
 # zstep
 
-**Zero-magic, step-explicit LLM inference engine built around Mode B (`1` Pure-Rust Master + `8` Explicit `sm_120` GPU Workers over POSIX `/dev/shm` + `eventfd`).**
+**Zero-magic, step-explicit LLM inference engine (`1` Pure-Rust Master + `8` Explicit `sm_120` GPU Workers over POSIX `/dev/shm` + `eventfd`).**
 
 `zstep` combines:
-1. **Pure Rust Master Control Plane**: Mode B over POSIX shared memory + `eventfd`, RAII slot/KV leases, stateless 3-token Engram lookback windows, piggyback mixed decode + chunked-prefill scheduling, `in_flight_depth=1` pure-decode pipelining, and zero `pyo3`/GIL or CUDA coupling in the master.
+1. **Pure Rust Master Control Plane**: single-master orchestration over POSIX shared memory + `eventfd`, RAII slot/KV leases, stateless 3-token Engram lookback windows, piggyback mixed decode + chunked-prefill scheduling, `in_flight_depth=1` pure-decode pipelining, and zero `pyo3`/GIL or CUDA coupling in the master.
 2. **Explicit Step Data Plane**: flat model structs, explicit tensor shapes, refresh-in-place GPU buffers, full-model 40-layer CUDA Graphs, SM120 `FlashInfer` autotuned tactics, deterministic global Top-2 logit argmax, and runtime zero-recompilation guards.
 3. **`sm_120` NUMA-Aware PCIe Collectives & Kernels**: `shm_v5` per-rank NUMA-local host-mapped SHM AllReduce / AllGather / Argmax with size-aware `NCCL_LOC` routing for non-P2P systems, plus Triton / CUDA C++ / TileLang / DeepGEMM operator primitives.
 
@@ -21,8 +21,8 @@ zstep/
 │   ├── zs-wire/                      # #[repr(C)] SHM layout, geometry & result ring
 │   ├── zs-shm/                       # RAII shm_open + mmap + eventfd transport
 │   ├── zs-kv/                        # BlockPool and standalone pure-attention Radix KV
-│   ├── zs-scheduler/                 # ModeBCoordinator + mixed continuous-batching serving
-│   └── zs-server/                    # zstep --mode-b synthetic/parity/benchmark binary
+│   ├── zs-scheduler/                 # WorkerCoordinator + mixed continuous-batching ServingEngine
+│   └── zs-server/                    # zstep synthetic/parity/benchmark binary
 ├── worker/
 │   ├── zstep_worker/
 │   │   ├── numa_pin.py               # PCIe BDF -> NUMA discovery and CPU pinning
@@ -32,13 +32,13 @@ zstep/
 │   │   │   ├── deepseek_v41.py       # Explicit 40-layer DeepSeek-V4.1-Flash TP=8 runner
 │   │   │   └── qwen35_moe.py         # Explicit 40-layer Qwen3.5-35B-A3B TP=8 runner
 │   │   └── kernels_sm120/            # shm_v5 collectives, b12x SM120 MoE/FP8, GDN/GQA/MoE
-│   └── tests/                        # SHM, Mode B, Phase 0, Phase 2 & Phase 3 harnesses
+│   └── tests/                        # SHM, Coordinator E2E, Phase 0, Phase 2 & Phase 3 harnesses
 └── docs/
     ├── 01-advisor-analysis.md
     ├── 02-architecture.md
     ├── 03-shm-protocol.md
     ├── 04-phase0-sm120-plan.md
-    ├── 05-phase1-mode-b-engine.md
+    ├── 05-phase1-shm-engine.md
     ├── 06-phase2-qwen35-benchmark.md
     ├── 07-phase3-dsv41-6000d-benchmark.md
     ├── 08-phase3-dsv41-optimization-plan.md
@@ -55,7 +55,7 @@ zstep/
 * **Phase 2 — `Qwen3.5-35B-A3B` (`8 × RTX 5090`, `TP=8`)**:
   * **6 / 6 Uncached Throughput Sweep vs No-APC `vLLM 0.33.0`**: With `--no-enable-prefix-caching` and per-`(round, tier)` isolated seeds, `zstep` leads on uncached output throughput across all 6 tiers (**`+11.00%..+54.08%`**), while explicitly reporting the `max_prefill_chunk=2048` tail-latency tradeoff at `c=32/128`.
   * **Greedy Audit**: Runtime emits **`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=17`**. `chunked` matches `vLLM` **448/448 tokens (100% across all 5 cases)**; remaining `single`/`batched` flips occur strictly at `<= 2` BF16 ULPs (`margin <= 0.25` at logit `~25`), preserved honestly as `all_matched=false` in [`phase2_greedy_parity_report.json`](docs/benchmarks/phase2_greedy_parity_report.json).
-* **Phase 1 / Mode B Control Plane**: 200-step 8-GPU measurement records **`4.690 µs/step`** Rust preparation (`0.166%` of GPU step time, `overlap_speedup=1.000269×`).
+* **Phase 1 / Shared-Memory Control Plane**: 200-step 8-GPU measurement records **`4.690 µs/step`** Rust preparation (`0.166%` of GPU step time, `overlap_speedup=1.000269×`).
 * **KV scope**: [`crates/zs-kv/src/radix.rs`](crates/zs-kv/src/radix.rs) (`PrefixTree` / `KvCacheManager`) is a standalone pure-attention component and is **not wired into `DeepSeek-V4.1-Flash` or `Qwen3.5-35B-A3B` serving**; both runners use `BlockPool` physical-page RAII only.
 
 ## Phase 3.6 (`+ b12x`) & Phase 3.5 Warm `n=3` Uncached Serving (`DeepSeek-V4.1-Flash`, `8 × RTX 6000D`)
@@ -108,11 +108,11 @@ Unified reproduction commands (including `git archive` source trees without `.gi
 ## Documentation Index
 
 * **[Benchmark ledger](docs/benchmarks/README.md)**: all 22 primary JSON files, 19 raw vLLM results, Top-2 greedy divergence tables, collective tables, and reproduction commands.
-* **[01 — Technology analysis](docs/01-advisor-analysis.md)**: ZML, TokenSpeed, b12x, and Mode A/B comparison.
+* **[01 — Technology analysis](docs/01-advisor-analysis.md)**: ZML, TokenSpeed, b12x, and embedded vs shared-memory worker topology comparison.
 * **[02 — Architecture](docs/02-architecture.md)**: control/data-plane boundary, non-P2P NUMA topology, overlap loop, and cache design.
 * **[03 — SHM protocol](docs/03-shm-protocol.md)**: wire layout, cacheline alignment, and lifecycle contracts.
 * **[04 — Phase 0](docs/04-phase0-sm120-plan.md)**: `sm_120` operator and NUMA AllReduce measurements.
-* **[05 — Phase 1 Mode B](docs/05-phase1-mode-b-engine.md)**: fresh IPC, preparation-cost, speedup, and RAII measurements.
+* **[05 — Phase 1 SHM Engine](docs/05-phase1-shm-engine.md)**: fresh IPC, preparation-cost, speedup, and RAII measurements.
 * **[06 — Phase 2 Qwen3.5](docs/06-phase2-qwen35-benchmark.md)**: `Qwen3.5-35B-A3B` (`8 × RTX 5090`) no-APC serving design, statistical comparison, and Top-2 correctness boundaries.
 * **[07 — Phase 3 / 3.5 DeepSeek-V4.1-Flash](docs/07-phase3-dsv41-6000d-benchmark.md)**: `DeepSeek-V4.1-Flash` (`8 × RTX 6000D`) `shm_v5` + size-aware collectives, piggyback mixed batching, SM120 SWA/TMA architecture, and no-APC `vLLM 0.31.0` `10/10` comparison.
 * **[08 — Phase 3.5 Optimization Plan & Results](docs/08-phase3-dsv41-optimization-plan.md)**: PR `#1` APC metrology alignment & deterministic Top-2 logit audit, piggyback mixed decode + chunked-prefill scheduling, size-aware collectives, and measured before/after impact.

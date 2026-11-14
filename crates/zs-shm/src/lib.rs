@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Linux POSIX shared-memory transport and safe typed Mode B protocol views.
+//! Linux POSIX shared-memory transport and safe typed protocol views.
 
 mod arena;
 mod eventfd;

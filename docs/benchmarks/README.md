@@ -1,6 +1,6 @@
 # `zstep` Master Benchmark Ledger (`sm_120` Non-P2P PCIe: `8×32 GB` & `8×85.6 GB`)
 
-本目录归档 Phase 0（`sm_120` 算子与 PCIe AllReduce）、Phase 1（Mode B Rust 控制面与双缓冲调度）、Phase 2（`8 × RTX 5090 32 GB` 上 `Qwen/Qwen3.5-35B-A3B` 无 APC 真权重 serving 与 `vLLM 0.33.0` 对标）、**Phase 3 / 3.5 / 3.6 / 3.7 / 3.8（`8 × RTX 6000D 85.6 GB` 上 `DeepSeek-V4.1-Flash` `TP=8` 无 APC 真权重 serving、`b12x` / `sm120_dsa_indexer` `156-SM` 优化与 `vLLM 0.31.0` 对标）**、**Phase 3.9（`8 × RTX 6000D` 上 `Qwen/Qwen3.5-35B-A3B` Route A：`shm_v5` Stage-2 尾融合 + SM120 `[V, K]` `GatedDeltaNet` 全量 A/B 审计）** 及 **Phase 3.10（当前 `main` 合入 `#21/#16/#19` 后 `Qwen3.5-35B-A3B` `OVERLAP=0/1` 消融与 15 档审计 + `DeepSeek-V4.1-Flash` 内置 `ae58183f` Overlay 与 `ZSTEP_REQUIRE_SM120_EXP=1` 最新审计）** 的实测 JSON。所有主结果均为 **warm、单配置、无前缀缓存（`--no-enable-prefix-caching`）、按 `(round, tier)` 独立种子、round-major 交错、`n=3`**；旧单轮与消融数据只作历史记录，不与主表混用。
+本目录归档 Phase 0（`sm_120` 算子与 PCIe AllReduce）、Phase 1（单主控共享内存 Rust 控制面与双缓冲调度）、Phase 2（`8 × RTX 5090 32 GB` 上 `Qwen/Qwen3.5-35B-A3B` 无 APC 真权重 serving 与 `vLLM 0.33.0` 对标）、**Phase 3 / 3.5 / 3.6 / 3.7 / 3.8（`8 × RTX 6000D 85.6 GB` 上 `DeepSeek-V4.1-Flash` `TP=8` 无 APC 真权重 serving、`b12x` / `sm120_dsa_indexer` `156-SM` 优化与 `vLLM 0.31.0` 对标）**、**Phase 3.9（`8 × RTX 6000D` 上 `Qwen/Qwen3.5-35B-A3B` Route A：`shm_v5` Stage-2 尾融合 + SM120 `[V, K]` `GatedDeltaNet` 全量 A/B 审计）** 及 **Phase 3.10（当前 `main` 合入 `#21/#16/#19` 后 `Qwen3.5-35B-A3B` `OVERLAP=0/1` 消融与 15 档审计 + `DeepSeek-V4.1-Flash` 内置 `ae58183f` Overlay 与 `ZSTEP_REQUIRE_SM120_EXP=1` 最新审计）** 的实测 JSON。所有主结果均为 **warm、单配置、无前缀缓存（`--no-enable-prefix-caching`）、按 `(round, tier)` 独立种子、round-major 交错、`n=3`**；旧单轮与消融数据只作历史记录，不与主表混用。
 
 ## 1. 硬件、软件与统计边界
 
@@ -34,8 +34,8 @@ SM120 Overlay (Phase 3.8 / 3.10): bundled `worker/third_party/flashinfer_sm120_o
 | Phase 0.5a | [`step_05a_mhc_engram_sm120.json`](step_05a_mhc_engram_sm120.json) | mHC 与 Engram VRAM / 主机 UVA |
 | Phase 0.5b | [`step_05b_pcie_allreduce_8gpu.json`](step_05b_pcie_allreduce_8gpu.json) | `H=5120` NUMA First-Touch AllReduce vs NCCL（4-NUMA 5090） |
 | Phase 0.5c | [`phase0_6000d_ar_shmv5.json`](phase0_6000d_ar_shmv5.json) | **`8 × RTX 6000D`** `H=5120, M=1..4096` `shm_v5` Per-Rank NUMA AllReduce vs `shm_v4` / `NCCL_LOC` |
-| Phase 1 | [`phase1_mode_b_1gpu.json`](phase1_mode_b_1gpu.json) | 1 GPU、200 步 Mode B IPC 与重叠实测 |
-| Phase 1 | [`phase1_mode_b_8gpu.json`](phase1_mode_b_8gpu.json) | 8 GPU、200 步 Mode B IPC 与重叠实测 |
+| Phase 1 | [`phase1_mode_b_1gpu.json`](phase1_mode_b_1gpu.json) | 1 GPU、200 步共享内存 IPC 与重叠实测 |
+| Phase 1 | [`phase1_mode_b_8gpu.json`](phase1_mode_b_8gpu.json) | 8 GPU、200 步共享内存 IPC 与重叠实测 |
 | Phase 2 | [`phase2_allreduce_h2048_8gpu.json`](phase2_allreduce_h2048_8gpu.json) | `H=2048, blocks=8, M=1..8192` 全尺寸 AllReduce 与 block 扫描 |
 | Phase 2 | [`phase2_zstep_qwen35_35b_a3b_tp8.json`](phase2_zstep_qwen35_35b_a3b_tp8.json) | **Phase 2 主结果**：`Qwen3.5-35B-A3B` 统一 4K 配置、按 `(round, tier)` 独立种子、六档交错 `n=3` |
 | Phase 2 | [`phase2_vllm_qwen35_35b_a3b_tp8.json`](phase2_vllm_qwen35_35b_a3b_tp8.json) | `vLLM 0.33.0`（`--no-enable-prefix-caching`、独立种子）六档交错 `n=3` 基线与硬件 provenance |
@@ -241,7 +241,7 @@ python3 worker/tests/phase3/bench_sm120_qwen35_route_a_ops.py \
 #    - 默认（或带 `--require-exact-cases prime_squares_table`）：校验 TRITON_RECOMPILATIONS=0 且结构化算术表 128/128 全匹配，预期 rc=0
 #    - `--max-greedy-mismatch-margin 0.25`：纯 BF16 窄裕度门禁（Phase 2 Qwen3.5 预期 rc=0；Phase 3/3.6/3.7 MXFP8/MXFP4 预期 rc=1）
 #    - `--require-exact-greedy true`：要求全部开放式续写 100% 逐位一致（`all_matched=false` 时预期 rc=1）
-./target/release/zstep --mode-b --world-size 8 \
+./target/release/zstep --world-size 8 \
   --python /usr/bin/python3 --worker-root ./worker \
   --model-dir "$ZSTEP_DSV41_MODEL_DIR" --allreduce-blocks 8 \
   --num-kv-pages 2560 --max-seqs 16 --max-step-tokens 4096 --max-decoder-rows 4096 \
@@ -253,7 +253,7 @@ python3 worker/tests/phase3/bench_sm120_qwen35_route_a_ops.py \
 # 2) Warm n=3 六档交错主基准（无前缀缓存，独立种子，顺风车混合步 3072）
 #    注：`--num-kv-pages 2560` 在 RTX 6000D (85,651 MiB) 上稳态占用 84,937..84,959 MiB (99.2%)；
 #    长期在线 HTTP 服务建议按需下调至 `--num-kv-pages 2048..2304` 预留 ~2.5..5.0 GiB/卡动态缓冲。
-./target/release/zstep --mode-b --world-size 8 \
+./target/release/zstep --world-size 8 \
   --python /usr/bin/python3 --worker-root ./worker \
   --model-dir "$ZSTEP_DSV41_MODEL_DIR" --allreduce-blocks 8 \
   --num-kv-pages 2560 --max-seqs 128 --max-step-tokens 4096 --max-decoder-rows 4096 \
@@ -269,7 +269,7 @@ export ZSTEP_QWEN35_MODEL_DIR=/path/to/Qwen3.5-35B-A3B
 # 与设备内跨步 Token 流水重叠 (ZSTEP_DECODE_DEVICE_TOKENS=1)；OVERLAP=0 消融传入 ZSTEP_DECODE_DEVICE_TOKENS=0。
 # Suite 3 长输入 4096->128 需将 --max-pages-per-seq 设为 512（16 tok/page × 512 = 8192 tokens）。
 python3 worker/tests/phase2/collect_vllm_reference.py --mode all --repeats 3 --seed 20261111
-./target/release/zstep --mode-b --world-size 8 \
+./target/release/zstep --world-size 8 \
   --python /usr/bin/python3 --worker-root ./worker \
   --model-dir "$ZSTEP_QWEN35_MODEL_DIR" \
   --allreduce-blocks 8 --allreduce-threads 256 --num-kv-pages 65536 \

@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Mode B subprocess orchestration and `in_flight_depth = 1` overlap loop.
+//! Shared-memory worker subprocess orchestration and `in_flight_depth = 1` overlap loop.
 
 use std::fmt;
 use std::fs;
@@ -55,9 +55,9 @@ pub struct WorkerLaunchConfig {
     pub num_kv_pages: u32,
 }
 
-/// Complete Mode B run configuration; every behavioral parameter is explicit.
+/// Complete engine run configuration; every behavioral parameter is explicit.
 #[derive(Debug, Clone)]
-pub struct ModeBConfig {
+pub struct EngineConfig {
     pub shm_name: String,
     pub geometry: zs_wire::ShmGeometry,
     pub max_prefill_chunk: usize,
@@ -70,13 +70,13 @@ pub struct ModeBConfig {
 }
 
 #[derive(Debug)]
-pub enum ModeBError {
+pub enum EngineError {
     Transport(ShmError),
     Io(io::Error),
     Protocol(String),
 }
 
-impl fmt::Display for ModeBError {
+impl fmt::Display for EngineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transport(error) => write!(formatter, "shared-memory transport: {error}"),
@@ -86,21 +86,21 @@ impl fmt::Display for ModeBError {
     }
 }
 
-impl std::error::Error for ModeBError {}
+impl std::error::Error for EngineError {}
 
-impl From<ShmError> for ModeBError {
+impl From<ShmError> for EngineError {
     fn from(error: ShmError) -> Self {
         Self::Transport(error)
     }
 }
 
-impl From<io::Error> for ModeBError {
+impl From<io::Error> for EngineError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
     }
 }
 
-pub type Result<T> = std::result::Result<T, ModeBError>;
+pub type Result<T> = std::result::Result<T, EngineError>;
 
 #[derive(Debug, Default)]
 struct WorkerProcesses(Vec<Child>);
@@ -109,7 +109,7 @@ impl WorkerProcesses {
     fn check_alive(&mut self) -> Result<()> {
         for (rank, child) in self.0.iter_mut().enumerate() {
             if let Some(status) = child.try_wait()? {
-                return Err(ModeBError::Protocol(format!(
+                return Err(EngineError::Protocol(format!(
                     "GPU worker rank {rank} exited prematurely with status {status}"
                 )));
             }
@@ -121,7 +121,7 @@ impl WorkerProcesses {
         for child in &mut self.0 {
             let status = child.wait()?;
             if !status.success() {
-                return Err(ModeBError::Protocol(format!(
+                return Err(EngineError::Protocol(format!(
                     "GPU worker exited with status {status}"
                 )));
             }
@@ -143,7 +143,7 @@ impl Drop for WorkerProcesses {
 
 /// Aggregate timing measurements. All latency fields are integer microseconds.
 #[derive(Debug, Clone)]
-pub struct ModeBMetrics {
+pub struct CoordinatorMetrics {
     pub world_size: u32,
     pub steps: u64,
     pub init_wall_us: u64,
@@ -159,7 +159,7 @@ pub struct ModeBMetrics {
     pub control_plane_samples_us: Vec<u64>,
 }
 
-impl ModeBMetrics {
+impl CoordinatorMetrics {
     pub fn overlap_hiding_efficiency(&self) -> f64 {
         ratio(self.hidden_prepare_us, self.prepare_next_us)
     }
@@ -182,7 +182,7 @@ impl ModeBMetrics {
         format!(
             concat!(
                 "{{\n",
-                "  \"mode\": \"B\",\n",
+                "  \"engine\": \"zstep\",\n",
                 "  \"world_size\": {},\n",
                 "  \"worker_numa_nodes\": [{}],\n",
                 "  \"steps\": {},\n",
@@ -251,7 +251,7 @@ fn percentile(samples: &[u64], percentile: usize) -> u64 {
 
 /// Owns every worker, descriptor, mapping, and rendezvous file for one run.
 #[derive(Debug)]
-pub struct ModeBCoordinator {
+pub struct WorkerCoordinator {
     workers: WorkerProcesses,
     plan_events: Vec<EventFd>,
     done_events: Vec<EventFd>,
@@ -259,13 +259,13 @@ pub struct ModeBCoordinator {
     last_published_step: u64,
     arena: SharedMemoryArena,
     layout: ShmLayout,
-    config: ModeBConfig,
+    config: EngineConfig,
     rendezvous_file: PathBuf,
 }
 
-impl ModeBCoordinator {
+impl WorkerCoordinator {
     /// Create the ABI region, spawn ranks `0..world_size`, and inherit explicit eventfds.
-    pub fn launch(config: ModeBConfig) -> Result<Self> {
+    pub fn launch(config: EngineConfig) -> Result<Self> {
         validate_config(&config)?;
         let layout = ShmLayout::compute(config.geometry)?;
         let mut arena = SharedMemoryArena::create(&config.shm_name, layout.total_bytes)?;
@@ -302,7 +302,7 @@ impl ModeBCoordinator {
     }
 
     /// Wait for GPU initialization, execute all steps, and gracefully stop every worker.
-    pub fn run(mut self) -> Result<ModeBMetrics> {
+    pub fn run(mut self) -> Result<CoordinatorMetrics> {
         let init_start = Instant::now();
         self.wait_all(0, self.config.ready_timeout, true)?;
         // Unlink `/dev/shm/<name>` immediately once every worker has attached so even SIGKILL
@@ -316,7 +316,7 @@ impl ModeBCoordinator {
         }
         let wall_start = Instant::now();
         self.prepare_step(1, StepOpcode::NormalStep)?;
-        let mut metrics = ModeBMetrics {
+        let mut metrics = CoordinatorMetrics {
             world_size: self.config.geometry.world_size,
             steps: self.config.steps,
             init_wall_us,
@@ -350,13 +350,13 @@ impl ModeBCoordinator {
             self.wait_all(step_id, self.config.step_timeout, false)?;
             let result = self.arena.result_slot(&self.layout, slot(step_id))?;
             if result.completed_step_id()? != step_id {
-                return Err(ModeBError::Protocol(format!(
+                return Err(EngineError::Protocol(format!(
                     "rank 0 returned the wrong completed step for {step_id}"
                 )));
             }
             let header = result.header()?;
             if header.status_code != 0 {
-                return Err(ModeBError::Protocol(format!(
+                return Err(EngineError::Protocol(format!(
                     "rank 0 failed step {step_id} with status {}",
                     header.status_code
                 )));
@@ -378,7 +378,7 @@ impl ModeBCoordinator {
         let (recompilations, _) = self.read_shutdown_triton_stats()?;
         self.workers.wait()?;
         if recompilations > 0 {
-            return Err(ModeBError::Protocol(format!(
+            return Err(EngineError::Protocol(format!(
                 "worker recorded {recompilations} unexpected runtime Triton JIT recompilations"
             )));
         }
@@ -399,11 +399,11 @@ impl ModeBCoordinator {
         Ok((init_wall_us, worker_numa_nodes))
     }
 
-    pub(crate) fn config(&self) -> &ModeBConfig {
+    pub(crate) fn config(&self) -> &EngineConfig {
         &self.config
     }
 
-    pub(crate) fn config_mut(&mut self) -> &mut ModeBConfig {
+    pub(crate) fn config_mut(&mut self) -> &mut EngineConfig {
         &mut self.config
     }
 
@@ -428,7 +428,7 @@ impl ModeBCoordinator {
         let (recompilations, _) = self.read_shutdown_triton_stats()?;
         self.workers.wait()?;
         if recompilations > 0 {
-            return Err(ModeBError::Protocol(format!(
+            return Err(EngineError::Protocol(format!(
                 "worker recorded {recompilations} unexpected runtime Triton JIT recompilations"
             )));
         }
@@ -465,7 +465,7 @@ impl ModeBCoordinator {
         if token_count > self.config.geometry.max_step_tokens
             || token_count > self.config.geometry.max_decoder_rows
         {
-            return Err(ModeBError::Protocol(format!(
+            return Err(EngineError::Protocol(format!(
                 "token count {token_count} exceeds configured geometry"
             )));
         }
@@ -551,7 +551,7 @@ impl ModeBCoordinator {
                     let now = Instant::now();
                     if now >= deadline {
                         let _ = self.arena.signal_abort();
-                        return Err(ModeBError::Protocol(format!(
+                        return Err(EngineError::Protocol(format!(
                             "rank {rank} timed out waiting for phase {step_id}"
                         )));
                     }
@@ -602,7 +602,7 @@ impl ModeBCoordinator {
     }
 }
 
-impl Drop for ModeBCoordinator {
+impl Drop for WorkerCoordinator {
     fn drop(&mut self) {
         let _ = self.arena.signal_abort();
         let _ = fs::remove_file(&self.rendezvous_file);
@@ -610,7 +610,7 @@ impl Drop for ModeBCoordinator {
 }
 
 fn spawn_workers(
-    config: &ModeBConfig,
+    config: &EngineConfig,
     source_shm_fd: i32,
     plan_events: &[EventFd],
     done_events: &[EventFd],
@@ -702,24 +702,24 @@ fn spawn_workers(
             });
         }
         let child = command.spawn().map_err(|error| {
-            ModeBError::Protocol(format!("failed to spawn GPU worker rank {rank}: {error}"))
+            EngineError::Protocol(format!("failed to spawn GPU worker rank {rank}: {error}"))
         })?;
         workers.0.push(child);
     }
     Ok(workers)
 }
 
-fn validate_config(config: &ModeBConfig) -> Result<()> {
+fn validate_config(config: &EngineConfig) -> Result<()> {
     if config.max_prefill_chunk == 0 {
-        return Err(ModeBError::Protocol(
+        return Err(EngineError::Protocol(
             "max_prefill_chunk must be positive".to_owned(),
         ));
     }
     if config.steps == 0 {
-        return Err(ModeBError::Protocol("steps must be positive".to_owned()));
+        return Err(EngineError::Protocol("steps must be positive".to_owned()));
     }
     if config.token_counts.is_empty() || config.token_counts.contains(&0) {
-        return Err(ModeBError::Protocol(
+        return Err(EngineError::Protocol(
             "token_counts must contain positive runtime values".to_owned(),
         ));
     }
@@ -730,7 +730,7 @@ fn validate_config(config: &ModeBConfig) -> Result<()> {
         || config.launch.router_top_k == 0
         || config.launch.router_top_k > config.launch.router_experts
     {
-        return Err(ModeBError::Protocol(
+        return Err(EngineError::Protocol(
             "invalid micro-step dimensions".to_owned(),
         ));
     }
@@ -738,7 +738,9 @@ fn validate_config(config: &ModeBConfig) -> Result<()> {
         || config.step_timeout.is_zero()
         || config.heartbeat_timeout.is_zero()
     {
-        return Err(ModeBError::Protocol("timeouts must be positive".to_owned()));
+        return Err(EngineError::Protocol(
+            "timeouts must be positive".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -757,7 +759,7 @@ fn check_peer_states_and_heartbeats(
         let pstatus = pstate.status_code.load(Ordering::Acquire);
         let perror = pstate.error_code.load(Ordering::Acquire);
         if pstatus == WORKER_STATUS_ERROR || perror != 0 {
-            return Err(ModeBError::Protocol(format!(
+            return Err(EngineError::Protocol(format!(
                 "rank {peer} reported worker error {perror} in phase {step_id}"
             )));
         }
@@ -771,7 +773,7 @@ fn check_peer_states_and_heartbeats(
                 && now.duration_since(tracker.1) >= stall_limit
             {
                 let stalled_secs = now.duration_since(tracker.1).as_secs_f64();
-                return Err(ModeBError::Protocol(format!(
+                return Err(EngineError::Protocol(format!(
                     "rank {peer} heartbeat stalled for {stalled_secs:.2}s in phase {step_id}"
                 )));
             }
@@ -791,17 +793,17 @@ fn verify_rank_ready_state(
     let status = state.status_code.load(Ordering::Acquire);
     let error_code = state.error_code.load(Ordering::Acquire);
     if status == WORKER_STATUS_ERROR || error_code != 0 {
-        return Err(ModeBError::Protocol(format!(
+        return Err(EngineError::Protocol(format!(
             "rank {rank} reported worker error {error_code} in phase {step_id}"
         )));
     }
     if !initializing && status == WORKER_STATUS_RUNNING {
-        return Err(ModeBError::Protocol(format!(
+        return Err(EngineError::Protocol(format!(
             "rank {rank} remained running in phase {step_id}"
         )));
     }
     if status != WORKER_STATUS_READY {
-        return Err(ModeBError::Protocol(format!(
+        return Err(EngineError::Protocol(format!(
             "rank {rank} has unexpected status {status} in phase {step_id}"
         )));
     }
@@ -809,7 +811,7 @@ fn verify_rank_ready_state(
         let ready_step = state.ready_step_id.load(Ordering::Acquire);
         let max_expected_step = last_published_step.max(step_id);
         if ready_step < step_id || ready_step > max_expected_step {
-            return Err(ModeBError::Protocol(format!(
+            return Err(EngineError::Protocol(format!(
                 "rank {rank} completed unexpected step {ready_step} in phase {step_id} (published up to {max_expected_step})"
             )));
         }

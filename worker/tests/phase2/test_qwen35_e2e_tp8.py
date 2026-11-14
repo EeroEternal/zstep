@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""End-to-end 8-GPU Mode B multi-sequence and chunked-prefill greedy parity."""
+"""End-to-end 8-GPU zstep multi-sequence and chunked-prefill greedy parity."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def match_statistics(expected: list[int], generated: list[int]) -> dict[str, Any
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="8 CUDA GPUs required for TP=8")
-def test_qwen35_35b_a3b_mode_b_tp8_greedy_parity() -> None:
+def test_qwen35_35b_a3b_tp8_greedy_parity() -> None:
     model_dir_env = os.environ.get("ZSTEP_QWEN35_MODEL_DIR", "")
     if not model_dir_env or not Path(model_dir_env).is_dir():
         pytest.skip("Set ZSTEP_QWEN35_MODEL_DIR to Qwen3.5-35B-A3B checkpoint directory")
@@ -73,7 +73,6 @@ def test_qwen35_35b_a3b_mode_b_tp8_greedy_parity() -> None:
 
     cmd = [
         str(zstep_bin),
-        "--mode-b",
         "--world-size",
         "8",
         "--python",
@@ -103,7 +102,7 @@ def test_qwen35_35b_a3b_mode_b_tp8_greedy_parity() -> None:
     ]
     proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=1800)
     assert proc.returncode == 0, (
-        f"zstep Mode B exited with {proc.returncode}:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        f"zstep exited with {proc.returncode}:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     )
     marker = re.search(r"TRITON_RECOMPILATIONS=(\d+) WATCHED_KERNELS=(\d+)", proc.stdout)
     assert marker is not None, f"Missing Triton audit marker:\n{proc.stdout}\n{proc.stderr}"

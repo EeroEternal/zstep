@@ -1,12 +1,12 @@
 # 07 — Phase 3 / 3.5 / 3.6 / 3.7 / 3.8 实测报告：`DeepSeek-V4.1-Flash` (`TP=8`) 在 `8 × RTX 6000D` 端到端推理、纯引擎同口径对标与 SM120 算子优化
 
-本文档记录 `zstep` Phase 3、Phase 3.5、Phase 3.6、Phase 3.7（`main` `d497e85`，PR `#11`）及 Phase 3.8（SM120 `FlashInfer` 实验算子筛选与集成）在对称双 NUMA、无 P2P 的 **`8 × NVIDIA RTX 6000D`**（每卡 `85,651 MiB` GDDR7、`sm_120`、156 SMs、驱动 `595.99.02`）服务器上，完成真权重端到端模型 **`DeepSeek-V4.1-Flash`**（`1017` 版本、`475.25 GiB` 混合量化权重：40 层 `DeepseekV41Attention` 稀疏 MLA + SWA 混合注意力、`cr=4` KV 压缩、384 专家 `UE8M0` MXFP4 MoE、TileLang 流形超连接 `mHC`、以及全驻留显存 Engram V2 3-token 查表）的 Mode B 架构实现、`shm_v5` + 按尺寸自适应跨卡集合通信、顺风车混合批调度、**Phase 3.6 / 3.7 / 3.8 选择性 `b12x` + `sm12x_mega_gate` + `sm120_dsa_indexer` SM120 算子集成与 `156-SM` 生命周期/全覆盖优化（40 层 `MXFP4 MoE` + 210 层 `[32, 32] UE8M0` FP8 Linear + 40 层 `M >= 32` 融合路由门控 + 8 层分页 Decode DSA Indexer）**、确定性全局 Top-2 贪心逐 token 审计，以及与官方容器 **`vllm/vllm-openai:v0.31.0`** 在 **双口径（进程内 `AsyncLLMEngine` + `TokensPrompt` 零 HTTP/分词/解码/SSE 纯引擎同口径基线 + `vllm bench serve` `/v1/completions` HTTP 流式基线）** 两组 Warm `n=3` 并发套件（4 档 `in512_out128` 与 6 档 `six_tier`）下的正面对标结果。
+本文档记录 `zstep` Phase 3、Phase 3.5、Phase 3.6、Phase 3.7（`main` `d497e85`，PR `#11`）及 Phase 3.8（SM120 `FlashInfer` 实验算子筛选与集成）在对称双 NUMA、无 P2P 的 **`8 × NVIDIA RTX 6000D`**（每卡 `85,651 MiB` GDDR7、`sm_120`、156 SMs、驱动 `595.99.02`）服务器上，完成真权重端到端模型 **`DeepSeek-V4.1-Flash`**（`1017` 版本、`475.25 GiB` 混合量化权重：40 层 `DeepseekV41Attention` 稀疏 MLA + SWA 混合注意力、`cr=4` KV 压缩、384 专家 `UE8M0` MXFP4 MoE、TileLang 流形超连接 `mHC`、以及全驻留显存 Engram V2 3-token 查表）的单主控共享内存架构实现、`shm_v5` + 按尺寸自适应跨卡集合通信、顺风车混合批调度、**Phase 3.6 / 3.7 / 3.8 选择性 `b12x` + `sm12x_mega_gate` + `sm120_dsa_indexer` SM120 算子集成与 `156-SM` 生命周期/全覆盖优化（40 层 `MXFP4 MoE` + 210 层 `[32, 32] UE8M0` FP8 Linear + 40 层 `M >= 32` 融合路由门控 + 8 层分页 Decode DSA Indexer）**、确定性全局 Top-2 贪心逐 token 审计，以及与官方容器 **`vllm/vllm-openai:v0.31.0`** 在 **双口径（进程内 `AsyncLLMEngine` + `TokensPrompt` 零 HTTP/分词/解码/SSE 纯引擎同口径基线 + `vllm bench serve` `/v1/completions` HTTP 流式基线）** 两组 Warm `n=3` 并发套件（4 档 `in512_out128` 与 6 档 `six_tier`）下的正面对标结果。
 
 > **口径约束声明**：
 > 1. 本机器 `can_device_access_peer` `8 × 8` 全为 `0`（`nvidia-smi topo -m` 跨卡全 `CNS`），所有 `TP=8` 集合通信与端到端吞吐/延迟结论均严格限定在 **无 P2P 的对称 2-NUMA `[0,0,0,0,1,1,1,1]` PCIe Gen5 拓扑**（`vLLM` 与 `zstep` 统一设置 `NCCL_P2P_DISABLE=1`、`NCCL_P2P_LEVEL=LOC`），不外推至具备 NVLink 或 PCIe P2P 的系统。
 > 2. 在官方镜像 `vllm/vllm-openai:v0.31.0` 中，`FlashInfer` 的 `sm_120` 稀疏滑动窗口注意力（SWA）与 `cr=1` 层在 `page_block_size=128` 下触发 TMA 描述符越界产生 `NaN`；本阶段对 **同机 `vLLM 0.31.0` 基线与 `zstep` 对称施加完全一致的 64-token SWA 页拆分与 512 B TMA 地址对齐修复**，确保两边运行相同的算子数值语义与显存驻留口径（`engram cpu_offload=false`）。
 > 3. **严格零前缀缓存与隔离种子口径**：[`crates/zs-kv/src/radix.rs`](../crates/zs-kv/src/radix.rs) 未接入 serving，`zstep` 仅启用 [`BlockPool`](../crates/zs-kv/src/lib.rs) 物理页分配；因此 `vLLM 0.31.0` 统一强制关闭自动前缀缓存（`--no-enable-prefix-caching` / `enable_prefix_caching=False`），且两边均采用确定性隔离种子 `tier_seed = base_seed + round_idx * 1000 + tier_idx`（Warmup 使用 `base_seed + 900_000`），彻底杜绝跨轮/跨档 APC 命中污染（详见 [`08-phase3-dsv41-optimization-plan.md`](08-phase3-dsv41-optimization-plan.md)）。
-> 4. **纯引擎同口径边界对齐（响应审查 Issue `#3` 二.1）**：由于 `zstep` 当前直接通过进程内 [`ModeBServingEngine::run_benchmark_tier_with_seed`](../crates/zs-scheduler/src/serving.rs) 输入确定性随机 `int32` token IDs（无 HTTP、无分词、无解码、无 SSE），本阶段专门新增 [`bench_vllm_pure_engine.py`](../worker/tests/phase3/bench_vllm_pure_engine.py)，在 `vLLM 0.31.0` 进程内直接驱动 `AsyncLLMEngine`（`OPENAI_API_SERVER` 上下文、`max_num_batched_tokens=8192`）+ `TokensPrompt(prompt_token_ids=...)` + `detokenize=False` + `RequestOutputKind.DELTA`，并与 `zstep` 共享**逐位完全相同的 SplitMix64 `int32` prompt 序列**与 FIFO 并发信号量，彻底剥离 API/分词/SSE 开销差异。
+> 4. **纯引擎同口径边界对齐（响应审查 Issue `#3` 二.1）**：由于 `zstep` 当前直接通过进程内 [`ServingEngine::run_benchmark_tier_with_seed`](../crates/zs-scheduler/src/serving.rs) 输入确定性随机 `int32` token IDs（无 HTTP、无分词、无解码、无 SSE），本阶段专门新增 [`bench_vllm_pure_engine.py`](../worker/tests/phase3/bench_vllm_pure_engine.py)，在 `vLLM 0.31.0` 进程内直接驱动 `AsyncLLMEngine`（`OPENAI_API_SERVER` 上下文、`max_num_batched_tokens=8192`）+ `TokensPrompt(prompt_token_ids=...)` + `detokenize=False` + `RequestOutputKind.DELTA`，并与 `zstep` 共享**逐位完全相同的 SplitMix64 `int32` prompt 序列**与 FIFO 并发信号量，彻底剥离 API/分词/SSE 开销差异。
 
 ---
 
@@ -22,7 +22,7 @@ GPU 4, 5, 6, 7 -> Socket 1 PCIe Gen5 -> NUMA 1
 互联约束: 无 NVLink；can_device_access_peer(i, j) == 0 (8×8 全 0, topo = CNS)
 ```
 
-[`numa_pin.py`](../worker/zstep_worker/numa_pin.py) 在 Worker 启动期自动探测 PCIe BDF 对应的 `numa_node`（实测 `worker_numa_nodes = [0, 0, 0, 0, 1, 1, 1, 1]`）并执行 `os.sched_setaffinity`，同时在 [`runtime_loop.py`](../worker/zstep_worker/runtime_loop.py) 与 [`mode_b.rs`](../crates/zs-scheduler/src/mode_b.rs) 中强制 `OMP_NUM_THREADS=1`，避免 8 个 Worker 在大模型权重加载期派生数千个 OpenMP 自旋线程引发跨 Socket 活锁。
+[`numa_pin.py`](../worker/zstep_worker/numa_pin.py) 在 Worker 启动期自动探测 PCIe BDF 对应的 `numa_node`（实测 `worker_numa_nodes = [0, 0, 0, 0, 1, 1, 1, 1]`）并执行 `os.sched_setaffinity`，同时在 [`runtime_loop.py`](../worker/zstep_worker/runtime_loop.py) 与 [`coordinator.rs`](../crates/zs-scheduler/src/coordinator.rs) 中强制 `OMP_NUM_THREADS=1`，避免 8 个 Worker 在大模型权重加载期派生数千个 OpenMP 自旋线程引发跨 Socket 活锁。
 
 ### 1.2 `H=5120` `shm_v5` Per-Rank NUMA-Local AllReduce 微基准与双通道自适应路由
 
@@ -49,14 +49,14 @@ GPU 4, 5, 6, 7 -> Socket 1 PCIe Gen5 -> NUMA 1
 
 ---
 
-## 2. `DeepSeekV41StepRunner` Mode B 与 Phase 3.5 混合批调度架构
+## 2. `DeepSeekV41StepRunner` 执行器与 Phase 3.5 混合批调度架构
 
 1. **128-token Rust 物理页池与 SM120 64-token SWA 页映射**：
    * Rust 控制面（[`serving.rs`](../crates/zs-scheduler/src/serving.rs)、[`zs-wire`](../crates/zs-wire/src/lib.rs)）以 `page_block_tokens = 128` 管理 KV 页表（`num_kv_pages = 2560`），显式保留物理页 `Block 0` 为全零 `null_block`，用于安全吸收解码 CUDA Graph 桶中的 padding 槽位写入与读取。
    * Python 执行器 [`deepseek_v41.py`](../worker/zstep_worker/models/deepseek_v41.py)（`DeepSeekV41StepRunner`）针对 `sm_120` 硬件约束，将 128-token 逻辑页无损映射为 2 个连续的 64-token SWA/`cr=1` 物理子页（`2 * page_id` 与 `2 * page_id + 1`），并保证 KV 缓存基址满足 512 B TMA 对齐。
 2. **顺风车混合批调度（Piggyback Mixed Decode + Chunked Prefill）**：
    * **无新请求等待或半完成 Prefill 时**：`active` 中 `1..128` 条在途解码序列直接命中已捕获的全 40 层单图 CUDA Graph 桶 `(1, 2, 4, 8, 16, 32, 64, 128)` 并保持 `in_flight_depth=1` 预暂存，**单流与纯解码稳态零退化（`Mean TPOT = 9.55..9.87 ms`）**。
-   * **存在活跃解码序列且有待推进 Prefill 时**：[`ModeBServingEngine::stage_mixed_step`](../crates/zs-scheduler/src/serving.rs) 在 `--max-mixed-step-tokens 3072` 预算内把在途单 token 解码与分块/整条新请求 Prefill 打包进同一个前向步，使在途解码与新请求 Prefill **共享同一次 `475.25 GiB` MoE 权重读取**，消除了旧分离式调度下每接纳一批新请求就单独读取整套专家权重所造成的吞吐断层与 `~650..682 ms` 停顿。
+   * **存在活跃解码序列且有待推进 Prefill 时**：[`ServingEngine::stage_mixed_step`](../crates/zs-scheduler/src/serving.rs) 在 `--max-mixed-step-tokens 3072` 预算内把在途单 token 解码与分块/整条新请求 Prefill 打包进同一个前向步，使在途解码与新请求 Prefill **共享同一次 `475.25 GiB` MoE 权重读取**，消除了旧分离式调度下每接纳一批新请求就单独读取整套专家权重所造成的吞吐断层与 `~650..682 ms` 停顿。
    * [`DeepSeekV41StepRunner.execute`](../worker/zstep_worker/models/deepseek_v41.py) 按 `FlashInfer` `sm_120` 稀疏 MLA / SWA / KV Compressor 元数据契约将混合批规范化排布为 4 个连续区域（真解码 `q=1, pos>0` → 单 token 初始步 `q=1, pos=0` → 续块 Prefill `q>1, pos>0` → 新块 Prefill `q>1, pos=0`），精确设置 `is_prefilling_cpu = (q_lens > 1) | (first_pos == 0)`，并通过置换表将采样结果无损映射回原始 `sample_row_indices`。
 3. **无状态精确 3-token Engram V2 滑窗与确定性全局 Top-2 词表归约**：
    * Rust 调度器在每个 `StepPlanSlot` 的 [`engram_prev_window`](../crates/zs-wire/src/lib.rs) 中直接下发跨 Prompt 边界与 Chunked Prefill 边界的精确前驱 3-token 窗口，Engram 权重全量驻留 GPU 显存（`cpu_offload=False`）。
