@@ -538,6 +538,66 @@ def test_gdn_vk_decode_modes_zero_ulp_vs_triton_kv(
     torch.testing.assert_close(ssm_vk.transpose(-1, -2), ssm_ref, atol=1.0e-6, rtol=1.0e-6)
 
 
+def test_gdn_sm120_decode_alignment_and_mode_guards(monkeypatch) -> None:
+    device = torch.device("cuda", 0)
+    conv_state = torch.zeros((4, 1024, 3), device=device, dtype=torch.bfloat16)
+    conv_w = torch.zeros((1024, 4), device=device, dtype=torch.bfloat16)
+    a_log = torch.zeros((4,), device=device, dtype=torch.float32)
+    dt_bias = torch.zeros((4,), device=device, dtype=torch.bfloat16)
+    ssm_vk = torch.zeros((4, 4, 128, 128), device=device, dtype=torch.float32)
+    norm_w = torch.ones((128,), device=device, dtype=torch.float32)
+    positions = torch.zeros((2,), device=device, dtype=torch.int32)
+    slots = torch.tensor([0, 1], device=device, dtype=torch.int32)
+    qkv_conv = torch.empty((2, 1024), device=device, dtype=torch.bfloat16)
+    qk_norm = torch.empty((2, 512), device=device, dtype=torch.float32)
+    raw_out = torch.empty((2, 512), device=device, dtype=torch.bfloat16)
+    gated_out = torch.empty((2, 512), device=device, dtype=torch.bfloat16)
+
+    # 1) Unrecognized decode mode env flag must raise ValueError rather than silently falling back
+    monkeypatch.setenv("ZSTEP_QWEN_ENABLE_FUSED_GDN", "1")
+    monkeypatch.setenv("ZSTEP_QWEN_GDN_DECODE_MODE", "invalid_mode")
+    with pytest.raises(ValueError, match="ZSTEP_QWEN_GDN_DECODE_MODE"):
+        qwen35_ops.linear_attn_decode_step(
+            torch.zeros((2, 1544), device=device, dtype=torch.bfloat16),
+            conv_state,
+            conv_w,
+            a_log,
+            dt_bias,
+            ssm_vk,
+            norm_w,
+            positions,
+            slots,
+            qkv_conv_buf=qkv_conv,
+            raw_out_buf=raw_out,
+            gated_out_buf=gated_out,
+            num_active_rows=2,
+            eps=1.0e-6,
+            qk_norm_buf=qk_norm,
+        )
+
+    # 2) Misaligned row stride (`stride(0) = 1546`, not divisible by 4) must be rejected by TORCH_CHECK
+    monkeypatch.setenv("ZSTEP_QWEN_GDN_DECODE_MODE", "split_3op")
+    unaligned_qkvzba = torch.zeros((2, 1546), device=device, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="stride\\(0\\) % 4 == 0"):
+        qwen35_ops.linear_attn_decode_step(
+            unaligned_qkvzba,
+            conv_state,
+            conv_w,
+            a_log,
+            dt_bias,
+            ssm_vk,
+            norm_w,
+            positions,
+            slots,
+            qkv_conv_buf=qkv_conv,
+            raw_out_buf=raw_out,
+            gated_out_buf=gated_out,
+            num_active_rows=2,
+            eps=1.0e-6,
+            qk_norm_buf=qk_norm,
+        )
+
+
 def _shm_ar_add_rmsnorm_worker(rank: int, world_size: int, init_file: str, shm_name: str) -> None:
     import torch.distributed as dist
 
@@ -652,7 +712,8 @@ def _shm_ar_add_rmsnorm_worker(rank: int, world_size: int, init_file: str, shm_n
                 expected_steps += 1
                 torch.cuda.synchronize(device)
                 assert torch.equal(res_f1, res_expected), f"H=5120 M={m} residual mismatch"
-                torch.testing.assert_close(norm_f1, norm_expected, atol=2.0e-2, rtol=1.0e-2)
+                ulp_diff_5120 = _max_bf16_ulp_diff(norm_f1, norm_expected)
+                assert ulp_diff_5120 <= 1, f"H=5120 M={m} normed_out max_bf16_ulp={ulp_diff_5120}"
                 assert comm.control[:8].cpu().tolist() == [expected_steps] * 8
         finally:
             comm.close()

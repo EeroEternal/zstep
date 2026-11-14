@@ -1168,19 +1168,19 @@ class Qwen35MoeStepRunner:
             torch.cuda.synchronize(self.device)
             dist.barrier(group=self.exchange_group)
 
-        # Ensure `_fused_add_zero_centered_rmsnorm_kernel` is pre-compiled across all 3
-        # Triton integer-specialization buckets even when small prefill warmups use the
-        # 1-op `shm_v5` epilogue, so large-M NCCL eager prefills never compile at runtime.
-        for warm_rows in (1, 5, 16):
-            self.reduced_buf[:warm_rows].zero_()
-            self.hidden_buf[:warm_rows].zero_()
-            fused_add_zero_centered_rmsnorm(
-                self.reduced_buf[:warm_rows],
-                self.hidden_buf[:warm_rows],
-                self.final_norm_weight,
-                normed_out=self.normed_buf[:warm_rows],
-                eps=self.config.rms_norm_eps,
-            )
+        # Ensure `_fused_add_zero_centered_rmsnorm_kernel` is pre-compiled during init
+        # even when small prefill warmups use the 1-op `shm_v5` epilogue, so large-M NCCL
+        # eager prefills never trigger Triton JIT compilation at runtime (`rows` is the 1D
+        # grid launch dimension and `stride_row == 2048` is constant).
+        self.reduced_buf[:1].zero_()
+        self.hidden_buf[:1].zero_()
+        fused_add_zero_centered_rmsnorm(
+            self.reduced_buf[:1],
+            self.hidden_buf[:1],
+            self.final_norm_weight,
+            normed_out=self.normed_buf[:1],
+            eps=self.config.rms_norm_eps,
+        )
         torch.cuda.synchronize(self.device)
 
         buckets = [b for b in DECODE_GRAPH_BUCKETS if b <= self.max_graph_bucket]

@@ -418,6 +418,7 @@ _CUDA_SOURCE = r"""
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <atomic>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -1679,13 +1680,18 @@ void launch_shm_v5_allreduce_add_rmsnorm_cuda(
     const int64_t vecs_per_cta = (num_vecs + blocks - 1) / blocks;
 
     if (use_cluster != 0 && rows < blocks && blocks == 8 && (blocks % rows) == 0) {
-        static bool attr_init = false;
-        if (!attr_init) {
-            cudaFuncSetAttribute(
+        int dev = 0;
+        ZSTEP_CUDA_CHECK(cudaGetDevice(&dev));
+        static std::atomic<uint64_t> attr_init_mask{0ULL};
+        const uint64_t bit = (dev >= 0 && dev < 64) ? (1ULL << dev) : 0ULL;
+        if (bit == 0ULL || (attr_init_mask.load(std::memory_order_acquire) & bit) == 0ULL) {
+            ZSTEP_CUDA_CHECK(cudaFuncSetAttribute(
                 shm_v5_ar_add_rmsnorm_cluster8_kernel,
                 cudaFuncAttributeNonPortableClusterSizeAllowed,
-                1);
-            attr_init = true;
+                1));
+            if (bit != 0ULL) {
+                attr_init_mask.fetch_or(bit, std::memory_order_release);
+            }
         }
         shm_v5_ar_add_rmsnorm_cluster8_kernel<<<8, 256, 0, stream>>>(
             reinterpret_cast<const uint4*>(input_ptr),
@@ -1988,7 +1994,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v9_ext",
+            name="zstep_shm_allreduce_sm120_v10_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[

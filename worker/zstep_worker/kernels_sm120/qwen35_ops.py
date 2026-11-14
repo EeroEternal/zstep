@@ -244,8 +244,10 @@ static void check_gdn_common_tensors(
         "GDN tensors must be CUDA tensors");
     TORCH_CHECK(
         qkvzba.scalar_type() == torch::kBFloat16 && qkvzba.dim() == 2 &&
-            qkvzba.size(1) >= 1544 && qkvzba.stride(1) == 1,
-        "qkvzba must be BF16 [rows, >=1544] with stride(1) == 1");
+            qkvzba.size(1) >= 1544 && qkvzba.stride(1) == 1 &&
+            (qkvzba.stride(0) % 4) == 0 &&
+            reinterpret_cast<std::uintptr_t>(qkvzba.data_ptr()) % 8 == 0,
+        "qkvzba must be 8B-aligned BF16 [rows, >=1544] with stride(1) == 1 and stride(0) % 4 == 0");
     TORCH_CHECK(
         conv_state.scalar_type() == torch::kBFloat16 && conv_state.dim() == 3 &&
             conv_state.size(1) == 1024 && conv_state.size(2) == 3 &&
@@ -265,10 +267,11 @@ static void check_gdn_common_tensors(
     TORCH_CHECK(
         ssm_state_vk.scalar_type() == torch::kFloat32 && ssm_state_vk.dim() == 4 &&
             ssm_state_vk.size(1) == 4 && ssm_state_vk.size(2) == 128 &&
-            ssm_state_vk.size(3) == 128 && ssm_state_vk.stride(2) == 128 &&
+            ssm_state_vk.size(3) == 128 && (ssm_state_vk.stride(0) % 4) == 0 &&
+            (ssm_state_vk.stride(1) % 4) == 0 && ssm_state_vk.stride(2) == 128 &&
             ssm_state_vk.stride(3) == 1 &&
             reinterpret_cast<std::uintptr_t>(ssm_state_vk.data_ptr()) % 16 == 0,
-        "ssm_state_vk must be 16B-aligned FP32 [slots, 4, 128, 128]");
+        "ssm_state_vk must be 16B-aligned FP32 [slots, 4, 128, 128] with 16B-aligned slot/head strides");
     TORCH_CHECK(
         norm_w.scalar_type() == torch::kFloat32 && norm_w.is_contiguous() &&
             norm_w.numel() == 128 &&
@@ -285,8 +288,9 @@ static void check_gdn_common_tensors(
         "req_slot_ids must be contiguous int32 [>=rows]");
     TORCH_CHECK(
         gated_out.scalar_type() == torch::kBFloat16 && gated_out.is_contiguous() &&
-            gated_out.dim() == 2 && gated_out.size(0) == rows && gated_out.size(1) == 512,
-        "gated_out must be contiguous BF16 [rows, 512]");
+            gated_out.dim() == 2 && gated_out.size(0) == rows && gated_out.size(1) == 512 &&
+            reinterpret_cast<std::uintptr_t>(gated_out.data_ptr()) % 8 == 0,
+        "gated_out must be 8B-aligned contiguous BF16 [rows, 512]");
 }
 
 void launch_gdn_decode_cluster2_vk(
@@ -361,8 +365,9 @@ void launch_gdn_decode_split_vk(
     if (mode != 0) {
         TORCH_CHECK(
             raw_out.is_cuda() && raw_out.scalar_type() == torch::kBFloat16 &&
-                raw_out.is_contiguous() && raw_out.numel() >= rows * 512,
-            "raw_out must be contiguous BF16 [>=rows * 512]");
+                raw_out.is_contiguous() && raw_out.numel() >= rows * 512 &&
+                reinterpret_cast<std::uintptr_t>(raw_out.data_ptr()) % 8 == 0,
+            "raw_out must be 8B-aligned contiguous BF16 [>=rows * 512]");
     }
     launch_gdn_decode_split_vk_cuda(
         qkvzba.data_ptr(),
@@ -426,8 +431,9 @@ void launch_gdn_prefill_vk(
         "v_conv_scratch must be contiguous BF16 [>=rows * 1024]");
     TORCH_CHECK(
         raw_out.is_cuda() && raw_out.scalar_type() == torch::kBFloat16 &&
-            raw_out.is_contiguous() && raw_out.numel() >= rows * 512,
-        "raw_out must be contiguous BF16 [>=rows * 512]");
+            raw_out.is_contiguous() && raw_out.numel() >= rows * 512 &&
+            reinterpret_cast<std::uintptr_t>(raw_out.data_ptr()) % 8 == 0,
+        "raw_out must be 8B-aligned contiguous BF16 [>=rows * 512]");
     launch_gdn_prefill_vk_cuda(
         qkvzba.data_ptr(),
         conv_state.data_ptr(),
@@ -1726,7 +1732,7 @@ def get_qwen35_cuda_ext():
     if _QWEN35_EXT is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _QWEN35_EXT = load_inline(
-            name="zstep_qwen35_ops_sm120_v6_ext",
+            name="zstep_qwen35_ops_sm120_v7_ext",
             cpp_sources=[_MOE_ALIGN_CPP],
             cuda_sources=[_MOE_ALIGN_CUDA],
             functions=[
@@ -2624,6 +2630,11 @@ def linear_attn_decode_step(
         ext = get_qwen35_cuda_ext()
         stream_handle = torch.cuda.current_stream(qkvzba.device).cuda_stream
         mode_cfg = os.environ.get("ZSTEP_QWEN_GDN_DECODE_MODE", "auto")
+        if mode_cfg not in ("auto", "cluster2", "split_2op", "split_3op"):
+            raise ValueError(
+                f"Unsupported ZSTEP_QWEN_GDN_DECODE_MODE={mode_cfg!r}; "
+                "expected one of ('auto', 'cluster2', 'split_2op', 'split_3op')"
+            )
         if mode_cfg == "cluster2" or (mode_cfg == "auto" and batch_rows > 32):
             ext.launch_gdn_decode_cluster2_vk(
                 qkvzba,
