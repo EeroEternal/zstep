@@ -416,3 +416,322 @@ def test_tp8_argmax_rejects_rows_above_capacity() -> None:
             32768,
             torch.cuda.current_stream(device).cuda_stream,
         )
+
+
+def _max_bf16_ulp_diff(a: torch.Tensor, b: torch.Tensor) -> int:
+    """Exact IEEE-754 BF16 ULP distance (`+0.0` and `-0.0` both map to 0)."""
+    assert a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
+    ia = a.view(torch.int16).to(torch.int32)
+    ib = b.view(torch.int16).to(torch.int32)
+    oa = torch.where(ia < 0, -0x8000 - ia, ia)
+    ob = torch.where(ib < 0, -0x8000 - ib, ib)
+    return int((oa - ob).abs().max().item())
+
+
+@pytest.mark.parametrize("mode", ["split_3op", "split_2op", "cluster2", "auto"])
+@pytest.mark.parametrize("batch_rows,active_rows", [(1, 1), (8, 8), (16, 13), (64, 61)])
+def test_gdn_vk_decode_modes_zero_ulp_vs_triton_kv(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    batch_rows: int,
+    active_rows: int,
+) -> None:
+    device = torch.device("cuda", 0)
+    torch.manual_seed(20261114 + batch_rows * 7 + active_rows)
+    num_slots = batch_rows + 2
+
+    qkvzba = torch.randn((batch_rows, 1544), device=device, dtype=torch.bfloat16) * 0.25
+    conv_w = torch.randn((1024, 4), device=device, dtype=torch.bfloat16) * 0.2
+    a_log = torch.log(torch.empty(4, device=device, dtype=torch.float32).uniform_(0.5, 4.0))
+    dt_bias = torch.randn(4, device=device, dtype=torch.bfloat16) * 0.3
+    norm_w = (torch.randn(128, device=device, dtype=torch.float32) * 0.1 + 1.0).contiguous()
+    positions = torch.arange(batch_rows, device=device, dtype=torch.int32) % 5
+    slots = torch.arange(batch_rows, device=device, dtype=torch.int32)
+
+    conv_init = torch.randn((num_slots, 1024, 3), device=device, dtype=torch.bfloat16) * 0.2
+    ssm_kv_init = torch.randn((num_slots, 4, 128, 128), device=device, dtype=torch.float32) * 0.1
+
+    # Reference 1: legacy Triton [K, V] path
+    conv_ref = conv_init.clone()
+    ssm_ref = ssm_kv_init.clone()
+    qkv_conv_ref = torch.empty((batch_rows, 1024), device=device, dtype=torch.bfloat16)
+    raw_ref = torch.empty((batch_rows, 512), device=device, dtype=torch.bfloat16)
+    gated_ref = torch.full((batch_rows, 512), -99.0, device=device, dtype=torch.bfloat16)
+    monkeypatch.setenv("ZSTEP_QWEN_ENABLE_FUSED_GDN", "0")
+    qwen35_ops.linear_attn_decode_step(
+        qkvzba,
+        conv_ref,
+        conv_w,
+        a_log,
+        dt_bias,
+        ssm_ref,
+        norm_w,
+        positions,
+        slots,
+        qkv_conv_buf=qkv_conv_ref,
+        raw_out_buf=raw_ref,
+        gated_out_buf=gated_ref,
+        num_active_rows=active_rows,
+        eps=1.0e-6,
+    )
+
+    # Reference 2: SM120 coalesced [V, K] `split_3op` baseline (must be 0-ULP identical across modes)
+    conv_3op = conv_init.clone()
+    ssm_3op = ssm_kv_init.transpose(-1, -2).contiguous()
+    gated_3op = torch.full((batch_rows, 512), -99.0, device=device, dtype=torch.bfloat16)
+    monkeypatch.setenv("ZSTEP_QWEN_ENABLE_FUSED_GDN", "1")
+    monkeypatch.setenv("ZSTEP_QWEN_GDN_DECODE_MODE", "split_3op")
+    qwen35_ops.linear_attn_decode_step(
+        qkvzba,
+        conv_3op,
+        conv_w,
+        a_log,
+        dt_bias,
+        ssm_3op,
+        norm_w,
+        positions,
+        slots,
+        qkv_conv_buf=torch.empty((batch_rows, 1024), device=device, dtype=torch.bfloat16),
+        raw_out_buf=torch.empty((batch_rows, 512), device=device, dtype=torch.bfloat16),
+        gated_out_buf=gated_3op,
+        num_active_rows=active_rows,
+        eps=1.0e-6,
+        qk_norm_buf=torch.empty((batch_rows, 512), device=device, dtype=torch.float32),
+    )
+
+    # Candidate: SM120 coalesced [V, K] path under `mode` (`ssm_vk == ssm_kv.transpose(-1, -2)`)
+    conv_vk = conv_init.clone()
+    ssm_vk = ssm_kv_init.transpose(-1, -2).contiguous()
+    qkv_conv_vk = torch.empty((batch_rows, 1024), device=device, dtype=torch.bfloat16)
+    qk_norm_vk = torch.empty((batch_rows, 512), device=device, dtype=torch.float32)
+    raw_vk = torch.empty((batch_rows, 512), device=device, dtype=torch.bfloat16)
+    gated_vk = torch.full((batch_rows, 512), -99.0, device=device, dtype=torch.bfloat16)
+    monkeypatch.setenv("ZSTEP_QWEN_GDN_DECODE_MODE", mode)
+    qwen35_ops.linear_attn_decode_step(
+        qkvzba,
+        conv_vk,
+        conv_w,
+        a_log,
+        dt_bias,
+        ssm_vk,
+        norm_w,
+        positions,
+        slots,
+        qkv_conv_buf=qkv_conv_vk,
+        raw_out_buf=raw_vk,
+        gated_out_buf=gated_vk,
+        num_active_rows=active_rows,
+        eps=1.0e-6,
+        qk_norm_buf=qk_norm_vk,
+    )
+
+    # Strict 0-ULP invariance across all SM120 [V, K] decode modes + inactive padding rows
+    assert torch.equal(conv_vk, conv_3op)
+    assert torch.equal(ssm_vk, ssm_3op)
+    assert torch.equal(gated_vk, gated_3op)
+    if active_rows < batch_rows:
+        assert torch.all(gated_vk[active_rows:] == 0)
+
+    # Parity vs legacy Triton [K, V] path (0 ULP on conv_state, <= 1 BF16 ULP on gated_out)
+    assert torch.equal(conv_vk, conv_ref)
+    assert _max_bf16_ulp_diff(gated_vk, gated_ref) <= 1
+    torch.testing.assert_close(ssm_vk.transpose(-1, -2), ssm_ref, atol=1.0e-6, rtol=1.0e-6)
+
+
+def test_gdn_sm120_decode_alignment_and_mode_guards(monkeypatch) -> None:
+    device = torch.device("cuda", 0)
+    conv_state = torch.zeros((4, 1024, 3), device=device, dtype=torch.bfloat16)
+    conv_w = torch.zeros((1024, 4), device=device, dtype=torch.bfloat16)
+    a_log = torch.zeros((4,), device=device, dtype=torch.float32)
+    dt_bias = torch.zeros((4,), device=device, dtype=torch.bfloat16)
+    ssm_vk = torch.zeros((4, 4, 128, 128), device=device, dtype=torch.float32)
+    norm_w = torch.ones((128,), device=device, dtype=torch.float32)
+    positions = torch.zeros((2,), device=device, dtype=torch.int32)
+    slots = torch.tensor([0, 1], device=device, dtype=torch.int32)
+    qkv_conv = torch.empty((2, 1024), device=device, dtype=torch.bfloat16)
+    qk_norm = torch.empty((2, 512), device=device, dtype=torch.float32)
+    raw_out = torch.empty((2, 512), device=device, dtype=torch.bfloat16)
+    gated_out = torch.empty((2, 512), device=device, dtype=torch.bfloat16)
+
+    # 1) Unrecognized decode mode env flag must raise ValueError rather than silently falling back
+    monkeypatch.setenv("ZSTEP_QWEN_ENABLE_FUSED_GDN", "1")
+    monkeypatch.setenv("ZSTEP_QWEN_GDN_DECODE_MODE", "invalid_mode")
+    with pytest.raises(ValueError, match="ZSTEP_QWEN_GDN_DECODE_MODE"):
+        qwen35_ops.linear_attn_decode_step(
+            torch.zeros((2, 1544), device=device, dtype=torch.bfloat16),
+            conv_state,
+            conv_w,
+            a_log,
+            dt_bias,
+            ssm_vk,
+            norm_w,
+            positions,
+            slots,
+            qkv_conv_buf=qkv_conv,
+            raw_out_buf=raw_out,
+            gated_out_buf=gated_out,
+            num_active_rows=2,
+            eps=1.0e-6,
+            qk_norm_buf=qk_norm,
+        )
+
+    # 2) Misaligned row stride (`stride(0) = 1546`, not divisible by 4) must be rejected by TORCH_CHECK
+    monkeypatch.setenv("ZSTEP_QWEN_GDN_DECODE_MODE", "split_3op")
+    unaligned_qkvzba = torch.zeros((2, 1546), device=device, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="stride\\(0\\) % 4 == 0"):
+        qwen35_ops.linear_attn_decode_step(
+            unaligned_qkvzba,
+            conv_state,
+            conv_w,
+            a_log,
+            dt_bias,
+            ssm_vk,
+            norm_w,
+            positions,
+            slots,
+            qkv_conv_buf=qkv_conv,
+            raw_out_buf=raw_out,
+            gated_out_buf=gated_out,
+            num_active_rows=2,
+            eps=1.0e-6,
+            qk_norm_buf=qk_norm,
+        )
+
+
+def _shm_ar_add_rmsnorm_worker(rank: int, world_size: int, init_file: str, shm_name: str) -> None:
+    import torch.distributed as dist
+
+    from zstep_worker.kernels_sm120.shm_allreduce import HostMappedShmAllReduce
+
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        comm = HostMappedShmAllReduce(
+            name=shm_name,
+            rank=rank,
+            world_size=world_size,
+            capacity_elements=128 * 5120,
+            blocks=8,
+            threads=256,
+            exchange_group=dist.group.WORLD,
+        )
+        try:
+            # 1) Exact 0-ULP parity at H=2048 (`zero_centered=True`) across cluster8, fallback,
+            #    one-shot, and two-shot regimes (including non-divisible M=3).
+            w2048 = (torch.randn(2048, device=device, dtype=torch.bfloat16, generator=torch.Generator(device=device).manual_seed(7)) * 0.1).contiguous()
+            # Broadcast identical residual & weight from rank 0 so all ranks check the exact same epilogue
+            w_cpu = w2048.cpu() if rank == 0 else torch.empty(2048, dtype=torch.bfloat16)
+            dist.broadcast(w_cpu, src=0)
+            w2048 = w_cpu.to(device).contiguous()
+
+            expected_steps = 0
+            for m in (1, 2, 3, 4, 8, 16, 32, 64):
+                g_rank = torch.Generator(device=device).manual_seed(1000 * m + rank)
+                inp = (torch.randn((m, 2048), device=device, dtype=torch.bfloat16, generator=g_rank) * 0.2).contiguous()
+                res_cpu = (
+                    torch.randn((m, 2048), dtype=torch.bfloat16, generator=torch.Generator().manual_seed(500 + m)) * 0.2
+                    if rank == 0
+                    else torch.empty((m, 2048), dtype=torch.bfloat16)
+                )
+                dist.broadcast(res_cpu, src=0)
+                res_ref = res_cpu.to(device).contiguous()
+                res_f1 = res_ref.clone()
+                norm_ref = torch.empty_like(res_ref)
+                norm_f1 = torch.empty_like(res_f1)
+                red_ref = torch.empty_like(inp)
+                scratch = torch.empty_like(inp)
+
+                comm.all_reduce(inp, output=red_ref)
+                qwen35_ops.fused_add_zero_centered_rmsnorm(
+                    red_ref, res_ref, w2048, normed_out=norm_ref, eps=1.0e-6
+                )
+                expected_steps += 1
+
+                comm.all_reduce_add_rmsnorm(
+                    inp,
+                    res_f1,
+                    w2048,
+                    normed_out=norm_f1,
+                    eps=1.0e-6,
+                    zero_centered=True,
+                    scratch_out=scratch,
+                )
+                expected_steps += 1
+
+                torch.cuda.synchronize(device)
+                assert torch.equal(res_f1, res_ref), f"H=2048 M={m} residual mismatch"
+                ulp_diff = _max_bf16_ulp_diff(norm_f1, norm_ref)
+                assert ulp_diff <= 1, f"H=2048 M={m} normed_out max_bf16_ulp={ulp_diff}"
+                ctrl = comm.control[:8].cpu().tolist()
+                assert ctrl == [expected_steps] * 8, f"lockstep broken at M={m}: {ctrl}"
+
+            # 2) H=5120 (`zero_centered=False`) parity + lockstep
+            w5120_cpu = (
+                torch.randn(5120, dtype=torch.bfloat16, generator=torch.Generator().manual_seed(99)) * 0.1 + 1.0
+                if rank == 0
+                else torch.empty(5120, dtype=torch.bfloat16)
+            )
+            dist.broadcast(w5120_cpu, src=0)
+            w5120 = w5120_cpu.to(device).contiguous()
+            for m in (1, 4, 8, 32):
+                g_rank = torch.Generator(device=device).manual_seed(9000 * m + rank)
+                inp = (torch.randn((m, 5120), device=device, dtype=torch.bfloat16, generator=g_rank) * 0.2).contiguous()
+                res_cpu = (
+                    torch.randn((m, 5120), dtype=torch.bfloat16, generator=torch.Generator().manual_seed(700 + m)) * 0.2
+                    if rank == 0
+                    else torch.empty((m, 5120), dtype=torch.bfloat16)
+                )
+                dist.broadcast(res_cpu, src=0)
+                res_ref = res_cpu.to(device).contiguous()
+                res_f1 = res_ref.clone()
+                norm_f1 = torch.empty_like(res_f1)
+                red_ref = torch.empty_like(inp)
+
+                comm.all_reduce(inp, output=red_ref)
+                res_expected = (res_ref.float() + red_ref.float()).to(torch.bfloat16)
+                rf = res_expected.float()
+                norm_expected = (
+                    rf * torch.rsqrt(rf.pow(2).mean(dim=-1, keepdim=True) + 1.0e-6) * w5120.float()
+                ).to(torch.bfloat16)
+                expected_steps += 1
+
+                comm.all_reduce_add_rmsnorm(
+                    inp,
+                    res_f1,
+                    w5120,
+                    normed_out=norm_f1,
+                    eps=1.0e-6,
+                    zero_centered=False,
+                )
+                expected_steps += 1
+                torch.cuda.synchronize(device)
+                assert torch.equal(res_f1, res_expected), f"H=5120 M={m} residual mismatch"
+                ulp_diff_5120 = _max_bf16_ulp_diff(norm_f1, norm_expected)
+                assert ulp_diff_5120 <= 1, f"H=5120 M={m} normed_out max_bf16_ulp={ulp_diff_5120}"
+                assert comm.control[:8].cpu().tolist() == [expected_steps] * 8
+        finally:
+            comm.close()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires >= 2 GPUs")
+def test_shm_v5_all_reduce_add_rmsnorm_parity_and_lockstep(tmp_path) -> None:
+    import os
+    import torch.multiprocessing as mp
+
+    world_size = 8 if torch.cuda.device_count() >= 8 else 2
+    init_file = str(tmp_path / "dist_init")
+    shm_name = f"zstep_ar_norm_test_{os.getpid()}"
+    mp.spawn(
+        _shm_ar_add_rmsnorm_worker,
+        args=(world_size, init_file, shm_name),
+        nprocs=world_size,
+        join=True,
+    )
