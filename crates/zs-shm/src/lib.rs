@@ -34,13 +34,17 @@ use std::io;
 /// Transport error with the failing system operation attached.
 #[derive(Debug)]
 pub struct ShmError {
-    context: &'static str,
+    /// `None` when `source` already carries the whole message.
+    context: Option<&'static str>,
     source: io::Error,
 }
 
 impl ShmError {
     pub fn new(context: &'static str, source: io::Error) -> Self {
-        Self { context, source }
+        Self {
+            context: Some(context),
+            source,
+        }
     }
 
     pub fn last_os(context: &'static str) -> Self {
@@ -48,16 +52,19 @@ impl ShmError {
     }
 
     pub fn invalid_input(message: &'static str) -> Self {
-        Self::new(
-            message,
-            io::Error::new(io::ErrorKind::InvalidInput, message),
-        )
+        Self {
+            context: None,
+            source: io::Error::new(io::ErrorKind::InvalidInput, message),
+        }
     }
 }
 
 impl fmt::Display for ShmError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}: {}", self.context, self.source)
+        match self.context {
+            Some(context) => write!(formatter, "{context}: {}", self.source),
+            None => write!(formatter, "{}", self.source),
+        }
     }
 }
 
@@ -68,3 +75,23 @@ impl std::error::Error for ShmError {
 }
 
 pub type Result<T> = std::result::Result<T, ShmError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_input_message_is_printed_once() {
+        let error = ShmError::invalid_input("world_size must be in 1..=8");
+        assert_eq!(error.to_string(), "world_size must be in 1..=8");
+        assert_eq!(error.source.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn os_error_keeps_operation_context() {
+        let error = ShmError::new("mmap", io::Error::from_raw_os_error(12));
+        let text = error.to_string();
+        assert!(text.starts_with("mmap: "), "{text}");
+        assert_ne!(text, "mmap: ");
+    }
+}
