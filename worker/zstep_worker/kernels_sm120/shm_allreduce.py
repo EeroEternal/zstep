@@ -86,6 +86,27 @@ void launch_shm_v5_allreduce_cuda(
     int one_shot_max_vecs,
     std::uintptr_t stream_handle);
 
+void launch_shm_v5_allreduce_add_rmsnorm_cuda(
+    const void* input_ptr,
+    void* residual_ptr,
+    const void* weight_ptr,
+    void* normed_out_ptr,
+    uint64_t* control_ptr,
+    const std::uintptr_t* rank_shm_dev_ptrs,
+    int64_t slot_stride_bytes,
+    int64_t rows,
+    int64_t vecs_per_row,
+    float inv_hidden,
+    float eps,
+    float weight_offset,
+    int rank,
+    int world_size,
+    int blocks,
+    int threads,
+    int one_shot_max_vecs,
+    int use_cluster,
+    std::uintptr_t stream_handle);
+
 void launch_shm_v5_allgather_cuda(
     const void* input_ptr,
     void* output_ptr,
@@ -214,6 +235,82 @@ void launch_shm_v5_allreduce(
         stream_handle);
 }
 
+void launch_shm_v5_allreduce_add_rmsnorm(
+    torch::Tensor input,
+    torch::Tensor residual,
+    torch::Tensor weight,
+    torch::Tensor normed_out,
+    torch::Tensor control,
+    torch::Tensor rank_shm_ptrs_u64,
+    int64_t slot_stride_bytes,
+    double eps,
+    double weight_offset,
+    int64_t rank,
+    int64_t world_size,
+    int64_t blocks,
+    int64_t threads,
+    int64_t one_shot_max_vecs,
+    int64_t use_cluster,
+    std::uintptr_t stream_handle) {
+    TORCH_CHECK(
+        input.is_cuda() && residual.is_cuda() && weight.is_cuda() && normed_out.is_cuda(),
+        "input/residual/weight/normed_out must be CUDA tensors");
+    TORCH_CHECK(
+        input.scalar_type() == at::kBFloat16 && residual.scalar_type() == at::kBFloat16 &&
+            weight.scalar_type() == at::kBFloat16 && normed_out.scalar_type() == at::kBFloat16,
+        "BF16 required");
+    TORCH_CHECK(
+        input.is_contiguous() && residual.is_contiguous() && weight.is_contiguous() &&
+            normed_out.is_contiguous(),
+        "input/residual/weight/normed_out must be contiguous");
+    TORCH_CHECK(input.dim() == 2, "input must be 2D [rows, hidden]");
+    const int64_t rows = input.size(0);
+    const int64_t hidden = input.size(1);
+    TORCH_CHECK(rows > 0 && hidden > 0 && hidden % 8 == 0, "hidden must be positive and % 8 == 0");
+    TORCH_CHECK(
+        residual.sizes() == input.sizes() && normed_out.sizes() == input.sizes(),
+        "residual/normed_out shapes must match input");
+    TORCH_CHECK(weight.dim() == 1 && weight.size(0) == hidden, "weight must be 1D [hidden]");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(input.data_ptr()) % 16 == 0 &&
+            reinterpret_cast<std::uintptr_t>(residual.data_ptr()) % 16 == 0 &&
+            reinterpret_cast<std::uintptr_t>(weight.data_ptr()) % 16 == 0 &&
+            reinterpret_cast<std::uintptr_t>(normed_out.data_ptr()) % 16 == 0,
+        "input/residual/weight/normed_out pointers must be 16-byte aligned");
+    TORCH_CHECK(input.numel() * 2 <= slot_stride_bytes / 2, "input exceeds SHM slot capacity");
+    const int64_t vecs_per_row = hidden / 8;
+    TORCH_CHECK(vecs_per_row <= 1536, "hidden exceeds 3-iter epilogue limit (12288)");
+    if (rows < blocks) {
+        TORCH_CHECK(blocks % rows == 0, "rows < blocks requires blocks % rows == 0");
+    }
+    if (rows * vecs_per_row > one_shot_max_vecs) {
+        TORCH_CHECK(
+            vecs_per_row % world_size == 0,
+            "two-shot epilogue requires (hidden / 8) % world_size == 0");
+    }
+
+    launch_shm_v5_allreduce_add_rmsnorm_cuda(
+        input.data_ptr(),
+        residual.data_ptr(),
+        weight.data_ptr(),
+        normed_out.data_ptr(),
+        reinterpret_cast<uint64_t*>(control.data_ptr<int64_t>()),
+        reinterpret_cast<const std::uintptr_t*>(rank_shm_ptrs_u64.data_ptr<int64_t>()),
+        slot_stride_bytes,
+        rows,
+        vecs_per_row,
+        1.0f / static_cast<float>(hidden),
+        static_cast<float>(eps),
+        static_cast<float>(weight_offset),
+        static_cast<int>(rank),
+        static_cast<int>(world_size),
+        static_cast<int>(blocks),
+        static_cast<int>(threads),
+        static_cast<int>(one_shot_max_vecs),
+        static_cast<int>(use_cluster),
+        stream_handle);
+}
+
 void launch_shm_v5_allgather(
     torch::Tensor input,
     torch::Tensor output,
@@ -318,11 +415,14 @@ void launch_tp8_argmax_gather_shm(
 """
 
 _CUDA_SOURCE = r"""
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+
+namespace cg = cooperative_groups;
 
 #define ZSTEP_CUDA_CHECK(expr)                                                      \
     do {                                                                            \
@@ -397,6 +497,50 @@ union Pack128Bf16 {
     uint4 u4;
     __nv_bfloat162 pairs[4];
 };
+
+__device__ __forceinline__ void load_peer_vecs(
+    uint4 (&vals)[kMaxRanks],
+    const uint4* __restrict__ input_vec,
+    char* const* peer_shm,
+    int slot,
+    int64_t slot_stride_bytes,
+    int64_t idx,
+    int rank,
+    int world_size) {
+    #pragma unroll
+    for (int p = 0; p < kMaxRanks; ++p) {
+        if (p < world_size) {
+            const uint4* p_in = reinterpret_cast<const uint4*>(
+                peer_shm[p] + 131072 + slot * slot_stride_bytes);
+            vals[p] = (p == rank) ? input_vec[idx] : ld_cv_uint4(p_in + idx);
+        }
+    }
+}
+
+__device__ __forceinline__ void accumulate_peer_vecs(
+    float (&acc)[8], const uint4 (&vals)[kMaxRanks], int world_size) {
+    #pragma unroll
+    for (int p = 0; p < kMaxRanks; ++p) {
+        if (p < world_size) {
+            Pack128Bf16 v;
+            v.u4 = vals[p];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 f = __bfloat1622float2(v.pairs[j]);
+                acc[2 * j] += f.x;
+                acc[2 * j + 1] += f.y;
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        val += __shfl_xor_sync(0xFFFFFFFFU, val, mask);
+    }
+    return val;
+}
 
 // Single-file fallback kernel used when `exchange_group is None` (standalone tests).
 __global__ void host_mapped_two_shot_fused_kernel(
@@ -553,7 +697,7 @@ __global__ void host_mapped_two_shot_fused_kernel(
 // [65536 .. 98304): done_flag[block][peer] (64B per (block, peer))
 // [98304 .. 98368): abort_flag             (64B cacheline-isolated cluster abort word)
 // [131072 .. ):     4 ring slots * (in_data + red_data)
-__global__ void shm_v5_allreduce_kernel(
+__global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
     const uint4* __restrict__ input_vec,
     uint4* __restrict__ output_vec,
     uint64_t* __restrict__ control,
@@ -628,22 +772,11 @@ __global__ void shm_v5_allreduce_kernel(
 
     if (num_vecs <= one_shot_max_vecs) {
         for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
+            uint4 peer_vals[kMaxRanks];
+            load_peer_vecs(
+                peer_vals, input_vec, s_peer_shm, slot, slot_stride_bytes, idx, rank, world_size);
             float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-            #pragma unroll
-            for (int p = 0; p < kMaxRanks; ++p) {
-                if (p < world_size) {
-                    const uint4* p_in = reinterpret_cast<const uint4*>(
-                        s_peer_shm[p] + 131072 + slot * slot_stride_bytes);
-                    Pack128Bf16 v;
-                    v.u4 = (p == rank) ? input_vec[idx] : ld_cv_uint4(p_in + idx);
-                    #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        const float2 f = __bfloat1622float2(v.pairs[j]);
-                        acc[2 * j] += f.x;
-                        acc[2 * j + 1] += f.y;
-                    }
-                }
-            }
+            accumulate_peer_vecs(acc, peer_vals, world_size);
             Pack128Bf16 out;
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -664,22 +797,11 @@ __global__ void shm_v5_allreduce_kernel(
     const int64_t s_end = c_begin + (c_len * (rank + 1)) / world_size;
     uint4* my_red = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes + half_slot);
     for (int64_t idx = s_begin + threadIdx.x; idx < s_end; idx += blockDim.x) {
+        uint4 peer_vals[kMaxRanks];
+        load_peer_vecs(
+            peer_vals, input_vec, s_peer_shm, slot, slot_stride_bytes, idx, rank, world_size);
         float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-        #pragma unroll
-        for (int p = 0; p < kMaxRanks; ++p) {
-            if (p < world_size) {
-                const uint4* p_in = reinterpret_cast<const uint4*>(
-                    s_peer_shm[p] + 131072 + slot * slot_stride_bytes);
-                Pack128Bf16 v;
-                v.u4 = (p == rank) ? input_vec[idx] : ld_cv_uint4(p_in + idx);
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const float2 f = __bfloat1622float2(v.pairs[j]);
-                    acc[2 * j] += f.x;
-                    acc[2 * j + 1] += f.y;
-                }
-            }
-        }
+        accumulate_peer_vecs(acc, peer_vals, world_size);
         Pack128Bf16 out;
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
@@ -706,13 +828,23 @@ __global__ void shm_v5_allreduce_kernel(
     if (s_aborted) {
         return;
     }
-    for (int owner = 0; owner < world_size; ++owner) {
-        const int64_t o_begin = c_begin + (c_len * owner) / world_size;
-        const int64_t o_end = c_begin + (c_len * (owner + 1)) / world_size;
-        const uint4* o_red = reinterpret_cast<const uint4*>(
-            s_peer_shm[owner] + 131072 + slot * slot_stride_bytes + half_slot);
-        for (int64_t idx = o_begin + threadIdx.x; idx < o_end; idx += blockDim.x) {
-            output_vec[idx] = ld_cv_uint4(o_red + idx);
+    if (c_len > 0 && (c_len % world_size) == 0) {
+        const int64_t sub_len = c_len / world_size;
+        for (int64_t off = threadIdx.x; off < c_len; off += blockDim.x) {
+            const int owner = static_cast<int>(off / sub_len);
+            const uint4* o_red = reinterpret_cast<const uint4*>(
+                s_peer_shm[owner] + 131072 + slot * slot_stride_bytes + half_slot);
+            output_vec[c_begin + off] = ld_cv_uint4(o_red + c_begin + off);
+        }
+    } else {
+        for (int owner = 0; owner < world_size; ++owner) {
+            const int64_t o_begin = c_begin + (c_len * owner) / world_size;
+            const int64_t o_end = c_begin + (c_len * (owner + 1)) / world_size;
+            const uint4* o_red = reinterpret_cast<const uint4*>(
+                s_peer_shm[owner] + 131072 + slot * slot_stride_bytes + half_slot);
+            for (int64_t idx = o_begin + threadIdx.x; idx < o_end; idx += blockDim.x) {
+                output_vec[idx] = ld_cv_uint4(o_red + idx);
+            }
         }
     }
     __syncthreads();
@@ -721,6 +853,623 @@ __global__ void shm_v5_allreduce_kernel(
             s_peer_shm[threadIdx.x] + 65536 + (b * 8 + rank) * 64);
         sys_store_release_u64(peer_done, step);
     }
+}
+
+__device__ __forceinline__ void apply_add_rmsnorm_epilogue_single_row(
+    int64_t row_base,
+    int64_t vecs_per_row,
+    uint4* __restrict__ residual_vec,
+    const uint4* __restrict__ weight_vec,
+    uint4* __restrict__ normed_out_vec,
+    const Pack128Bf16 (&red_packs)[3],
+    int num_iters,
+    float inv_hidden,
+    float eps,
+    float weight_offset,
+    float* s_warp_sq,
+    float& s_inv_rms) {
+    float s_f32[3][8];
+    float thread_sq = 0.0f;
+
+    #pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        if (k < num_iters) {
+            const int64_t col = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+            if (col < vecs_per_row) {
+                const int64_t idx = row_base + col;
+                Pack128Bf16 res_pack;
+                res_pack.u4 = residual_vec[idx];
+                Pack128Bf16 sum_pack;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 rf = __bfloat1622float2(red_packs[k].pairs[j]);
+                    const float2 sf = __bfloat1622float2(res_pack.pairs[j]);
+                    sum_pack.pairs[j] = __floats2bfloat162_rn(rf.x + sf.x, rf.y + sf.y);
+                    const float2 sum_rt = __bfloat1622float2(sum_pack.pairs[j]);
+                    s_f32[k][2 * j] = sum_rt.x;
+                    s_f32[k][2 * j + 1] = sum_rt.y;
+                    thread_sq += sum_rt.x * sum_rt.x + sum_rt.y * sum_rt.y;
+                }
+                residual_vec[idx] = sum_pack.u4;
+            }
+        }
+    }
+
+    const float warp_sq = warp_reduce_sum(thread_sq);
+    const int warp_id = threadIdx.x >> 5;
+    const int lane_id = threadIdx.x & 31;
+    const int num_warps = blockDim.x >> 5;
+    if (lane_id == 0) {
+        s_warp_sq[warp_id] = warp_sq;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        float acc_sq = (lane_id < num_warps) ? s_warp_sq[lane_id] : 0.0f;
+        acc_sq = warp_reduce_sum(acc_sq);
+        if (lane_id == 0) {
+            s_inv_rms = rsqrtf(acc_sq * inv_hidden + eps);
+        }
+    }
+    __syncthreads();
+    const float inv_rms = s_inv_rms;
+
+    #pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        if (k < num_iters) {
+            const int64_t col = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+            if (col < vecs_per_row) {
+                Pack128Bf16 w_pack;
+                w_pack.u4 = weight_vec[col];
+                Pack128Bf16 out_pack;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 wf = __bfloat1622float2(w_pack.pairs[j]);
+                    const float y0 = (s_f32[k][2 * j] * inv_rms) * (weight_offset + wf.x);
+                    const float y1 = (s_f32[k][2 * j + 1] * inv_rms) * (weight_offset + wf.y);
+                    out_pack.pairs[j] = __floats2bfloat162_rn(y0, y1);
+                }
+                normed_out_vec[row_base + col] = out_pack.u4;
+            }
+        }
+    }
+}
+
+// Fused Stage-2 epilogue (`AllReduce + Residual Add + [Zero-Centered] RMSNorm`) preserving
+// `done-wait`, 90s spin timeout, and strict `control[0..blocks)` ring lockstep.
+__global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
+    const uint4* __restrict__ input_vec,
+    uint4* __restrict__ residual_vec,
+    const uint4* __restrict__ weight_vec,
+    uint4* __restrict__ normed_out_vec,
+    uint64_t* __restrict__ control,
+    char* const* __restrict__ rank_shm,
+    int64_t slot_stride_bytes,
+    int64_t rows,
+    int64_t vecs_per_row,
+    float inv_hidden,
+    float eps,
+    float weight_offset,
+    int rank,
+    int world_size,
+    int one_shot_max_vecs) {
+    const int b = blockIdx.x;
+    const int blocks = gridDim.x;
+    __shared__ uint64_t s_step;
+    __shared__ int s_aborted;
+    __shared__ char* s_peer_shm[kMaxRanks];
+    __shared__ float s_warp_sq[16];
+    __shared__ float s_inv_rms_arr[2];
+
+    if (threadIdx.x < world_size) {
+        s_peer_shm[threadIdx.x] = rank_shm[threadIdx.x];
+    }
+    if (threadIdx.x == 0) {
+        const uint64_t ns = control[b] + 1ULL;
+        control[b] = ns;
+        s_step = ns;
+        s_aborted = 0;
+    }
+    __syncthreads();
+    const uint64_t step = s_step;
+    const int slot = static_cast<int>((step - 1ULL) & 3);
+    char* my_shm = s_peer_shm[rank];
+    const uint64_t* abort_flag = reinterpret_cast<const uint64_t*>(my_shm + kShmV5AbortOffset);
+
+    if (step > 4ULL) {
+        const uint64_t min_done = step - 4ULL;
+        if (threadIdx.x < world_size) {
+            const uint64_t* my_done = reinterpret_cast<const uint64_t*>(
+                my_shm + 65536 + (b * 8 + threadIdx.x) * 64);
+            if (!spin_wait_ge_u64(my_done, min_done, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+    }
+
+    const int64_t num_vecs = rows * vecs_per_row;
+    const int64_t half_slot = slot_stride_bytes / 2;
+    uint4* my_in = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes);
+
+    if (rows < blocks) {
+        const int64_t c_begin = (num_vecs * b) / blocks;
+        const int64_t c_end = (num_vecs * (b + 1)) / blocks;
+        for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
+            st_wt_uint4(my_in + idx, input_vec[idx]);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+        }
+        __syncthreads();
+        if (threadIdx.x < world_size) {
+            uint64_t* peer_in_flag = reinterpret_cast<uint64_t*>(
+                s_peer_shm[threadIdx.x] + (b * 8 + rank) * 64);
+            sys_store_release_u64(peer_in_flag, step);
+            const uint64_t* local_in_flag = reinterpret_cast<const uint64_t*>(
+                my_shm + (b * 8 + threadIdx.x) * 64);
+            if (!spin_wait_ge_u64(local_in_flag, step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+
+        const int k_grp = static_cast<int>(blocks / rows);
+        if ((b % k_grp) != 0) {
+            return;
+        }
+        const int extra_flags = (k_grp - 1) * world_size;
+        for (int f = threadIdx.x; f < extra_flags; f += blockDim.x) {
+            const int b_sub = b + 1 + (f / world_size);
+            const int peer = f % world_size;
+            const uint64_t* local_in_flag = reinterpret_cast<const uint64_t*>(
+                my_shm + (b_sub * 8 + peer) * 64);
+            if (!spin_wait_ge_u64(local_in_flag, step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+
+        const int64_t r = b / k_grp;
+        const int64_t row_base = r * vecs_per_row;
+        const int num_iters = static_cast<int>((vecs_per_row + blockDim.x - 1) / blockDim.x);
+        Pack128Bf16 red_packs[3];
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            if (k < num_iters) {
+                const int64_t col = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+                if (col < vecs_per_row) {
+                    const int64_t idx = row_base + col;
+                    uint4 peer_vals[kMaxRanks];
+                    load_peer_vecs(
+                        peer_vals, input_vec, s_peer_shm, slot, slot_stride_bytes, idx, rank, world_size);
+                    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                    accumulate_peer_vecs(acc, peer_vals, world_size);
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        red_packs[k].pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+                    }
+                }
+            }
+        }
+        apply_add_rmsnorm_epilogue_single_row(
+            row_base, vecs_per_row, residual_vec, weight_vec, normed_out_vec,
+            red_packs, num_iters, inv_hidden, eps, weight_offset, s_warp_sq, s_inv_rms_arr[0]);
+        __syncthreads();
+        const int total_done_flags = k_grp * world_size;
+        for (int f = threadIdx.x; f < total_done_flags; f += blockDim.x) {
+            const int b_sub = b + (f / world_size);
+            const int peer = f % world_size;
+            uint64_t* peer_done = reinterpret_cast<uint64_t*>(
+                s_peer_shm[peer] + 65536 + (b_sub * 8 + rank) * 64);
+            sys_store_release_u64(peer_done, step);
+        }
+        return;
+    }
+
+    const int64_t r_begin = (rows * b) / blocks;
+    const int64_t r_end = (rows * (b + 1)) / blocks;
+    const int64_t c_begin = r_begin * vecs_per_row;
+    const int64_t c_end = r_end * vecs_per_row;
+
+    for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
+        st_wt_uint4(my_in + idx, input_vec[idx]);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (threadIdx.x < world_size) {
+        uint64_t* peer_in_flag = reinterpret_cast<uint64_t*>(
+            s_peer_shm[threadIdx.x] + (b * 8 + rank) * 64);
+        sys_store_release_u64(peer_in_flag, step);
+        const uint64_t* local_in_flag = reinterpret_cast<const uint64_t*>(
+            my_shm + (b * 8 + threadIdx.x) * 64);
+        if (!spin_wait_ge_u64(local_in_flag, step, abort_flag)) {
+            s_aborted = 1;
+        }
+    }
+    __syncthreads();
+    if (s_aborted) {
+        return;
+    }
+
+    const int num_iters = static_cast<int>((vecs_per_row + blockDim.x - 1) / blockDim.x);
+
+    if (num_vecs <= one_shot_max_vecs) {
+        for (int64_t r = r_begin; r < r_end; ++r) {
+            const int64_t row_base = r * vecs_per_row;
+            Pack128Bf16 red_packs[3];
+            #pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                if (k < num_iters) {
+                    const int64_t col = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+                    if (col < vecs_per_row) {
+                        const int64_t idx = row_base + col;
+                        uint4 peer_vals[kMaxRanks];
+                        load_peer_vecs(
+                            peer_vals, input_vec, s_peer_shm, slot, slot_stride_bytes, idx, rank, world_size);
+                        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                        accumulate_peer_vecs(acc, peer_vals, world_size);
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            red_packs[k].pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+                        }
+                    }
+                }
+            }
+            apply_add_rmsnorm_epilogue_single_row(
+                row_base, vecs_per_row, residual_vec, weight_vec, normed_out_vec,
+                red_packs, num_iters, inv_hidden, eps, weight_offset, s_warp_sq, s_inv_rms_arr[0]);
+            __syncthreads();
+        }
+        if (threadIdx.x < world_size) {
+            uint64_t* peer_done = reinterpret_cast<uint64_t*>(
+                s_peer_shm[threadIdx.x] + 65536 + (b * 8 + rank) * 64);
+            sys_store_release_u64(peer_done, step);
+        }
+        return;
+    }
+
+    const int64_t cols_per_rank = vecs_per_row / world_size;
+    const int64_t col_s_begin = cols_per_rank * rank;
+    const int64_t total_s_vecs = (r_end - r_begin) * cols_per_rank;
+    uint4* my_red = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes + half_slot);
+
+    for (int64_t t_idx = threadIdx.x; t_idx < total_s_vecs; t_idx += blockDim.x) {
+        const int64_t r = r_begin + (t_idx / cols_per_rank);
+        const int64_t col = col_s_begin + (t_idx % cols_per_rank);
+        const int64_t idx = r * vecs_per_row + col;
+        uint4 peer_vals[kMaxRanks];
+        load_peer_vecs(
+            peer_vals, input_vec, s_peer_shm, slot, slot_stride_bytes, idx, rank, world_size);
+        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        accumulate_peer_vecs(acc, peer_vals, world_size);
+        Pack128Bf16 out;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            out.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+        }
+        st_wt_uint4(my_red + idx, out.u4);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (threadIdx.x < world_size) {
+        uint64_t* peer_red_flag = reinterpret_cast<uint64_t*>(
+            s_peer_shm[threadIdx.x] + 32768 + (b * 8 + rank) * 64);
+        sys_store_release_u64(peer_red_flag, step);
+        const uint64_t* local_red_flag = reinterpret_cast<const uint64_t*>(
+            my_shm + 32768 + (b * 8 + threadIdx.x) * 64);
+        if (!spin_wait_ge_u64(local_red_flag, step, abort_flag)) {
+            s_aborted = 1;
+        }
+    }
+    __syncthreads();
+    if (s_aborted) {
+        return;
+    }
+
+    if (vecs_per_row == 256 && blockDim.x == 512) {
+        const int row_slot = threadIdx.x >> 8;
+        const int sub_tid = threadIdx.x & 255;
+        const int sub_warp = sub_tid >> 5;
+        const int lane_id = sub_tid & 31;
+        const int owner = static_cast<int>(sub_tid / cols_per_rank);
+        const uint4* o_red = reinterpret_cast<const uint4*>(
+            s_peer_shm[owner] + 131072 + slot * slot_stride_bytes + half_slot);
+        Pack128Bf16 w_pack;
+        w_pack.u4 = weight_vec[sub_tid];
+        float2 wf[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            wf[j] = __bfloat1622float2(w_pack.pairs[j]);
+        }
+
+        for (int64_t r0 = r_begin; r0 < r_end; r0 += 2) {
+            const int64_t r = r0 + row_slot;
+            float s_f32[8];
+            float thread_sq = 0.0f;
+            if (r < r_end) {
+                const int64_t idx = r * 256 + sub_tid;
+                Pack128Bf16 red_pack;
+                red_pack.u4 = ld_cv_uint4(o_red + idx);
+                Pack128Bf16 res_pack;
+                res_pack.u4 = residual_vec[idx];
+                Pack128Bf16 sum_pack;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 rf = __bfloat1622float2(red_pack.pairs[j]);
+                    const float2 sf = __bfloat1622float2(res_pack.pairs[j]);
+                    sum_pack.pairs[j] = __floats2bfloat162_rn(rf.x + sf.x, rf.y + sf.y);
+                    const float2 sum_rt = __bfloat1622float2(sum_pack.pairs[j]);
+                    s_f32[2 * j] = sum_rt.x;
+                    s_f32[2 * j + 1] = sum_rt.y;
+                    thread_sq += sum_rt.x * sum_rt.x + sum_rt.y * sum_rt.y;
+                }
+                residual_vec[idx] = sum_pack.u4;
+            }
+            const float warp_sq = warp_reduce_sum(thread_sq);
+            if (lane_id == 0) {
+                s_warp_sq[row_slot * 8 + sub_warp] = warp_sq;
+            }
+            __syncthreads();
+            if (sub_warp == 0) {
+                float acc_sq = (lane_id < 8) ? s_warp_sq[row_slot * 8 + lane_id] : 0.0f;
+                acc_sq = warp_reduce_sum(acc_sq);
+                if (lane_id == 0) {
+                    s_inv_rms_arr[row_slot] = rsqrtf(acc_sq * inv_hidden + eps);
+                }
+            }
+            __syncthreads();
+            if (r < r_end) {
+                const float inv_rms = s_inv_rms_arr[row_slot];
+                Pack128Bf16 out_pack;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float y0 = (s_f32[2 * j] * inv_rms) * (weight_offset + wf[j].x);
+                    const float y1 = (s_f32[2 * j + 1] * inv_rms) * (weight_offset + wf[j].y);
+                    out_pack.pairs[j] = __floats2bfloat162_rn(y0, y1);
+                }
+                normed_out_vec[r * 256 + sub_tid] = out_pack.u4;
+            }
+            __syncthreads();
+        }
+    } else {
+        for (int64_t r = r_begin; r < r_end; ++r) {
+            const int64_t row_base = r * vecs_per_row;
+            Pack128Bf16 red_packs[3];
+            #pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                if (k < num_iters) {
+                    const int64_t col = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+                    if (col < vecs_per_row) {
+                        const int owner = static_cast<int>(col / cols_per_rank);
+                        const uint4* o_red = reinterpret_cast<const uint4*>(
+                            s_peer_shm[owner] + 131072 + slot * slot_stride_bytes + half_slot);
+                        red_packs[k].u4 = ld_cv_uint4(o_red + row_base + col);
+                    }
+                }
+            }
+            apply_add_rmsnorm_epilogue_single_row(
+                row_base, vecs_per_row, residual_vec, weight_vec, normed_out_vec,
+                red_packs, num_iters, inv_hidden, eps, weight_offset, s_warp_sq, s_inv_rms_arr[0]);
+            __syncthreads();
+        }
+    }
+
+    if (threadIdx.x < world_size) {
+        uint64_t* peer_done = reinterpret_cast<uint64_t*>(
+            s_peer_shm[threadIdx.x] + 65536 + (b * 8 + rank) * 64);
+        sys_store_release_u64(peer_done, step);
+    }
+}
+
+// SM120 Cluster-8 DSMEM fused `AllReduce + Residual Add + RMSNorm` for `rows < 8`:
+// keeps all 8 SMs reading 1/8th slice across PCIe in parallel and exchanges only 1 float (`s_cta_sq`)
+// via Distributed Shared Memory (`cluster.map_shared_rank`).
+__global__ __cluster_dims__(8, 1, 1) __launch_bounds__(256, 1) void shm_v5_ar_add_rmsnorm_cluster8_kernel(
+    const uint4* __restrict__ input_vec,
+    uint4* __restrict__ residual_vec,
+    const uint4* __restrict__ weight_vec,
+    uint4* __restrict__ normed_out_vec,
+    uint64_t* __restrict__ control,
+    char* const* __restrict__ rank_shm,
+    int64_t slot_stride_bytes,
+    int64_t rows,
+    int64_t vecs_per_row,
+    float inv_hidden,
+    float eps,
+    float weight_offset,
+    int rank,
+    int world_size) {
+    cg::cluster_group cluster = cg::this_cluster();
+    const int b = cluster.block_rank();
+    constexpr int blocks = 8;
+
+    __shared__ uint64_t s_step;
+    __shared__ int s_aborted_local;
+    __shared__ int s_aborted_any;
+    __shared__ char* s_peer_shm[kMaxRanks];
+    __shared__ float s_warp_sq[16];
+    __shared__ float s_cta_sq;
+    __shared__ float s_inv_rms;
+
+    if (threadIdx.x < world_size) {
+        s_peer_shm[threadIdx.x] = rank_shm[threadIdx.x];
+    }
+    if (threadIdx.x == 0) {
+        const uint64_t ns = control[b] + 1ULL;
+        control[b] = ns;
+        s_step = ns;
+        s_aborted_local = 0;
+        s_aborted_any = 0;
+    }
+    __syncthreads();
+    const uint64_t step = s_step;
+    const int slot = static_cast<int>((step - 1ULL) & 3);
+    char* my_shm = s_peer_shm[rank];
+    const uint64_t* abort_flag = reinterpret_cast<const uint64_t*>(my_shm + kShmV5AbortOffset);
+
+    if (step > 4ULL) {
+        const uint64_t min_done = step - 4ULL;
+        if (threadIdx.x < world_size) {
+            const uint64_t* my_done = reinterpret_cast<const uint64_t*>(
+                my_shm + 65536 + (b * 8 + threadIdx.x) * 64);
+            if (!spin_wait_ge_u64(my_done, min_done, abort_flag)) {
+                s_aborted_local = 1;
+            }
+        }
+        __syncthreads();
+    }
+
+    const int64_t num_vecs = rows * vecs_per_row;
+    const int64_t c_begin = (num_vecs * b) / blocks;
+    const int64_t c_end = (num_vecs * (b + 1)) / blocks;
+    const int64_t slice_len = c_end - c_begin;
+    uint4* my_in = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes);
+
+    if (!s_aborted_local) {
+        for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
+            st_wt_uint4(my_in + idx, input_vec[idx]);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+        }
+        __syncthreads();
+        if (threadIdx.x < world_size) {
+            uint64_t* peer_in_flag = reinterpret_cast<uint64_t*>(
+                s_peer_shm[threadIdx.x] + (b * 8 + rank) * 64);
+            sys_store_release_u64(peer_in_flag, step);
+            const uint64_t* local_in_flag = reinterpret_cast<const uint64_t*>(
+                my_shm + (b * 8 + threadIdx.x) * 64);
+            if (!spin_wait_ge_u64(local_in_flag, step, abort_flag)) {
+                s_aborted_local = 1;
+            }
+        }
+        __syncthreads();
+    }
+
+    const int k_grp = static_cast<int>(blocks / rows);
+    const int64_t r = b / k_grp;
+    const int64_t row_base = r * vecs_per_row;
+    const int num_iters = static_cast<int>((slice_len + blockDim.x - 1) / blockDim.x);
+
+    float s_f32[3][8];
+    float thread_sq = 0.0f;
+
+    if (!s_aborted_local) {
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            if (k < num_iters) {
+                const int64_t local_off = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+                if (local_off < slice_len) {
+                    const int64_t idx = c_begin + local_off;
+                    uint4 peer_vals[kMaxRanks];
+                    load_peer_vecs(
+                        peer_vals, input_vec, s_peer_shm, slot, slot_stride_bytes, idx, rank, world_size);
+                    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                    accumulate_peer_vecs(acc, peer_vals, world_size);
+                    Pack128Bf16 red_pack;
+                    Pack128Bf16 res_pack;
+                    res_pack.u4 = residual_vec[idx];
+                    Pack128Bf16 sum_pack;
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        red_pack.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+                        const float2 rf = __bfloat1622float2(red_pack.pairs[j]);
+                        const float2 sf = __bfloat1622float2(res_pack.pairs[j]);
+                        sum_pack.pairs[j] = __floats2bfloat162_rn(rf.x + sf.x, rf.y + sf.y);
+                        const float2 sum_rt = __bfloat1622float2(sum_pack.pairs[j]);
+                        s_f32[k][2 * j] = sum_rt.x;
+                        s_f32[k][2 * j + 1] = sum_rt.y;
+                        thread_sq += sum_rt.x * sum_rt.x + sum_rt.y * sum_rt.y;
+                    }
+                    residual_vec[idx] = sum_pack.u4;
+                }
+            }
+        }
+        const float warp_sq = warp_reduce_sum(thread_sq);
+        const int warp_id = threadIdx.x >> 5;
+        const int lane_id = threadIdx.x & 31;
+        const int num_warps = blockDim.x >> 5;
+        if (lane_id == 0) {
+            s_warp_sq[warp_id] = warp_sq;
+        }
+        __syncthreads();
+        if (warp_id == 0) {
+            float acc_sq = (lane_id < num_warps) ? s_warp_sq[lane_id] : 0.0f;
+            acc_sq = warp_reduce_sum(acc_sq);
+            if (lane_id == 0) {
+                s_cta_sq = acc_sq;
+            }
+        }
+        __syncthreads();
+    }
+
+    cluster.sync();
+
+    if (threadIdx.x == 0) {
+        int any_ab = 0;
+        for (int c = 0; c < blocks; ++c) {
+            any_ab |= *cluster.map_shared_rank(&s_aborted_local, c);
+        }
+        s_aborted_any = any_ab;
+        if (!any_ab) {
+            float row_sq = 0.0f;
+            const int grp_base = static_cast<int>(r) * k_grp;
+            for (int c = 0; c < k_grp; ++c) {
+                row_sq += *cluster.map_shared_rank(&s_cta_sq, grp_base + c);
+            }
+            s_inv_rms = rsqrtf(row_sq * inv_hidden + eps);
+        }
+    }
+    __syncthreads();
+
+    if (!s_aborted_any) {
+        const float inv_rms = s_inv_rms;
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            if (k < num_iters) {
+                const int64_t local_off = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+                if (local_off < slice_len) {
+                    const int64_t idx = c_begin + local_off;
+                    const int64_t col = idx - row_base;
+                    Pack128Bf16 w_pack;
+                    w_pack.u4 = weight_vec[col];
+                    Pack128Bf16 out_pack;
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float2 wf = __bfloat1622float2(w_pack.pairs[j]);
+                        const float y0 = (s_f32[k][2 * j] * inv_rms) * (weight_offset + wf.x);
+                        const float y1 = (s_f32[k][2 * j + 1] * inv_rms) * (weight_offset + wf.y);
+                        out_pack.pairs[j] = __floats2bfloat162_rn(y0, y1);
+                    }
+                    normed_out_vec[idx] = out_pack.u4;
+                }
+            }
+        }
+        if (threadIdx.x < world_size) {
+            uint64_t* peer_done = reinterpret_cast<uint64_t*>(
+                s_peer_shm[threadIdx.x] + 65536 + (b * 8 + rank) * 64);
+            sys_store_release_u64(peer_done, step);
+        }
+    }
+
+    cluster.sync();
 }
 
 // 1-shot NUMA-local SHM AllGather for `[outer_rows, vecs_per_row * 8]` ->
@@ -889,7 +1638,9 @@ void launch_shm_v5_allreduce_cuda(
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     const int64_t vecs_per_cta = (num_vecs + blocks - 1) / blocks;
-    const int launch_threads = (threads == 256 && vecs_per_cta > 256) ? 512 : threads;
+    const int capped_threads = threads > 512 ? 512 : threads;
+    const int launch_threads =
+        (capped_threads == 256 && vecs_per_cta > 256) ? 512 : capped_threads;
     shm_v5_allreduce_kernel<<<blocks, launch_threads, 0, stream>>>(
         reinterpret_cast<const uint4*>(input_ptr),
         reinterpret_cast<uint4*>(output_ptr),
@@ -897,6 +1648,82 @@ void launch_shm_v5_allreduce_cuda(
         reinterpret_cast<char* const*>(rank_shm_dev_ptrs),
         slot_stride_bytes,
         num_vecs,
+        rank,
+        world_size,
+        one_shot_max_vecs);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_shm_v5_allreduce_add_rmsnorm_cuda(
+    const void* input_ptr,
+    void* residual_ptr,
+    const void* weight_ptr,
+    void* normed_out_ptr,
+    uint64_t* control_ptr,
+    const std::uintptr_t* rank_shm_dev_ptrs,
+    int64_t slot_stride_bytes,
+    int64_t rows,
+    int64_t vecs_per_row,
+    float inv_hidden,
+    float eps,
+    float weight_offset,
+    int rank,
+    int world_size,
+    int blocks,
+    int threads,
+    int one_shot_max_vecs,
+    int use_cluster,
+    std::uintptr_t stream_handle) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    const int64_t num_vecs = rows * vecs_per_row;
+    const int64_t vecs_per_cta = (num_vecs + blocks - 1) / blocks;
+
+    if (use_cluster != 0 && rows < blocks && blocks == 8 && (blocks % rows) == 0) {
+        static bool attr_init = false;
+        if (!attr_init) {
+            cudaFuncSetAttribute(
+                shm_v5_ar_add_rmsnorm_cluster8_kernel,
+                cudaFuncAttributeNonPortableClusterSizeAllowed,
+                1);
+            attr_init = true;
+        }
+        shm_v5_ar_add_rmsnorm_cluster8_kernel<<<8, 256, 0, stream>>>(
+            reinterpret_cast<const uint4*>(input_ptr),
+            reinterpret_cast<uint4*>(residual_ptr),
+            reinterpret_cast<const uint4*>(weight_ptr),
+            reinterpret_cast<uint4*>(normed_out_ptr),
+            control_ptr,
+            reinterpret_cast<char* const*>(rank_shm_dev_ptrs),
+            slot_stride_bytes,
+            rows,
+            vecs_per_row,
+            inv_hidden,
+            eps,
+            weight_offset,
+            rank,
+            world_size);
+        ZSTEP_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    const int capped_threads = threads > 512 ? 512 : threads;
+    const int launch_threads =
+        (capped_threads == 256 && (vecs_per_cta > 256 || vecs_per_row > 256))
+            ? 512
+            : capped_threads;
+    shm_v5_ar_add_rmsnorm_kernel<<<blocks, launch_threads, 0, stream>>>(
+        reinterpret_cast<const uint4*>(input_ptr),
+        reinterpret_cast<uint4*>(residual_ptr),
+        reinterpret_cast<const uint4*>(weight_ptr),
+        reinterpret_cast<uint4*>(normed_out_ptr),
+        control_ptr,
+        reinterpret_cast<char* const*>(rank_shm_dev_ptrs),
+        slot_stride_bytes,
+        rows,
+        vecs_per_row,
+        inv_hidden,
+        eps,
+        weight_offset,
         rank,
         world_size,
         one_shot_max_vecs);
@@ -1161,7 +1988,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v8_ext",
+            name="zstep_shm_allreduce_sm120_v9_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -1169,6 +1996,7 @@ def get_host_mapped_allreduce_extension():
                 "unregister_mapped_host",
                 "launch_host_mapped_two_shot",
                 "launch_shm_v5_allreduce",
+                "launch_shm_v5_allreduce_add_rmsnorm",
                 "launch_shm_v5_allgather",
                 "launch_local_top2_bf16",
                 "launch_tp8_argmax_gather_shm",
@@ -1435,6 +2263,103 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
                 stream_handle,
             )
         return output
+
+    def can_fuse_add_rmsnorm(self, input: torch.Tensor) -> bool:
+        """Return True when `input` (`[rows, hidden]`) can run the 1-op `shm_v5` epilogue."""
+        if not self._use_shm_v5 or input.ndim != 2:
+            return False
+        rows, hidden = int(input.shape[0]), int(input.shape[1])
+        if rows <= 0 or hidden <= 0 or hidden % 8 != 0:
+            return False
+        vecs_per_row = hidden // 8
+        capped_threads = 512 if self.threads > 512 else self.threads
+        vecs_per_cta = (rows * vecs_per_row + self.blocks - 1) // self.blocks
+        launch_threads = (
+            512
+            if (capped_threads == 256 and (vecs_per_cta > 256 or vecs_per_row > 256))
+            else capped_threads
+        )
+        if vecs_per_row > 3 * launch_threads or vecs_per_row > 1536:
+            return False
+        if rows < self.blocks and (self.blocks % rows) != 0:
+            return False
+        if rows * vecs_per_row > self.one_shot_max_vecs and (vecs_per_row % self.world_size) != 0:
+            return False
+        return True
+
+    def all_reduce_add_rmsnorm(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        normed_out: torch.Tensor,
+        eps: float,
+        zero_centered: bool = True,
+        scratch_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Fused `AllReduce + Residual Add + [Zero-Centered] RMSNorm` with lockstep `control`."""
+        if self._closed:
+            raise RuntimeError("AllReduce channel is closed")
+        if input.ndim != 2:
+            raise ValueError(f"Expected 2D [rows, hidden] input, got shape={tuple(input.shape)}")
+        if residual.shape != input.shape or normed_out.shape != input.shape:
+            raise ValueError("residual and normed_out shapes must match input")
+        if weight.shape != (input.shape[1],):
+            raise ValueError(f"weight shape {tuple(weight.shape)} != ({input.shape[1]},)")
+        if input.numel() > self.capacity_elements:
+            raise ValueError("input exceeds channel capacity")
+        if input.numel() == 0:
+            return normed_out
+
+        if (
+            self.can_fuse_add_rmsnorm(input)
+            and input.is_contiguous()
+            and residual.is_contiguous()
+            and weight.is_contiguous()
+            and normed_out.is_contiguous()
+        ):
+            rows, hidden = int(input.shape[0]), int(input.shape[1])
+            vecs_per_row = hidden // 8
+            use_cluster = (
+                1
+                if (
+                    rows < self.blocks
+                    and self.blocks == 8
+                    and (self.blocks % rows) == 0
+                    and (vecs_per_row // (self.blocks // rows)) <= 3 * 256
+                )
+                else 0
+            )
+            stream_handle = torch.cuda.current_stream(self.device).cuda_stream
+            self._extension.launch_shm_v5_allreduce_add_rmsnorm(
+                input,
+                residual,
+                weight,
+                normed_out,
+                self.control,
+                self._rank_shm_ptrs,
+                self.slot_stride_bytes,
+                float(eps),
+                1.0 if zero_centered else 0.0,
+                self.rank,
+                self.world_size,
+                self.blocks,
+                self.threads,
+                self.one_shot_max_vecs,
+                use_cluster,
+                stream_handle,
+            )
+            return normed_out
+
+        scratch = scratch_out if scratch_out is not None else torch.empty_like(input)
+        self.all_reduce(input, output=scratch)
+        residual.copy_((residual.float() + scratch.float()).to(torch.bfloat16))
+        res_f32 = residual.float()
+        inv_rms = torch.rsqrt(res_f32.pow(2).mean(dim=-1, keepdim=True) + float(eps))
+        w_scale = (1.0 + weight.float()) if zero_centered else weight.float()
+        normed_out.copy_((res_f32 * inv_rms * w_scale).to(torch.bfloat16))
+        return normed_out
 
     def close(self, *, abort: bool = False) -> None:
         """Release CUDA host mapping and POSIX shared memory handle(s)."""

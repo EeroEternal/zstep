@@ -157,14 +157,313 @@ void launch_tp8_argmax_gather_shm(
         static_cast<int>(vocab_per_rank),
         stream_handle);
 }
+
+void launch_gdn_decode_cluster2_vk_cuda(
+    const void* qkvzba_ptr,
+    void* conv_state_ptr,
+    const void* conv_w_ptr,
+    const float* a_log_ptr,
+    const void* dt_bias_ptr,
+    float* ssm_state_vk_ptr,
+    const float* norm_w_ptr,
+    const int32_t* positions_ptr,
+    const int32_t* req_slot_ids_ptr,
+    void* gated_out_ptr,
+    int64_t stride_qkvzba_row,
+    int64_t stride_conv_slot,
+    int64_t stride_ssm_slot,
+    int64_t stride_ssm_head,
+    int num_rows,
+    int num_active_rows,
+    float eps,
+    std::uintptr_t stream_handle);
+
+void launch_gdn_decode_split_vk_cuda(
+    const void* qkvzba_ptr,
+    void* conv_state_ptr,
+    const void* conv_w_ptr,
+    const float* a_log_ptr,
+    const void* dt_bias_ptr,
+    float* ssm_state_vk_ptr,
+    const float* norm_w_ptr,
+    const int32_t* positions_ptr,
+    const int32_t* req_slot_ids_ptr,
+    float* qk_norm_scratch_ptr,
+    void* v_conv_scratch_ptr,
+    void* raw_out_ptr,
+    void* gated_out_ptr,
+    int64_t stride_qkvzba_row,
+    int64_t stride_conv_slot,
+    int64_t stride_ssm_slot,
+    int64_t stride_ssm_head,
+    int num_rows,
+    int num_active_rows,
+    float eps,
+    int mode,
+    std::uintptr_t stream_handle);
+
+void launch_gdn_prefill_vk_cuda(
+    const void* qkvzba_ptr,
+    void* conv_state_ptr,
+    const void* conv_w_ptr,
+    const float* a_log_ptr,
+    const void* dt_bias_ptr,
+    float* ssm_state_vk_ptr,
+    const float* norm_w_ptr,
+    const int32_t* query_start_loc_ptr,
+    const int32_t* positions_ptr,
+    const int32_t* req_slot_ids_ptr,
+    float* qk_norm_scratch_ptr,
+    void* v_conv_scratch_ptr,
+    void* raw_out_ptr,
+    void* gated_out_ptr,
+    int64_t stride_qkvzba_row,
+    int64_t stride_conv_slot,
+    int64_t stride_ssm_slot,
+    int64_t stride_ssm_head,
+    int num_seqs,
+    int total_rows,
+    float eps,
+    std::uintptr_t stream_handle);
+
+static void check_gdn_common_tensors(
+    const torch::Tensor& qkvzba,
+    const torch::Tensor& conv_state,
+    const torch::Tensor& conv_w,
+    const torch::Tensor& a_log,
+    const torch::Tensor& dt_bias,
+    const torch::Tensor& ssm_state_vk,
+    const torch::Tensor& norm_w,
+    const torch::Tensor& positions,
+    const torch::Tensor& req_slot_ids,
+    const torch::Tensor& gated_out) {
+    TORCH_CHECK(
+        qkvzba.is_cuda() && conv_state.is_cuda() && conv_w.is_cuda() && a_log.is_cuda() &&
+            dt_bias.is_cuda() && ssm_state_vk.is_cuda() && norm_w.is_cuda() &&
+            positions.is_cuda() && req_slot_ids.is_cuda() && gated_out.is_cuda(),
+        "GDN tensors must be CUDA tensors");
+    TORCH_CHECK(
+        qkvzba.scalar_type() == torch::kBFloat16 && qkvzba.dim() == 2 &&
+            qkvzba.size(1) >= 1544 && qkvzba.stride(1) == 1,
+        "qkvzba must be BF16 [rows, >=1544] with stride(1) == 1");
+    TORCH_CHECK(
+        conv_state.scalar_type() == torch::kBFloat16 && conv_state.dim() == 3 &&
+            conv_state.size(1) == 1024 && conv_state.size(2) == 3 &&
+            conv_state.stride(1) == 3 && conv_state.stride(2) == 1,
+        "conv_state must be BF16 [slots, 1024, 3]");
+    TORCH_CHECK(
+        conv_w.scalar_type() == torch::kBFloat16 && conv_w.is_contiguous() &&
+            conv_w.numel() == 4096,
+        "conv_w must be contiguous BF16 [1024, 4]");
+    TORCH_CHECK(
+        a_log.scalar_type() == torch::kFloat32 && a_log.is_contiguous() && a_log.numel() == 4,
+        "a_log must be contiguous FP32 [4]");
+    TORCH_CHECK(
+        dt_bias.scalar_type() == torch::kBFloat16 && dt_bias.is_contiguous() &&
+            dt_bias.numel() == 4,
+        "dt_bias must be contiguous BF16 [4]");
+    TORCH_CHECK(
+        ssm_state_vk.scalar_type() == torch::kFloat32 && ssm_state_vk.dim() == 4 &&
+            ssm_state_vk.size(1) == 4 && ssm_state_vk.size(2) == 128 &&
+            ssm_state_vk.size(3) == 128 && ssm_state_vk.stride(2) == 128 &&
+            ssm_state_vk.stride(3) == 1 &&
+            reinterpret_cast<std::uintptr_t>(ssm_state_vk.data_ptr()) % 16 == 0,
+        "ssm_state_vk must be 16B-aligned FP32 [slots, 4, 128, 128]");
+    TORCH_CHECK(
+        norm_w.scalar_type() == torch::kFloat32 && norm_w.is_contiguous() &&
+            norm_w.numel() == 128 &&
+            reinterpret_cast<std::uintptr_t>(norm_w.data_ptr()) % 16 == 0,
+        "norm_w must be 16B-aligned contiguous FP32 [128]");
+    const int64_t rows = qkvzba.size(0);
+    TORCH_CHECK(
+        positions.scalar_type() == torch::kInt32 && positions.is_contiguous() &&
+            positions.numel() >= rows,
+        "positions must be contiguous int32 [>=rows]");
+    TORCH_CHECK(
+        req_slot_ids.scalar_type() == torch::kInt32 && req_slot_ids.is_contiguous() &&
+            req_slot_ids.numel() >= rows,
+        "req_slot_ids must be contiguous int32 [>=rows]");
+    TORCH_CHECK(
+        gated_out.scalar_type() == torch::kBFloat16 && gated_out.is_contiguous() &&
+            gated_out.dim() == 2 && gated_out.size(0) == rows && gated_out.size(1) == 512,
+        "gated_out must be contiguous BF16 [rows, 512]");
+}
+
+void launch_gdn_decode_cluster2_vk(
+    torch::Tensor qkvzba,
+    torch::Tensor conv_state,
+    torch::Tensor conv_w,
+    torch::Tensor a_log,
+    torch::Tensor dt_bias,
+    torch::Tensor ssm_state_vk,
+    torch::Tensor norm_w,
+    torch::Tensor positions,
+    torch::Tensor req_slot_ids,
+    torch::Tensor gated_out,
+    int64_t num_active_rows,
+    double eps,
+    std::uintptr_t stream_handle) {
+    check_gdn_common_tensors(
+        qkvzba, conv_state, conv_w, a_log, dt_bias, ssm_state_vk,
+        norm_w, positions, req_slot_ids, gated_out);
+    launch_gdn_decode_cluster2_vk_cuda(
+        qkvzba.data_ptr(),
+        conv_state.data_ptr(),
+        conv_w.data_ptr(),
+        a_log.data_ptr<float>(),
+        dt_bias.data_ptr(),
+        ssm_state_vk.data_ptr<float>(),
+        norm_w.data_ptr<float>(),
+        positions.data_ptr<int32_t>(),
+        req_slot_ids.data_ptr<int32_t>(),
+        gated_out.data_ptr(),
+        qkvzba.stride(0),
+        conv_state.stride(0),
+        ssm_state_vk.stride(0),
+        ssm_state_vk.stride(1),
+        static_cast<int>(qkvzba.size(0)),
+        static_cast<int>(num_active_rows),
+        static_cast<float>(eps),
+        stream_handle);
+}
+
+void launch_gdn_decode_split_vk(
+    torch::Tensor qkvzba,
+    torch::Tensor conv_state,
+    torch::Tensor conv_w,
+    torch::Tensor a_log,
+    torch::Tensor dt_bias,
+    torch::Tensor ssm_state_vk,
+    torch::Tensor norm_w,
+    torch::Tensor positions,
+    torch::Tensor req_slot_ids,
+    torch::Tensor qk_norm_scratch,
+    torch::Tensor v_conv_scratch,
+    torch::Tensor raw_out,
+    torch::Tensor gated_out,
+    int64_t num_active_rows,
+    double eps,
+    int64_t mode,
+    std::uintptr_t stream_handle) {
+    check_gdn_common_tensors(
+        qkvzba, conv_state, conv_w, a_log, dt_bias, ssm_state_vk,
+        norm_w, positions, req_slot_ids, gated_out);
+    const int64_t rows = qkvzba.size(0);
+    TORCH_CHECK(
+        qk_norm_scratch.is_cuda() && qk_norm_scratch.scalar_type() == torch::kFloat32 &&
+            qk_norm_scratch.is_contiguous() && qk_norm_scratch.numel() >= rows * 512 &&
+            reinterpret_cast<std::uintptr_t>(qk_norm_scratch.data_ptr()) % 16 == 0,
+        "qk_norm_scratch must be 16B-aligned contiguous FP32 [>=rows * 512]");
+    TORCH_CHECK(
+        v_conv_scratch.is_cuda() && v_conv_scratch.scalar_type() == torch::kBFloat16 &&
+            v_conv_scratch.is_contiguous() && v_conv_scratch.numel() >= rows * 512,
+        "v_conv_scratch must be contiguous BF16 [>=rows * 512]");
+    if (mode != 0) {
+        TORCH_CHECK(
+            raw_out.is_cuda() && raw_out.scalar_type() == torch::kBFloat16 &&
+                raw_out.is_contiguous() && raw_out.numel() >= rows * 512,
+            "raw_out must be contiguous BF16 [>=rows * 512]");
+    }
+    launch_gdn_decode_split_vk_cuda(
+        qkvzba.data_ptr(),
+        conv_state.data_ptr(),
+        conv_w.data_ptr(),
+        a_log.data_ptr<float>(),
+        dt_bias.data_ptr(),
+        ssm_state_vk.data_ptr<float>(),
+        norm_w.data_ptr<float>(),
+        positions.data_ptr<int32_t>(),
+        req_slot_ids.data_ptr<int32_t>(),
+        qk_norm_scratch.data_ptr<float>(),
+        v_conv_scratch.data_ptr(),
+        raw_out.data_ptr(),
+        gated_out.data_ptr(),
+        qkvzba.stride(0),
+        conv_state.stride(0),
+        ssm_state_vk.stride(0),
+        ssm_state_vk.stride(1),
+        static_cast<int>(rows),
+        static_cast<int>(num_active_rows),
+        static_cast<float>(eps),
+        static_cast<int>(mode),
+        stream_handle);
+}
+
+void launch_gdn_prefill_vk(
+    torch::Tensor qkvzba,
+    torch::Tensor conv_state,
+    torch::Tensor conv_w,
+    torch::Tensor a_log,
+    torch::Tensor dt_bias,
+    torch::Tensor ssm_state_vk,
+    torch::Tensor norm_w,
+    torch::Tensor query_start_loc,
+    torch::Tensor positions,
+    torch::Tensor req_slot_ids,
+    torch::Tensor qk_norm_scratch,
+    torch::Tensor v_conv_scratch,
+    torch::Tensor raw_out,
+    torch::Tensor gated_out,
+    int64_t num_seqs,
+    double eps,
+    std::uintptr_t stream_handle) {
+    check_gdn_common_tensors(
+        qkvzba, conv_state, conv_w, a_log, dt_bias, ssm_state_vk,
+        norm_w, positions, req_slot_ids, gated_out);
+    const int64_t rows = qkvzba.size(0);
+    TORCH_CHECK(
+        query_start_loc.is_cuda() && query_start_loc.scalar_type() == torch::kInt32 &&
+            query_start_loc.is_contiguous() && query_start_loc.numel() >= num_seqs + 1,
+        "query_start_loc must be contiguous int32 [>=num_seqs + 1]");
+    TORCH_CHECK(
+        qk_norm_scratch.is_cuda() && qk_norm_scratch.scalar_type() == torch::kFloat32 &&
+            qk_norm_scratch.is_contiguous() && qk_norm_scratch.numel() >= rows * 512 &&
+            reinterpret_cast<std::uintptr_t>(qk_norm_scratch.data_ptr()) % 16 == 0,
+        "qk_norm_scratch must be 16B-aligned contiguous FP32 [>=rows * 512]");
+    TORCH_CHECK(
+        v_conv_scratch.is_cuda() && v_conv_scratch.scalar_type() == torch::kBFloat16 &&
+            v_conv_scratch.is_contiguous() && v_conv_scratch.numel() >= rows * 1024,
+        "v_conv_scratch must be contiguous BF16 [>=rows * 1024]");
+    TORCH_CHECK(
+        raw_out.is_cuda() && raw_out.scalar_type() == torch::kBFloat16 &&
+            raw_out.is_contiguous() && raw_out.numel() >= rows * 512,
+        "raw_out must be contiguous BF16 [>=rows * 512]");
+    launch_gdn_prefill_vk_cuda(
+        qkvzba.data_ptr(),
+        conv_state.data_ptr(),
+        conv_w.data_ptr(),
+        a_log.data_ptr<float>(),
+        dt_bias.data_ptr(),
+        ssm_state_vk.data_ptr<float>(),
+        norm_w.data_ptr<float>(),
+        query_start_loc.data_ptr<int32_t>(),
+        positions.data_ptr<int32_t>(),
+        req_slot_ids.data_ptr<int32_t>(),
+        qk_norm_scratch.data_ptr<float>(),
+        v_conv_scratch.data_ptr(),
+        raw_out.data_ptr(),
+        gated_out.data_ptr(),
+        qkvzba.stride(0),
+        conv_state.stride(0),
+        ssm_state_vk.stride(0),
+        ssm_state_vk.stride(1),
+        static_cast<int>(num_seqs),
+        static_cast<int>(rows),
+        static_cast<float>(eps),
+        stream_handle);
+}
 """
 
 _MOE_ALIGN_CUDA = r"""
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+
+namespace cg = cooperative_groups;
 
 #define ZSTEP_CUDA_CHECK(expr)                                                      \
     do {                                                                            \
@@ -442,6 +741,710 @@ __global__ void tp8_argmax_gather_shm_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// SM120 Coalesced `[V, K]` GatedDeltaNet Decode & Varlen Prefill Kernels
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        val += __shfl_xor_sync(0xFFFFFFFFU, val, mask);
+    }
+    return val;
+}
+
+__device__ __forceinline__ float silu_f32(float x) {
+    return x / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ float softplus_f32(float x) {
+    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+}
+
+__device__ __forceinline__ float conv1d_silu_bf16_round(
+    const __nv_bfloat16* __restrict__ qkvzba_row,
+    __nv_bfloat16* __restrict__ conv_slot_base,
+    const __nv_bfloat16* __restrict__ conv_w,
+    int c,
+    int pos) {
+    const float x = __bfloat162float(qkvzba_row[c]);
+    __nv_bfloat16* st = conv_slot_base + c * 3;
+    float s0 = 0.0f;
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+    if (pos != 0) {
+        s0 = __bfloat162float(st[0]);
+        s1 = __bfloat162float(st[1]);
+        s2 = __bfloat162float(st[2]);
+    }
+    st[0] = __float2bfloat16_rn(s1);
+    st[1] = __float2bfloat16_rn(s2);
+    st[2] = __float2bfloat16_rn(x);
+
+    const __nv_bfloat16* cw = conv_w + c * 4;
+    const float acc = __bfloat162float(cw[0]) * s0 + __bfloat162float(cw[1]) * s1 +
+                      __bfloat162float(cw[2]) * s2 + __bfloat162float(cw[3]) * x;
+    return __bfloat162float(__float2bfloat16_rn(silu_f32(acc)));
+}
+
+// Single-launch SM120 Cluster-2 (`__cluster_dims__(2, 1, 1)`, 512 threads) `[V, K]` GDN Decode:
+// CTA 0 computes Q_kh + V_{2*kh}, CTA 1 computes K_kh + V_{2*kh+1}, all 8 `float4` state rows per
+// warp are preloaded before DSMEM Q/K exchange, and GatedRMSNormSiLU runs CTA-locally.
+__global__ __cluster_dims__(2, 1, 1) __launch_bounds__(512, 1) void gdn_decode_fused_cluster2_512_vk_kernel(
+    const __nv_bfloat16* __restrict__ qkvzba,
+    __nv_bfloat16* __restrict__ conv_state,
+    const __nv_bfloat16* __restrict__ conv_w,
+    const float* __restrict__ a_log,
+    const __nv_bfloat16* __restrict__ dt_bias,
+    float* __restrict__ ssm_state_vk,
+    const float* __restrict__ norm_w,
+    const int32_t* __restrict__ positions,
+    const int32_t* __restrict__ req_slot_ids,
+    __nv_bfloat16* __restrict__ gated_out,
+    int64_t stride_qkvzba_row,
+    int64_t stride_conv_slot,
+    int64_t stride_ssm_slot,
+    int64_t stride_ssm_head,
+    int num_active_rows,
+    float eps) {
+    cg::cluster_group cluster = cg::this_cluster();
+    const int cta_rank = cluster.block_rank();
+    const int kh = blockIdx.x >> 1;
+    const int vh = 2 * kh + cta_rank;
+    const int64_t row = static_cast<int64_t>(blockIdx.y);
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    __shared__ __align__(16) float s_my_qk_norm[128];
+    __shared__ __align__(16) float s_peer_qk_norm[128];
+    __shared__ float s_v[128];
+    __shared__ float s_out[128];
+    __shared__ float s_warp[16];
+    __shared__ float s_meta[4];
+
+    const bool active = (row < num_active_rows);
+    float4 st_regs[8];
+    float4* state_base4 = nullptr;
+    const __nv_bfloat16* row_ptr = nullptr;
+
+    if (active) {
+        const int64_t slot = static_cast<int64_t>(req_slot_ids[row]);
+        const int pos = positions[row];
+        row_ptr = qkvzba + row * stride_qkvzba_row;
+        __nv_bfloat16* conv_slot = conv_state + slot * stride_conv_slot;
+        state_base4 = reinterpret_cast<float4*>(
+            ssm_state_vk + slot * stride_ssm_slot + vh * stride_ssm_head);
+
+        if (pos == 0) {
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                st_regs[r] = make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+        } else {
+            const int v_base = warp_id * 8;
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                st_regs[r] = state_base4[(v_base + r) * 32 + lane];
+            }
+        }
+
+        float qk_val = 0.0f;
+        if (tid < 128) {
+            const int c_qk = (cta_rank == 0) ? (kh * 128 + tid) : (256 + kh * 128 + tid);
+            qk_val = conv1d_silu_bf16_round(row_ptr, conv_slot, conv_w, c_qk, pos);
+        } else if (tid < 256) {
+            const int d_v = tid - 128;
+            const int c_v = 512 + vh * 128 + d_v;
+            s_v[d_v] = conv1d_silu_bf16_round(row_ptr, conv_slot, conv_w, c_v, pos);
+        } else if (tid == 256) {
+            const float b_raw = __bfloat162float(row_ptr[1536 + vh]);
+            const float a_raw = __bfloat162float(row_ptr[1540 + vh]);
+            const float al = a_log[vh];
+            const float db = __bfloat162float(dt_bias[vh]);
+            s_meta[1] = 1.0f / (1.0f + expf(-b_raw));
+            s_meta[2] = expf(-expf(al) * softplus_f32(a_raw + db));
+        }
+
+        if (warp_id < 4) {
+            const float w_sq = warp_reduce_sum(qk_val * qk_val);
+            if (lane == 0) {
+                s_warp[warp_id] = w_sq;
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            const float sq = s_warp[0] + s_warp[1] + s_warp[2] + s_warp[3];
+            const float extra = (cta_rank == 0) ? 0.08838834764831845f : 1.0f;
+            s_meta[0] = rsqrtf(sq + 1.0e-6f) * extra;
+        }
+        __syncthreads();
+        if (tid < 128) {
+            s_my_qk_norm[tid] = qk_val * s_meta[0];
+        }
+    }
+
+    cluster.sync();
+
+    if (active) {
+        if (tid < 128) {
+            s_peer_qk_norm[tid] = cluster.map_shared_rank(s_my_qk_norm, 1 - cta_rank)[tid];
+        }
+        __syncthreads();
+
+        const float4 q4 = (cta_rank == 0)
+            ? reinterpret_cast<const float4*>(s_my_qk_norm)[lane]
+            : reinterpret_cast<const float4*>(s_peer_qk_norm)[lane];
+        const float4 k4 = (cta_rank == 1)
+            ? reinterpret_cast<const float4*>(s_my_qk_norm)[lane]
+            : reinterpret_cast<const float4*>(s_peer_qk_norm)[lane];
+        const float beta = s_meta[1];
+        const float decay = s_meta[2];
+        const int v_base = warp_id * 8;
+
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int vr = v_base + r;
+            float4 st4 = st_regs[r];
+            st4.x *= decay;
+            st4.y *= decay;
+            st4.z *= decay;
+            st4.w *= decay;
+            const float kv_p = st4.x * k4.x + st4.y * k4.y + st4.z * k4.z + st4.w * k4.w;
+            const float kv_mem = warp_reduce_sum(kv_p);
+            const float delta = (s_v[vr] - kv_mem) * beta;
+            st4.x += k4.x * delta;
+            st4.y += k4.y * delta;
+            st4.z += k4.z * delta;
+            st4.w += k4.w * delta;
+            state_base4[vr * 32 + lane] = st4;
+            const float out_p = st4.x * q4.x + st4.y * q4.y + st4.z * q4.z + st4.w * q4.w;
+            const float out_v = warp_reduce_sum(out_p);
+            if (lane == 0) {
+                s_out[vr] = __bfloat162float(__float2bfloat16_rn(out_v));
+            }
+        }
+        __syncthreads();
+
+        if (tid < 128) {
+            const float x_out = s_out[tid];
+            const float w_sq = warp_reduce_sum(x_out * x_out);
+            if (lane == 0) {
+                s_warp[warp_id] = w_sq;
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            const float h_sq = s_warp[0] + s_warp[1] + s_warp[2] + s_warp[3];
+            s_meta[3] = rsqrtf(h_sq * (1.0f / 128.0f) + eps);
+        }
+        __syncthreads();
+        if (tid < 128) {
+            const float inv_rms = s_meta[3];
+            const float normed =
+                __bfloat162float(__float2bfloat16_rn(s_out[tid] * inv_rms)) * norm_w[tid];
+            const float z = __bfloat162float(row_ptr[1024 + vh * 128 + tid]);
+            gated_out[row * 512 + vh * 128 + tid] = __float2bfloat16_rn(normed * silu_f32(z));
+        }
+    } else {
+        if (tid < 128) {
+            gated_out[row * 512 + vh * 128 + tid] = __float2bfloat16_rn(0.0f);
+        }
+    }
+
+    cluster.sync();
+}
+
+__global__ void gdn_decode_prologue_conv_qknorm_kernel(
+    const __nv_bfloat16* __restrict__ qkvzba,
+    __nv_bfloat16* __restrict__ conv_state,
+    const __nv_bfloat16* __restrict__ conv_w,
+    const int32_t* __restrict__ positions,
+    const int32_t* __restrict__ req_slot_ids,
+    float* __restrict__ qk_norm_out,
+    __nv_bfloat16* __restrict__ v_out,
+    int64_t stride_qkvzba_row,
+    int64_t stride_conv_slot,
+    int num_active_rows) {
+    const int64_t row = blockIdx.x;
+    const int kh = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    if (row >= num_active_rows) {
+        return;
+    }
+
+    __shared__ float s_sq[8];
+    __shared__ float s_scales[2];
+
+    const int64_t slot = req_slot_ids[row];
+    const int pos = positions[row];
+    const __nv_bfloat16* row_ptr = qkvzba + row * stride_qkvzba_row;
+    __nv_bfloat16* conv_slot = conv_state + slot * stride_conv_slot;
+
+    const int c_qk = (tid < 128) ? (kh * 128 + tid) : (256 + kh * 128 + (tid - 128));
+    const float qk_val = conv1d_silu_bf16_round(row_ptr, conv_slot, conv_w, c_qk, pos);
+    const int c_v = 512 + kh * 256 + tid;
+    const float v_val = conv1d_silu_bf16_round(row_ptr, conv_slot, conv_w, c_v, pos);
+    v_out[row * 512 + kh * 256 + tid] = __float2bfloat16_rn(v_val);
+
+    const float w_sq = warp_reduce_sum(qk_val * qk_val);
+    if (lane == 0) {
+        s_sq[warp_id] = w_sq;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        s_scales[0] =
+            rsqrtf(s_sq[0] + s_sq[1] + s_sq[2] + s_sq[3] + 1.0e-6f) * 0.08838834764831845f;
+        s_scales[1] = rsqrtf(s_sq[4] + s_sq[5] + s_sq[6] + s_sq[7] + 1.0e-6f);
+    }
+    __syncthreads();
+    if (tid < 128) {
+        qk_norm_out[row * 512 + kh * 128 + tid] = qk_val * s_scales[0];
+    } else {
+        qk_norm_out[row * 512 + 256 + kh * 128 + (tid - 128)] = qk_val * s_scales[1];
+    }
+}
+
+__global__ __launch_bounds__(512, 1) void gdn_decode_vhead512_epilogue_vk_kernel(
+    const float* __restrict__ qk_norm,
+    const __nv_bfloat16* __restrict__ v_conv,
+    const __nv_bfloat16* __restrict__ qkvzba,
+    const float* __restrict__ a_log,
+    const __nv_bfloat16* __restrict__ dt_bias,
+    float* __restrict__ ssm_state_vk,
+    const float* __restrict__ norm_w,
+    const int32_t* __restrict__ positions,
+    const int32_t* __restrict__ req_slot_ids,
+    __nv_bfloat16* __restrict__ gated_out,
+    int64_t stride_qkvzba_row,
+    int64_t stride_ssm_slot,
+    int64_t stride_ssm_head,
+    int num_active_rows,
+    float eps) {
+    const int64_t row = blockIdx.x;
+    const int vh = blockIdx.y;
+    const int kh = vh >> 1;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    if (row >= num_active_rows) {
+        if (tid < 128) {
+            gated_out[row * 512 + vh * 128 + tid] = __float2bfloat16_rn(0.0f);
+        }
+        return;
+    }
+
+    __shared__ float s_out[128];
+    __shared__ float s_warp[4];
+    __shared__ float s_inv_rms;
+
+    const int64_t slot = req_slot_ids[row];
+    const int pos = positions[row];
+    float4* state_base4 = reinterpret_cast<float4*>(
+        ssm_state_vk + slot * stride_ssm_slot + vh * stride_ssm_head);
+    const int v_base = warp_id * 8;
+
+    float4 st_regs[8];
+    if (pos == 0) {
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            st_regs[r] = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    } else {
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            st_regs[r] = state_base4[(v_base + r) * 32 + lane];
+        }
+    }
+
+    const float4 q4 = reinterpret_cast<const float4*>(qk_norm + row * 512 + kh * 128)[lane];
+    const float4 k4 = reinterpret_cast<const float4*>(qk_norm + row * 512 + 256 + kh * 128)[lane];
+    const __nv_bfloat16* row_ptr = qkvzba + row * stride_qkvzba_row;
+    const float beta = 1.0f / (1.0f + expf(-__bfloat162float(row_ptr[1536 + vh])));
+    const float decay = expf(
+        -expf(a_log[vh]) *
+        softplus_f32(__bfloat162float(row_ptr[1540 + vh]) + __bfloat162float(dt_bias[vh])));
+    const __nv_bfloat16* v_ptr = v_conv + row * 512 + vh * 128;
+
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int vr = v_base + r;
+        float4 st4 = st_regs[r];
+        st4.x *= decay;
+        st4.y *= decay;
+        st4.z *= decay;
+        st4.w *= decay;
+        const float kv_mem =
+            warp_reduce_sum(st4.x * k4.x + st4.y * k4.y + st4.z * k4.z + st4.w * k4.w);
+        const float delta = (__bfloat162float(v_ptr[vr]) - kv_mem) * beta;
+        st4.x += k4.x * delta;
+        st4.y += k4.y * delta;
+        st4.z += k4.z * delta;
+        st4.w += k4.w * delta;
+        state_base4[vr * 32 + lane] = st4;
+        const float out_v =
+            warp_reduce_sum(st4.x * q4.x + st4.y * q4.y + st4.z * q4.z + st4.w * q4.w);
+        if (lane == 0) {
+            s_out[vr] = __bfloat162float(__float2bfloat16_rn(out_v));
+        }
+    }
+    __syncthreads();
+
+    if (tid < 128) {
+        const float x_out = s_out[tid];
+        const float w_sq = warp_reduce_sum(x_out * x_out);
+        if (lane == 0) {
+            s_warp[warp_id] = w_sq;
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        s_inv_rms =
+            rsqrtf((s_warp[0] + s_warp[1] + s_warp[2] + s_warp[3]) * (1.0f / 128.0f) + eps);
+    }
+    __syncthreads();
+    if (tid < 128) {
+        const float normed =
+            __bfloat162float(__float2bfloat16_rn(s_out[tid] * s_inv_rms)) * norm_w[tid];
+        const float z = __bfloat162float(row_ptr[1024 + vh * 128 + tid]);
+        gated_out[row * 512 + vh * 128 + tid] = __float2bfloat16_rn(normed * silu_f32(z));
+    }
+}
+
+__global__ void gdn_decode_32tile_vk_kernel(
+    const float* __restrict__ qk_norm,
+    const __nv_bfloat16* __restrict__ v_conv,
+    const __nv_bfloat16* __restrict__ qkvzba,
+    const float* __restrict__ a_log,
+    const __nv_bfloat16* __restrict__ dt_bias,
+    float* __restrict__ ssm_state_vk,
+    const int32_t* __restrict__ positions,
+    const int32_t* __restrict__ req_slot_ids,
+    __nv_bfloat16* __restrict__ raw_out,
+    int64_t stride_qkvzba_row,
+    int64_t stride_ssm_slot,
+    int64_t stride_ssm_head,
+    int num_active_rows) {
+    const int64_t row = blockIdx.x;
+    if (row >= num_active_rows) {
+        return;
+    }
+    const int hv_tile = blockIdx.y;
+    const int vh = hv_tile >> 3;
+    const int v_blk = hv_tile & 7;
+    const int kh = vh >> 1;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    const int64_t slot = req_slot_ids[row];
+    const int pos = positions[row];
+    const int v_base = v_blk * 16 + warp_id * 4;
+    float4* state_base4 = reinterpret_cast<float4*>(
+        ssm_state_vk + slot * stride_ssm_slot + vh * stride_ssm_head);
+
+    float4 st_regs[4];
+    if (pos == 0) {
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            st_regs[r] = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    } else {
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            st_regs[r] = state_base4[(v_base + r) * 32 + lane];
+        }
+    }
+
+    const float4 q4 = reinterpret_cast<const float4*>(qk_norm + row * 512 + kh * 128)[lane];
+    const float4 k4 = reinterpret_cast<const float4*>(qk_norm + row * 512 + 256 + kh * 128)[lane];
+    const __nv_bfloat16* row_ptr = qkvzba + row * stride_qkvzba_row;
+    const float beta = 1.0f / (1.0f + expf(-__bfloat162float(row_ptr[1536 + vh])));
+    const float decay = expf(
+        -expf(a_log[vh]) *
+        softplus_f32(__bfloat162float(row_ptr[1540 + vh]) + __bfloat162float(dt_bias[vh])));
+    const __nv_bfloat16* v_ptr = v_conv + row * 512 + vh * 128;
+    __nv_bfloat16* out_ptr = raw_out + row * 512 + vh * 128;
+
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const int vr = v_base + r;
+        float4 st4 = st_regs[r];
+        st4.x *= decay;
+        st4.y *= decay;
+        st4.z *= decay;
+        st4.w *= decay;
+        const float kv_mem =
+            warp_reduce_sum(st4.x * k4.x + st4.y * k4.y + st4.z * k4.z + st4.w * k4.w);
+        const float delta = (__bfloat162float(v_ptr[vr]) - kv_mem) * beta;
+        st4.x += k4.x * delta;
+        st4.y += k4.y * delta;
+        st4.z += k4.z * delta;
+        st4.w += k4.w * delta;
+        state_base4[vr * 32 + lane] = st4;
+        const float out_v =
+            warp_reduce_sum(st4.x * q4.x + st4.y * q4.y + st4.z * q4.z + st4.w * q4.w);
+        if (lane == 0) {
+            out_ptr[vr] = __float2bfloat16_rn(out_v);
+        }
+    }
+}
+
+__global__ void gdn_rmsnorm_gated_silu_decode_cuda_kernel(
+    const __nv_bfloat16* __restrict__ raw_out,
+    const __nv_bfloat16* __restrict__ qkvzba,
+    const float* __restrict__ norm_w,
+    __nv_bfloat16* __restrict__ gated_out,
+    int64_t stride_qkvzba_row,
+    int num_active_rows,
+    float eps) {
+    const int64_t row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int v_head = tid >> 5;
+    const int lane = tid & 31;
+    const int base_off = v_head * 128 + lane * 4;
+    if (row >= num_active_rows) {
+        *reinterpret_cast<uint2*>(gated_out + row * 512 + base_off) = make_uint2(0, 0);
+        return;
+    }
+    const uint2 rx = *reinterpret_cast<const uint2*>(raw_out + row * 512 + base_off);
+    const uint2 rz =
+        *reinterpret_cast<const uint2*>(qkvzba + row * stride_qkvzba_row + 1024 + base_off);
+    const float4 wf = *reinterpret_cast<const float4*>(norm_w + lane * 4);
+    const float2 xf01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rx.x));
+    const float2 xf23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rx.y));
+    const float2 zf01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rz.x));
+    const float2 zf23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rz.y));
+    const float sq = xf01.x * xf01.x + xf01.y * xf01.y + xf23.x * xf23.x + xf23.y * xf23.y;
+    const float inv_rms = rsqrtf(warp_reduce_sum(sq) * (1.0f / 128.0f) + eps);
+    const float2 nf01 =
+        __bfloat1622float2(__floats2bfloat162_rn(xf01.x * inv_rms, xf01.y * inv_rms));
+    const float2 nf23 =
+        __bfloat1622float2(__floats2bfloat162_rn(xf23.x * inv_rms, xf23.y * inv_rms));
+    const __nv_bfloat162 out01 = __floats2bfloat162_rn(
+        (nf01.x * wf.x) * silu_f32(zf01.x), (nf01.y * wf.y) * silu_f32(zf01.y));
+    const __nv_bfloat162 out23 = __floats2bfloat162_rn(
+        (nf23.x * wf.z) * silu_f32(zf23.x), (nf23.y * wf.w) * silu_f32(zf23.y));
+    uint2 packed_out;
+    packed_out.x = *reinterpret_cast<const uint32_t*>(&out01);
+    packed_out.y = *reinterpret_cast<const uint32_t*>(&out23);
+    *reinterpret_cast<uint2*>(gated_out + row * 512 + base_off) = packed_out;
+}
+
+__global__ void gdn_conv1d_prefill_varlen_cuda_kernel(
+    const __nv_bfloat16* __restrict__ qkvzba,
+    __nv_bfloat16* __restrict__ conv_state,
+    const __nv_bfloat16* __restrict__ conv_w,
+    const int32_t* __restrict__ query_start_loc,
+    const int32_t* __restrict__ positions,
+    const int32_t* __restrict__ req_slot_ids,
+    __nv_bfloat16* __restrict__ v_conv_out,
+    int64_t stride_in_row,
+    int64_t stride_state_slot) {
+    const int seq_idx = blockIdx.x;
+    const int c = blockIdx.y * 64 + threadIdx.x;
+    const int64_t q_start = query_start_loc[seq_idx];
+    const int64_t q_end = query_start_loc[seq_idx + 1];
+    if (q_start >= q_end) {
+        return;
+    }
+
+    const int64_t slot = req_slot_ids[q_start];
+    const int start_pos = positions[q_start];
+    __nv_bfloat16* st = conv_state + slot * stride_state_slot + c * 3;
+
+    float s0 = 0.0f;
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+    if (start_pos != 0) {
+        s0 = __bfloat162float(st[0]);
+        s1 = __bfloat162float(st[1]);
+        s2 = __bfloat162float(st[2]);
+    }
+    const __nv_bfloat16* cw = conv_w + c * 4;
+    const float w0 = __bfloat162float(cw[0]);
+    const float w1 = __bfloat162float(cw[1]);
+    const float w2 = __bfloat162float(cw[2]);
+    const float w3 = __bfloat162float(cw[3]);
+
+    for (int64_t row = q_start; row < q_end; ++row) {
+        const float x = __bfloat162float(qkvzba[row * stride_in_row + c]);
+        const float acc = w0 * s0 + w1 * s1 + w2 * s2 + w3 * x;
+        const float y = silu_f32(acc);
+        v_conv_out[row * 1024 + c] = __float2bfloat16_rn(y);
+        s0 = s1;
+        s1 = s2;
+        s2 = x;
+    }
+    st[0] = __float2bfloat16_rn(s0);
+    st[1] = __float2bfloat16_rn(s1);
+    st[2] = __float2bfloat16_rn(s2);
+}
+
+__global__ void gdn_qk_l2norm_rows_kernel(
+    const __nv_bfloat16* __restrict__ qkv_conv,
+    float* __restrict__ qk_norm,
+    int total_rows) {
+    const int64_t row = blockIdx.x;
+    if (row >= total_rows) {
+        return;
+    }
+    const int vec_id = blockIdx.y;
+    const int tid = threadIdx.x;
+    __shared__ float s_w[4];
+    __shared__ float s_scale;
+
+    const float v = __bfloat162float(qkv_conv[row * 1024 + vec_id * 128 + tid]);
+    const float w_sq = warp_reduce_sum(v * v);
+    if ((tid & 31) == 0) {
+        s_w[tid >> 5] = w_sq;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const float sq = s_w[0] + s_w[1] + s_w[2] + s_w[3];
+        const float extra = (vec_id < 2) ? 0.08838834764831845f : 1.0f;
+        s_scale = rsqrtf(sq + 1.0e-6f) * extra;
+    }
+    __syncthreads();
+    qk_norm[row * 512 + vec_id * 128 + tid] = v * s_scale;
+}
+
+__global__ void gdn_prefill_recurrent_vk_kernel(
+    const float* __restrict__ qk_norm,
+    const __nv_bfloat16* __restrict__ qkv_conv,
+    const __nv_bfloat16* __restrict__ qkvzba,
+    const float* __restrict__ a_log,
+    const __nv_bfloat16* __restrict__ dt_bias,
+    float* __restrict__ ssm_state_vk,
+    const int32_t* __restrict__ query_start_loc,
+    const int32_t* __restrict__ positions,
+    const int32_t* __restrict__ req_slot_ids,
+    __nv_bfloat16* __restrict__ raw_out,
+    int64_t stride_qkvzba_row,
+    int64_t stride_ssm_slot,
+    int64_t stride_ssm_head) {
+    const int seq_idx = blockIdx.x;
+    const int hv_tile = blockIdx.y;
+    const int v_head = hv_tile >> 3;
+    const int v_blk = hv_tile & 7;
+    const int k_head = v_head >> 1;
+
+    const int64_t q_start = query_start_loc[seq_idx];
+    const int64_t q_end = query_start_loc[seq_idx + 1];
+    if (q_start >= q_end) {
+        return;
+    }
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    const int64_t slot = req_slot_ids[q_start];
+    const int start_pos = positions[q_start];
+    const int v_base = v_blk * 16 + warp_id * 4;
+    float4* state_base4 = reinterpret_cast<float4*>(
+        ssm_state_vk + slot * stride_ssm_slot + v_head * stride_ssm_head);
+
+    float4 st[4];
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        st[r] = (start_pos == 0)
+            ? make_float4(0.f, 0.f, 0.f, 0.f)
+            : state_base4[(v_base + r) * 32 + lane];
+    }
+
+    const float neg_a = -expf(a_log[v_head]);
+    const float db = __bfloat162float(dt_bias[v_head]);
+
+    for (int64_t row = q_start; row < q_end; ++row) {
+        const float4 q4 = reinterpret_cast<const float4*>(qk_norm + row * 512 + k_head * 128)[lane];
+        const float4 k4 =
+            reinterpret_cast<const float4*>(qk_norm + row * 512 + 256 + k_head * 128)[lane];
+        const __nv_bfloat16* zb_row = qkvzba + row * stride_qkvzba_row;
+        const float beta = 1.0f / (1.0f + expf(-__bfloat162float(zb_row[1536 + v_head])));
+        const float decay = expf(neg_a * softplus_f32(__bfloat162float(zb_row[1540 + v_head]) + db));
+        const __nv_bfloat16* v_row = qkv_conv + row * 1024 + 512 + v_head * 128;
+        __nv_bfloat16* out_row = raw_out + row * 512 + v_head * 128;
+
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const int vr = v_base + r;
+            st[r].x *= decay;
+            st[r].y *= decay;
+            st[r].z *= decay;
+            st[r].w *= decay;
+            const float kv_p = st[r].x * k4.x + st[r].y * k4.y + st[r].z * k4.z + st[r].w * k4.w;
+            const float kv_mem = warp_reduce_sum(kv_p);
+            const float v_val = __bfloat162float(v_row[vr]);
+            const float delta = (v_val - kv_mem) * beta;
+            st[r].x += k4.x * delta;
+            st[r].y += k4.y * delta;
+            st[r].z += k4.z * delta;
+            st[r].w += k4.w * delta;
+            const float out_p = st[r].x * q4.x + st[r].y * q4.y + st[r].z * q4.z + st[r].w * q4.w;
+            const float out_v = warp_reduce_sum(out_p);
+            if (lane == 0) {
+                out_row[vr] = __float2bfloat16_rn(out_v);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        state_base4[(v_base + r) * 32 + lane] = st[r];
+    }
+}
+
+__global__ void gdn_rmsnorm_gated_silu_cuda_kernel(
+    const __nv_bfloat16* __restrict__ raw_out,
+    const __nv_bfloat16* __restrict__ qkvzba,
+    const float* __restrict__ norm_w,
+    __nv_bfloat16* __restrict__ gated_out,
+    int64_t stride_qkvzba_row,
+    int total_rows,
+    float eps) {
+    const int64_t row = blockIdx.x;
+    if (row >= total_rows) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    const int v_head = tid >> 5;
+    const int lane = tid & 31;
+
+    const int base_off = v_head * 128 + lane * 4;
+    const uint2 rx = *reinterpret_cast<const uint2*>(raw_out + row * 512 + base_off);
+    const uint2 rz =
+        *reinterpret_cast<const uint2*>(qkvzba + row * stride_qkvzba_row + 1024 + base_off);
+    const float4 wf = *reinterpret_cast<const float4*>(norm_w + lane * 4);
+
+    const float2 xf01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rx.x));
+    const float2 xf23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rx.y));
+    const float2 zf01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rz.x));
+    const float2 zf23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rz.y));
+
+    const float sq = xf01.x * xf01.x + xf01.y * xf01.y + xf23.x * xf23.x + xf23.y * xf23.y;
+    const float head_sq = warp_reduce_sum(sq);
+    const float inv_rms = rsqrtf(head_sq * (1.0f / 128.0f) + eps);
+
+    const float2 nf01 =
+        __bfloat1622float2(__floats2bfloat162_rn(xf01.x * inv_rms, xf01.y * inv_rms));
+    const float2 nf23 =
+        __bfloat1622float2(__floats2bfloat162_rn(xf23.x * inv_rms, xf23.y * inv_rms));
+
+    const __nv_bfloat162 out01 = __floats2bfloat162_rn(
+        (nf01.x * wf.x) * silu_f32(zf01.x), (nf01.y * wf.y) * silu_f32(zf01.y));
+    const __nv_bfloat162 out23 = __floats2bfloat162_rn(
+        (nf23.x * wf.z) * silu_f32(zf23.x), (nf23.y * wf.w) * silu_f32(zf23.y));
+
+    uint2 packed_out;
+    packed_out.x = *reinterpret_cast<const uint32_t*>(&out01);
+    packed_out.y = *reinterpret_cast<const uint32_t*>(&out23);
+    *reinterpret_cast<uint2*>(gated_out + row * 512 + base_off) = packed_out;
+}
+
 }  // namespace
 
 void launch_moe_align_block_size_cuda(
@@ -509,24 +1512,230 @@ void launch_tp8_argmax_gather_shm_cuda(
         vocab_per_rank);
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
+
+void launch_gdn_decode_cluster2_vk_cuda(
+    const void* qkvzba_ptr,
+    void* conv_state_ptr,
+    const void* conv_w_ptr,
+    const float* a_log_ptr,
+    const void* dt_bias_ptr,
+    float* ssm_state_vk_ptr,
+    const float* norm_w_ptr,
+    const int32_t* positions_ptr,
+    const int32_t* req_slot_ids_ptr,
+    void* gated_out_ptr,
+    int64_t stride_qkvzba_row,
+    int64_t stride_conv_slot,
+    int64_t stride_ssm_slot,
+    int64_t stride_ssm_head,
+    int num_rows,
+    int num_active_rows,
+    float eps,
+    std::uintptr_t stream_handle) {
+    if (num_rows <= 0) {
+        return;
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    dim3 grid(2 * 2, static_cast<unsigned int>(num_rows), 1);
+    gdn_decode_fused_cluster2_512_vk_kernel<<<grid, 512, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qkvzba_ptr),
+        reinterpret_cast<__nv_bfloat16*>(conv_state_ptr),
+        reinterpret_cast<const __nv_bfloat16*>(conv_w_ptr),
+        a_log_ptr,
+        reinterpret_cast<const __nv_bfloat16*>(dt_bias_ptr),
+        ssm_state_vk_ptr,
+        norm_w_ptr,
+        positions_ptr,
+        req_slot_ids_ptr,
+        reinterpret_cast<__nv_bfloat16*>(gated_out_ptr),
+        stride_qkvzba_row,
+        stride_conv_slot,
+        stride_ssm_slot,
+        stride_ssm_head,
+        num_active_rows,
+        eps);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_gdn_decode_split_vk_cuda(
+    const void* qkvzba_ptr,
+    void* conv_state_ptr,
+    const void* conv_w_ptr,
+    const float* a_log_ptr,
+    const void* dt_bias_ptr,
+    float* ssm_state_vk_ptr,
+    const float* norm_w_ptr,
+    const int32_t* positions_ptr,
+    const int32_t* req_slot_ids_ptr,
+    float* qk_norm_scratch_ptr,
+    void* v_conv_scratch_ptr,
+    void* raw_out_ptr,
+    void* gated_out_ptr,
+    int64_t stride_qkvzba_row,
+    int64_t stride_conv_slot,
+    int64_t stride_ssm_slot,
+    int64_t stride_ssm_head,
+    int num_rows,
+    int num_active_rows,
+    float eps,
+    int mode,
+    std::uintptr_t stream_handle) {
+    if (num_rows <= 0) {
+        return;
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    dim3 g_pro(static_cast<unsigned int>(num_rows), 2, 1);
+    gdn_decode_prologue_conv_qknorm_kernel<<<g_pro, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qkvzba_ptr),
+        reinterpret_cast<__nv_bfloat16*>(conv_state_ptr),
+        reinterpret_cast<const __nv_bfloat16*>(conv_w_ptr),
+        positions_ptr,
+        req_slot_ids_ptr,
+        qk_norm_scratch_ptr,
+        reinterpret_cast<__nv_bfloat16*>(v_conv_scratch_ptr),
+        stride_qkvzba_row,
+        stride_conv_slot,
+        num_active_rows);
+    if (mode == 0) {
+        dim3 g_vh(static_cast<unsigned int>(num_rows), 4, 1);
+        gdn_decode_vhead512_epilogue_vk_kernel<<<g_vh, 512, 0, stream>>>(
+            qk_norm_scratch_ptr,
+            reinterpret_cast<const __nv_bfloat16*>(v_conv_scratch_ptr),
+            reinterpret_cast<const __nv_bfloat16*>(qkvzba_ptr),
+            a_log_ptr,
+            reinterpret_cast<const __nv_bfloat16*>(dt_bias_ptr),
+            ssm_state_vk_ptr,
+            norm_w_ptr,
+            positions_ptr,
+            req_slot_ids_ptr,
+            reinterpret_cast<__nv_bfloat16*>(gated_out_ptr),
+            stride_qkvzba_row,
+            stride_ssm_slot,
+            stride_ssm_head,
+            num_active_rows,
+            eps);
+    } else {
+        dim3 g_32(static_cast<unsigned int>(num_rows), 32, 1);
+        gdn_decode_32tile_vk_kernel<<<g_32, 128, 0, stream>>>(
+            qk_norm_scratch_ptr,
+            reinterpret_cast<const __nv_bfloat16*>(v_conv_scratch_ptr),
+            reinterpret_cast<const __nv_bfloat16*>(qkvzba_ptr),
+            a_log_ptr,
+            reinterpret_cast<const __nv_bfloat16*>(dt_bias_ptr),
+            ssm_state_vk_ptr,
+            positions_ptr,
+            req_slot_ids_ptr,
+            reinterpret_cast<__nv_bfloat16*>(raw_out_ptr),
+            stride_qkvzba_row,
+            stride_ssm_slot,
+            stride_ssm_head,
+            num_active_rows);
+        gdn_rmsnorm_gated_silu_decode_cuda_kernel<<<static_cast<unsigned int>(num_rows), 128, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(raw_out_ptr),
+            reinterpret_cast<const __nv_bfloat16*>(qkvzba_ptr),
+            norm_w_ptr,
+            reinterpret_cast<__nv_bfloat16*>(gated_out_ptr),
+            stride_qkvzba_row,
+            num_active_rows,
+            eps);
+    }
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_gdn_prefill_vk_cuda(
+    const void* qkvzba_ptr,
+    void* conv_state_ptr,
+    const void* conv_w_ptr,
+    const float* a_log_ptr,
+    const void* dt_bias_ptr,
+    float* ssm_state_vk_ptr,
+    const float* norm_w_ptr,
+    const int32_t* query_start_loc_ptr,
+    const int32_t* positions_ptr,
+    const int32_t* req_slot_ids_ptr,
+    float* qk_norm_scratch_ptr,
+    void* v_conv_scratch_ptr,
+    void* raw_out_ptr,
+    void* gated_out_ptr,
+    int64_t stride_qkvzba_row,
+    int64_t stride_conv_slot,
+    int64_t stride_ssm_slot,
+    int64_t stride_ssm_head,
+    int num_seqs,
+    int total_rows,
+    float eps,
+    std::uintptr_t stream_handle) {
+    if (total_rows <= 0 || num_seqs <= 0) {
+        return;
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+
+    dim3 grid_conv(static_cast<unsigned int>(num_seqs), 16, 1);
+    gdn_conv1d_prefill_varlen_cuda_kernel<<<grid_conv, 64, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(qkvzba_ptr),
+        reinterpret_cast<__nv_bfloat16*>(conv_state_ptr),
+        reinterpret_cast<const __nv_bfloat16*>(conv_w_ptr),
+        query_start_loc_ptr,
+        positions_ptr,
+        req_slot_ids_ptr,
+        reinterpret_cast<__nv_bfloat16*>(v_conv_scratch_ptr),
+        stride_qkvzba_row,
+        stride_conv_slot);
+
+    dim3 grid_norm(static_cast<unsigned int>(total_rows), 4, 1);
+    gdn_qk_l2norm_rows_kernel<<<grid_norm, 128, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(v_conv_scratch_ptr),
+        qk_norm_scratch_ptr,
+        total_rows);
+
+    dim3 grid_rec(static_cast<unsigned int>(num_seqs), 32, 1);
+    gdn_prefill_recurrent_vk_kernel<<<grid_rec, 128, 0, stream>>>(
+        qk_norm_scratch_ptr,
+        reinterpret_cast<const __nv_bfloat16*>(v_conv_scratch_ptr),
+        reinterpret_cast<const __nv_bfloat16*>(qkvzba_ptr),
+        a_log_ptr,
+        reinterpret_cast<const __nv_bfloat16*>(dt_bias_ptr),
+        ssm_state_vk_ptr,
+        query_start_loc_ptr,
+        positions_ptr,
+        req_slot_ids_ptr,
+        reinterpret_cast<__nv_bfloat16*>(raw_out_ptr),
+        stride_qkvzba_row,
+        stride_ssm_slot,
+        stride_ssm_head);
+
+    gdn_rmsnorm_gated_silu_cuda_kernel<<<static_cast<unsigned int>(total_rows), 128, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(raw_out_ptr),
+        reinterpret_cast<const __nv_bfloat16*>(qkvzba_ptr),
+        norm_w_ptr,
+        reinterpret_cast<__nv_bfloat16*>(gated_out_ptr),
+        stride_qkvzba_row,
+        total_rows,
+        eps);
+
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
 """
 
 _QWEN35_EXT = None
 
 
 def get_qwen35_cuda_ext():
-    """Compile or return the inline CUDA helper extension for MoE align + TP8 Top-2 gather."""
+    """Compile or return the inline CUDA helper extension for MoE align, Top-2, and SM120 GDN."""
     global _QWEN35_EXT
     if _QWEN35_EXT is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _QWEN35_EXT = load_inline(
-            name="zstep_qwen35_ops_sm120_v5_ext",
+            name="zstep_qwen35_ops_sm120_v6_ext",
             cpp_sources=[_MOE_ALIGN_CPP],
             cuda_sources=[_MOE_ALIGN_CUDA],
             functions=[
                 "launch_moe_align_block_size",
                 "launch_local_top2_bf16",
                 "launch_tp8_argmax_gather_shm",
+                "launch_gdn_decode_cluster2_vk",
+                "launch_gdn_decode_split_vk",
+                "launch_gdn_prefill_vk",
             ],
             extra_cflags=["-O3"],
             extra_cuda_cflags=["-O3", "-gencode=arch=compute_120,code=sm_120"],
@@ -1405,9 +2614,62 @@ def linear_attn_decode_step(
     gated_out_buf: torch.Tensor,
     num_active_rows: int,
     eps: float,
+    qk_norm_buf: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused decode step for Qwen3_5MoeGatedDeltaNet (TP=8: 2 K-heads, 4 V-heads)."""
     batch_rows = qkvzba.shape[0]
+    if batch_rows == 0:
+        return gated_out_buf
+    if os.environ.get("ZSTEP_QWEN_ENABLE_FUSED_GDN", "1") != "0":
+        ext = get_qwen35_cuda_ext()
+        stream_handle = torch.cuda.current_stream(qkvzba.device).cuda_stream
+        mode_cfg = os.environ.get("ZSTEP_QWEN_GDN_DECODE_MODE", "auto")
+        if mode_cfg == "cluster2" or (mode_cfg == "auto" and batch_rows > 32):
+            ext.launch_gdn_decode_cluster2_vk(
+                qkvzba,
+                conv_state,
+                conv_weight,
+                a_log,
+                dt_bias,
+                ssm_state,
+                norm_weight,
+                positions,
+                req_slot_ids,
+                gated_out_buf,
+                num_active_rows,
+                float(eps),
+                stream_handle,
+            )
+            return gated_out_buf
+
+        split_mode = 0 if (mode_cfg == "split_2op" or (mode_cfg == "auto" and batch_rows > 8)) else 1
+        qk_scratch = (
+            qk_norm_buf
+            if qk_norm_buf is not None
+            else torch.empty((batch_rows, 512), dtype=torch.float32, device=qkvzba.device)
+        )
+        v_conv_scratch = qkv_conv_buf.reshape(-1)[: batch_rows * 512]
+        ext.launch_gdn_decode_split_vk(
+            qkvzba,
+            conv_state,
+            conv_weight,
+            a_log,
+            dt_bias,
+            ssm_state,
+            norm_weight,
+            positions,
+            req_slot_ids,
+            qk_scratch,
+            v_conv_scratch,
+            raw_out_buf,
+            gated_out_buf,
+            num_active_rows,
+            float(eps),
+            split_mode,
+            stream_handle,
+        )
+        return gated_out_buf
+
     _causal_conv1d_decode_kernel[(batch_rows, 1024 // 128)](
         qkvzba,
         conv_state,
@@ -1467,9 +2729,41 @@ def linear_attn_prefill_varlen(
     gated_out_buf: torch.Tensor,
     num_seqs: int,
     eps: float,
+    qk_norm_buf: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Varlen prefill for Qwen3_5MoeGatedDeltaNet keeping SSM tiles in registers across tokens."""
     total_rows = qkvzba.shape[0]
+    if total_rows == 0 or num_seqs == 0:
+        return gated_out_buf
+    if os.environ.get("ZSTEP_QWEN_ENABLE_FUSED_GDN", "1") != "0":
+        ext = get_qwen35_cuda_ext()
+        stream_handle = torch.cuda.current_stream(qkvzba.device).cuda_stream
+        qk_scratch = (
+            qk_norm_buf
+            if qk_norm_buf is not None
+            else torch.empty((total_rows, 512), dtype=torch.float32, device=qkvzba.device)
+        )
+        ext.launch_gdn_prefill_vk(
+            qkvzba,
+            conv_state,
+            conv_weight,
+            a_log,
+            dt_bias,
+            ssm_state,
+            norm_weight,
+            query_start_loc,
+            positions,
+            req_slot_ids,
+            qk_scratch,
+            qkv_conv_buf,
+            raw_out_buf,
+            gated_out_buf,
+            num_seqs,
+            float(eps),
+            stream_handle,
+        )
+        return gated_out_buf
+
     _causal_conv1d_prefill_varlen_kernel[(num_seqs, 1024 // 32)](
         qkvzba,
         conv_state,

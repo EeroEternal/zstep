@@ -411,6 +411,9 @@ class Qwen35MoeStepRunner:
         self.shm_max_ar_numel: int = int(
             os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(320 * 5120))
         )
+        self.enable_fused_ar_norm: bool = (
+            os.environ.get("ZSTEP_QWEN_ENABLE_FUSED_AR_NORM", "1") != "0"
+        )
         self.shm_ar_calls: int = 0
         self.nccl_eager_large_calls: int = 0
         self.communicator: HostMappedShmAllReduce = HostMappedShmAllReduce(
@@ -523,6 +526,9 @@ class Qwen35MoeStepRunner:
         )
         self.lin_gated_out_buf: torch.Tensor = torch.empty(
             (mt, 512), dtype=torch.bfloat16, device=self.device
+        )
+        self.lin_qk_norm_buf: torch.Tensor = torch.empty(
+            (mt, 512), dtype=torch.float32, device=self.device
         )
         self.qkv_attn_buf: torch.Tensor = torch.empty(
             (mt, 1536), dtype=torch.bfloat16, device=self.device
@@ -820,6 +826,7 @@ class Qwen35MoeStepRunner:
                     gated_out_buf=self.lin_gated_out_buf[:bucket],
                     num_active_rows=bucket,
                     eps=eps,
+                    qk_norm_buf=self.lin_qk_norm_buf[:bucket],
                 )
                 torch.matmul(gated, lw.w_out_proj.t(), out=proj_local)
             else:
@@ -860,9 +867,13 @@ class Qwen35MoeStepRunner:
                 )
                 torch.matmul(attn_out, lw.w_o_proj.t(), out=proj_local)
 
-            self.communicator.all_reduce(proj_local, output=reduced)
-            fused_add_zero_centered_rmsnorm(
-                reduced, hidden, lw.post_attn_norm_w, normed_out=normed, eps=eps
+            self._all_reduce_add_norm_decode(
+                proj_local,
+                hidden,
+                lw.post_attn_norm_w,
+                normed=normed,
+                reduced=reduced,
+                eps=eps,
             )
 
             moe_local = sparse_moe_tp8_forward(
@@ -885,19 +896,19 @@ class Qwen35MoeStepRunner:
                 moe_out_buf=self.moe_out_buf,
                 num_active_rows=bucket,
             )
-            self.communicator.all_reduce(moe_local, output=reduced)
-            if idx + 1 < len(self.layers):
-                fused_add_zero_centered_rmsnorm(
-                    reduced,
-                    hidden,
-                    self.layers[idx + 1].input_norm_w,
-                    normed_out=normed,
-                    eps=eps,
-                )
-            else:
-                fused_add_zero_centered_rmsnorm(
-                    reduced, hidden, self.final_norm_weight, normed_out=normed, eps=eps
-                )
+            next_norm_w = (
+                self.layers[idx + 1].input_norm_w
+                if idx + 1 < len(self.layers)
+                else self.final_norm_weight
+            )
+            self._all_reduce_add_norm_decode(
+                moe_local,
+                hidden,
+                next_norm_w,
+                normed=normed,
+                reduced=reduced,
+                eps=eps,
+            )
 
         logits = self.logits_local_buf[:bucket]
         torch.matmul(normed, self.lm_head_weight.t(), out=logits)
@@ -908,6 +919,32 @@ class Qwen35MoeStepRunner:
             out_tokens=self.out_tokens_gpu[:bucket],
             out_logprob_bits=self.out_logprobs_gpu[:bucket],
             vocab_per_rank=self.vocab_per_rank,
+        )
+
+    def _all_reduce_add_norm_decode(
+        self,
+        input_: torch.Tensor,
+        hidden: torch.Tensor,
+        norm_w: torch.Tensor,
+        *,
+        normed: torch.Tensor,
+        reduced: torch.Tensor,
+        eps: float,
+    ) -> None:
+        if self.enable_fused_ar_norm:
+            self.communicator.all_reduce_add_rmsnorm(
+                input_,
+                hidden,
+                norm_w,
+                normed_out=normed,
+                eps=eps,
+                zero_centered=True,
+                scratch_out=reduced,
+            )
+            return
+        self.communicator.all_reduce(input_, output=reduced)
+        fused_add_zero_centered_rmsnorm(
+            reduced, hidden, norm_w, normed_out=normed, eps=eps
         )
 
     def _all_reduce_prefill(self, input_: torch.Tensor, *, output: torch.Tensor) -> None:
@@ -923,6 +960,42 @@ class Qwen35MoeStepRunner:
             return
         self.communicator.all_reduce(input_, output=output)
         self.shm_ar_calls += 1
+
+    def _all_reduce_add_norm_prefill(
+        self,
+        input_: torch.Tensor,
+        hidden: torch.Tensor,
+        norm_w: torch.Tensor,
+        *,
+        normed: torch.Tensor,
+        reduced: torch.Tensor,
+        eps: float,
+    ) -> None:
+        use_nccl_large = (
+            self.nccl_group is not None
+            and not torch.cuda.is_current_stream_capturing()
+            and input_.numel() > self.shm_max_ar_numel
+        )
+        if (
+            self.enable_fused_ar_norm
+            and not use_nccl_large
+            and self.communicator.can_fuse_add_rmsnorm(input_)
+        ):
+            self.communicator.all_reduce_add_rmsnorm(
+                input_,
+                hidden,
+                norm_w,
+                normed_out=normed,
+                eps=eps,
+                zero_centered=True,
+                scratch_out=reduced,
+            )
+            self.shm_ar_calls += 1
+            return
+        self._all_reduce_prefill(input_, output=reduced)
+        fused_add_zero_centered_rmsnorm(
+            reduced, hidden, norm_w, normed_out=normed, eps=eps
+        )
 
     def _run_prefill_varlen_forward(
         self,
@@ -967,6 +1040,7 @@ class Qwen35MoeStepRunner:
                     gated_out_buf=self.lin_gated_out_buf[:total_tokens],
                     num_seqs=num_seqs,
                     eps=eps,
+                    qk_norm_buf=self.lin_qk_norm_buf[:total_tokens],
                 )
                 torch.matmul(gated, lw.w_out_proj.t(), out=proj_local)
             else:
@@ -1006,9 +1080,13 @@ class Qwen35MoeStepRunner:
                 )
                 torch.matmul(attn_out, lw.w_o_proj.t(), out=proj_local)
 
-            self._all_reduce_prefill(proj_local, output=reduced)
-            fused_add_zero_centered_rmsnorm(
-                reduced, hidden, lw.post_attn_norm_w, normed_out=normed, eps=eps
+            self._all_reduce_add_norm_prefill(
+                proj_local,
+                hidden,
+                lw.post_attn_norm_w,
+                normed=normed,
+                reduced=reduced,
+                eps=eps,
             )
 
             moe_local = sparse_moe_tp8_forward(
@@ -1031,19 +1109,19 @@ class Qwen35MoeStepRunner:
                 moe_out_buf=self.moe_out_buf,
                 num_active_rows=total_tokens,
             )
-            self._all_reduce_prefill(moe_local, output=reduced)
-            if idx + 1 < len(self.layers):
-                fused_add_zero_centered_rmsnorm(
-                    reduced,
-                    hidden,
-                    self.layers[idx + 1].input_norm_w,
-                    normed_out=normed,
-                    eps=eps,
-                )
-            else:
-                fused_add_zero_centered_rmsnorm(
-                    reduced, hidden, self.final_norm_weight, normed_out=normed, eps=eps
-                )
+            next_norm_w = (
+                self.layers[idx + 1].input_norm_w
+                if idx + 1 < len(self.layers)
+                else self.final_norm_weight
+            )
+            self._all_reduce_add_norm_prefill(
+                moe_local,
+                hidden,
+                next_norm_w,
+                normed=normed,
+                reduced=reduced,
+                eps=eps,
+            )
 
         if num_sample_rows > 0:
             sampled_normed = self.sample_hidden_buf[:num_sample_rows]
@@ -1089,6 +1167,21 @@ class Qwen35MoeStepRunner:
             dist.all_reduce(self.reduced_buf[:1], group=self.nccl_group)
             torch.cuda.synchronize(self.device)
             dist.barrier(group=self.exchange_group)
+
+        # Ensure `_fused_add_zero_centered_rmsnorm_kernel` is pre-compiled across all 3
+        # Triton integer-specialization buckets even when small prefill warmups use the
+        # 1-op `shm_v5` epilogue, so large-M NCCL eager prefills never compile at runtime.
+        for warm_rows in (1, 5, 16):
+            self.reduced_buf[:warm_rows].zero_()
+            self.hidden_buf[:warm_rows].zero_()
+            fused_add_zero_centered_rmsnorm(
+                self.reduced_buf[:warm_rows],
+                self.hidden_buf[:warm_rows],
+                self.final_norm_weight,
+                normed_out=self.normed_buf[:warm_rows],
+                eps=self.config.rms_norm_eps,
+            )
+        torch.cuda.synchronize(self.device)
 
         buckets = [b for b in DECODE_GRAPH_BUCKETS if b <= self.max_graph_bucket]
         if not buckets or buckets[-1] != self.max_graph_bucket:
