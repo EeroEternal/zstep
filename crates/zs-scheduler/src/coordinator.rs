@@ -20,13 +20,15 @@
 
 //! Shared-memory worker subprocess orchestration and `in_flight_depth = 1` overlap loop.
 
+use std::ffi::CString;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use zs_shm::{EventFd, SharedMemoryArena, ShmError, ShmLayout};
@@ -53,6 +55,8 @@ pub struct WorkerLaunchConfig {
     pub allreduce_threads: u32,
     pub model_dir: Option<PathBuf>,
     pub num_kv_pages: u32,
+    pub max_model_len: Option<usize>,
+    pub cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 /// Complete engine run configuration; every behavioral parameter is explicit.
@@ -128,16 +132,21 @@ impl WorkerProcesses {
         }
         Ok(())
     }
-}
 
-impl Drop for WorkerProcesses {
-    fn drop(&mut self) {
+    fn terminate_all(&mut self) {
         for child in &mut self.0 {
             let _ = child.kill();
         }
         for child in &mut self.0 {
             let _ = child.wait();
         }
+        self.0.clear();
+    }
+}
+
+impl Drop for WorkerProcesses {
+    fn drop(&mut self) {
+        self.terminate_all();
     }
 }
 
@@ -442,6 +451,30 @@ impl WorkerCoordinator {
         Ok((recompilations, watched))
     }
 
+    pub(crate) fn check_workers_healthy(&mut self) -> Result<()> {
+        if let Err(err) = self.workers.check_alive() {
+            let _ = self.arena.signal_abort();
+            return Err(err);
+        }
+        for rank in 0..self.config.geometry.world_size as usize {
+            let state = self.arena.worker_state(rank)?;
+            let status = state.status_code.load(Ordering::Acquire);
+            let error_code = state.error_code.load(Ordering::Acquire);
+            if status == WORKER_STATUS_ERROR || error_code != 0 {
+                let _ = self.arena.signal_abort();
+                return Err(EngineError::Protocol(format!(
+                    "rank {rank} reported worker error {error_code}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn current_triton_recompilations(&self) -> u32 {
+        self.read_shutdown_triton_stats()
+            .map_or(0, |(recompilations, _)| recompilations)
+    }
+
     fn read_shutdown_triton_stats(&self) -> Result<(u32, u32)> {
         let mut max_recompilations = 0u32;
         let mut watched_kernels = 0u32;
@@ -548,6 +581,19 @@ impl WorkerCoordinator {
                 self.pending_done_signals[rank] -= 1;
             } else {
                 loop {
+                    if initializing
+                        && self
+                            .config
+                            .launch
+                            .cancel_flag
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Acquire))
+                    {
+                        let _ = self.arena.signal_abort();
+                        return Err(EngineError::Protocol(
+                            "engine launch cancelled by shutdown signal".to_owned(),
+                        ));
+                    }
                     let now = Instant::now();
                     if now >= deadline {
                         let _ = self.arena.signal_abort();
@@ -605,7 +651,16 @@ impl WorkerCoordinator {
 impl Drop for WorkerCoordinator {
     fn drop(&mut self) {
         let _ = self.arena.signal_abort();
+        self.workers.terminate_all();
         let _ = fs::remove_file(&self.rendezvous_file);
+        for suffix in ["_ar", "_ar_argmax"] {
+            if let Ok(c_name) = CString::new(format!("/{}{suffix}", self.config.shm_name)) {
+                // SAFETY: `c_name` is a valid NUL-terminated POSIX shared-memory object name.
+                unsafe {
+                    let _ = libc::shm_unlink(c_name.as_ptr());
+                }
+            }
+        }
     }
 }
 
@@ -681,6 +736,9 @@ fn spawn_workers(
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        if let Some(max_model_len) = config.launch.max_model_len {
+            command.env("ZSTEP_MAX_MODEL_LEN", max_model_len.to_string());
+        }
         // SAFETY: the closure only calls async-signal-safe `prctl` and `dup2`; the targets are
         // disjoint from normal descriptors and `dup2` clears CLOEXEC on the inherited descriptors.
         unsafe {

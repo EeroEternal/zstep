@@ -32,9 +32,13 @@ pub use coordinator::{
 };
 pub use serving::{
     AggregateMetric, BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierResult,
-    BenchmarkTierSpec, DEFAULT_PREFILL_COALESCE_WAIT_MS, GenerationScheduleStats, GreedyTop2Batch,
-    ServingBenchmarkReport, ServingEngine, SlotLease, SlotPool, StepTop2Logits, TierAggregateStats,
-    build_deterministic_random_prompts, build_deterministic_random_prompts_seeded,
+    BenchmarkTierSpec, DEFAULT_PREFILL_COALESCE_WAIT_MS, EngineState, EventSink,
+    GenerationScheduleStats, GreedyTop2Batch, LoopEvent, LoopFinishReason, MockScript,
+    OnlineConfig, OnlineMetrics, ServeLoopHandle, ServingBenchmarkReport, ServingEngine, SlotLease,
+    SlotPool, StepTop2Logits, SubmitError, SubmitRequest, TPOT_BUCKET_BOUNDS_SECS,
+    TTFT_BUCKET_BOUNDS_SECS, TierAggregateStats, build_deterministic_random_prompts,
+    build_deterministic_random_prompts_seeded, request_kv_page_demand, spawn_mock,
+    spawn_serve_loop, spawn_serve_loop_with_state,
 };
 
 /// Compatibility alias retained for external branches migrating off legacy `ModeB*` names.
