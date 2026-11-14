@@ -1,6 +1,6 @@
 # `zstep` Master Benchmark Ledger (`sm_120` Non-P2P PCIe: `8×32 GB` & `8×85.6 GB`)
 
-本目录归档 Phase 0（`sm_120` 算子与 PCIe AllReduce）、Phase 1（Mode B Rust 控制面与双缓冲调度）、Phase 2（`8 × RTX 5090 32 GB` 上 `Qwen/Qwen3.5-35B-A3B` 无 APC 真权重 serving 与 `vLLM 0.33.0` 对标）及 **Phase 3 / 3.5 / 3.6 / 3.7（`8 × RTX 6000D 85.6 GB` 上 `DeepSeek-V4.1-Flash` `TP=8` 无 APC 真权重 serving、`b12x` `156-SM` 优化与 `vLLM 0.31.0` 对标）** 的实测 JSON。所有主结果均为 **warm、单配置、无前缀缓存（`--no-enable-prefix-caching`）、按 `(round, tier)` 独立种子、round-major 交错、`n=3`**；旧单轮与消融数据只作历史记录，不与主表混用。
+本目录归档 Phase 0（`sm_120` 算子与 PCIe AllReduce）、Phase 1（Mode B Rust 控制面与双缓冲调度）、Phase 2（`8 × RTX 5090 32 GB` 上 `Qwen/Qwen3.5-35B-A3B` 无 APC 真权重 serving 与 `vLLM 0.33.0` 对标）、**Phase 3 / 3.5 / 3.6 / 3.7 / 3.8（`8 × RTX 6000D 85.6 GB` 上 `DeepSeek-V4.1-Flash` `TP=8` 无 APC 真权重 serving、`b12x` / `sm120_dsa_indexer` `156-SM` 优化与 `vLLM 0.31.0` 对标）** 及 **Phase 3.9（`8 × RTX 6000D` 上 `Qwen/Qwen3.5-35B-A3B` Route A：`shm_v5` Stage-2 `AllReduce + Residual Add + RMSNorm` 尾融合 + SM120 `[V, K]` `GatedDeltaNet` 全量 A/B 审计）** 的实测 JSON。所有主结果均为 **warm、单配置、无前缀缓存（`--no-enable-prefix-caching`）、按 `(round, tier)` 独立种子、round-major 交错、`n=3`**；旧单轮与消融数据只作历史记录，不与主表混用。
 
 ## 1. 硬件、软件与统计边界
 
@@ -23,7 +23,7 @@ b12x 3.6/3.7: vllm/vllm-openai:v0.31.0 + read-only mount of `flashinfer/experime
 
 ## 2. 归档文件总览
 
-共有 **33 份主 JSON + 19 份 vLLM 逐轮/warmup 原始 JSON = 52 份 JSON**。
+共有 **34 份主 JSON + 19 份 vLLM 逐轮/warmup 原始 JSON = 53 份 JSON**。
 
 | 阶段 | 文件 | 内容 |
 | :--- | :--- | :--- |
@@ -61,6 +61,31 @@ b12x 3.6/3.7: vllm/vllm-openai:v0.31.0 + read-only mount of `flashinfer/experime
 | Phase 3.7 | [`phase37_b12x_greedy_parity_report.json`](phase37_b12x_greedy_parity_report.json) | `zstep 3.7 + b12x`（`git_sha=d497e85...`，`moe=40, lin=210/6, unprepared_warnings=0`）全局 Top-2 贪心审计（`prime_squares_table` `128/128` 100% 匹配，零重编译） |
 | Phase 3.7 | [`phase37_6000d_comm_audit.json`](phase37_6000d_comm_audit.json) | **`zstep#14` 8 卡通信与 PCIe ACS/CX-8（`15b3:197c`）审计**：`H=2048` / `H=5120` AllReduce 与 `[M, 640]->[M, 5120]` AllGather（`shm_v5_prod` 自适应 `256->512` 线程 + `64 KiB` One-Shot vs 旧基线 / `nodone` / `pkt64` / `NCCL_LOC`）、SM BAR MMIO `UR` 证明与 `DeepSeek-V4.1` Amdahl 消融 |
 | Phase 3.8 | [`phase38_6000d_flashinfer_ops_audit.json`](phase38_6000d_flashinfer_ops_audit.json) | **SM120 `FlashInfer` 实验算子筛选与 `TP=8` 端到端审计**（`ae58183f`）：`b12x` 新旧对比、`sm12x_mega_gate`（`M >= 32`）门限消融、分页 Decode `sm120_dsa_indexer`（8 层 CUDAGraph `3.55×..4.33×`）、淘汰项负向实证及三套件 12 档 Warm `n=3` 结果（`in1024_c128` 突破 `6,005.25 tok/s`） |
+| Phase 3.9 | [`phase39_6000d_qwen35_route_a_audit.json`](phase39_6000d_qwen35_route_a_audit.json) | **Route A（`Qwen3.5-35B-A3B` `TP=8`, `8 × RTX 6000D`）`shm_v5` Stage-2 尾融合 + SM120 `[V, K]` `GatedDeltaNet` 全量审计**（`893495c4 -> 98724b4c`）：`H=2048/5120` `cluster8` DSMEM / `fused_1op` 微基准、30 层 `[V, K]` 自适应解码与 `cuda_vk_recurrent` Prefill 微基准、贪心零重编译门禁及三套件 15 档 Warm `n=3` 结果（`15/15` 全胜，`c1` `+23.80%`、`Mean TPOT = 2.95 ms`，`in1024_c128` 总吞吐 `14,783.15 tok/s`） |
+
+---
+
+## 2.8 Phase 3.9（Route A：`Qwen3.5-35B-A3B` `shm_v5` Stage-2 尾融合 + SM120 `[V, K]` `GatedDeltaNet`）最新主结果（`8 × RTX 6000D`, Warm `n=3`）
+
+> 归档于 [`phase39_6000d_qwen35_route_a_audit.json`](phase39_6000d_qwen35_route_a_audit.json)，算子设计与物理归因详见 **[`06-phase2-qwen35-benchmark.md` §7](../06-phase2-qwen35-benchmark.md)**。在完整保留 `shm_v5` 4 槽环形 `done-wait`、`90 s` 超时熔断与 `control[0..blocks)` 锁步的前提下，融合 Stage-2 `AllReduce + Residual Add + RMSNorm`（`M ∈ {1, 2, 4}` 解码桶走 `__cluster_dims__(8, 1, 1)` DSMEM `cluster8`，`M >= 8` 走行对齐 `fused_1op`）消除每步 80 次独立 RMSNorm 发射与 `reduced_buf` 往返，并将 30 层 `GatedDeltaNet` 状态池转置为 `float4` 合并访存 `[V, K]`（Decode 自适应 `split_3op` / `split_2op` / `cluster2` 跨桶 `0 ULP` 等价 + 变长 Prefill `cuda_vk_recurrent`）。运行时审计 **`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=20`**，相对 `main` `893495c4` 在 **全部 `15 / 15` 档位上同时取得吞吐提升（`+3.53% .. +23.80%`）、Mean TPOT 下降、Median TTFT 缩短与 P99 ITL 降低**。
+
+| 套件 / 档位 | 基线 `893495c` (`tok/s`) | 仅 Part A1 (`tok/s`) | **完整 Route A (`tok/s`)** | Route A vs 基线 | Mean TPOT 基线 -> **Route A** (`ms`) | Med TTFT 基线 -> **Route A** (`ms`) | P99 ITL 基线 -> **Route A** (`ms`) |
+| :--- | ---: | ---: | ---: | :--- | :---: | :---: | :---: |
+| Suite 1 `c1` (`512->128`) | `248.07 ± 2.82` | `284.25 ± 0.78` (`+14.58%`) | **`307.11 ± 11.03`** | **`+23.80%`** | `3.69` -> **`2.95`** | `47.83` -> **`43.09`** | `3.84` -> **`3.35`** |
+| Suite 1 `c2` (`512->128`) | `451.49 ± 3.42` | `497.66 ± 1.00` (`+10.23%`) | **`535.96 ± 22.90`** | **`+18.71%`** | `3.91` -> **`3.26`** | `69.77` -> **`64.01`** | `4.10` -> **`3.65`** |
+| Suite 1 `c4` (`512->128`) | `758.58 ± 7.30` | `805.78 ± 2.18` (`+6.22%`) | **`844.07 ± 26.63`** | **`+11.27%`** | `4.44` -> **`3.96`** | `111.23` -> **`103.72`** | `4.69` -> **`4.33`** |
+| Suite 1 `c8` (`512->128`) | `1,257.85 ± 11.49` | `1,270.24 ± 2.89` (`+0.99%`) | **`1,318.37 ± 14.91`** | **`+4.81%`** | `4.87` -> **`4.68`** | `196.04` -> **`183.20`** | `5.19` -> **`5.10`** |
+| Suite 1 `c16` (`512->128`) | `1,690.35 ± 14.64` | `1,707.63 ± 2.49` (`+1.02%`) | **`1,781.42 ± 6.41`** | **`+5.39%`** | `8.00` -> **`7.62`** | `156.26` -> **`144.59`** | `137.52` -> **`125.72`** |
+| Suite 1 `c32` (`512->128`) | `2,225.78 ± 9.29` | `2,342.80 ± 5.19` (`+5.26%`) | **`2,533.34 ± 7.70`** | **`+13.82%`** | `12.33` -> **`10.80`** | `168.32` -> **`149.71`** | `165.97` -> **`145.06`** |
+| Suite 1 `c64` (`512->128`) | `2,743.41 ± 6.47` | `2,769.50 ± 8.54` (`+0.95%`) | **`3,033.29 ± 16.27`** | **`+10.57%`** | `18.65` -> **`16.97`** | `340.07` -> **`293.06`** | `170.31` -> **`147.98`** |
+| Suite 2 `in512_c1` (`out=256`) | `261.82 ± 0.32` | — | **`307.14 ± 10.01`** | **`+17.31%`** | `3.65` -> **`3.10`** | `47.34` -> **`43.28`** | `3.81` -> **`3.32`** |
+| Suite 2 `in512_c16` (`out=256`) | `1,978.11 ± 3.54` | — | **`2,048.01 ± 38.53`** | **`+3.53%`** | `7.29` -> **`7.07`** | `155.62` -> **`144.90`** | `7.06` -> **`6.92`** |
+| Suite 2 `in512_c128` (`out=256`) | `4,447.25 ± 4.78` | — | **`4,791.36 ± 18.52`** | **`+7.74%`** | `24.44` -> **`22.89`** | `348.96` -> **`300.43`** | `174.36` -> **`150.07`** |
+| Suite 2 `in1024_c1` (`out=256`) | `246.33 ± 0.97` | — | **`288.43 ± 9.29`** | **`+17.09%`** | `3.74` -> **`3.17`** | `87.02` -> **`79.32`** | `3.86` -> **`3.38`** |
+| Suite 2 `in1024_c32` (`out=256`) | `1,961.16 ± 6.22` | — | **`2,166.66 ± 5.43`** | **`+10.48%`** | `14.38` -> **`12.98`** | `179.39` -> **`159.91`** | `179.24` -> **`159.86`** |
+| Suite 2 `in1024_c128` (`out=256`) | `2,675.34 ± 0.30` | — | **`2,956.63 ± 4.68`** | **`+10.51%`** | `40.28` -> **`36.45`** | `382.16` -> **`328.73`** | `194.18` -> **`164.96`** |
+| Suite 3 `in4096_c1` (`out=128`) | `148.64 ± 0.33` | — | **`164.85 ± 0.37`** | **`+10.91%`** | `4.15` -> **`3.75`** | `333.77` -> **`300.52`** | `4.33` -> **`3.92`** |
+| Suite 3 `in4096_c16` (`out=128`) | `369.75 ± 0.72` | — | **`412.22 ± 0.77`** | **`+11.49%`** | `30.65` -> **`27.68`** | `646.54` -> **`578.35`** | `216.62` -> **`193.23`** |
 
 ---
 
@@ -223,8 +248,11 @@ python3 worker/tests/phase3/bench_shmv5_nccl_comm_audit.py \
   --bench-tiers "in512_c1:1:8:512:256;in512_c16:16:48:512:256;in512_c128:128:256:512:256;in1024_c1:1:20:1024:256;in1024_c32:32:200:1024:256;in1024_c128:128:400:1024:256" \
   --metrics-output docs/benchmarks/phase37_zstep_b12x_dsv41_tp8_6tier.json
 
-# ── Phase 2: Qwen3.5-35B-A3B TP=8 (8 × RTX 5090, inside vllm/vllm-openai:v0.33.0) ────
+# ── Phase 2 / Phase 3.9 (Route A): Qwen3.5-35B-A3B TP=8 (8 × RTX 5090 or 8 × RTX 6000D) ─
 export ZSTEP_QWEN35_MODEL_DIR=/path/to/Qwen3.5-35B-A3B
+# 默认开启 Part A1 (ZSTEP_QWEN_ENABLE_FUSED_AR_NORM=1) 与 Part A2 (ZSTEP_QWEN_ENABLE_FUSED_GDN=1)；
+# A1-only 消融传入 ZSTEP_QWEN_ENABLE_FUSED_GDN=0；回退未融合基线同时设两者为 0。
+# Suite 3 长输入 4096->128 需将 --max-pages-per-seq 设为 512（16 tok/page × 512 = 8192 tokens）。
 python3 worker/tests/phase2/collect_vllm_reference.py --mode all --repeats 3 --seed 20261111
 ./target/release/zstep --mode-b --world-size 8 \
   --python /usr/bin/python3 --worker-root ./worker \
