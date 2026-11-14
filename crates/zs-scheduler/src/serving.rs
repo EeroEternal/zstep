@@ -32,7 +32,8 @@ use std::time::Instant;
 
 use zs_kv::{BlockLease, BlockPool, CacheGroupKind};
 use zs_wire::{
-    DECODE_GRAPH_BUCKETS, MAX_DECODE_GRAPH_SEQS, STEP_FLAG_DECODE_ONLY, StepHeader, StepOpcode,
+    DECODE_GRAPH_BUCKETS, MAX_DECODE_GRAPH_SEQS, STEP_FLAG_DECODE_ONLY, STEP_FLAG_DEVICE_TOKENS,
+    STEP_FLAG_NEXT_PREPUBLISHED, StepHeader, StepOpcode,
 };
 
 use crate::mode_b::{ModeBConfig, ModeBCoordinator, ModeBError, Result};
@@ -655,6 +656,7 @@ pub struct ModeBServingEngine {
     worker_numa_nodes: Vec<i32>,
     max_mixed_step_tokens: Option<usize>,
     max_prefill_coalesce_wait_ms: u64,
+    device_token_overlap: bool,
     last_generation_schedule: GenerationScheduleStats,
 }
 
@@ -670,6 +672,21 @@ fn validate_serving_max_seqs(max_seqs: u32) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Whether every active sequence is prompt-complete and still needs a decode step after the
+/// step being planned, given `in_flight` earlier steps whose tokens are not harvested yet.
+fn decode_continues_for_all(
+    active: &[ActiveSequence],
+    waiting_permitted: &VecDeque<PendingRequest>,
+    in_flight: usize,
+) -> bool {
+    waiting_permitted.is_empty()
+        && !active.is_empty()
+        && active.iter().all(|seq| {
+            seq.prefilled_tokens == seq.prompt_tokens.len()
+                && seq.generated_tokens.len() + in_flight + 1 < seq.target_output_len
+        })
 }
 
 fn sync_dirty_page_table_rows(
@@ -724,6 +741,7 @@ impl ModeBServingEngine {
             worker_numa_nodes,
             max_mixed_step_tokens: None,
             max_prefill_coalesce_wait_ms: DEFAULT_PREFILL_COALESCE_WAIT_MS,
+            device_token_overlap: false,
             last_generation_schedule: GenerationScheduleStats::default(),
         })
     }
@@ -756,6 +774,21 @@ impl ModeBServingEngine {
 
     pub fn set_max_prefill_coalesce_wait_ms(&mut self, wait_ms: u64) {
         self.max_prefill_coalesce_wait_ms = wait_ms;
+    }
+
+    /// Publish decode steps before the previous step's result is read. Workers must implement
+    /// `STEP_FLAG_DEVICE_TOKENS` and `STEP_FLAG_NEXT_PREPUBLISHED`.
+    pub fn set_device_token_overlap(&mut self, enabled: bool) {
+        self.device_token_overlap = enabled;
+    }
+
+    fn plan_flags(&mut self, step_id: u64) -> Result<u32> {
+        Ok(self.coordinator.plan_slot_mut(step_id)?.header_mut()?.flags)
+    }
+
+    fn or_plan_flags(&mut self, step_id: u64, bits: u32) -> Result<()> {
+        self.coordinator.plan_slot_mut(step_id)?.header_mut()?.flags |= bits;
+        Ok(())
     }
 
     /// Generate exact greedy completions for `prompts` (`target_output_len` new tokens each).
@@ -981,9 +1014,17 @@ impl ModeBServingEngine {
         let mut slot_to_active: Vec<usize> = vec![usize::MAX; max_seqs];
         let mut consecutive_prefills = 0usize;
         let mut prestaged_step_id: Option<u64> = None;
+        // A decode step published before its predecessor's result was read, and whether its
+        // plan promised that the step after it is also published ahead.
+        let mut published_ahead: Option<(u64, bool)> = None;
 
         while !active.is_empty() || !waiting_permitted.is_empty() || !unpermitted_pool.is_empty() {
-            let step_id = if let Some(ready_step) = prestaged_step_id.take() {
+            let mut ahead_promise = None;
+            let step_id = if let Some((ahead_step, promise)) = published_ahead.take() {
+                *overlapped_out += 1;
+                ahead_promise = Some(promise);
+                ahead_step
+            } else if let Some(ready_step) = prestaged_step_id.take() {
                 *overlapped_out += 1;
                 ready_step
             } else {
@@ -1102,13 +1143,51 @@ impl ModeBServingEngine {
                 sid
             };
 
-            self.coordinator.publish_step(step_id)?;
-            *steps_out += 1;
+            let publish_next = match ahead_promise {
+                Some(promise) => promise,
+                None => {
+                    let promise = self.device_token_overlap
+                        && self.plan_flags(step_id)? & STEP_FLAG_DECODE_ONLY != 0
+                        && decode_continues_for_all(&active, waiting_permitted, 0);
+                    if promise {
+                        self.or_plan_flags(step_id, STEP_FLAG_NEXT_PREPUBLISHED)?;
+                    }
+                    self.coordinator.publish_step(step_id)?;
+                    *steps_out += 1;
+                    promise
+                }
+            };
+
+            // Device-token overlap: while the GPUs run `step_id`, publish the next decode step
+            // from known sequence lengths. Workers take its input tokens from the tokens they
+            // sampled on the GPU, so the GPUs never wait for this loop to read `step_id`'s result.
+            if publish_next {
+                let next_sid = self.step_cursor + 1;
+                self.step_cursor = next_sid;
+                self.last_generation_schedule.decode_steps += 1;
+                self.stage_decode_step(
+                    next_sid,
+                    &mut active,
+                    page_block_tokens,
+                    max_pages_per_seq,
+                    true,
+                )?;
+                let promise = decode_continues_for_all(&active, waiting_permitted, 1);
+                let mut flags = STEP_FLAG_DEVICE_TOKENS;
+                if promise {
+                    flags |= STEP_FLAG_NEXT_PREPUBLISHED;
+                }
+                self.or_plan_flags(next_sid, flags)?;
+                self.coordinator.publish_step(next_sid)?;
+                *steps_out += 1;
+                published_ahead = Some((next_sid, promise));
+            }
 
             // `in_flight_depth = 1` overlap: if no prefills are waiting and every active
             // sequence still needs >= 2 tokens (so none retires after `step_id`), pre-allocate
             // pages and pre-write `plan_slot(step_id + 1)` while the 8 GPUs execute `step_id`.
-            let can_overlap_next = waiting_permitted.is_empty()
+            let can_overlap_next = !publish_next
+                && waiting_permitted.is_empty()
                 && !active.is_empty()
                 && active.iter().all(|seq| {
                     seq.prefilled_tokens == seq.prompt_tokens.len()
@@ -1191,6 +1270,12 @@ impl ModeBServingEngine {
                         });
                     }
                 }
+            }
+
+            // `decode_continues_for_all` guaranteed that no sequence retires after `step_id`.
+            if published_ahead.is_some() {
+                consecutive_prefills = 0;
+                continue;
             }
 
             if let Some(next_sid) = prestaged_step_id {

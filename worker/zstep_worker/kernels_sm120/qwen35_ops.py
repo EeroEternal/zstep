@@ -75,6 +75,55 @@ void launch_tp8_argmax_gather_shm_cuda(
     int vocab_per_rank,
     std::uintptr_t stream_handle);
 
+void launch_decode_select_tokens_cuda(
+    int32_t* tokens,
+    const int32_t* last_tokens,
+    const int32_t* req_slot_ids,
+    const int32_t* mode,
+    int64_t num_rows,
+    std::uintptr_t stream_handle);
+
+void launch_decode_publish_tokens_cuda(
+    int32_t* last_tokens,
+    const int32_t* req_slot_ids,
+    const int32_t* top2_tokens,
+    int64_t num_rows,
+    std::uintptr_t stream_handle);
+
+void launch_decode_select_tokens(
+    torch::Tensor tokens,
+    torch::Tensor last_tokens,
+    torch::Tensor req_slot_ids,
+    torch::Tensor mode,
+    int64_t num_rows,
+    std::uintptr_t stream_handle) {
+    TORCH_CHECK(num_rows <= tokens.numel() && num_rows <= req_slot_ids.numel(),
+                "num_rows exceeds decode token buffers");
+    launch_decode_select_tokens_cuda(
+        tokens.data_ptr<int32_t>(),
+        last_tokens.data_ptr<int32_t>(),
+        req_slot_ids.data_ptr<int32_t>(),
+        mode.data_ptr<int32_t>(),
+        num_rows,
+        stream_handle);
+}
+
+void launch_decode_publish_tokens(
+    torch::Tensor last_tokens,
+    torch::Tensor req_slot_ids,
+    torch::Tensor top2_tokens,
+    int64_t num_rows,
+    std::uintptr_t stream_handle) {
+    TORCH_CHECK(num_rows <= req_slot_ids.numel() && num_rows * 2 <= top2_tokens.numel(),
+                "num_rows exceeds decode token buffers");
+    launch_decode_publish_tokens_cuda(
+        last_tokens.data_ptr<int32_t>(),
+        req_slot_ids.data_ptr<int32_t>(),
+        top2_tokens.data_ptr<int32_t>(),
+        num_rows,
+        stream_handle);
+}
+
 void launch_moe_align_block_size(
     torch::Tensor topk_ids,
     torch::Tensor sorted_pair_ids,
@@ -724,7 +773,8 @@ __global__ void tp8_argmax_gather_shm_kernel(
         return;
     }
 
-    if (rank == 0) {
+    // Every rank merges so each GPU holds the sampled tokens for device-resident decode inputs.
+    {
         for (int64_t r = threadIdx.x; r < num_rows; r += blockDim.x) {
             Top2Acc acc{-1.0e38f, -1, -1.0e38f, -1};
             for (int peer = 0; peer < world_size; ++peer) {
@@ -1451,7 +1501,62 @@ __global__ void gdn_rmsnorm_gated_silu_cuda_kernel(
     *reinterpret_cast<uint2*>(gated_out + row * 512 + base_off) = packed_out;
 }
 
+// When `*mode` is non-zero, each decode row takes the token sampled for its request slot in the
+// previous decode step instead of the host-provided one.
+__global__ void decode_select_tokens_kernel(
+    int32_t* __restrict__ tokens,
+    const int32_t* __restrict__ last_tokens,
+    const int32_t* __restrict__ req_slot_ids,
+    const int32_t* __restrict__ mode,
+    int64_t num_rows) {
+    if (*mode == 0) {
+        return;
+    }
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < num_rows) {
+        tokens[i] = last_tokens[req_slot_ids[i]];
+    }
+}
+
+__global__ void decode_publish_tokens_kernel(
+    int32_t* __restrict__ last_tokens,
+    const int32_t* __restrict__ req_slot_ids,
+    const int32_t* __restrict__ top2_tokens,
+    int64_t num_rows) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < num_rows) {
+        last_tokens[req_slot_ids[i]] = top2_tokens[i * 2];
+    }
+}
+
 }  // namespace
+
+void launch_decode_select_tokens_cuda(
+    int32_t* tokens,
+    const int32_t* last_tokens,
+    const int32_t* req_slot_ids,
+    const int32_t* mode,
+    int64_t num_rows,
+    std::uintptr_t stream_handle) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    const unsigned int blocks = static_cast<unsigned int>((num_rows + 127) / 128);
+    decode_select_tokens_kernel<<<blocks, 128, 0, stream>>>(
+        tokens, last_tokens, req_slot_ids, mode, num_rows);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_decode_publish_tokens_cuda(
+    int32_t* last_tokens,
+    const int32_t* req_slot_ids,
+    const int32_t* top2_tokens,
+    int64_t num_rows,
+    std::uintptr_t stream_handle) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    const unsigned int blocks = static_cast<unsigned int>((num_rows + 127) / 128);
+    decode_publish_tokens_kernel<<<blocks, 128, 0, stream>>>(
+        last_tokens, req_slot_ids, top2_tokens, num_rows);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
 
 void launch_moe_align_block_size_cuda(
     const int32_t* topk_ids,
@@ -1732,7 +1837,7 @@ def get_qwen35_cuda_ext():
     if _QWEN35_EXT is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _QWEN35_EXT = load_inline(
-            name="zstep_qwen35_ops_sm120_v7_ext",
+            name="zstep_qwen35_ops_sm120_v8_ext",
             cpp_sources=[_MOE_ALIGN_CPP],
             cuda_sources=[_MOE_ALIGN_CUDA],
             functions=[
@@ -1742,6 +1847,8 @@ def get_qwen35_cuda_ext():
                 "launch_gdn_decode_cluster2_vk",
                 "launch_gdn_decode_split_vk",
                 "launch_gdn_prefill_vk",
+                "launch_decode_select_tokens",
+                "launch_decode_publish_tokens",
             ],
             extra_cflags=["-O3"],
             extra_cuda_cflags=["-O3", "-gencode=arch=compute_120,code=sm_120"],
