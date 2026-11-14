@@ -541,12 +541,15 @@ __global__ void moe_align_block_size_256_kernel(
     int32_t* __restrict__ num_valid_tiles_out,
     int64_t num_pairs,
     int64_t max_padded_slots) {
+    constexpr int kNumWarps = kNumExperts / 32;
     __shared__ int s_counts[kNumExperts];
-    __shared__ int s_tiles[kNumExperts];
+    __shared__ int s_warp_tiles[kNumWarps];
     __shared__ int s_tile_offsets[kNumExperts + 1];
     __shared__ int s_write_cursor[kNumExperts];
 
     const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
     s_counts[tid] = 0;
     __syncthreads();
 
@@ -558,18 +561,31 @@ __global__ void moe_align_block_size_256_kernel(
     }
     __syncthreads();
 
-    const int count = s_counts[tid];
-    s_tiles[tid] = (count + kBlockM - 1) / kBlockM;
+    // Block-wide exclusive scan of per-expert tile counts (one expert per thread).
+    const int tiles = (s_counts[tid] + kBlockM - 1) / kBlockM;
+    int incl = tiles;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const int up = __shfl_up_sync(0xffffffffu, incl, off);
+        if (lane >= off) incl += up;
+    }
+    if (lane == 31) s_warp_tiles[warp] = incl;
     __syncthreads();
-
-    if (tid == 0) {
-        int running = 0;
-        for (int e = 0; e < kNumExperts; ++e) {
-            s_tile_offsets[e] = running;
-            running += s_tiles[e];
+    if (warp == 0) {
+        int w = lane < kNumWarps ? s_warp_tiles[lane] : 0;
+#pragma unroll
+        for (int off = 1; off < kNumWarps; off <<= 1) {
+            const int up = __shfl_up_sync(0xffffffffu, w, off);
+            if (lane >= off) w += up;
         }
-        s_tile_offsets[kNumExperts] = running;
-        *num_valid_tiles_out = running;
+        if (lane < kNumWarps) s_warp_tiles[lane] = w;
+    }
+    __syncthreads();
+    const int excl = incl - tiles + (warp > 0 ? s_warp_tiles[warp - 1] : 0);
+    s_tile_offsets[tid] = excl;
+    if (tid == kNumExperts - 1) {
+        s_tile_offsets[kNumExperts] = excl + tiles;
+        *num_valid_tiles_out = excl + tiles;
     }
     __syncthreads();
 
@@ -1837,7 +1853,7 @@ def get_qwen35_cuda_ext():
     if _QWEN35_EXT is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _QWEN35_EXT = load_inline(
-            name="zstep_qwen35_ops_sm120_v8_ext",
+            name="zstep_qwen35_ops_sm120_v9_ext",
             cpp_sources=[_MOE_ALIGN_CPP],
             cuda_sources=[_MOE_ALIGN_CUDA],
             functions=[
