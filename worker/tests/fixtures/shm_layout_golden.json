@@ -95,7 +95,7 @@
         "temperatures_offset": 270336,
         "total_slot_bytes": 274432,
         "result_slot_stride": 16384,
-        "layout_hash_hex": "0xd000ab372247b76e"
+        "layout_hash_hex": "0x97bd78fcd5f39c04"
       }
     },
     {
@@ -126,7 +126,7 @@
         "temperatures_offset": 2371584,
         "total_slot_bytes": 2375680,
         "result_slot_stride": 16384,
-        "layout_hash_hex": "0x27f4269c276da805"
+        "layout_hash_hex": "0xb534562826707ecf"
       }
     },
     {
@@ -157,7 +157,7 @@
         "temperatures_offset": 3328,
         "total_slot_bytes": 4096,
         "result_slot_stride": 4096,
-        "layout_hash_hex": "0x587d9ad20b4f0bd8"
+        "layout_hash_hex": "0x6ad84c4fd7611a5a"
       }
     }
   ]

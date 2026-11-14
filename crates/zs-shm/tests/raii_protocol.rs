@@ -216,7 +216,7 @@ fn cross_language_golden_layout_and_hash_parity() {
             ],
             total_slot_bytes: 274432,
             result_slot_stride: 16384,
-            layout_hash: 0xd000_ab37_2247_b76e,
+            layout_hash: 0x97bd_78fc_d5f3_9c04,
         },
         GoldenCase {
             name: "qwen35_tp8_vram32g",
@@ -227,7 +227,7 @@ fn cross_language_golden_layout_and_hash_parity() {
             ],
             total_slot_bytes: 2375680,
             result_slot_stride: 16384,
-            layout_hash: 0x27f4_269c_276d_a805,
+            layout_hash: 0xb534_5628_2670_7ecf,
         },
         GoldenCase {
             name: "odd_prime_bounds",
@@ -245,7 +245,7 @@ fn cross_language_golden_layout_and_hash_parity() {
             ],
             total_slot_bytes: 4096,
             result_slot_stride: 4096,
-            layout_hash: 0x587d_9ad2_0b4f_0bd8,
+            layout_hash: 0x6ad8_4c4f_d761_1a5a,
         },
     ];
 

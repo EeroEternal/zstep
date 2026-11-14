@@ -273,6 +273,8 @@ def compute_layout_hash(layout: StepPlanLayout, result_slot_stride: int) -> int:
         SUPERBLOCK_ABORT_OFFSET,
         WORKER_STATES_OFFSET,
         STEP_FLAG_DECODE_ONLY,
+        STEP_FLAG_DEVICE_TOKENS,
+        STEP_FLAG_NEXT_PREPUBLISHED,
         MAX_DECODE_GRAPH_SEQS,
         SUPERBLOCK_TOTAL_BYTES_OFFSET,
         SUPERBLOCK_PLAN_OFFSETS_OFFSET,

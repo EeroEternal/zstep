@@ -744,3 +744,236 @@ def test_shm_v5_all_reduce_add_rmsnorm_parity_and_lockstep(tmp_path) -> None:
         nprocs=world_size,
         join=True,
     )
+
+
+def test_decode_select_and_publish_tokens_bounds_and_modes() -> None:
+    device = torch.device("cuda", 0)
+    ext = qwen35_ops.get_qwen35_cuda_ext()
+    stream = torch.cuda.current_stream(device).cuda_stream
+
+    active_slots = 4
+    dummy_slot = active_slots
+    last_tokens = torch.tensor([101, 102, 103, 104, 777], dtype=torch.int32, device=device)
+    req_slots = torch.tensor([2, 0, dummy_slot, dummy_slot, -1, 99], dtype=torch.int32, device=device)
+    top2_tokens = torch.tensor(
+        [[501, 500], [601, 600], [-1, -1], [888, 887], [901, 900], [902, 900]],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    # Zero rows must be a safe no-op without launching <<<0, 128>>>.
+    mode = torch.tensor([1], dtype=torch.int32, device=device)
+    tokens = torch.tensor([11, 12, 13, 14, 15, 16], dtype=torch.int32, device=device)
+    ext.launch_decode_publish_tokens(last_tokens, req_slots, top2_tokens, 0, active_slots, stream)
+    ext.launch_decode_select_tokens(tokens, last_tokens, req_slots, mode, 0, active_slots, stream)
+    torch.cuda.synchronize(device)
+    assert last_tokens.cpu().tolist() == [101, 102, 103, 104, 777]
+    assert tokens.cpu().tolist() == [11, 12, 13, 14, 15, 16]
+
+    # Publish updates only `0 <= slot < active_slots` with `tok >= 0`; dummy/OOB slots stay untouched.
+    ext.launch_decode_publish_tokens(last_tokens, req_slots, top2_tokens, 6, active_slots, stream)
+    torch.cuda.synchronize(device)
+    assert last_tokens.cpu().tolist() == [601, 102, 501, 104, 777]
+
+    # Negative token on an active slot must also be ignored so `-1` never poisons `embed_weight`.
+    bad_top2 = torch.tensor([[-1, -1]], dtype=torch.int32, device=device)
+    slot0 = torch.tensor([0], dtype=torch.int32, device=device)
+    ext.launch_decode_publish_tokens(last_tokens, slot0, bad_top2, 1, active_slots, stream)
+    torch.cuda.synchronize(device)
+    assert last_tokens.cpu().tolist() == [601, 102, 501, 104, 777]
+
+    # `mode == 0` preserves host-staged tokens verbatim.
+    mode.zero_()
+    ext.launch_decode_select_tokens(tokens, last_tokens, req_slots, mode, 6, active_slots, stream)
+    torch.cuda.synchronize(device)
+    assert tokens.cpu().tolist() == [11, 12, 13, 14, 15, 16]
+
+    # `mode == 1` gathers `last_tokens[slot]` for active slots and zeroes dummy/OOB rows.
+    mode.fill_(1)
+    ext.launch_decode_select_tokens(tokens, last_tokens, req_slots, mode, 6, active_slots, stream)
+    torch.cuda.synchronize(device)
+    assert tokens.cpu().tolist() == [501, 601, 0, 0, 0, 0]
+
+    # Validation guards reject CPU tensors, bad dtypes, and out-of-range dimensions.
+    cpu_tok = torch.zeros(6, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="must be CUDA"):
+        ext.launch_decode_select_tokens(cpu_tok, last_tokens, req_slots, mode, 6, active_slots, stream)
+    bad_dtype = torch.zeros(6, dtype=torch.int64, device=device)
+    with pytest.raises(RuntimeError, match="must be int32"):
+        ext.launch_decode_select_tokens(bad_dtype, last_tokens, req_slots, mode, 6, active_slots, stream)
+    with pytest.raises(RuntimeError, match="active_slots out of range"):
+        ext.launch_decode_publish_tokens(last_tokens, req_slots, top2_tokens, 6, 99, stream)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires >= 2 GPUs")
+def test_tp8_argmax_shm_all_ranks_populate_outputs() -> None:
+    import ctypes
+    import mmap
+    import struct
+
+    ext = qwen35_ops.get_qwen35_cuda_ext()
+    ar_ext = get_host_mapped_allreduce_extension()
+    rows = 5
+    max_rows_per_step = 8
+    vocab_per_rank = 1024
+    shm_bytes = (256 + 4 * 8 * (max_rows_per_step * 2) * 8 + 4095) & ~4095
+
+    mapping = mmap.mmap(-1, shm_bytes, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+    host_addr = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+    ctypes.memset(host_addr, 0, shm_bytes)
+
+    dev0 = torch.device("cuda", 0)
+    dev1 = torch.device("cuda", 1)
+    with torch.cuda.device(dev0):
+        dptr = ar_ext.register_mapped_host(host_addr, shm_bytes)
+    try:
+        vals0 = torch.tensor(
+            [[5.0, 4.0], [9.5, 8.0], [3.0, 2.0], [7.0, 7.0], [1.0, 0.5]],
+            dtype=torch.float32,
+            device=dev0,
+        )
+        ids0 = torch.tensor(
+            [[10, 20], [30, 40], [50, 60], [70, 80], [90, 100]],
+            dtype=torch.int32,
+            device=dev0,
+        )
+        vals1 = torch.tensor(
+            [[6.0, 4.5], [9.0, 8.5], [3.0, 2.5], [6.5, 6.0], [12.0, 11.0]],
+            dtype=torch.float32,
+            device=dev1,
+        )
+        ids1 = torch.tensor(
+            [[11, 21], [31, 41], [5, 6], [71, 81], [91, 101]],
+            dtype=torch.int32,
+            device=dev1,
+        )
+        out_tok0 = torch.zeros((rows, 2), dtype=torch.int32, device=dev0)
+        out_bits0 = torch.zeros((rows, 2), dtype=torch.int32, device=dev0)
+        step0 = torch.zeros(1, dtype=torch.int64, device=dev0)
+        out_tok1 = torch.zeros((rows, 2), dtype=torch.int32, device=dev1)
+        out_bits1 = torch.zeros((rows, 2), dtype=torch.int32, device=dev1)
+        step1 = torch.zeros(1, dtype=torch.int64, device=dev1)
+
+        s0 = torch.cuda.Stream(device=dev0)
+        s1 = torch.cuda.Stream(device=dev1)
+        for _ in range(5):
+            with torch.cuda.stream(s0):
+                ext.launch_tp8_argmax_gather_shm(
+                    vals0,
+                    ids0,
+                    out_tok0,
+                    out_bits0,
+                    step0,
+                    dptr,
+                    rows,
+                    max_rows_per_step,
+                    0,
+                    2,
+                    vocab_per_rank,
+                    s0.cuda_stream,
+                )
+            with torch.cuda.stream(s1):
+                ext.launch_tp8_argmax_gather_shm(
+                    vals1,
+                    ids1,
+                    out_tok1,
+                    out_bits1,
+                    step1,
+                    dptr,
+                    rows,
+                    max_rows_per_step,
+                    1,
+                    2,
+                    vocab_per_rank,
+                    s1.cuda_stream,
+                )
+        s0.synchronize()
+        s1.synchronize()
+
+        expected_toks = [
+            [vocab_per_rank + 11, 10],
+            [30, vocab_per_rank + 31],
+            [50, vocab_per_rank + 5],
+            [70, 80],
+            [vocab_per_rank + 91, vocab_per_rank + 101],
+        ]
+        assert out_tok0.cpu().tolist() == expected_toks
+        assert out_tok1.cpu().tolist() == expected_toks
+        assert out_bits0.cpu().tolist() == out_bits1.cpu().tolist()
+        top1_vals = [
+            struct.unpack("<f", struct.pack("<I", b[0] & 0xFFFF_FFFF))[0]
+            for b in out_bits1.cpu().tolist()
+        ]
+        assert top1_vals == [6.0, 9.5, 3.0, 7.0, 12.0]
+    finally:
+        torch.cuda.synchronize(dev0)
+        torch.cuda.synchronize(dev1)
+        with torch.cuda.device(dev0):
+            ar_ext.unregister_mapped_host(host_addr)
+        mapping.close()
+
+
+def test_moe_align_block_size_256_all_warps_scan() -> None:
+    device = torch.device("cuda", 0)
+    ext = qwen35_ops.get_qwen35_cuda_ext()
+    stream = torch.cuda.current_stream(device).cuda_stream
+    block_m = 16
+    num_experts = 256
+
+    # Populate non-zero expert assignments across all 8 warps (including >1 tile in several experts).
+    expert_list: list[int] = []
+    for warp in range(8):
+        e_a = warp * 32 + warp
+        e_b = warp * 32 + 31
+        expert_list.extend([e_a] * (block_m + 3 + warp))
+        expert_list.extend([e_b] * (5 + warp))
+    # Pad to a multiple of top_k=8 as `topk_ids` expects flattened `(rows * 8,)`.
+    while len(expert_list) % 8 != 0:
+        expert_list.append(255)
+
+    g = torch.Generator().manual_seed(20261114)
+    perm = torch.randperm(len(expert_list), generator=g).tolist()
+    shuffled = [expert_list[i] for i in perm]
+    num_pairs = len(shuffled)
+    max_tiles = (num_pairs + block_m - 1) // block_m + num_experts
+    max_padded_slots = max_tiles * block_m
+
+    topk_ids = torch.tensor(shuffled, dtype=torch.int32, device=device)
+    sorted_pair_ids = torch.empty(max_padded_slots, dtype=torch.int32, device=device)
+    expert_ids_per_tile = torch.empty(max_tiles, dtype=torch.int32, device=device)
+    num_valid_tiles = torch.zeros(1, dtype=torch.int32, device=device)
+
+    ext.launch_moe_align_block_size(
+        topk_ids, sorted_pair_ids, expert_ids_per_tile, num_valid_tiles, num_pairs, stream
+    )
+    torch.cuda.synchronize(device)
+
+    counts = [0] * num_experts
+    for e in shuffled:
+        counts[e] += 1
+    expected_tiles_per_expert = [(c + block_m - 1) // block_m for c in counts]
+    expected_total_tiles = sum(expected_tiles_per_expert)
+    assert int(num_valid_tiles.item()) == expected_total_tiles
+
+    tiles_cpu = expert_ids_per_tile[:expected_total_tiles].cpu().tolist()
+    expected_tile_experts: list[int] = []
+    for e, t in enumerate(expected_tiles_per_expert):
+        expected_tile_experts.extend([e] * t)
+    assert tiles_cpu == expected_tile_experts
+
+    slots_cpu = sorted_pair_ids[: expected_total_tiles * block_m].cpu().tolist()
+    seen_pairs: list[int] = []
+    cursor = 0
+    for e, c in enumerate(counts):
+        t = (c + block_m - 1) // block_m
+        if t == 0:
+            continue
+        seg = slots_cpu[cursor * block_m : (cursor + t) * block_m]
+        valid = [p for p in seg if p != -1]
+        assert len(valid) == c
+        assert all(shuffled[p] == e for p in valid)
+        assert seg[c:] == [-1] * (t * block_m - c)
+        seen_pairs.extend(valid)
+        cursor += t
+    assert sorted(seen_pairs) == list(range(num_pairs))
+

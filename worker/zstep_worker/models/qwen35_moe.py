@@ -855,6 +855,7 @@ class Qwen35MoeStepRunner:
             self.dec_req_slot_ids_gpu,
             self.dec_mode_gpu,
             bucket,
+            self.max_seqs,
             stream_handle,
         )
         torch.index_select(
@@ -982,6 +983,7 @@ class Qwen35MoeStepRunner:
             self.dec_req_slot_ids_gpu,
             self.out_tokens_gpu,
             bucket,
+            self.max_seqs,
             stream_handle,
         )
 

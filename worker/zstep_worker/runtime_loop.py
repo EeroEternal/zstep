@@ -54,6 +54,7 @@ from zstep_worker.numa_pin import (
 )
 from zstep_worker.shm_bridge import (
     STEP_FLAG_DECODE_ONLY,
+    STEP_FLAG_DEVICE_TOKENS,
     STEP_FLAG_NEXT_PREPUBLISHED,
     SeqResult,
     ShmBridge,
@@ -570,11 +571,24 @@ class RuntimeLoop:
                         break
                     if header.opcode != OPCODE_NORMAL_STEP:
                         raise RuntimeError(f"unsupported step opcode {header.opcode}")
+                    overlap_flags = header.flags & (
+                        STEP_FLAG_DEVICE_TOKENS | STEP_FLAG_NEXT_PREPUBLISHED
+                    )
                     if not pipelined:
+                        if overlap_flags != 0:
+                            raise RuntimeError(
+                                f"step {header.step_id} set overlap flags {overlap_flags:#x} "
+                                f"on non-pipelined runner {type(self.runner).__name__}"
+                            )
                         outputs, gpu_exec_us = self.runner.execute(plan, header)
                         self._complete_step(header.step_id, outputs, gpu_exec_us, watched_count)
                         continue
                     is_decode = (header.flags & STEP_FLAG_DECODE_ONLY) != 0
+                    if not is_decode and overlap_flags != 0:
+                        raise RuntimeError(
+                            f"non-decode step {header.step_id} must not set overlap flags "
+                            f"{overlap_flags:#x}"
+                        )
                     if pending is not None and not is_decode:
                         # Only decode steps double-buffer their host staging.
                         self._finish_pending(pending, watched_count)

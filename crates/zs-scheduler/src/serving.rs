@@ -657,6 +657,7 @@ pub struct ModeBServingEngine {
     max_mixed_step_tokens: Option<usize>,
     max_prefill_coalesce_wait_ms: u64,
     device_token_overlap: bool,
+    poisoned: bool,
     last_generation_schedule: GenerationScheduleStats,
 }
 
@@ -742,6 +743,7 @@ impl ModeBServingEngine {
             max_mixed_step_tokens: None,
             max_prefill_coalesce_wait_ms: DEFAULT_PREFILL_COALESCE_WAIT_MS,
             device_token_overlap: false,
+            poisoned: false,
             last_generation_schedule: GenerationScheduleStats::default(),
         })
     }
@@ -776,8 +778,11 @@ impl ModeBServingEngine {
         self.max_prefill_coalesce_wait_ms = wait_ms;
     }
 
-    /// Publish decode steps before the previous step's result is read. Workers must implement
-    /// `STEP_FLAG_DEVICE_TOKENS` and `STEP_FLAG_NEXT_PREPUBLISHED`.
+    /// Publish decode steps before the previous step's result is read.
+    ///
+    /// Workers must implement `launch`/`finish`, `STEP_FLAG_DEVICE_TOKENS`, and
+    /// `STEP_FLAG_NEXT_PREPUBLISHED`, and must not rely on host-updated `engram_prev_window`
+    /// during overlapped decode bursts (enable only for models without host Engram lookback).
     pub fn set_device_token_overlap(&mut self, enabled: bool) {
         self.device_token_overlap = enabled;
     }
@@ -1003,6 +1008,12 @@ impl ModeBServingEngine {
         steps_out: &mut u64,
         overlapped_out: &mut u64,
     ) -> Result<()> {
+        if self.poisoned {
+            return Err(ModeBError::Protocol(
+                "serving engine is poisoned after a failed in-flight step".to_owned(),
+            ));
+        }
+        self.poisoned = true;
         let geometry = self.coordinator.config().geometry;
         let max_seqs = geometry.max_seqs as usize;
         let max_step_tokens = geometry.max_step_tokens as usize;
@@ -1345,6 +1356,7 @@ impl ModeBServingEngine {
                 }
             }
         }
+        self.poisoned = false;
         Ok(())
     }
 
@@ -1922,12 +1934,24 @@ impl ModeBServingEngine {
     }
 
     pub fn shutdown(mut self) -> Result<()> {
+        if self.poisoned {
+            return Err(ModeBError::Protocol(
+                "cannot gracefully shut down engine after failed in-flight step; cluster aborted"
+                    .to_owned(),
+            ));
+        }
         self.step_cursor += 1;
         let stop_step = self.step_cursor;
         self.coordinator.shutdown_and_wait(stop_step)
     }
 
     pub fn shutdown_with_stats(mut self) -> Result<(u32, u32)> {
+        if self.poisoned {
+            return Err(ModeBError::Protocol(
+                "cannot gracefully shut down engine after failed in-flight step; cluster aborted"
+                    .to_owned(),
+            ));
+        }
         self.step_cursor += 1;
         let stop_step = self.step_cursor;
         self.coordinator.shutdown_and_wait_with_stats(stop_step)
@@ -2390,5 +2414,56 @@ mod tests {
         seq.generated_tokens.push(203);
         assert_eq!(seq.lookback_window(4), [102, 201, 202]);
         assert_eq!(seq.lookback_window(5), [201, 202, 203]);
+    }
+
+    #[test]
+    fn decode_continues_for_all_respects_inflight_prefill_and_waiting() {
+        let slot_pool = SlotPool::new(2);
+        let now = Instant::now();
+        let make_seq = |slot_pool: &SlotPool, prefilled: usize, generated: usize, target: usize| {
+            ActiveSequence {
+                request_id: 0,
+                slot_lease: slot_pool.allocate().expect("slot"),
+                kv_leases: Vec::new(),
+                page_ids: Vec::new(),
+                prompt_tokens: vec![10, 20, 30, 40],
+                prefilled_tokens: prefilled,
+                current_seq_len: prefilled + generated.saturating_sub(1),
+                last_token: 99,
+                generated_tokens: vec![99; generated],
+                generated_top2: Vec::new(),
+                target_output_len: target,
+                permit_time: now,
+                submit_time: now,
+                first_token_time: None,
+                last_token_time: None,
+            }
+        };
+
+        let empty_waiting = VecDeque::new();
+        assert!(!decode_continues_for_all(&[], &empty_waiting, 0));
+
+        // 1 generated out of 4: in_flight=0 -> 1+0+1=2 < 4 (true); in_flight=1 -> 1+1+1=3 < 4 (true);
+        // in_flight=2 -> 1+2+1=4 < 4 (false, retires right after planned step).
+        let active = vec![make_seq(&slot_pool, 4, 1, 4)];
+        assert!(decode_continues_for_all(&active, &empty_waiting, 0));
+        assert!(decode_continues_for_all(&active, &empty_waiting, 1));
+        assert!(!decode_continues_for_all(&active, &empty_waiting, 2));
+
+        // Waiting permitted request blocks overlap so prefill interleaving is not starved.
+        let mut non_empty_waiting = VecDeque::new();
+        non_empty_waiting.push_back(PendingRequest {
+            request_id: 1,
+            prompt_tokens: vec![1, 2],
+            target_output_len: 4,
+            permit_time: now,
+            submit_time: now,
+        });
+        assert!(!decode_continues_for_all(&active, &non_empty_waiting, 0));
+        drop(active);
+
+        // Partial prefill sequence in `active` blocks decode-only pre-publishing.
+        let partial = vec![make_seq(&slot_pool, 2, 0, 4)];
+        assert!(!decode_continues_for_all(&partial, &empty_waiting, 0));
     }
 }

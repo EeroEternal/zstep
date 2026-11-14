@@ -139,7 +139,7 @@ pub struct SeqStepOutput {
    * Python/C Worker 从 `plan_efd` 醒来后，通过 C 扩展或原子读取执行 `Acquire` 栅栏读取 `step_id`，确保所有数组字节对当前 CPU 核及随后的 DMA 引擎完全可见。
 2. **零孤儿进程（`PR_SET_PDEATHSIG`）、即时 `shm_unlink` 与广播中止（`SUPERBLOCK_ABORT_OFFSET`）**：
    * 8 个 Worker 子进程启动时设置 `prctl(PR_SET_PDEATHSIG, SIGTERM)` 并安装 `SIGTERM`/`SIGINT` 信号处理器；Rust 主控在全部 8 个 Worker 完成 `mmap` 挂载握手后**立即执行 `SharedMemoryArena::unlink_now()`**（数据面 `shm_v5` AllReduce/AllGather 与 `HostMappedShmArgmax` 同样在 `dist.barrier` 后立即 `os.unlink`），因此即使遭遇 `SIGKILL` 极端断电/强杀，`/dev/shm` 也保持 **0 文件残留**。
-   * `ShmSuperblock` 显式携带 `result_slot_stride`（offset `96`）、`layout_hash`（offset `104`，64-bit FNV-1a 摘要，同时覆盖 `ZSTEP_PROTOCOL_VERSION`、全部 POD 关键字段偏移、`STEP_FLAG_DECODE_ONLY` 与 `StepPlanLayout` 切片偏移）与 `max_decode_graph_seqs = 128`（offset `112`，紧邻 `_pad_u32` offset `116`），Python `ShmBridge` 在挂载时逐项强校验；`SUPERBLOCK_ABORT_OFFSET = 128` 提供无锁全局中止位，Worker 通过 `poll(plan_efd, 250ms)` 与后台心跳线程感知异常并立即中断 GPU 集体通信自旋。
+   * `ShmSuperblock` 显式携带 `result_slot_stride`（offset `96`）、`layout_hash`（offset `104`，64-bit FNV-1a 摘要，同时覆盖 `ZSTEP_PROTOCOL_VERSION`、全部 POD 关键字段偏移、`STEP_FLAG_DECODE_ONLY` / `STEP_FLAG_DEVICE_TOKENS` / `STEP_FLAG_NEXT_PREPUBLISHED` 与 `StepPlanLayout` 切片偏移）与 `max_decode_graph_seqs = 128`（offset `112`，紧邻 `_pad_u32` offset `116`），Python `ShmBridge` 在挂载时逐项强校验；`SUPERBLOCK_ABORT_OFFSET = 128` 提供无锁全局中止位，Worker 通过 `poll(plan_efd, 250ms)` 与后台心跳线程感知异常并立即中断 GPU 集体通信自旋。
    * `WorkerSlotState` 独立字段 `triton_recompilations`（offset `44`）与 `watched_kernels`（offset `48`）按 Rank 汇报 Triton JIT 编译增量，不再复用 `StepResultHeader` 状态位。
 
 ---

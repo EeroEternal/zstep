@@ -343,6 +343,8 @@ impl StepPlanLayout {
             SUPERBLOCK_ABORT_OFFSET as u64,
             WORKER_STATES_OFFSET as u64,
             STEP_FLAG_DECODE_ONLY as u64,
+            STEP_FLAG_DEVICE_TOKENS as u64,
+            STEP_FLAG_NEXT_PREPUBLISHED as u64,
             MAX_DECODE_GRAPH_SEQS as u64,
             std::mem::offset_of!(ShmSuperblock, total_shm_bytes) as u64,
             std::mem::offset_of!(ShmSuperblock, plan_slot_offsets) as u64,
