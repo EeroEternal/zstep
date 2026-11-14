@@ -23,7 +23,7 @@ b12x 3.6/3.7: vllm/vllm-openai:v0.31.0 + read-only mount of `flashinfer/experime
 
 ## 2. 归档文件总览
 
-共有 **32 份主 JSON + 19 份 vLLM 逐轮/warmup 原始 JSON = 51 份 JSON**。
+共有 **33 份主 JSON + 19 份 vLLM 逐轮/warmup 原始 JSON = 52 份 JSON**。
 
 | 阶段 | 文件 | 内容 |
 | :--- | :--- | :--- |
@@ -60,6 +60,7 @@ b12x 3.6/3.7: vllm/vllm-openai:v0.31.0 + read-only mount of `flashinfer/experime
 | Phase 3.7 | [`phase37_zstep_b12x_dsv41_tp8_6tier.json`](phase37_zstep_b12x_dsv41_tp8_6tier.json) | **Phase 3.7 套件二主结果**（`git_commit=d497e85`）：`zstep 3.7 + b12x` 六档交错无缓存独立种子 `n=3`（峰值 `1,717.41 tok/s` 输出 / `5,945.57 tok/s` 总吞吐） |
 | Phase 3.7 | [`phase37_b12x_greedy_parity_report.json`](phase37_b12x_greedy_parity_report.json) | `zstep 3.7 + b12x`（`git_sha=d497e85...`，`moe=40, lin=210/6, unprepared_warnings=0`）全局 Top-2 贪心审计（`prime_squares_table` `128/128` 100% 匹配，零重编译） |
 | Phase 3.7 | [`phase37_6000d_comm_audit.json`](phase37_6000d_comm_audit.json) | **`zstep#14` 8 卡通信与 PCIe ACS/CX-8（`15b3:197c`）审计**：`H=2048` / `H=5120` AllReduce 与 `[M, 640]->[M, 5120]` AllGather（`shm_v5_prod` 自适应 `256->512` 线程 + `64 KiB` One-Shot vs 旧基线 / `nodone` / `pkt64` / `NCCL_LOC`）、SM BAR MMIO `UR` 证明与 `DeepSeek-V4.1` Amdahl 消融 |
+| Phase 3.8 | [`phase38_6000d_flashinfer_ops_audit.json`](phase38_6000d_flashinfer_ops_audit.json) | **SM120 `FlashInfer` 实验算子筛选与 `TP=8` 端到端审计**（`ae58183f`）：`b12x` 新旧对比、`sm12x_mega_gate`（`M >= 32`）门限消融、分页 Decode `sm120_dsa_indexer`（8 层 CUDAGraph `3.55×..4.33×`）、淘汰项负向实证及三套件 12 档 Warm `n=3` 结果（`in1024_c128` 突破 `6,005.25 tok/s`） |
 
 ---
 

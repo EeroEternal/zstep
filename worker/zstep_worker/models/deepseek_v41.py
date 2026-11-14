@@ -42,9 +42,12 @@ import torch
 import torch.distributed as dist
 
 from zstep_worker.kernels_sm120.b12x_dsv41 import (
+    SM120_DSA_CANDIDATE_COVER_TOKENS,
     B12xPrepareSummary,
     close_b12x_dsv41_model,
     install_b12x_dsv41_quant_patches,
+    install_sm120_dsa_indexer_patches,
+    is_sm120_dsa_decode_available,
     prepare_b12x_dsv41_model,
 )
 from zstep_worker.kernels_sm120.shm_allreduce import (
@@ -164,8 +167,17 @@ def apply_vllm_sm120_dsv41_patches() -> None:
     comp_cache_cls.bind_kv_cache = _patched_comp_bind
 
     orig_get_paged_meta = mla_indexer.get_paged_mqa_logits_metadata
+    skip_paged_meta_state: list[bool] = [False]
+    empty_sched_by_dev: dict[torch.device, torch.Tensor] = {}
 
     def _patched_get_paged_meta(context_lens, block_kv, num_sms, *args, **kwargs):
+        if skip_paged_meta_state[0]:
+            dev = context_lens.device
+            empty = empty_sched_by_dev.get(dev)
+            if empty is None:
+                empty = torch.empty((0, 2), dtype=torch.int32, device=dev)
+                empty_sched_by_dev[dev] = empty
+            return empty
         effective_block_kv = 64 if block_kv == 128 else block_kv
         return orig_get_paged_meta(
             context_lens, effective_block_kv, num_sms, *args, **kwargs
@@ -180,6 +192,12 @@ def apply_vllm_sm120_dsv41_patches() -> None:
     def _patched_idx_builder_init(self, *args, block_table_width: int, **kwargs):
         orig_idx_builder_init(
             self, *args, block_table_width=block_table_width, **kwargs
+        )
+        self._sm120_dsa_decode_active = bool(
+            is_sm120_dsa_decode_available()
+            and not self.use_pcp
+            and self.dcp_world_size <= 1
+            and not self.supports_varlen
         )
         self._sm120_split_cr1_64 = (
             self.compress_ratio == 1 and self.kv_cache_spec.num_states == 128
@@ -198,9 +216,24 @@ def apply_vllm_sm120_dsv41_patches() -> None:
     def _patched_idx_builder_build(
         self, common_prefix_len, common_attn_metadata, fast_build: bool = False
     ):
-        meta = orig_idx_builder_build(
-            self, common_prefix_len, common_attn_metadata, fast_build=fast_build
+        compressed_max_seq = (
+            int(common_attn_metadata.max_seq_len) + self.compress_ratio - 1
+        ) // self.compress_ratio
+        skip_sched = bool(
+            getattr(self, "_sm120_dsa_decode_active", False)
+            and (
+                self.compress_ratio > 1
+                or compressed_max_seq <= SM120_DSA_CANDIDATE_COVER_TOKENS
+            )
         )
+        prev_skip = skip_paged_meta_state[0]
+        skip_paged_meta_state[0] = skip_sched
+        try:
+            meta = orig_idx_builder_build(
+                self, common_prefix_len, common_attn_metadata, fast_build=fast_build
+            )
+        finally:
+            skip_paged_meta_state[0] = prev_skip
         if getattr(self, "_sm120_split_cr1_64", False):
             if meta.prefill is not None:
                 for chunk in meta.prefill.chunks:
@@ -237,6 +270,7 @@ def apply_vllm_sm120_dsv41_patches() -> None:
     idx_builder_cls.__init__ = _patched_idx_builder_init
     idx_builder_cls.build = _patched_idx_builder_build
     install_b12x_dsv41_quant_patches()
+    install_sm120_dsa_indexer_patches()
 
 
 @dataclass
@@ -568,6 +602,11 @@ class DeepSeekV41StepRunner:
         self.start_event: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
         self.end_event: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
         self.max_graph_bucket: int = min(self.geometry.max_seqs, 128)
+        self.decode_graph_max_seq_len: int = (
+            min(self.max_model_len, SM120_DSA_CANDIDATE_COVER_TOKENS)
+            if self.b12x_summary.dsa_decode_enabled
+            else self.max_model_len
+        )
 
         self._warmup_and_capture_decode_graphs()
 
@@ -931,6 +970,7 @@ class DeepSeekV41StepRunner:
             ([512] * 8, 0),
             ([1024] * 4, 0),
             ([2048, 2048], 0),
+            ([1], 2560),
             ([24], 2560),
             ([17, 24, 13], 2560),
             ([64, 64], 2560),
@@ -1058,7 +1098,7 @@ class DeepSeekV41StepRunner:
                     num_reqs=warm_b,
                     num_tokens=warm_b,
                     max_query_len=1,
-                    max_seq_len=self.max_model_len,
+                    max_seq_len=self.decode_graph_max_seq_len,
                     qsl_gpu=self.decode_qsl_gpu[: warm_b + 1],
                     qsl_cpu=self.decode_qsl_cpu[: warm_b + 1],
                     seq_lens_gpu=self.seq_lens_gpu[:warm_b],
@@ -1147,7 +1187,7 @@ class DeepSeekV41StepRunner:
                         num_reqs=b,
                         num_tokens=b,
                         max_query_len=1,
-                        max_seq_len=self.max_model_len,
+                        max_seq_len=self.decode_graph_max_seq_len,
                         qsl_gpu=self.decode_qsl_gpu[: b + 1],
                         qsl_cpu=self.decode_qsl_cpu[: b + 1],
                         seq_lens_gpu=self.seq_lens_gpu[:b],
@@ -1177,7 +1217,7 @@ class DeepSeekV41StepRunner:
                     num_reqs=b,
                     num_tokens=b,
                     max_query_len=1,
-                    max_seq_len=self.max_model_len,
+                    max_seq_len=self.decode_graph_max_seq_len,
                     qsl_gpu=self.decode_qsl_gpu[: b + 1],
                     qsl_cpu=self.decode_qsl_cpu[: b + 1],
                     seq_lens_gpu=self.seq_lens_gpu[:b],
@@ -1217,9 +1257,22 @@ class DeepSeekV41StepRunner:
                 if self.b12x_summary.enabled
                 else "b12x=off"
             )
+            mg_info = (
+                f"mega_gate=on({self.b12x_summary.mega_gate_layers}/"
+                f"{self.b12x_summary.mega_gate_schedules},"
+                f"min_m={self.b12x_summary.mega_gate_min_tokens})"
+                if self.b12x_summary.mega_gate_layers > 0
+                else "mega_gate=off"
+            )
+            dsa_info = (
+                f"dsa_decode=on(cg_max_seq={self.decode_graph_max_seq_len})"
+                if self.b12x_summary.dsa_decode_enabled
+                else "dsa_decode=off"
+            )
             print(
                 f"[DeepSeekV41StepRunner] ready: max_model_len={self.max_model_len} "
-                f"kv_pages={self.num_kv_pages} buckets={buckets} {b12x_info} "
+                f"kv_pages={self.num_kv_pages} buckets={buckets} "
+                f"{b12x_info} {mg_info} {dsa_info} "
                 f"shm_ar_warm={self.shm_ar_calls} shm_ag_warm={self.shm_ag_calls} "
                 f"nccl_large_warm={self.nccl_eager_large_calls} "
                 f"nccl_fallback_warm={self.nccl_fallback_calls}",
@@ -1271,7 +1324,7 @@ class DeepSeekV41StepRunner:
         is_decode = (header.flags & STEP_FLAG_DECODE_ONLY) != 0
 
         self.start_event.record()
-        if is_decode:
+        if is_decode and int(seq_lens_np.max()) <= self.decode_graph_max_seq_len:
             bucket = select_decode_bucket(num_seqs, self.max_graph_bucket)
             active_pt = pt_np[slot_np, :] + 1
 
@@ -1345,7 +1398,7 @@ class DeepSeekV41StepRunner:
                 num_reqs=bucket,
                 num_tokens=bucket,
                 max_query_len=1,
-                max_seq_len=self.max_model_len,
+                max_seq_len=self.decode_graph_max_seq_len,
                 qsl_gpu=self.decode_qsl_gpu[: bucket + 1],
                 qsl_cpu=self.decode_qsl_cpu[: bucket + 1],
                 seq_lens_gpu=self.seq_lens_gpu[:bucket],
