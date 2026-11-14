@@ -6,6 +6,7 @@ members = [
     "crates/zs-kv",
     "crates/zs-scheduler",
     "crates/zs-server",
+    "crates/zs-tokenizer",
 ]
 
 [workspace.package]

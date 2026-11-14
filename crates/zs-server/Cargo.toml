@@ -1,20 +1,32 @@
 [package]
 name = "zs-server"
-description = "zstep master CLI: continuous-batching scheduler, Top-2 greedy verifier, and benchmark driver"
+description = "zstep master CLI: continuous-batching scheduler, online OpenAI HTTP server, Top-2 greedy verifier, and benchmark driver"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "zs_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "zstep"
-path = "src/main.rs"
+path = "src/bin/zstep.rs"
+
+[[bin]]
+name = "zs-server"
+path = "src/bin/zs-server.rs"
 
 [dependencies]
+axum = "0.7"
+futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-zs-scheduler = { path = "../zs-scheduler" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 zs-kv = { path = "../zs-kv" }
+zs-scheduler = { path = "../zs-scheduler" }
+zs-tokenizer = { path = "../zs-tokenizer" }
 zs-wire = { path = "../zs-wire" }
 
 [lints]
