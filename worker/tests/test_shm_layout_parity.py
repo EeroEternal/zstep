@@ -600,6 +600,7 @@ def test_runtime_loop_rejects_invalid_overlap_flags(
         shm_path.unlink(missing_ok=True)
 
 
+@pytest.mark.skipif(not hasattr(os, "eventfd"), reason="Linux eventfd required")
 def test_runtime_loop_missing_torch_guard_allows_fake_runner_and_rejects_real_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
