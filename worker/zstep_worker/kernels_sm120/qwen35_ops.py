@@ -2482,12 +2482,14 @@ def _gated_delta_decode_kernel(
     softplus = tl.where(sp_in > 20.0, sp_in, tl.log(1.0 + tl.exp(sp_in)))
     decay = tl.exp(-tl.exp(a_log) * softplus)
 
+    # The register tile is [K, V] but ssm_state is stored [V, K], the layout the SM120 CUDA
+    # GDN kernels use, so both paths can update the same state tensor.
     ssm_ptrs = (
         ssm_state_ptr
         + slot * stride_ssm_slot
         + v_head * stride_ssm_head
-        + offs_k[:, None] * 128
-        + offs_v[None, :]
+        + offs_v[None, :] * 128
+        + offs_k[:, None]
     )
     if pos == 0:
         state = tl.zeros([128, BLOCK_V], dtype=tl.float32)
@@ -2536,12 +2538,13 @@ def _gated_delta_prefill_varlen_kernel(
     offs_k = tl.arange(0, 128)
     offs_v = v_blk * BLOCK_V + tl.arange(0, BLOCK_V)
 
+    # ssm_state is stored [V, K]; see `_gated_delta_decode_kernel`.
     ssm_ptrs = (
         ssm_state_ptr
         + slot * stride_ssm_slot
         + v_head * stride_ssm_head
-        + offs_k[:, None] * 128
-        + offs_v[None, :]
+        + offs_v[None, :] * 128
+        + offs_k[:, None]
     )
     if start_pos == 0:
         state = tl.zeros([128, BLOCK_V], dtype=tl.float32)
