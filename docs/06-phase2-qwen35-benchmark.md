@@ -139,7 +139,7 @@ Stage 4 最新的 200 步、8 GPU 记录（[`phase1_mode_b_8gpu.json`](benchmark
 
 ## 7. Phase 3.9（`8 × RTX 6000D` Route A）：`shm_v5` Stage-2 尾融合与 SM120 `[V, K]` `GatedDeltaNet` 审计及 `TP=8` 实测
 
-本节归档 Route A 在 `Host B`（`8 × NVIDIA RTX 6000D`，`sm_120`，`156 SMs`，`85,651 MiB` GDDR7，2-NUMA `[0,0,0,0,1,1,1,1]`，`20 × Mellanox CX-8` 桥 `ACSCtl=0x001d` 强制 CNS 主机内存路径）上针对通用跨卡通信尾融合（Part A1）与 `Qwen3.5-35B-A3B` 30 层线性注意力 `Qwen3_5MoeGatedDeltaNet`（Part A2）的单算子微基准、数值逐位对齐审计及 `TP=8` 真权重三套共 15 档 Warm `n=3` A/B 主结果（原始数据归档于 [`phase39_6000d_qwen35_route_a_audit.json`](benchmarks/phase39_6000d_qwen35_route_a_audit.json)，基线 `main` `893495c4` vs 候选 `98724b4c`）。
+本节归档 Route A 在 `Host B`（`8 × NVIDIA RTX 6000D`，`sm_120`，`156 SMs`，`85,651 MiB` GDDR7，2-NUMA `[0,0,0,0,1,1,1,1]`，`20 × Mellanox CX-8` 桥 `ACSCtl=0x001d` 强制 CNS 主机内存路径）上针对通用跨卡通信尾融合（Part A1）与 `Qwen3.5-35B-A3B` 30 层线性注意力 `Qwen3_5MoeGatedDeltaNet`（Part A2）的单算子微基准、数值逐位对齐审计及 `TP=8` 真权重三套共 15 档 Warm `n=3` A/B 主结果（单算子延迟与逐位对齐生成脚本：[`bench_sm120_qwen35_route_a_ops.py`](../worker/tests/phase3/bench_sm120_qwen35_route_a_ops.py)；原始数据归档于 [`phase39_6000d_qwen35_route_a_audit.json`](benchmarks/phase39_6000d_qwen35_route_a_audit.json)，基线 `main` `893495c4` vs 候选 `98724b4c`）。
 
 ### 7.1 Part A1：`shm_v5` 非交错对端预取与 Stage-2 `AllReduce + Residual Add + RMSNorm` 尾融合
 
@@ -216,3 +216,53 @@ Stage 4 最新的 200 步、8 GPU 记录（[`phase1_mode_b_8gpu.json`](benchmark
 | Suite 2 `in1024_c128` | `2,675.34 ± 0.30` | **`2,956.63 ± 4.68`** | **`+10.51%`** | `13,376.69` -> **`14,783.15`** | `40.28` -> **`36.45`** | `382.16` -> **`328.73`** | `194.18` -> **`164.96`** |
 | Suite 3 `in4096_c1` | `148.64 ± 0.33` | **`164.85 ± 0.37`** | **`+10.91%`** | `4,905.04` -> **`5,440.10`** | `4.15` -> **`3.75`** | `333.77` -> **`300.52`** | `4.33` -> **`3.92`** |
 | Suite 3 `in4096_c16` | `369.75 ± 0.72` | **`412.22 ± 0.77`** | **`+11.49%`** | `12,201.71` -> **`13,603.36`** | `30.65` -> **`27.68`** | `646.54` -> **`578.35`** | `216.62` -> **`193.23`** |
+
+---
+
+## 8. Phase 3.10（PR `#21` + `#16` + `#19` 合入审计）：设备驻留 Token 跨步流水重叠与并行 `moe_align`（`8 × RTX 6000D`, Warm `n=3`）
+
+在 Phase 3.9 Route A（`#20`）基础上，`main` 依次合入三项控制面/数据面协同变更，并在同台 `8 × NVIDIA RTX 6000D` 上完成完整 Warm `n=3` 消融与 15 档全量归档（原始 JSON：[`phase310_6000d_qwen35_overlap_audit.json`](benchmarks/phase310_6000d_qwen35_overlap_audit.json)）：
+
+1. **`GatedDeltaNet` Triton 回退核 `[V, K]` 状态布局对齐（PR `#21`, `44859cf`）**：将 `ZSTEP_QWEN_ENABLE_FUSED_GDN=0` 的 Triton Prefill / Decode 回退核统一改为 `[num_slots, H_v, V, K]` 状态步幅，并在 [`test_qwen35_ops_sm120.py`](../worker/tests/phase2/test_qwen35_ops_sm120.py) 覆盖 `(CUDA, Triton) × (Prefill, Decode)` 全部 4 种组合混用测试（状态最大偏差 `< 1e-6`，输出 `<= 1 BF16 ULP`）。
+2. **`RuntimeLoop` 单次页锁主机拼包与零拷贝 SHM 视图（PR `#16`, `91b3991`）**：通过 `np.frombuffer` 零拷贝读取共享内存切片，并将每步解码元数据搬运合并进单块双缓冲页锁主机缓冲 `dec_io_cpu`（`_dec_io_np[parity]`）做单次异步 H2D 拷贝；同时对 `runtime_loop.py` 中的算子模块改为惰性导入，使无 `torch` 的纯 CPU 控制面单测（`test_shm_layout_parity.py` `9/9`）在标准 CI 容器中直接运行。
+3. **设备驻留 Token 跨步流水重叠 + 8-Warp 并行前缀和 `moe_align_block_size_256`（PR `#19`, `cf531bc`）**：
+   * **跨步设备内 Token 直传（`STEP_FLAG_DEVICE_TOKENS`）**：当连续纯解码步满足 `decode_continues_for_all` 时，Rust 调度器无需等待上一拍采样结果经 PCIe D2H 回传再写回下一拍 SHM `token_ids`，而是提前在双缓冲另一槽位预发布下一拍 `StepPlan`；GPU 侧由捕获进 CUDA Graph 头部的 `decode_select_tokens_kernel`（`launch_decode_select_tokens`）从设备驻留 `last_token_gpu` 按 `req_slot_ids` 选取输入 Token，并在尾声由采样写回 `out_tokens_gpu`（`out_io_gpu`，异步 D2H 拷入主机页锁缓冲 `out_io_cpu`）且由 `decode_publish_tokens_kernel`（`launch_decode_publish_tokens`）将本拍全局 Top-1 结果同步写回 `last_token_gpu`，实现真正的 `in_flight_depth = 1` 零气泡跨步流水重叠（可通过 `ZSTEP_DECODE_DEVICE_TOKENS=0` 独立关停做严格消融）。
+   * **并行 `moe_align_block_size_256_kernel`**：将 256 专家直方图与块偏移前缀和由单 Warp 串行扫描升级为全部 8 个 Warp 协同归约扫描，且全部分支满足 `tp8_argmax_shm_all_ranks_populate_outputs` 非零 Rank 输出写回与越界边界保护。
+
+### 8.1 贪心逐位对齐与零重编译门禁（`OVERLAP=1`）
+
+在 `ZSTEP_DECODE_DEVICE_TOKENS=1` 默认开启下对照 [`phase2_vllm_greedy_reference.json`](benchmarks/phase2_vllm_greedy_reference.json)：
+* 运行时审计 **`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=20`**，退出后 `/dev/shm` 零残留；
+* 全部 5 条用例在 `single`、`batched`（`bucket=8`）与 `chunked`（`--max-prefill-chunk 24`）三种模式下的生成序列与 Phase 3.9 Route A（§7.3）**100% 逐 token 完全一致**（`france_capital` `32/32`、`prime_squares_table` `128/128` 三模式精确匹配；跨模式最大首处分歧裕度仍为 `dijkstra_shortest_path` 第 65 token 处的 `0.375` = `3` 个 BF16 ULP）。
+
+### 8.2 Suite 1：`ZSTEP_DECODE_DEVICE_TOKENS=0` vs `=1` 受控消融（`in512 -> out128`, Warm `n=3`）
+
+以下两组测试在同一二进制（`cac7e00`）、同一调度配置（[`README.md` §6](benchmarks/README.md) 标准默认参数：`num_kv_pages=65536`、`max_pages_per_seq=256`、默认单序列 Prefill 穿插即未显式传 `--max-mixed-step-tokens`）下仅切换 `ZSTEP_DECODE_DEVICE_TOKENS=0/1`：
+
+| 档位 | `OVERLAP=0` (`tok/s`) | **`OVERLAP=1` (`tok/s`)** | `OVERLAP=1` vs `OVERLAP=0` | Mean TPOT `OVL=0` -> **`OVL=1`** (`ms`) | Med TTFT `OVL=0` -> **`OVL=1`** (`ms`) | P99 ITL `OVL=0` -> **`OVL=1`** (`ms`) |
+| :--- | ---: | ---: | :--- | :---: | :---: | :---: |
+| `c1` | `285.99 ± 0.59` | **`335.62 ± 0.11`** | **`+17.35%`** | `3.18` -> **`2.66`** (`-16.4%`) | `43.61` -> **`42.82`** | `3.38` -> **`2.81`** |
+| `c2` | `500.55 ± 4.16` | **`584.21 ± 0.83`** | **`+16.71%`** | `3.52` -> **`2.95`** (`-16.2%`) | `64.76` -> **`63.71`** | `3.70` -> **`3.08`** |
+| `c4` | `836.46 ± 8.00` | **`945.81 ± 3.52`** | **`+13.07%`** | `4.00` -> **`3.45`** (`-13.8%`) | `104.37` -> **`103.51`** | `4.24` -> **`3.64`** |
+| `c8` | `1,315.09 ± 15.85` | **`1,455.36 ± 1.89`** | **`+10.67%`** | `4.68` -> **`4.10`** (`-12.4%`) | `184.13` -> **`182.97`** | `4.99` -> **`4.35`** |
+| `c16` | `1,812.25 ± 9.20` | **`1,944.68 ± 11.71`** | **`+7.31%`** | `7.26` -> **`6.66`** (`-8.3%`) | `184.00` -> **`183.09`** | `6.53` -> **`5.98`** |
+| `c32` | `2,577.80 ± 0.88` | **`2,715.08 ± 11.04`** | **`+5.33%`** | `10.49` -> **`9.86`** (`-6.0%`) | `183.87` -> **`183.17`** | `190.79` -> **`189.96`** |
+| `c64` | `3,083.74 ± 4.12` | **`3,182.99 ± 6.75`** | **`+3.22%`** | `16.76` -> **`16.12`** (`-3.8%`) | `183.49` -> **`183.34`** | `193.46` -> **`193.09`** |
+
+* **物理归因**：开启设备驻留 Token 直传后，每拍消除了 `GPU -> SHM -> Rust eventfd -> SHM -> GPU H2D` 串行控制面空泡（约 **`0.52..0.63 ms/step`**），将单流 `c1` 稳态 `Mean TPOT` 从 `3.18 ms` 进一步压低至 **`2.66 ms`**（输出吞吐达 **`335.62 tok/s`**），且随单拍 GPU 计算时长从 `2.66 ms`（`c1`）增长至 `16.12 ms`（`c64`），固定气泡消除对应的相对吞吐增幅严格符合 Amdahl 定律单调收敛（`+17.35% -> +3.22%`），同时跨轮抖动（`std`）大幅收敛。
+
+### 8.3 Suite 2（标准六档交错）与 Suite 3（`in4096 -> out128`）默认 `OVERLAP=1` 主结果（Warm `n=3`）
+
+> **调度口径注记**：本节严格采用 [`README.md` §6](benchmarks/README.md) 文档化默认 CLI（不额外传入 `--max-mixed-step-tokens 3072`），当存在活跃解码序列时每次混合步仅穿插 1 条新 Prefill，因此 `c16` 稳态尾延迟大幅下降（Suite 1 `c16` `P99 ITL = 5.98 ms`、Suite 2 `in512_c16` `P99 ITL = 6.10 ms`），`c128` 高并发排队首字延迟亦显著降低（`in512_c128` `Med TTFT = 183.52 ms`、`in1024_c128` `Med TTFT = 197.61 ms`）；而全部 **15 / 15** 档位的 Output 吞吐与 `Mean TPOT` 均全面超越 §7.4 Phase 3.9 主表：
+
+| 套件 / 档位 | §7.4 Phase 3.9 (`tok/s`) | **当前 `main` (`OVERLAP=1`, `tok/s`)** | 相对 Phase 3.9 | Total 吞吐 (`tok/s`) | Mean TPOT (`ms`) | Med TTFT (`ms`) | P99 ITL (`ms`) |
+| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: |
+| Suite 2 `in512_c1` | `307.14 ± 10.01` | **`353.98 ± 0.24`** | **`+15.25%`** | **`1,061.93`** | **`2.67`** | **`43.13`** | **`2.74`** |
+| Suite 2 `in512_c16` | `2,048.01 ± 38.53` | **`2,267.10 ± 16.18`** | **`+10.70%`** | **`6,801.30`** | **`6.24`** | `183.38` | **`6.10`** |
+| Suite 2 `in512_c128` | `4,791.36 ± 18.52` | **`5,039.13 ± 6.31`** | **`+5.17%`** | **`15,117.38`** | **`21.82`** | **`183.52`** | `198.82` |
+| Suite 2 `in1024_c1` | `288.43 ± 9.29` | **`328.65 ± 0.15`** | **`+13.94%`** | **`1,643.23`** | **`2.74`** | **`79.29`** | **`2.82`** |
+| Suite 2 `in1024_c32` | `2,166.66 ± 5.43` | **`2,367.78 ± 1.63`** | **`+9.28%`** | **`11,838.89`** | **`11.82`** | `197.51` | `205.37` |
+| Suite 2 `in1024_c128` | `2,956.63 ± 4.68` | **`3,128.09 ± 4.86`** | **`+5.80%`** | **`15,640.43`** | **`34.65`** | **`197.61`** | `214.13` |
+| Suite 3 `in4096_c1` | `164.85 ± 0.37` | **`181.72 ± 0.02`** | **`+10.23%`** | **`5,996.72`** | **`3.18`** | **`300.12`** | **`3.38`** |
+| Suite 3 `in4096_c16` | `412.22 ± 0.77` | **`453.58 ± 0.67`** | **`+10.03%`** | **`14,968.26`** | **`25.34`** | **`464.48`** | `237.33` |
+

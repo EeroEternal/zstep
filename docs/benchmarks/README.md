@@ -1,6 +1,6 @@
 # `zstep` Master Benchmark Ledger (`sm_120` Non-P2P PCIe: `8×32 GB` & `8×85.6 GB`)
 
-本目录归档 Phase 0（`sm_120` 算子与 PCIe AllReduce）、Phase 1（Mode B Rust 控制面与双缓冲调度）、Phase 2（`8 × RTX 5090 32 GB` 上 `Qwen/Qwen3.5-35B-A3B` 无 APC 真权重 serving 与 `vLLM 0.33.0` 对标）、**Phase 3 / 3.5 / 3.6 / 3.7 / 3.8（`8 × RTX 6000D 85.6 GB` 上 `DeepSeek-V4.1-Flash` `TP=8` 无 APC 真权重 serving、`b12x` / `sm120_dsa_indexer` `156-SM` 优化与 `vLLM 0.31.0` 对标）** 及 **Phase 3.9（`8 × RTX 6000D` 上 `Qwen/Qwen3.5-35B-A3B` Route A：`shm_v5` Stage-2 `AllReduce + Residual Add + RMSNorm` 尾融合 + SM120 `[V, K]` `GatedDeltaNet` 全量 A/B 审计）** 的实测 JSON。所有主结果均为 **warm、单配置、无前缀缓存（`--no-enable-prefix-caching`）、按 `(round, tier)` 独立种子、round-major 交错、`n=3`**；旧单轮与消融数据只作历史记录，不与主表混用。
+本目录归档 Phase 0（`sm_120` 算子与 PCIe AllReduce）、Phase 1（Mode B Rust 控制面与双缓冲调度）、Phase 2（`8 × RTX 5090 32 GB` 上 `Qwen/Qwen3.5-35B-A3B` 无 APC 真权重 serving 与 `vLLM 0.33.0` 对标）、**Phase 3 / 3.5 / 3.6 / 3.7 / 3.8（`8 × RTX 6000D 85.6 GB` 上 `DeepSeek-V4.1-Flash` `TP=8` 无 APC 真权重 serving、`b12x` / `sm120_dsa_indexer` `156-SM` 优化与 `vLLM 0.31.0` 对标）**、**Phase 3.9（`8 × RTX 6000D` 上 `Qwen/Qwen3.5-35B-A3B` Route A：`shm_v5` Stage-2 尾融合 + SM120 `[V, K]` `GatedDeltaNet` 全量 A/B 审计）** 及 **Phase 3.10（当前 `main` 合入 `#21/#16/#19` 后 `Qwen3.5-35B-A3B` `OVERLAP=0/1` 消融与 15 档审计 + `DeepSeek-V4.1-Flash` 内置 `ae58183f` Overlay 与 `ZSTEP_REQUIRE_SM120_EXP=1` 最新审计）** 的实测 JSON。所有主结果均为 **warm、单配置、无前缀缓存（`--no-enable-prefix-caching`）、按 `(round, tier)` 独立种子、round-major 交错、`n=3`**；旧单轮与消融数据只作历史记录，不与主表混用。
 
 ## 1. 硬件、软件与统计边界
 
@@ -11,19 +11,19 @@ Topology:  4-NUMA PCIe Gen5 ([0,0,0,1,2,2,2,3]), no NVLink, can_device_access_pe
 Model:     Qwen/Qwen3.5-35B-A3B, BF16, TP=8
 Baseline:  vLLM 0.33.0, BF16, TP=8, --no-enable-prefix-caching, isolated per-(round,tier) seeds, degraded NCCL SHM
 
-[Host B — Phase 3 / 3.5 / 3.6 / 3.7]
+[Host B — Phase 3 / 3.5 / 3.6 / 3.7 / 3.8 / 3.9 / 3.10]
 GPU:       8 × NVIDIA RTX 6000D (sm_120, 156 SMs, 85,651 MiB GDDR7 per GPU, Driver 595.99.02)
 Topology:  2-NUMA PCIe Gen5 ([0,0,0,0,1,1,1,1]), no NVLink, 20 × Mellanox CX-8 PCIe bridge ports (`15b3:197c`, `ACSCtl=0x001d`, SM BAR MMIO P2P unsupported -> CNS host-DRAM path)
-Model:     DeepSeek-V4.1-Flash (1017, 475.25 GiB MXFP8/MXFP4/BF16, engram cpu_offload=false), TP=8
+Models:    DeepSeek-V4.1-Flash (1017, 475.25 GiB MXFP8/MXFP4/BF16, engram cpu_offload=false) & Qwen/Qwen3.5-35B-A3B (BF16), TP=8
 Baseline:  vllm/vllm-openai:v0.31.0, TP=8, --no-enable-prefix-caching, isolated per-(round,tier) seeds, NCCL_P2P_DISABLE=1, NCCL_P2P_LEVEL=LOC, symmetric SM120 64-tok SWA shim
-b12x 3.6/3.7: vllm/vllm-openai:v0.31.0 + read-only mount of `flashinfer/experimental/b12x` from `https://github.com/local-inference-lab/flashinfer.git` tag `flashinfer-cu134-sm120-beta-79819b112f8bda7d09709c24bb31de16d7ce59c6` (`79819b112f8bda7d09709c24bb31de16d7ce59c6`), `ZSTEP_REQUIRE_B12X=1`, `B12X_W4A8_TINY_DECODE=0` (Phase 3.7 `main` commit `d497e85`, PR `#11`)
+SM120 Overlay (Phase 3.8 / 3.10): bundled `worker/third_party/flashinfer_sm120_overlay_ae58183f.tar.xz` (`ae58183fff34c545b3e3020d81d591f2a79658fc`, SHA256 `90e4db7f...`) mounted via `./scripts/prepare_sm120_overlay.sh --print-docker-args` (`ZSTEP_REQUIRE_B12X=1`, `ZSTEP_REQUIRE_SM120_EXP=1`, `B12X_W4A8_TINY_DECODE=0`)
 ```
 
 所有跨卡结论严格限定于对应无 P2P PCIe 拓扑，不外推到 NVLink 或 PCIe P2P。表中 `std` 是三轮重复测量的**总体标准差**；完整 `mean/std/min/max` 以 JSON 为准。吞吐“持平”规则为：相对差 `<3%`，或均值差 `<=2×sqrt(zstep_std²+vllm_std²)`；`n=3` 的持平不是严格等价证明。
 
 ## 2. 归档文件总览
 
-共有 **34 份主 JSON + 19 份 vLLM 逐轮/warmup 原始 JSON = 53 份 JSON**。
+共有 **36 份主 JSON + 19 份 vLLM 逐轮/warmup 原始 JSON = 55 份 JSON**。
 
 | 阶段 | 文件 | 内容 |
 | :--- | :--- | :--- |
@@ -62,6 +62,16 @@ b12x 3.6/3.7: vllm/vllm-openai:v0.31.0 + read-only mount of `flashinfer/experime
 | Phase 3.7 | [`phase37_6000d_comm_audit.json`](phase37_6000d_comm_audit.json) | **`zstep#14` 8 卡通信与 PCIe ACS/CX-8（`15b3:197c`）审计**：`H=2048` / `H=5120` AllReduce 与 `[M, 640]->[M, 5120]` AllGather（`shm_v5_prod` 自适应 `256->512` 线程 + `64 KiB` One-Shot vs 旧基线 / `nodone` / `pkt64` / `NCCL_LOC`）、SM BAR MMIO `UR` 证明与 `DeepSeek-V4.1` Amdahl 消融 |
 | Phase 3.8 | [`phase38_6000d_flashinfer_ops_audit.json`](phase38_6000d_flashinfer_ops_audit.json) | **SM120 `FlashInfer` 实验算子筛选与 `TP=8` 端到端审计**（`ae58183f`）：`b12x` 新旧对比、`sm12x_mega_gate`（`M >= 32`）门限消融、分页 Decode `sm120_dsa_indexer`（8 层 CUDAGraph `3.55×..4.33×`）、淘汰项负向实证及三套件 12 档 Warm `n=3` 结果（`in1024_c128` 突破 `6,005.25 tok/s`） |
 | Phase 3.9 | [`phase39_6000d_qwen35_route_a_audit.json`](phase39_6000d_qwen35_route_a_audit.json) | **Route A（`Qwen3.5-35B-A3B` `TP=8`, `8 × RTX 6000D`）`shm_v5` Stage-2 尾融合 + SM120 `[V, K]` `GatedDeltaNet` 全量审计**（`893495c4 -> 98724b4c`）：`H=2048/5120` `cluster8` DSMEM / `fused_1op` 微基准、30 层 `[V, K]` 自适应解码与 `cuda_vk_recurrent` Prefill 微基准、贪心零重编译门禁及三套件 15 档 Warm `n=3` 结果（`15/15` 全胜，`c1` `+23.80%`、`Mean TPOT = 2.95 ms`，`in1024_c128` 总吞吐 `14,783.15 tok/s`） |
+| Phase 3.10 | [`phase310_6000d_qwen35_overlap_audit.json`](phase310_6000d_qwen35_overlap_audit.json) | **`Qwen3.5-35B-A3B` 合入 `#21/#16/#19` 后设备驻留 Token 跨步流水重叠与并行 `moe_align` 全量审计**（`8 × RTX 6000D`, Warm `n=3`）：Suite 1 `ZSTEP_DECODE_DEVICE_TOKENS=0/1` 受控消融（`c1` `285.99 -> 335.62 tok/s` **`+17.35%`**，`Mean TPOT = 2.66 ms`）+ 15 档主结果（`in512_c1` **`353.98 tok/s`**，`in512_c128` 输出 **`5,039.13 tok/s`**，`in1024_c128` 总吞吐 **`15,640.43 tok/s`**）+ 贪心 `0` 重编译门禁 |
+| Phase 3.10 | [`phase310_6000d_dsv41_post_route_a_audit.json`](phase310_6000d_dsv41_post_route_a_audit.json) | **`DeepSeek-V4.1-Flash` 合入 `#20/#16/#19` 后内置 `ae58183f` Overlay（`ZSTEP_REQUIRE_SM120_EXP=1`）全量审计**（`8 × RTX 6000D`, Warm `n=3`）：Suite 1 `b12x`-only 回退（`98.60 tok/s`）vs 内置 Overlay（`c1` 突破 **`100.44 ± 0.13 tok/s`**，`Mean TPOT = 8.70 ms`）+ Suite 2/3 最新主结果（`in512_c1` **`107.03 tok/s`**，`in4096_c16` 总吞吐 **`6,518.90 tok/s`**） |
+
+---
+
+## 2.7 Phase 3.10（当前 `main` 最新主结果：`Qwen3.5` 设备内 Token 流水重叠 + `DeepSeek-V4.1` 内置 `ae58183f` Overlay，`8 × RTX 6000D` Warm `n=3`）
+
+> 归档于 [`phase310_6000d_qwen35_overlap_audit.json`](phase310_6000d_qwen35_overlap_audit.json)（详见 **[`06-phase2-qwen35-benchmark.md` §8](../06-phase2-qwen35-benchmark.md)**）与 [`phase310_6000d_dsv41_post_route_a_audit.json`](phase310_6000d_dsv41_post_route_a_audit.json)（详见 **[`07-phase3-dsv41-6000d-benchmark.md` §10](../07-phase3-dsv41-6000d-benchmark.md)**）：
+> * **`Qwen3.5-35B-A3B` (`TP=8`)**：开启 `STEP_FLAG_DEVICE_TOKENS` 设备内跨步直传与 8-Warp 并行 `moe_align` 后，Suite 1 `OVERLAP=0 -> 1` 单流 `c1` 由 `285.99 ± 0.59` 提升 **`+17.35%` 至 `335.62 ± 0.11 tok/s`**（`Mean TPOT = 2.66 ms`）；Suite 2 `in512_c1` 达 **`353.98 ± 0.24 tok/s`**、`in512_c128` 输出 **`5,039.13 ± 6.31 tok/s`**（总吞吐 **`15,117.38 tok/s`**）、`in1024_c128` 输出 **`3,128.09 ± 4.86 tok/s`**（总吞吐 **`15,640.43 tok/s`**）；Suite 3 `in4096_c1 / c16` 达 **`181.72 / 453.58 tok/s`**。
+> * **`DeepSeek-V4.1-Flash` (`TP=8`)**：通过仓库内置 `./scripts/prepare_sm120_overlay.sh` + `ZSTEP_REQUIRE_SM120_EXP=1` 激活 `b12x + sm12x_mega_gate (min_m=32) + sm120_dsa_indexer` 并叠加 `#20` `shm_v5` 预取后，Suite 1 `c1 / c8 / c16 / c32` 由仅 `b12x` 回退的 `98.60 / 467.33 / 644.97 / 839.05 tok/s` 进一步推进至 **`100.44 ± 0.13 / 470.84 ± 1.08 / 649.06 ± 1.40 / 840.34 ± 4.43 tok/s`**（单流 `Mean TPOT = 8.70 ms`）；Suite 2 `in512_c1` **`107.03 ± 0.08 tok/s`**、`in512_c128` **`1,733.34 ± 6.14 tok/s`**、`in1024_c128` **`1,200.63 ± 1.88 tok/s`**（总吞吐 **`6,003.15 tok/s`**）；Suite 3 `in4096_c1 / c16` **`76.63 ± 0.06 / 197.54 ± 0.84 tok/s`**（总吞吐 **`6,518.90 tok/s`**）。
 
 ---
 
@@ -203,23 +213,28 @@ cargo build --release -p zs-server
 # 若在无 .git 的 git archive 目录运行且需精确记录 Git SHA，可传入 export ZSTEP_GIT_SHA=<40-hex-sha>；
 # 未设置时 BenchmarkProvenance 与 GreedyParityReport 自动回退编译期 SHA 或 "unknown"，不会因缺少 .git 报错。
 
-# ── Phase 3.6 / 3.7 (+ b12x): DeepSeek-V4.1-Flash TP=8 (8 × RTX 6000D) ────────────────
-# 0) 拉取公开 SM120 b12x overlay（精确锁定 commit 79819b112f8bda7d09709c24bb31de16d7ce59c6）
-git clone --depth 1 --branch flashinfer-cu134-sm120-beta-79819b112f8bda7d09709c24bb31de16d7ce59c6 \
-  https://github.com/local-inference-lab/flashinfer.git /tmp/fi-b12x
-
-# 在容器启动时挂载 `-v /tmp/fi-b12x/flashinfer/experimental/b12x:/usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x:ro`
+# ── Phase 3.8 / 3.10 (+ 内置 SM120 实验 Overlay): DeepSeek-V4.1-Flash TP=8 (8 × RTX 6000D) ─
+# 0) 校验解压仓库内置确定性 SM120 overlay（ae58183f）并生成 docker run 挂载与强门禁参数：
+#    自动开启 ZSTEP_ENABLE_B12X=1 ZSTEP_REQUIRE_B12X=1 ZSTEP_REQUIRE_SM120_EXP=1 B12X_W4A8_TINY_DECODE=0
+./scripts/prepare_sm120_overlay.sh /tmp/zstep-sm120-overlay
+DOCKER_OVERLAY_ARGS=($(./scripts/prepare_sm120_overlay.sh --print-docker-args /tmp/zstep-sm120-overlay))
+# 在 docker run vllm/vllm-openai:v0.31.0 时直接传入 "${DOCKER_OVERLAY_ARGS[@]}"；
+# 若需消融回退到仅 b12x（关闭 mega_gate 与 dsa_decode），追加：
+#   -e ZSTEP_ENABLE_SM12X_MEGA_GATE=0 -e ZSTEP_ENABLE_SM120_DSA_DECODE=0 -e ZSTEP_REQUIRE_SM120_EXP=0
 export ZSTEP_DSV41_MODEL_DIR=/models/DeepSeek-V4.1-Flash
 export OMP_NUM_THREADS=1 NCCL_P2P_DISABLE=1 NCCL_P2P_LEVEL=LOC
-export ZSTEP_REQUIRE_B12X=1 B12X_W4A8_TINY_DECODE=0   # Phase 3.5 对照组改为 ZSTEP_ENABLE_B12X=0
 
-# 0b) 156-SM 单算子微基准与数值审计（单卡 GPU 0 即可运行）
+# 0b) 156-SM 单算子微基准与 SM120 实验算子筛选（单卡 GPU 0 即可运行）
 CUDA_VISIBLE_DEVICES=0 python3 worker/tests/phase3/bench_sm120_dsv41_operators.py \
   --output docs/benchmarks/phase37_6000d_operator_audit.json
+CUDA_VISIBLE_DEVICES=0 python3 worker/tests/phase3/bench_sm120_flashinfer_exp_ops.py \
+  --output /tmp/sm120_flashinfer_exp_ops.json
 
-# 0c) 8 卡 shm_v5 vs NCCL_LOC 全矩阵通信与 PCIe ACS/CX-8 审计（zstep#14）
+# 0c) 8 卡 shm_v5 vs NCCL_LOC 通信审计（zstep#14）及 Route A Stage-2 尾融合 + [V, K] GDN 微基准
 python3 worker/tests/phase3/bench_shmv5_nccl_comm_audit.py \
   --output docs/benchmarks/phase37_6000d_comm_audit.json
+python3 worker/tests/phase3/bench_sm120_qwen35_route_a_ops.py \
+  --part all --output /tmp/sm120_qwen35_route_a_ops.json
 
 # 1) 贪心对齐审计（全局 Top-2 Logits）+ 5-kernel 零重编译检查
 #    门禁退出码约定：
@@ -248,10 +263,10 @@ python3 worker/tests/phase3/bench_shmv5_nccl_comm_audit.py \
   --bench-tiers "in512_c1:1:8:512:256;in512_c16:16:48:512:256;in512_c128:128:256:512:256;in1024_c1:1:20:1024:256;in1024_c32:32:200:1024:256;in1024_c128:128:400:1024:256" \
   --metrics-output docs/benchmarks/phase37_zstep_b12x_dsv41_tp8_6tier.json
 
-# ── Phase 2 / Phase 3.9 (Route A): Qwen3.5-35B-A3B TP=8 (8 × RTX 5090 or 8 × RTX 6000D) ─
+# ── Phase 2 / Phase 3.9 / Phase 3.10: Qwen3.5-35B-A3B TP=8 (8 × RTX 5090 or 8 × RTX 6000D) ─
 export ZSTEP_QWEN35_MODEL_DIR=/path/to/Qwen3.5-35B-A3B
-# 默认开启 Part A1 (ZSTEP_QWEN_ENABLE_FUSED_AR_NORM=1) 与 Part A2 (ZSTEP_QWEN_ENABLE_FUSED_GDN=1)；
-# A1-only 消融传入 ZSTEP_QWEN_ENABLE_FUSED_GDN=0；回退未融合基线同时设两者为 0。
+# 默认开启 Part A1 (ZSTEP_QWEN_ENABLE_FUSED_AR_NORM=1)、Part A2 (ZSTEP_QWEN_ENABLE_FUSED_GDN=1)
+# 与设备内跨步 Token 流水重叠 (ZSTEP_DECODE_DEVICE_TOKENS=1)；OVERLAP=0 消融传入 ZSTEP_DECODE_DEVICE_TOKENS=0。
 # Suite 3 长输入 4096->128 需将 --max-pages-per-seq 设为 512（16 tok/page × 512 = 8192 tokens）。
 python3 worker/tests/phase2/collect_vllm_reference.py --mode all --repeats 3 --seed 20261111
 ./target/release/zstep --mode-b --world-size 8 \

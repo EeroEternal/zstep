@@ -40,14 +40,6 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
-from zstep_worker.kernels_sm120.moe_router import (
-    dsv41_sqrt_softplus_topk,
-    dsv41_sqrt_softplus_topk_kernel,
-)
-from zstep_worker.kernels_sm120.norm_quant import (
-    rmsnorm_quantize_mxfp8_group32,
-    rmsnorm_quantize_mxfp8_group32_kernel,
-)
 from zstep_worker.numa_pin import (
     DeviceNumaTopology,
     pin_process_to_device_numa,
@@ -119,7 +111,12 @@ class MicroStep:
         import torch.distributed as dist
 
         from zstep_worker.kernels_sm120.b12x_dsv41 import maybe_enable_b12x_for_dsv41
+        from zstep_worker.kernels_sm120.moe_router import dsv41_sqrt_softplus_topk
+        from zstep_worker.kernels_sm120.norm_quant import rmsnorm_quantize_mxfp8_group32
         from zstep_worker.kernels_sm120.shm_allreduce import HostMappedShmAllReduce
+
+        self._dsv41_sqrt_softplus_topk = dsv41_sqrt_softplus_topk
+        self._rmsnorm_quantize_mxfp8_group32 = rmsnorm_quantize_mxfp8_group32
 
         maybe_enable_b12x_for_dsv41()
         from flashinfer.experimental.b12x.gemm import mxfp8_linear
@@ -235,7 +232,7 @@ class MicroStep:
             (column_offsets + token_offsets + position_offsets + request_offsets) % 1024
         ).to(torch.bfloat16) * (1.0 / 1024.0)
 
-        quantized, scales = rmsnorm_quantize_mxfp8_group32(
+        quantized, scales = self._rmsnorm_quantize_mxfp8_group32(
             activations,
             self.norm_weight,
             eps=1.0e-6,
@@ -246,7 +243,7 @@ class MicroStep:
             * scale_values.unsqueeze(-1)
         ).reshape(rows, self.hidden_size).to(torch.bfloat16)
         gemm_output = self.mxfp8_linear.mm(dequantized, self.packed_weight)
-        router_weights, _router_ids = dsv41_sqrt_softplus_topk(
+        router_weights, _router_ids = self._dsv41_sqrt_softplus_topk(
             gemm_output[:, : self.router_experts].float(),
             top_k=self.router_top_k,
             renormalize=True,
@@ -474,10 +471,22 @@ class RuntimeLoop:
         self._write_state(status=WORKER_STATUS_READY, error_code=0)
         os.eventfd_write(self.args.done_fd, 1)
 
-        watched_kernels: list[tuple[str, object]] = [
-            ("norm_mxfp8", rmsnorm_quantize_mxfp8_group32_kernel),
-            ("router_dsv41", dsv41_sqrt_softplus_topk_kernel),
-        ]
+        watched_kernels: list[tuple[str, object]] = []
+        try:
+            from zstep_worker.kernels_sm120.moe_router import dsv41_sqrt_softplus_topk_kernel
+            from zstep_worker.kernels_sm120.norm_quant import (
+                rmsnorm_quantize_mxfp8_group32_kernel,
+            )
+
+            watched_kernels.extend(
+                [
+                    ("norm_mxfp8", rmsnorm_quantize_mxfp8_group32_kernel),
+                    ("router_dsv41", dsv41_sqrt_softplus_topk_kernel),
+                ]
+            )
+        except ModuleNotFoundError:
+            if self.args.model_dir or isinstance(self.runner, MicroStep):
+                raise
         if self.args.model_dir and self.model_type == "deepseek_v41":
             extra_watched = getattr(self.runner, "watched_triton_kernels", None)
             if callable(extra_watched):

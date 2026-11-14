@@ -172,11 +172,23 @@ def _compute_b12x_source_fingerprint() -> str:
 
 def is_sm120_dsa_decode_available() -> bool:
     """Return True when SM120 fused paged DSA indexer decode is enabled and importable."""
+    require_exp = _env_flag("ZSTEP_REQUIRE_SM120_EXP", default=False)
     if not _env_flag("ZSTEP_ENABLE_SM120_DSA_DECODE", default=True):
+        if require_exp:
+            raise RuntimeError(
+                "ZSTEP_REQUIRE_SM120_EXP=1 conflicts with ZSTEP_ENABLE_SM120_DSA_DECODE=0"
+            )
         return False
     if not torch.cuda.is_available():
+        if require_exp:
+            raise RuntimeError("ZSTEP_REQUIRE_SM120_EXP=1 set, but CUDA is unavailable")
         return False
-    if torch.cuda.get_device_capability() != (12, 0):
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) != (12, 0):
+        if require_exp:
+            raise RuntimeError(
+                f"ZSTEP_REQUIRE_SM120_EXP=1 requires sm_120 GPU, got sm_{major}{minor}"
+            )
         return False
     try:
         from flashinfer.experimental.sm120_dsa_indexer._api import (  # noqa: F401
@@ -185,9 +197,20 @@ def is_sm120_dsa_decode_available() -> bool:
         from flashinfer.utils import is_sm120f_supported
 
         dev = torch.device("cuda", torch.cuda.current_device())
-        return bool(is_sm120f_supported(dev))
-    except (ImportError, RuntimeError, AttributeError):
+        supported = bool(is_sm120f_supported(dev))
+    except (ImportError, RuntimeError, AttributeError) as exc:
+        if require_exp:
+            raise RuntimeError(
+                "ZSTEP_REQUIRE_SM120_EXP=1 set, but `flashinfer.experimental.sm120_dsa_indexer` "
+                f"is unavailable: {exc}. Run `./scripts/prepare_sm120_overlay.sh` and mount "
+                "the unpacked SM120 overlay into the container."
+            ) from exc
         return False
+    if not supported and require_exp:
+        raise RuntimeError(
+            "ZSTEP_REQUIRE_SM120_EXP=1 set, but `is_sm120f_supported` returned False"
+        )
+    return supported
 
 
 def _prepend_pythonpath(entry: str) -> None:
@@ -205,7 +228,9 @@ def _prepend_pythonpath(entry: str) -> None:
 
 def maybe_enable_b12x_for_dsv41() -> bool:
     """Configure environment & import paths for `b12x` on SM120 if available."""
-    require_b12x = _env_flag("ZSTEP_REQUIRE_B12X", default=False)
+    require_b12x = _env_flag("ZSTEP_REQUIRE_B12X", default=False) or _env_flag(
+        "ZSTEP_REQUIRE_SM120_EXP", default=False
+    )
     explicit_enable = os.environ.get("ZSTEP_ENABLE_B12X") is not None
     if not _env_flag("ZSTEP_ENABLE_B12X", default=True):
         if require_b12x:
@@ -247,9 +272,10 @@ def maybe_enable_b12x_for_dsv41() -> bool:
         msg = (
             "SM120 `b12x` overlay package could not be imported "
             f"(checked ZSTEP_B12X_COMPAT_DIR and {_DEFAULT_COMPAT_CANDIDATES}): {exc}. "
-            "Mount `flashinfer/experimental/b12x` from "
-            "local-inference-lab/flashinfer@79819b112f8bda7d09709c24bb31de16d7ce59c6 "
-            "or set ZSTEP_ENABLE_B12X=0."
+            "Mount the bundled SM120 overlay via "
+            "`./scripts/prepare_sm120_overlay.sh --print-docker-args` "
+            "(`worker/third_party/flashinfer_sm120_overlay_ae58183f.tar.xz`), "
+            "or unset ZSTEP_REQUIRE_B12X / ZSTEP_REQUIRE_SM120_EXP (or set ZSTEP_ENABLE_B12X=0)."
         )
         if require_b12x:
             raise RuntimeError(msg) from exc
@@ -1143,12 +1169,24 @@ def _prepare_sm12x_mega_gate(
     exchange_group: dist.ProcessGroup | None,
 ) -> tuple[int, int, int]:
     """Pre-compile SM120 CuTe-DSL MegaGate schedules (rank 0 first) and patch eligible MoERunners."""
+    require_exp = _env_flag("ZSTEP_REQUIRE_SM120_EXP", default=False)
     if not _env_flag("ZSTEP_ENABLE_SM12X_MEGA_GATE", default=True):
+        if require_exp:
+            raise RuntimeError(
+                "ZSTEP_REQUIRE_SM120_EXP=1 conflicts with ZSTEP_ENABLE_SM12X_MEGA_GATE=0"
+            )
         return 0, 0, 0
     min_tokens = _env_int("ZSTEP_MEGA_GATE_MIN_TOKENS", DEFAULT_MEGA_GATE_MIN_TOKENS)
     if min_tokens <= 0 or min_tokens > int(max_tokens):
+        if require_exp:
+            raise RuntimeError(
+                f"ZSTEP_REQUIRE_SM120_EXP=1 set, but ZSTEP_MEGA_GATE_MIN_TOKENS={min_tokens} "
+                f"is outside (0, {int(max_tokens)}]"
+            )
         return 0, 0, 0
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
+        if require_exp:
+            raise RuntimeError("ZSTEP_REQUIRE_SM120_EXP=1 requires an sm_120 CUDA device")
         return 0, 0, 0
 
     try:
@@ -1174,6 +1212,12 @@ def _prepare_sm12x_mega_gate(
 
         arch, sms = device_facts(rank)
     except (ImportError, RuntimeError, AttributeError) as exc:
+        if require_exp:
+            raise RuntimeError(
+                "ZSTEP_REQUIRE_SM120_EXP=1 set, but `flashinfer.experimental.sm12x_mega_gate` "
+                f"is unavailable: {exc}. Run `./scripts/prepare_sm120_overlay.sh` and mount "
+                "the unpacked SM120 overlay into the container."
+            ) from exc
         if rank == 0:
             _LOG.warning("SM12x MegaGate unavailable on rank %d: %s", rank, exc)
         return 0, 0, 0
@@ -1293,6 +1337,10 @@ def _prepare_sm12x_mega_gate(
         max_top_k = max(max_top_k, top_k)
 
     if not eligible:
+        if require_exp:
+            raise RuntimeError(
+                "ZSTEP_REQUIRE_SM120_EXP=1 set, but SM12x MegaGate found 0 eligible MoERunner layers"
+            )
         if rank == 0:
             _LOG.warning("SM12x MegaGate found 0 eligible MoERunner layers")
         return 0, 0, 0
@@ -1337,6 +1385,10 @@ def _prepare_sm12x_mega_gate(
         geom_cfg_by_m[(hidden, num_experts, top_k, has_bias, has_image_bias)] = cfgs_m
 
     if not specs_to_compile:
+        if require_exp:
+            raise RuntimeError(
+                "ZSTEP_REQUIRE_SM120_EXP=1 set, but SM12x MegaGate compiled 0 schedules"
+            )
         return 0, 0, 0
 
     compiled_by_spec: dict[KernelSpec, Any] = {}
