@@ -18,13 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Selective SM120 (`sm_120`) `b12x` compute integration for DeepSeek-V4.1-Flash.
+"""Selective SM120 (`sm_120`) compute integrations for DeepSeek-V4.1-Flash.
 
-Integrates the two winning SM120 `b12x` operator families into `zstep`'s Mode B
+Integrates the measured winning SM120 operator families into `zstep`'s Mode B
 `DeepSeekV41StepRunner` while keeping `zstep`'s Rust SHM control plane, `shm_v5`
-NUMA-local collectives (`M <= 256` + 100% CUDAGraph), `NCCL_LOC` (`M > 256`),
-and vLLM 0.31.0's `mhc_shifted_post_pre` / `GateLinear` / `ParallelLMHead` /
-FlashInfer sparse MLA+SWA untouched:
+NUMA-local collectives (`M <= 320` + 100% CUDAGraph), `NCCL_LOC` (`M > 320`),
+and vLLM 0.31.0's `mhc_shifted_post_pre` / `ParallelLMHead` / FlashInfer sparse
+MLA+SWA untouched:
 
 1. **Routed MoE (`40 layers`, `E=384, top_k=6, H=5120, I_tp8=288`, MXFP4 + UE8M0)**:
    - Unpadded `I_tp8 = 288` (`288 % 32 == 0`, vs vLLM's `384` padding) saves
@@ -42,17 +42,33 @@ FlashInfer sparse MLA+SWA untouched:
      `3200 x 6144`), while retaining `PreparationSession` across the runner
      lifetime so autotuned plans and compiled caches are never evicted.
    - Leaves 3D BMM `.wo_a` on standard `ModelOptLinearMethod`.
+3. **Fused BF16 Router GEMM + `sqrtsoftplus` Top-6 Gate (`sm12x_mega_gate`, `40 layers`)**:
+   - Uses `flashinfer.experimental.sm12x_mega_gate` (`enable_pdl=False`, pre-compiled
+     CuTe-DSL TVM-FFI schedules + shared static scratch/self-rearming barriers) for
+     `M >= ZSTEP_MEGA_GATE_MIN_TOKENS` (default `32`), keeping small `M < 32` decode
+     batches on `GateLinear` + `dsv4_topk` and accelerating `M >= 32` decode and
+     eager prefill (`1.44x-3.27x` faster across `M = 256..3072`).
+4. **Fused Paged DSA Indexer (`sm120_dsa_indexer`, `8 layers`)**:
+   - Uses `flashinfer.experimental.sm120_dsa_indexer._api.dsa_indexer_det_topk_paged`
+     for paged decode (`3.0x-4.3x` faster across all 8 indexer layers in CUDAGraph
+     decode), exploiting exact two-level candidate block identity whenever
+     compressed context length `<= candidate_topk_blocks * candidate_block_size`
+     (`2048 * 8 == 16384 == kRowSelKeys`) and falling back to two-level `candidate_blocks`
+     above `16384` tokens on `compress_ratio == 1` layers. Keeps ragged prefill on
+     stock `fp8_fp4_mqa_logits + top_k_per_row_prefill`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import logging
 import math
 import os
 from pathlib import Path
 import sys
 import time
+import types
 from typing import Any
 
 import torch
@@ -63,6 +79,9 @@ _LOG = logging.getLogger(__name__)
 _DEFAULT_COMPAT_CANDIDATES: tuple[str, ...] = (
     "/usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/_compat",
 )
+
+SM120_DSA_CANDIDATE_COVER_TOKENS: int = 16384
+DEFAULT_MEGA_GATE_MIN_TOKENS: int = 32
 
 # Per-shape eager Cutlass crossover thresholds measured on RTX 6000D (`sm_120`,
 # 156 SMs) with retained `PreparationSession` + `autotune=True`:
@@ -85,6 +104,30 @@ class B12xPrepareSummary:
     moe_scratch_bytes: int
     linear_scratch_bytes: int
     prepare_ms: float
+    mega_gate_layers: int = 0
+    mega_gate_schedules: int = 0
+    mega_gate_min_tokens: int = 0
+    dsa_decode_enabled: bool = False
+
+
+@dataclass
+class _Sm120MegaGateState:
+    scratch_flat: torch.Tensor
+    score_barriers_u64: torch.Tensor
+    barriers_i32_flat: torch.Tensor
+    ids_i64_buf: torch.Tensor
+    img_mask_bool: torch.Tensor
+    img_lt_bool: torch.Tensor
+    img_zero_u8: torch.Tensor
+    sentinel_logits: torch.Tensor
+    dummy_f32: torch.Tensor
+    dummy_u8: torch.Tensor
+    dummy_i32: torch.Tensor
+    dummy_i64_by_topk: dict[int, torch.Tensor]
+    min_tokens: int
+    max_tokens: int
+    num_schedules: int
+    patched_layers: int
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -92,6 +135,59 @@ def _env_flag(name: str, default: bool = True) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return int(raw.strip())
+
+
+def _compute_b12x_source_fingerprint() -> str:
+    """Compute a short deterministic hash over loaded `b12x` sources to isolate disk caches."""
+    b12x_mod = sys.modules.get("b12x")
+    b12x_file = getattr(b12x_mod, "__file__", None) if b12x_mod is not None else None
+    if not b12x_file:
+        return "default"
+    pkg_dir = Path(b12x_file).resolve().parent
+    rel_files = (
+        "__init__.py",
+        "preparation/session.py",
+        "gemm/block_fp8_linear.py",
+        "gemm/_shared/block_fp8.py",
+        "moe/fused_moe/__init__.py",
+        "moe/fused_moe/api.py",
+    )
+    digest = hashlib.sha256()
+    matched = 0
+    for rel in rel_files:
+        p = pkg_dir / rel
+        if p.is_file():
+            digest.update(rel.encode("utf-8"))
+            digest.update(p.read_bytes())
+            matched += 1
+    return digest.hexdigest()[:10] if matched > 0 else "default"
+
+
+def is_sm120_dsa_decode_available() -> bool:
+    """Return True when SM120 fused paged DSA indexer decode is enabled and importable."""
+    if not _env_flag("ZSTEP_ENABLE_SM120_DSA_DECODE", default=True):
+        return False
+    if not torch.cuda.is_available():
+        return False
+    if torch.cuda.get_device_capability() != (12, 0):
+        return False
+    try:
+        from flashinfer.experimental.sm120_dsa_indexer._api import (  # noqa: F401
+            dsa_indexer_det_topk_paged,
+        )
+        from flashinfer.utils import is_sm120f_supported
+
+        dev = torch.device("cuda", torch.cuda.current_device())
+        return bool(is_sm120f_supported(dev))
+    except (ImportError, RuntimeError, AttributeError):
+        return False
 
 
 def _prepend_pythonpath(entry: str) -> None:
@@ -709,6 +805,778 @@ def install_b12x_dsv41_quant_patches() -> bool:
     return True
 
 
+def install_sm120_dsa_indexer_patches() -> bool:
+    """Idempotently patch `SparseAttnIndexer.forward_cuda` to fuse paged decode on SM120."""
+    if not is_sm120_dsa_decode_available():
+        return False
+
+    from flashinfer.experimental.sm120_dsa_indexer._api import (
+        dsa_indexer_det_topk_paged,
+    )
+    from vllm import _custom_ops as ops
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import get_forward_context
+    from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+        apply_candidate_mask as _apply_candidate_mask,
+    )
+    from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+        select_candidate_blocks as _select_candidate_blocks,
+    )
+    import vllm.model_executor.layers.sparse_attn_indexer as sai
+    from vllm.platforms import current_platform
+    from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
+    from vllm.utils.torch_utils import _resolve_layer_name
+    from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+    from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    indexer_cls = sai.SparseAttnIndexer
+    if getattr(indexer_cls, "_zstep_sm120_dsa_patched", False):
+        return True
+
+    orig_forward_cuda = indexer_cls.forward_cuda
+    gather_ws_shapes = sai._gather_workspace_shapes
+
+    def _patched_forward_cuda(
+        self,
+        hidden_states: torch.Tensor,
+        q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        k: torch.Tensor | None,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if (
+            self.use_pcp
+            or self.dcp_world_size > 1
+            or self.head_dim != 128
+            or not (1 <= self.topk_tokens <= 4096)
+        ):
+            return orig_forward_cuda(self, hidden_states, q_quant, k, weights)
+
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return orig_forward_cuda(self, hidden_states, q_quant, k, weights)
+
+        attn_metadata_narrowed = attn_metadata.get(self.k_cache.prefix)
+        if attn_metadata_narrowed is None or attn_metadata_narrowed.num_decodes <= 0:
+            return orig_forward_cuda(self, hidden_states, q_quant, k, weights)
+
+        decode_metadata = attn_metadata_narrowed.decode
+        if (
+            decode_metadata is None
+            or decode_metadata.global_seq_lens is not None
+            or decode_metadata.indices is not None
+        ):
+            return orig_forward_cuda(self, hidden_states, q_quant, k, weights)
+
+        compressed_max_seq = (
+            int(attn_metadata_narrowed.max_seq_len) + self.compress_ratio - 1
+        ) // self.compress_ratio
+        candidate_blocks = self.candidate_blocks
+        if candidate_blocks is not None:
+            cand_cover = int(candidate_blocks.shape[1]) * int(self.candidate_block_size)
+            if compressed_max_seq > cand_cover:
+                return orig_forward_cuda(self, hidden_states, q_quant, k, weights)
+
+        if isinstance(q_quant, tuple):
+            q_values, q_scale = q_quant
+        else:
+            q_values, q_scale = q_quant, None
+
+        if q_values.shape[-2] not in (32, 64):
+            return orig_forward_cuda(self, hidden_states, q_quant, k, weights)
+
+        num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
+        decode_lens = decode_metadata.decode_lens
+        needs_padded_path = decode_metadata.requires_padding or (
+            num_decode_tokens % decode_lens.shape[0] != 0
+        )
+        if num_decode_tokens == 0:
+            est_next_n = 1
+        elif needs_padded_path:
+            # Check max decode length via metadata upper bound before mutating kv_cache.
+            est_next_n = int(getattr(decode_metadata, "write_max_decode_len", 1))
+        else:
+            est_next_n = num_decode_tokens // decode_lens.shape[0]
+        if not (1 <= est_next_n <= 16):
+            return orig_forward_cuda(self, hidden_states, q_quant, k, weights)
+
+        raw_kv_cache = self.k_cache.kv_cache
+        slot_mapping = attn_metadata_narrowed.slot_mapping
+        has_prefill = attn_metadata_narrowed.num_prefills > 0
+        topk_tokens = self.topk_tokens
+        topk_indices_buffer = self.topk_indices_buffer
+
+        num_tokens = slot_mapping.shape[0]
+        k_local = k[:num_tokens] if k is not None else None
+        if not self.skip_k_cache_insert:
+            assert k_local is not None and self.scale_fmt is not None
+            k_ins, slot_mapping_for_cache = maybe_gather_indexer_k(
+                k_local, slot_mapping, num_decode_tokens, False
+            )
+            ops.indexer_k_quant_and_cache(
+                k_ins,
+                raw_kv_cache,
+                slot_mapping_for_cache,
+                self.quant_block_size,
+                self.scale_fmt,
+            )
+
+        if forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL:
+            dense_mha_layer = _resolve_layer_name(self.dense_mha_metadata_layer_name)
+            if dense_mha_layer:
+                mla_metadata = attn_metadata.get(dense_mha_layer)
+                mla_prefill = getattr(mla_metadata, "prefill", None)
+                if (
+                    getattr(mla_prefill, "use_dense_mha", False)
+                    and getattr(mla_metadata, "num_decode_tokens", -1) == 0
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    return topk_indices_buffer
+
+        if num_decode_tokens == 0:
+            padded_q = q_values[:1].reshape(1, 1, *q_values.shape[1:])
+            padded_q_scale = (
+                q_scale[:1].reshape(1, 1, *q_scale.shape[1:])
+                if q_scale is not None
+                else None
+            )
+        elif needs_padded_path:
+            if q_scale is not None:
+                padded_q = pack_seq_triton(
+                    q_values[:num_decode_tokens], decode_lens, pad_value=0
+                )
+                padded_q_scale = pack_seq_triton(
+                    q_scale[:num_decode_tokens], decode_lens, pad_value=0
+                )
+            else:
+                padded_q = pack_seq_triton(q_values[:num_decode_tokens], decode_lens)
+                padded_q_scale = None
+        else:
+            padded_q = q_values[:num_decode_tokens].reshape(
+                decode_lens.shape[0], -1, *q_values.shape[1:]
+            )
+            padded_q_scale = (
+                q_scale[:num_decode_tokens].reshape(
+                    decode_lens.shape[0], -1, *q_scale.shape[1:]
+                )
+                if q_scale is not None
+                else None
+            )
+
+        batch_size = padded_q.shape[0]
+        next_n = padded_q.shape[1]
+        num_padded_tokens = batch_size * next_n
+
+        # `dsa_indexer_det_topk_paged` writes every `[num_padded_tokens, topk_tokens]`
+        # slot directly (filling `-1` for `i >= seq_len`, including `seq_len == 0`
+        # padded CUDAGraph rows), so pure non-padded decode needs no prior `-1` fill.
+        if (
+            has_prefill
+            or needs_padded_path
+            or num_padded_tokens != hidden_states.shape[0]
+            or topk_indices_buffer.shape[1] != topk_tokens
+        ):
+            topk_indices_buffer[: hidden_states.shape[0]] = -1
+
+        if has_prefill:
+            prefill_metadata = attn_metadata_narrowed.prefill
+            assert prefill_metadata is not None
+            fp8_dtype = current_platform.fp8_dtype()
+            values_spec, scales_spec = gather_ws_shapes(
+                self.max_total_seq_len, self.head_dim, fp8_dtype, self.use_fp4_cache
+            )
+            k_quant_full, k_scale_full = current_workspace_manager().get_simultaneous(
+                values_spec, scales_spec
+            )
+            for chunk in prefill_metadata.chunks:
+                cu_seqlen_ks = chunk.cu_seqlen_ks
+                cu_seqlen_ke = chunk.cu_seqlen_ke
+                k_quant = k_quant_full[: chunk.max_local_total_seq_lens]
+                k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
+                if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:
+                    ops.cp_gather_indexer_k_quant_cache(
+                        raw_kv_cache,
+                        k_quant,
+                        k_scale,
+                        chunk.block_table,
+                        chunk.local_cu_seq_lens,
+                    )
+                q_slice = q_values[chunk.token_start : chunk.token_end]
+                q_scale_slice = (
+                    q_scale[chunk.token_start : chunk.token_end]
+                    if q_scale is not None
+                    else None
+                )
+                prefill_topk = topk_indices_buffer[
+                    chunk.token_start : chunk.token_end, :topk_tokens
+                ]
+                if chunk.local_total_seq_lens == 0 or q_slice.shape[0] == 0:
+                    prefill_topk.fill_(-1)
+                else:
+                    if self.use_fp4_cache:
+                        q_slice_cast = q_slice.view(torch.int8)
+                        k_quant_cast = k_quant.view(torch.int8)
+                        k_scale_cast = k_scale.view(torch.int32).squeeze(-1)
+                    else:
+                        q_slice_cast = q_slice
+                        k_quant_cast = k_quant
+                        k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
+                    logits = fp8_fp4_mqa_logits(
+                        (q_slice_cast, q_scale_slice),
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        clean_logits=False,
+                    )
+                    num_rows = logits.shape[0]
+                    if candidate_blocks is not None:
+                        chunk_candidates = candidate_blocks[
+                            chunk.token_start : chunk.token_end
+                        ]
+                        if self.candidate_write:
+                            _select_candidate_blocks(
+                                logits,
+                                cu_seqlen_ks,
+                                cu_seqlen_ke,
+                                chunk_candidates.shape[1],
+                                self.candidate_block_size,
+                                chunk_candidates,
+                            )
+                        else:
+                            _apply_candidate_mask(
+                                logits,
+                                cu_seqlen_ks,
+                                cu_seqlen_ke,
+                                chunk_candidates,
+                                self.candidate_block_size,
+                            )
+                    ops.top_k_per_row_prefill(
+                        logits,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        prefill_topk,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
+
+        seq_lens = decode_metadata.seq_lens[:batch_size]
+        block_table = decode_metadata.block_table[:batch_size]
+        page_rows = int(raw_kv_cache.shape[1])
+        bt_cap = int(block_table.shape[1]) * page_rows
+        eff_max_ctx = min(bt_cap, max(compressed_max_seq, 1))
+        decode_topk = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+
+        dsa_indexer_det_topk_paged(
+            padded_q,
+            raw_kv_cache,
+            weights[:num_padded_tokens],
+            seq_lens,
+            block_table,
+            top_k=topk_tokens,
+            max_context_len=eff_max_ctx,
+            page_rows=page_rows,
+            q_scale=padded_q_scale,
+            indices=decode_topk,
+            return_scores=False,
+        )
+
+        if needs_padded_path:
+            unpacked = unpack_seq_triton(
+                decode_topk.reshape(batch_size, -1, decode_topk.shape[-1]),
+                decode_lens,
+            )
+            topk_indices_buffer[: unpacked.shape[0], : unpacked.shape[-1]] = unpacked
+
+        return topk_indices_buffer
+
+    indexer_cls.forward_cuda = _patched_forward_cuda
+    indexer_cls._zstep_sm120_dsa_patched = True
+    return True
+
+
+def _prepare_sm120_dsa_indexer(
+    *,
+    rank: int,
+    device: torch.device,
+    decode_buckets: tuple[int, ...],
+    exchange_group: dist.ProcessGroup | None,
+) -> bool:
+    """Compile `sm120_dsa_indexer` on rank 0 first and pre-size decode workspace."""
+    if not is_sm120_dsa_decode_available():
+        return False
+    install_sm120_dsa_indexer_patches()
+
+    from flashinfer.experimental.sm120_dsa_indexer._api import (
+        _decode_logits,
+        _module,
+        _row_sel_keys,
+    )
+
+    if exchange_group is not None and dist.is_initialized():
+        if rank == 0:
+            _module()
+        dist.barrier(group=exchange_group)
+        if rank != 0:
+            _module()
+        dist.barrier(group=exchange_group)
+    else:
+        _module()
+
+    max_rows = max((int(b) for b in decode_buckets if int(b) > 0), default=128)
+    max_rows = max(max_rows, 256)
+    _decode_logits(
+        device, max_rows, min(int(_row_sel_keys()), SM120_DSA_CANDIDATE_COVER_TOKENS)
+    )
+    return True
+
+
+def _prepare_sm12x_mega_gate(
+    model: torch.nn.Module,
+    *,
+    rank: int,
+    device: torch.device,
+    max_tokens: int,
+    exchange_group: dist.ProcessGroup | None,
+) -> tuple[int, int, int]:
+    """Pre-compile SM120 CuTe-DSL MegaGate schedules (rank 0 first) and patch eligible MoERunners."""
+    if not _env_flag("ZSTEP_ENABLE_SM12X_MEGA_GATE", default=True):
+        return 0, 0, 0
+    min_tokens = _env_int("ZSTEP_MEGA_GATE_MIN_TOKENS", DEFAULT_MEGA_GATE_MIN_TOKENS)
+    if min_tokens <= 0 or min_tokens > int(max_tokens):
+        return 0, 0, 0
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
+        return 0, 0, 0
+
+    try:
+        from flashinfer.experimental.sm12x_mega_gate.heuristics import (
+            BLOCK_K,
+            MAX_EXPERTS,
+            MegaGateConfig,
+            select_config,
+        )
+        from flashinfer.experimental.sm12x_mega_gate.mega_gate import (
+            EXPERTS_PER_LANE,
+            MAX_SLOTS,
+            SCORE_BARRIER_WORDS,
+            KernelSpec,
+            device_facts,
+            load_kernel,
+        )
+        import vllm.envs as vllm_envs
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        arch, sms = device_facts(rank)
+    except (ImportError, RuntimeError, AttributeError) as exc:
+        if rank == 0:
+            _LOG.warning("SM12x MegaGate unavailable on rank %d: %s", rank, exc)
+        return 0, 0, 0
+
+    check_skip_pad = bool(getattr(vllm_envs, "VLLM_MOE_SKIP_PADDING", False))
+
+    eligible: list[
+        tuple[
+            Any,
+            torch.Tensor,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            int,
+            int,
+            float,
+        ]
+    ] = []
+    unique_geom: set[tuple[int, int, int, bool, bool]] = set()
+    max_top_k = 0
+    max_tok_cap = int(max_tokens)
+
+    for mod in model.modules():
+        if mod.__class__.__name__ != "MoERunner":
+            continue
+        if getattr(mod, "_zstep_mega_gate_patched", False):
+            continue
+        gate = getattr(mod, "gate", None)
+        router = getattr(mod, "router", None)
+        moe_cfg = getattr(mod, "moe_config", None)
+        routed_exp = getattr(mod, "routed_experts", None)
+        if gate is None or router is None or moe_cfg is None or routed_exp is None:
+            continue
+        qm = getattr(routed_exp, "quant_method", None)
+        if qm is None or bool(getattr(qm, "is_monolithic", False)):
+            continue
+        eplb_state = getattr(router, "eplb_state", None)
+        if (
+            bool(getattr(mod, "_fse_fuse_gate", False))
+            or bool(getattr(mod, "do_naive_dispatch_combine", False))
+            or int(getattr(moe_cfg, "pcp_size", 1)) > 1
+            or getattr(gate, "tid2eid", None) is not None
+            or (
+                eplb_state is not None
+                and getattr(eplb_state, "logical_to_physical_map", None) is not None
+            )
+            or getattr(router, "_hash_indices_table", None) is not None
+            or int(getattr(router, "num_fused_shared_experts", 0)) != 0
+            or getattr(router, "scoring_func", None) != "sqrtsoftplus"
+            or not bool(getattr(router, "renormalize", False))
+        ):
+            continue
+
+        weight = getattr(gate, "weight", None)
+        if (
+            not isinstance(weight, torch.Tensor)
+            or weight.ndim != 2
+            or weight.dtype != torch.bfloat16
+            or weight.device != device
+            or not weight.is_contiguous()
+            or weight.data_ptr() % 16 != 0
+        ):
+            continue
+        num_experts, hidden = int(weight.shape[0]), int(weight.shape[1])
+        if (
+            hidden <= 0
+            or hidden % BLOCK_K != 0
+            or not (0 < num_experts <= MAX_EXPERTS)
+            or num_experts % EXPERTS_PER_LANE != 0
+        ):
+            continue
+
+        top_k = int(getattr(router, "top_k", 0))
+        if not (0 < top_k <= min(num_experts, MAX_SLOTS)):
+            continue
+
+        routed_scale = float(getattr(router, "routed_scaling_factor", 1.0))
+        if not math.isfinite(routed_scale):
+            continue
+
+        bias_param = getattr(router, "e_score_correction_bias", None)
+        bias_t: torch.Tensor | None = None
+        if bias_param is not None:
+            bias_t = bias_param.data
+            if (
+                bias_t.ndim != 1
+                or int(bias_t.shape[0]) != num_experts
+                or bias_t.dtype != torch.float32
+                or bias_t.device != device
+                or not bias_t.is_contiguous()
+                or bias_t.data_ptr() % 16 != 0
+            ):
+                continue
+
+        img_sentinel_lo = int(getattr(router, "image_sentinel_lo", 0))
+        bias_vl_param = getattr(router, "bias_vl", None)
+        if bias_vl_param is None:
+            bias_vl_param = getattr(gate, "bias_vl", None)
+        bias_vl_t: torch.Tensor | None = None
+        if bias_vl_param is not None and img_sentinel_lo > 0:
+            bias_vl_t = bias_vl_param.data
+            if (
+                bias_vl_t.ndim != 1
+                or int(bias_vl_t.shape[0]) != num_experts
+                or bias_vl_t.dtype != torch.float32
+                or bias_vl_t.device != device
+                or not bias_vl_t.is_contiguous()
+                or bias_vl_t.data_ptr() % 16 != 0
+            ):
+                continue
+
+        eligible.append(
+            (mod, weight, bias_t, bias_vl_t, img_sentinel_lo, top_k, routed_scale)
+        )
+        unique_geom.add(
+            (hidden, num_experts, top_k, bias_t is not None, bias_vl_t is not None)
+        )
+        max_top_k = max(max_top_k, top_k)
+
+    if not eligible:
+        if rank == 0:
+            _LOG.warning("SM12x MegaGate found 0 eligible MoERunner layers")
+        return 0, 0, 0
+
+    enable_pdl = _env_flag("ZSTEP_MEGA_GATE_ENABLE_PDL", default=False)
+    specs_to_compile: list[KernelSpec] = []
+    geom_cfg_by_m: dict[
+        tuple[int, int, int, bool, bool], list[MegaGateConfig | None]
+    ] = {}
+    max_scratch_elems = 16
+    max_barrier_rows = 1
+
+    for hidden, num_experts, top_k, has_bias, has_image_bias in sorted(unique_geom):
+        cfgs_m: list[MegaGateConfig | None] = [None] * (max_tok_cap + 1)
+        seen_cfgs: dict[MegaGateConfig, KernelSpec] = {}
+        for m in range(min_tokens, max_tok_cap + 1):
+            cfg = select_config(m, hidden, num_experts, sms, False)
+            if cfg.num_logical_ctas > sms or (hidden // BLOCK_K) % cfg.num_split_k != 0:
+                continue
+            cfgs_m[m] = cfg
+            max_scratch_elems = max(
+                max_scratch_elems, int(math.prod(cfg.scratch_shape(m, num_experts)))
+            )
+            max_barrier_rows = max(max_barrier_rows, int(cfg.num_token_blocks(m)))
+            if cfg not in seen_cfgs:
+                spec = KernelSpec(
+                    config=cfg,
+                    hidden=hidden,
+                    num_experts=num_experts,
+                    num_topk=top_k,
+                    num_shared=0,
+                    has_bias=has_bias,
+                    has_image_bias=has_image_bias,
+                    has_mask=False,
+                    has_physical_map=False,
+                    has_unmapped=False,
+                    enable_pdl=enable_pdl,
+                    has_fixed_routing=False,
+                )
+                seen_cfgs[cfg] = spec
+                specs_to_compile.append(spec)
+        geom_cfg_by_m[(hidden, num_experts, top_k, has_bias, has_image_bias)] = cfgs_m
+
+    if not specs_to_compile:
+        return 0, 0, 0
+
+    compiled_by_spec: dict[KernelSpec, Any] = {}
+
+    def _compile_all() -> None:
+        for sp in specs_to_compile:
+            compiled_by_spec[sp] = load_kernel(arch, rank, sp)
+
+    if exchange_group is not None and dist.is_initialized():
+        if rank == 0:
+            _compile_all()
+        dist.barrier(group=exchange_group)
+        if rank != 0:
+            _compile_all()
+        dist.barrier(group=exchange_group)
+    else:
+        _compile_all()
+
+    scratch_flat = torch.empty(max_scratch_elems, dtype=torch.float32, device=device)
+    score_barriers_u64 = torch.zeros(
+        (max_barrier_rows, SCORE_BARRIER_WORDS), dtype=torch.uint64, device=device
+    )
+    barriers_i32_flat = score_barriers_u64.view(torch.int32).view(-1)
+    ids_i64_buf = torch.empty(
+        (max_tok_cap, max_top_k), dtype=torch.int64, device=device
+    )
+    img_mask_bool = torch.zeros(max_tok_cap, dtype=torch.bool, device=device)
+    img_lt_bool = torch.zeros(max_tok_cap, dtype=torch.bool, device=device)
+    img_mask_u8 = img_mask_bool.view(torch.uint8)
+    img_zero_u8 = torch.zeros(max_tok_cap, dtype=torch.uint8, device=device)
+    sentinel_logits = torch.empty((0,), dtype=torch.float32, device=device)
+    dummy_f32 = torch.zeros(1, dtype=torch.float32, device=device)
+    dummy_u8 = torch.zeros(1, dtype=torch.uint8, device=device)
+    dummy_i32 = torch.zeros(1, dtype=torch.int32, device=device)
+    dummy_i64_by_topk: dict[int, torch.Tensor] = {
+        tk: torch.zeros((1, tk), dtype=torch.int64, device=device)
+        for _h, _e, tk, _hb, _hib in unique_geom
+    }
+
+    # Build O(1) runtime dispatch tables indexed by `M` (`0..max_tok_cap`):
+    # `(compiled_kernel, num_worker_groups, scratch_len, barrier_i32_len)` or `None`.
+    geom_tables: dict[
+        tuple[int, int, int, bool, bool], tuple[tuple[Any, int, int, int] | None, ...]
+    ] = {}
+    for gkey, cfgs_m in geom_cfg_by_m.items():
+        hidden, num_experts, top_k, has_bias, has_image_bias = gkey
+        entries: list[tuple[Any, int, int, int] | None] = [None] * (max_tok_cap + 1)
+        for m in range(min_tokens, max_tok_cap + 1):
+            cfg = cfgs_m[m]
+            if cfg is None:
+                continue
+            spec = KernelSpec(
+                config=cfg,
+                hidden=hidden,
+                num_experts=num_experts,
+                num_topk=top_k,
+                num_shared=0,
+                has_bias=has_bias,
+                has_image_bias=has_image_bias,
+                has_mask=False,
+                has_physical_map=False,
+                has_unmapped=False,
+                enable_pdl=enable_pdl,
+                has_fixed_routing=False,
+            )
+            kern = compiled_by_spec[spec]
+            nwg = int(cfg.num_worker_groups(m, sms))
+            scr_len = int(math.prod(cfg.scratch_shape(m, num_experts)))
+            bar_len = int(cfg.num_token_blocks(m)) * (SCORE_BARRIER_WORDS * 2)
+            entries[m] = (kern, nwg, scr_len, bar_len)
+        geom_tables[gkey] = tuple(entries)
+
+    seen_img_lo: set[int] = set()
+    for (
+        runner,
+        weight,
+        bias_t,
+        bias_vl_t,
+        img_sentinel_lo,
+        top_k,
+        routed_scale,
+    ) in eligible:
+        hidden = int(weight.shape[1])
+        num_experts = int(weight.shape[0])
+        has_img_bias = bias_vl_t is not None
+        gkey = (hidden, num_experts, top_k, bias_t is not None, has_img_bias)
+        sched_table = geom_tables[gkey]
+        bias_arg = bias_t if bias_t is not None else dummy_f32
+        img_bias_arg = bias_vl_t if bias_vl_t is not None else dummy_f32
+        is_mask_producer = False
+        if has_img_bias and img_sentinel_lo not in seen_img_lo:
+            seen_img_lo.add(img_sentinel_lo)
+            is_mask_producer = True
+        dummy_i64 = dummy_i64_by_topk[top_k]
+        orig_gate_forward = runner.gate.forward
+        orig_select_experts = runner.router.select_experts
+
+        def _make_hooks(
+            *,
+            _orig_gate_fwd: Any = orig_gate_forward,
+            _orig_sel: Any = orig_select_experts,
+            _router: Any = runner.router,
+            _weight: torch.Tensor = weight,
+            _bias_arg: torch.Tensor = bias_arg,
+            _img_bias_arg: torch.Tensor = img_bias_arg,
+            _has_img_bias: bool = has_img_bias,
+            _img_lo: int = img_sentinel_lo,
+            _produce_mask: bool = is_mask_producer,
+            _dummy_i64: torch.Tensor = dummy_i64,
+            _table: tuple[tuple[Any, int, int, int] | None, ...] = sched_table,
+            _hidden: int = hidden,
+            _top_k: int = top_k,
+            _scale: float = routed_scale,
+        ):
+            def _gate_fwd(self_gate: Any, x: torch.Tensor):
+                x_2d = x if x.ndim == 2 else x.reshape(-1, x.shape[-1])
+                m = int(x_2d.shape[0])
+                if (
+                    min_tokens <= m <= max_tok_cap
+                    and x_2d.shape[1] == _hidden
+                    and x_2d.dtype == torch.bfloat16
+                    and x_2d.is_contiguous()
+                    and x_2d.data_ptr() % 16 == 0
+                    and _table[m] is not None
+                    and not (
+                        check_skip_pad
+                        and is_forward_context_available()
+                        and get_forward_context().is_padding is not None
+                    )
+                ):
+                    return sentinel_logits, None
+                return _orig_gate_fwd(x)
+
+            def _select_experts(
+                hidden_states: torch.Tensor,
+                router_logits: torch.Tensor,
+                topk_indices_dtype: torch.dtype | None = None,
+                *,
+                input_ids: torch.Tensor | None = None,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                if router_logits is sentinel_logits:
+                    x_2d = (
+                        hidden_states
+                        if hidden_states.ndim == 2
+                        else hidden_states.reshape(-1, _hidden)
+                    )
+                    m = int(x_2d.shape[0])
+                    entry = _table[m]
+                    assert entry is not None
+                    kern, nwg, scr_len, bar_len = entry
+                    if _has_img_bias:
+                        if input_ids is not None:
+                            if _produce_mask:
+                                ids_flat = input_ids.reshape(-1)[:m]
+                                torch.ge(ids_flat, _img_lo, out=img_mask_bool[:m])
+                                torch.lt(ids_flat, _img_lo + 5, out=img_lt_bool[:m])
+                                img_mask_bool[:m].logical_and_(img_lt_bool[:m])
+                            img_mask_arg = img_mask_u8[:m]
+                        else:
+                            img_mask_arg = img_zero_u8[:m]
+                    else:
+                        img_mask_arg = dummy_u8
+                    ids_i64 = (
+                        ids_i64_buf[:m]
+                        if _top_k == max_top_k
+                        else ids_i64_buf[:m, :_top_k].contiguous()
+                    )
+                    out_wts = torch.empty(
+                        (m, _top_k), dtype=torch.float32, device=device
+                    )
+                    kern(
+                        x_2d,
+                        _weight,
+                        _bias_arg,
+                        _img_bias_arg,
+                        img_mask_arg,
+                        dummy_u8,
+                        dummy_u8,
+                        dummy_i32,
+                        dummy_i32,
+                        ids_i64,
+                        out_wts,
+                        _dummy_i64,
+                        scratch_flat[:scr_len],
+                        barriers_i32_flat[:bar_len],
+                        m,
+                        0,
+                        _scale,
+                        1,
+                        nwg,
+                    )
+                    target_dtype = (
+                        torch.int32
+                        if topk_indices_dtype is None
+                        else topk_indices_dtype
+                    )
+                    out_ids = (
+                        ids_i64.clone()
+                        if target_dtype == torch.int64
+                        else ids_i64.to(dtype=target_dtype)
+                    )
+                    replay_out = getattr(_router, "_routing_replay_out", None)
+                    if replay_out is not None:
+                        replay_out[:m].copy_(out_ids.to(torch.int16))
+                    return out_wts, out_ids
+                return _orig_sel(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=topk_indices_dtype,
+                    input_ids=input_ids,
+                )
+
+            return _gate_fwd, _select_experts
+
+        gate_fwd_fn, sel_fn = _make_hooks()
+        runner.gate.forward = types.MethodType(gate_fwd_fn, runner.gate)
+        runner.router.select_experts = sel_fn
+        runner._zstep_mega_gate_patched = True
+
+    model._sm120_mega_gate_state = _Sm120MegaGateState(  # type: ignore[attr-defined]
+        scratch_flat=scratch_flat,
+        score_barriers_u64=score_barriers_u64,
+        barriers_i32_flat=barriers_i32_flat,
+        ids_i64_buf=ids_i64_buf,
+        img_mask_bool=img_mask_bool,
+        img_lt_bool=img_lt_bool,
+        img_zero_u8=img_zero_u8,
+        sentinel_logits=sentinel_logits,
+        dummy_f32=dummy_f32,
+        dummy_u8=dummy_u8,
+        dummy_i32=dummy_i32,
+        dummy_i64_by_topk=dummy_i64_by_topk,
+        min_tokens=min_tokens,
+        max_tokens=max_tok_cap,
+        num_schedules=len(specs_to_compile),
+        patched_layers=len(eligible),
+    )
+    return len(eligible), len(specs_to_compile), min_tokens
+
+
 def prepare_b12x_dsv41_model(
     model: torch.nn.Module,
     *,
@@ -718,10 +1586,37 @@ def prepare_b12x_dsv41_model(
     decode_buckets: tuple[int, ...],
     exchange_group: dist.ProcessGroup | None = None,
 ) -> B12xPrepareSummary:
-    """Compile/autotune all `b12x` MoE & Block32 FP8 plans (rank 0 first) and bind static scratch."""
+    """Compile/autotune all SM120 `b12x`, `sm12x_mega_gate` & `sm120_dsa_indexer` plans (rank 0 first)."""
     t0 = time.perf_counter()
+    dsa_enabled = _prepare_sm120_dsa_indexer(
+        rank=rank,
+        device=device,
+        decode_buckets=decode_buckets,
+        exchange_group=exchange_group,
+    )
+    mg_layers, mg_schedules, mg_min_tokens = _prepare_sm12x_mega_gate(
+        model,
+        rank=rank,
+        device=device,
+        max_tokens=max_tokens,
+        exchange_group=exchange_group,
+    )
+
     if not maybe_enable_b12x_for_dsv41():
-        return B12xPrepareSummary(False, 0, 0, 0, 0, 0, 0.0)
+        prep_ms = (time.perf_counter() - t0) * 1000.0
+        return B12xPrepareSummary(
+            enabled=False,
+            moe_layers=0,
+            linear_layers=0,
+            linear_shapes=0,
+            moe_scratch_bytes=0,
+            linear_scratch_bytes=0,
+            prepare_ms=prep_ms,
+            mega_gate_layers=mg_layers,
+            mega_gate_schedules=mg_schedules,
+            mega_gate_min_tokens=mg_min_tokens,
+            dsa_decode_enabled=dsa_enabled,
+        )
 
     from b12x.gemm import block_fp8_linear
     from b12x.gemm._shared.block_fp8 import (
@@ -746,7 +1641,20 @@ def prepare_b12x_dsv41_model(
             linear_layers.append((mod_name, mod, qm))
 
     if not moe_layers and not linear_layers:
-        return B12xPrepareSummary(False, 0, 0, 0, 0, 0, 0.0)
+        prep_ms = (time.perf_counter() - t0) * 1000.0
+        return B12xPrepareSummary(
+            enabled=False,
+            moe_layers=0,
+            linear_layers=0,
+            linear_shapes=0,
+            moe_scratch_bytes=0,
+            linear_scratch_bytes=0,
+            prepare_ms=prep_ms,
+            mega_gate_layers=mg_layers,
+            mega_gate_schedules=mg_schedules,
+            mega_gate_min_tokens=mg_min_tokens,
+            dsa_decode_enabled=dsa_enabled,
+        )
 
     caps_set = set(int(b) for b in decode_buckets if int(b) > 0)
     for extra_c in (256, 512, 1024, 2048, 3072, int(max_tokens)):
@@ -756,7 +1664,21 @@ def prepare_b12x_dsv41_model(
     caps_tuple: tuple[int, ...] = tuple(sorted(caps_set))
 
     moe_warmup_counts = tuple(
-        sorted({1, 2, 4, 8, 16, 32, 64, 128, 512, min(3072, int(max_tokens)), int(max_tokens)})
+        sorted(
+            {
+                1,
+                2,
+                4,
+                8,
+                16,
+                32,
+                64,
+                128,
+                512,
+                min(3072, int(max_tokens)),
+                int(max_tokens),
+            }
+        )
     )
 
     requests: list[Any] = []
@@ -899,9 +1821,15 @@ def prepare_b12x_dsv41_model(
     # IMPORTANT: Do NOT call `sess.close()` here — `sess.prepare()` already drains
     # and closes its `CompilePool`, whereas `sess.close()` clears `plan._prepared`
     # and evicts unretained compiled programs before CUDAGraph capture & serving!
+    b12x_fp = _compute_b12x_source_fingerprint()
+    default_cache_name = (
+        "b12x_zstep_dsv41_v2"
+        if b12x_fp == "default"
+        else f"b12x_zstep_dsv41_v2_{b12x_fp}"
+    )
     cache_dir = os.environ.get(
         "ZSTEP_B12X_CACHE_DIR",
-        str(Path.home() / ".cache" / "b12x_zstep_dsv41_v2"),
+        str(Path.home() / ".cache" / default_cache_name),
     )
     autotune = _env_flag("ZSTEP_B12X_AUTOTUNE", default=True)
 
@@ -1045,14 +1973,28 @@ def prepare_b12x_dsv41_model(
         moe_scratch_bytes=moe_scratch_bytes,
         linear_scratch_bytes=linear_scratch_bytes,
         prepare_ms=prepare_ms,
+        mega_gate_layers=mg_layers,
+        mega_gate_schedules=mg_schedules,
+        mega_gate_min_tokens=mg_min_tokens,
+        dsa_decode_enabled=dsa_enabled,
     )
 
 
 def close_b12x_dsv41_model(model: torch.nn.Module | None) -> None:
-    """Close any retained `b12x` `PreparationSession` attached to `model` during runner teardown."""
-    if model is None:
-        return
-    sess = getattr(model, "_b12x_session", None)
-    if sess is not None:
-        model._b12x_session = None  # type: ignore[attr-defined]
-        sess.close()
+    """Release retained `b12x`, `sm12x_mega_gate`, and `sm120_dsa_indexer` state during teardown."""
+    if model is not None:
+        sess = getattr(model, "_b12x_session", None)
+        if sess is not None:
+            model._b12x_session = None  # type: ignore[attr-defined]
+            sess.close()
+        if hasattr(model, "_b12x_scratch_arenas"):
+            model._b12x_scratch_arenas = None  # type: ignore[attr-defined]
+        if hasattr(model, "_sm120_mega_gate_state"):
+            model._sm120_mega_gate_state = None  # type: ignore[attr-defined]
+
+    dsa_api = sys.modules.get("flashinfer.experimental.sm120_dsa_indexer._api")
+    if dsa_api is not None:
+        for attr in ("_LOGITS", "_LONG_WS", "_RETIRED"):
+            container = getattr(dsa_api, attr, None)
+            if container is not None and hasattr(container, "clear"):
+                container.clear()
