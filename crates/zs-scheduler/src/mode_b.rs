@@ -255,6 +255,8 @@ pub struct ModeBCoordinator {
     workers: WorkerProcesses,
     plan_events: Vec<EventFd>,
     done_events: Vec<EventFd>,
+    pending_done_signals: Vec<u64>,
+    last_published_step: u64,
     arena: SharedMemoryArena,
     layout: ShmLayout,
     config: ModeBConfig,
@@ -271,6 +273,7 @@ impl ModeBCoordinator {
         // Unlink `/dev/shm/<name>` BEFORE spawning children and pass the live open FD via
         // `dup2` in `pre_exec`, eliminating even a millisecond-scale SIGKILL leak window.
         arena.unlink_now()?;
+        let world_size = config.geometry.world_size as usize;
         let plan_events = (0..config.geometry.world_size)
             .map(|_| EventFd::new())
             .collect::<zs_shm::Result<Vec<_>>>()?;
@@ -289,6 +292,8 @@ impl ModeBCoordinator {
             workers,
             plan_events,
             done_events,
+            pending_done_signals: vec![0; world_size],
+            last_published_step: 0,
             arena,
             layout,
             config,
@@ -513,6 +518,7 @@ impl ModeBCoordinator {
     }
 
     fn publish_prepared(&mut self, step_id: u64) -> Result<()> {
+        self.last_published_step = step_id;
         self.arena
             .plan_slot_mut(&self.layout, slot(step_id))?
             .publish(step_id)?;
@@ -538,64 +544,52 @@ impl ModeBCoordinator {
         }
 
         for rank in 0..world_size {
-            loop {
-                let now = Instant::now();
-                if now >= deadline {
-                    let _ = self.arena.signal_abort();
-                    return Err(ModeBError::Protocol(format!(
-                        "rank {rank} timed out waiting for phase {step_id}"
-                    )));
-                }
-                let slice_end = (now + Duration::from_millis(200)).min(deadline);
-                match self.done_events[rank].wait_until(slice_end) {
-                    Ok(()) => break,
-                    Err(_) => {
-                        if let Err(err) = self.workers.check_alive() {
-                            let _ = self.arena.signal_abort();
-                            return Err(err);
-                        }
-                        if let Err(err) = check_peer_states_and_heartbeats(
-                            &self.arena,
-                            world_size,
-                            step_id,
-                            initializing,
-                            stall_limit,
-                            Instant::now(),
-                            &mut hb_tracker,
-                        ) {
-                            let _ = self.arena.signal_abort();
-                            return Err(err);
+            if self.pending_done_signals[rank] > 0 {
+                self.pending_done_signals[rank] -= 1;
+            } else {
+                loop {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        let _ = self.arena.signal_abort();
+                        return Err(ModeBError::Protocol(format!(
+                            "rank {rank} timed out waiting for phase {step_id}"
+                        )));
+                    }
+                    let slice_end = (now + Duration::from_millis(200)).min(deadline);
+                    match self.done_events[rank].wait_until(slice_end) {
+                        Ok(()) => break,
+                        Err(_) => {
+                            if let Err(err) = self.workers.check_alive() {
+                                let _ = self.arena.signal_abort();
+                                return Err(err);
+                            }
+                            if let Err(err) = check_peer_states_and_heartbeats(
+                                &self.arena,
+                                world_size,
+                                step_id,
+                                initializing,
+                                stall_limit,
+                                Instant::now(),
+                                &mut hb_tracker,
+                            ) {
+                                let _ = self.arena.signal_abort();
+                                return Err(err);
+                            }
                         }
                     }
                 }
+                let signals = self.done_events[rank].read()?;
+                self.pending_done_signals[rank] += signals.saturating_sub(1);
             }
-            self.done_events[rank].read()?;
-            let state = self.arena.worker_state(rank)?;
-            let status = state.status_code.load(Ordering::Acquire);
-            let error_code = state.error_code.load(Ordering::Acquire);
-            if status == WORKER_STATUS_ERROR || error_code != 0 {
+            if let Err(err) = verify_rank_ready_state(
+                &self.arena,
+                rank,
+                step_id,
+                self.last_published_step,
+                initializing,
+            ) {
                 let _ = self.arena.signal_abort();
-                return Err(ModeBError::Protocol(format!(
-                    "rank {rank} reported worker error {error_code} in phase {step_id}"
-                )));
-            }
-            if !initializing && status == WORKER_STATUS_RUNNING {
-                let _ = self.arena.signal_abort();
-                return Err(ModeBError::Protocol(format!(
-                    "rank {rank} remained running in phase {step_id}"
-                )));
-            }
-            if status != WORKER_STATUS_READY {
-                let _ = self.arena.signal_abort();
-                return Err(ModeBError::Protocol(format!(
-                    "rank {rank} has unexpected status {status} in phase {step_id}"
-                )));
-            }
-            if !initializing && state.ready_step_id.load(Ordering::Acquire) != step_id {
-                let _ = self.arena.signal_abort();
-                return Err(ModeBError::Protocol(format!(
-                    "rank {rank} completed the wrong step in phase {step_id}"
-                )));
+                return Err(err);
             }
         }
         Ok(())
@@ -786,6 +780,43 @@ fn check_peer_states_and_heartbeats(
     Ok(())
 }
 
+fn verify_rank_ready_state(
+    arena: &SharedMemoryArena,
+    rank: usize,
+    step_id: u64,
+    last_published_step: u64,
+    initializing: bool,
+) -> Result<()> {
+    let state = arena.worker_state(rank)?;
+    let status = state.status_code.load(Ordering::Acquire);
+    let error_code = state.error_code.load(Ordering::Acquire);
+    if status == WORKER_STATUS_ERROR || error_code != 0 {
+        return Err(ModeBError::Protocol(format!(
+            "rank {rank} reported worker error {error_code} in phase {step_id}"
+        )));
+    }
+    if !initializing && status == WORKER_STATUS_RUNNING {
+        return Err(ModeBError::Protocol(format!(
+            "rank {rank} remained running in phase {step_id}"
+        )));
+    }
+    if status != WORKER_STATUS_READY {
+        return Err(ModeBError::Protocol(format!(
+            "rank {rank} has unexpected status {status} in phase {step_id}"
+        )));
+    }
+    if !initializing {
+        let ready_step = state.ready_step_id.load(Ordering::Acquire);
+        let max_expected_step = last_published_step.max(step_id);
+        if ready_step < step_id || ready_step > max_expected_step {
+            return Err(ModeBError::Protocol(format!(
+                "rank {rank} completed unexpected step {ready_step} in phase {step_id} (published up to {max_expected_step})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn slot(step_id: u64) -> usize {
     (step_id & 1) as usize
 }
@@ -902,6 +933,66 @@ mod tests {
         .expect_err("stalled rank 1 must fail fast");
         assert!(
             err.to_string().contains("rank 1 heartbeat stalled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn done_signal_backlog_preserves_prepublished_completions() {
+        let geom = zs_wire::ShmGeometry {
+            world_size: 1,
+            max_seqs: 2,
+            max_step_tokens: 8,
+            max_decoder_rows: 8,
+            max_pages_per_seq: 4,
+            page_block_tokens: 16,
+            spec_verify_width: 1,
+        };
+        let layout = ShmLayout::compute(geom).expect("layout");
+        let shm_name = format!("zstep_prepub_done_{}", std::process::id());
+        let mut arena = SharedMemoryArena::create(&shm_name, layout.total_bytes).expect("arena");
+        arena.initialize(&layout).expect("init");
+        arena.unlink_now().expect("unlink");
+
+        let done_fd = EventFd::new().expect("eventfd");
+        let mut pending_done = 0u64;
+
+        // Simulate worker completing step 10 AND pre-published tail step 11 (`promise == false`)
+        // before master drains `done_fd` for step 10.
+        {
+            let st = arena.worker_state(0).expect("r0");
+            st.status_code.store(WORKER_STATUS_READY, Ordering::Release);
+            st.ready_step_id.store(10, Ordering::Release);
+            done_fd.write(1).expect("signal 10");
+
+            st.ready_step_id.store(11, Ordering::Release);
+            done_fd.write(1).expect("signal 11");
+        }
+
+        // Phase 10 (`last_published_step = 11`): coalesced read (`2`) must bank `1` signal
+        // and accept `ready_step_id == 11` in `10..=11`.
+        let signals = done_fd.read().expect("read coalesced");
+        assert_eq!(signals, 2);
+        pending_done += signals.saturating_sub(1);
+        assert_eq!(pending_done, 1);
+        verify_rank_ready_state(&arena, 0, 10, 11, false).expect("phase 10 valid");
+
+        // Phase 11 (`last_published_step = 11`): banked signal resolves without blocking on empty fd.
+        assert!(pending_done > 0);
+        pending_done -= 1;
+        assert_eq!(pending_done, 0);
+        verify_rank_ready_state(&arena, 0, 11, 11, false).expect("phase 11 valid");
+
+        // Rogue `ready_step_id` beyond `last_published_step` must still fail fast.
+        arena
+            .worker_state(0)
+            .expect("r0")
+            .ready_step_id
+            .store(12, Ordering::Release);
+        let err = verify_rank_ready_state(&arena, 0, 11, 11, false)
+            .expect_err("step beyond published must fail");
+        assert!(
+            err.to_string().contains("completed unexpected step 12"),
             "unexpected error: {err}"
         );
     }

@@ -53,6 +53,9 @@ from zstep_worker.numa_pin import (
     pin_process_to_device_numa,
 )
 from zstep_worker.shm_bridge import (
+    STEP_FLAG_DECODE_ONLY,
+    STEP_FLAG_DEVICE_TOKENS,
+    STEP_FLAG_NEXT_PREPUBLISHED,
     SeqResult,
     ShmBridge,
     StepHeader,
@@ -384,6 +387,7 @@ class RuntimeLoop:
             self._total_vram_mb: int = total_bytes // (1024 * 1024)
             self.current_step: int = 0
             self.last_step: int = 0
+            self._pending_plan_signals: int = 0
         except BaseException:
             self._stop_watchdog()
             self.bridge.close()
@@ -429,14 +433,42 @@ class RuntimeLoop:
         )
 
     def _wait_for_plan_signal(self, poller: select.poll) -> None:
+        # The plan eventfd is not a semaphore: one read drains every publish since the last
+        # read, and the master may publish a step ahead of the one this worker is running.
+        if self._pending_plan_signals > 0:
+            self._pending_plan_signals -= 1
+            return
         while True:
             if self.bridge.is_aborted():
                 raise RuntimeError("master signaled cluster abort in SHM superblock")
             events = poller.poll(250)
             if events:
-                os.eventfd_read(self.args.plan_fd)
+                self._pending_plan_signals += os.eventfd_read(self.args.plan_fd) - 1
                 return
             self.bridge.touch_heartbeat(self.args.rank)
+
+    def _complete_step(
+        self, step_id: int, outputs: list, gpu_exec_us: int, watched_count: int
+    ) -> None:
+        if self.args.rank == 0:
+            self.bridge.result(step_id).write(
+                step_id=step_id,
+                gpu_exec_us=gpu_exec_us,
+                status_code=0,
+                outputs=outputs,
+            )
+        self.last_step = step_id
+        self._write_state(
+            status=WORKER_STATUS_READY,
+            error_code=0,
+            watched_kernels=watched_count,
+        )
+        os.eventfd_write(self.args.done_fd, 1)
+
+    def _finish_pending(self, pending: tuple[int, object], watched_count: int) -> None:
+        step_id, launched = pending
+        outputs, gpu_exec_us = self.runner.finish(launched)
+        self._complete_step(step_id, outputs, gpu_exec_us, watched_count)
 
     def run(self) -> int:
         self._write_state(status=WORKER_STATUS_READY, error_code=0)
@@ -494,6 +526,11 @@ class RuntimeLoop:
                     for name, kernel in watched_kernels
                 ]
                 watched_count = len(spies)
+                pipelined = callable(getattr(self.runner, "launch", None)) and callable(
+                    getattr(self.runner, "finish", None)
+                )
+                # A step launched under STEP_FLAG_NEXT_PREPUBLISHED and not yet completed.
+                pending: tuple[int, object] | None = None
                 while True:
                     self._wait_for_plan_signal(poller)
                     plan = self.bridge.plan(self.current_step + 1)
@@ -510,6 +547,11 @@ class RuntimeLoop:
                         watched_kernels=watched_count,
                     )
                     if header.opcode == OPCODE_SHUTDOWN:
+                        if pending is not None:
+                            raise RuntimeError(
+                                f"shutdown step {header.step_id} published while step "
+                                f"{pending[0]} was still pending"
+                            )
                         recompiled_count = sum(spy.call_count for _, spy in spies)
                         if self.args.rank == 0:
                             self.bridge.result(header.step_id).write(
@@ -529,21 +571,37 @@ class RuntimeLoop:
                         break
                     if header.opcode != OPCODE_NORMAL_STEP:
                         raise RuntimeError(f"unsupported step opcode {header.opcode}")
-                    outputs, gpu_exec_us = self.runner.execute(plan, header)
-                    if self.args.rank == 0:
-                        self.bridge.result(header.step_id).write(
-                            step_id=header.step_id,
-                            gpu_exec_us=gpu_exec_us,
-                            status_code=0,
-                            outputs=outputs,
-                        )
-                    self.last_step = header.step_id
-                    self._write_state(
-                        status=WORKER_STATUS_READY,
-                        error_code=0,
-                        watched_kernels=watched_count,
+                    overlap_flags = header.flags & (
+                        STEP_FLAG_DEVICE_TOKENS | STEP_FLAG_NEXT_PREPUBLISHED
                     )
-                    os.eventfd_write(self.args.done_fd, 1)
+                    if not pipelined:
+                        if overlap_flags != 0:
+                            raise RuntimeError(
+                                f"step {header.step_id} set overlap flags {overlap_flags:#x} "
+                                f"on non-pipelined runner {type(self.runner).__name__}"
+                            )
+                        outputs, gpu_exec_us = self.runner.execute(plan, header)
+                        self._complete_step(header.step_id, outputs, gpu_exec_us, watched_count)
+                        continue
+                    is_decode = (header.flags & STEP_FLAG_DECODE_ONLY) != 0
+                    if not is_decode and overlap_flags != 0:
+                        raise RuntimeError(
+                            f"non-decode step {header.step_id} must not set overlap flags "
+                            f"{overlap_flags:#x}"
+                        )
+                    if pending is not None and not is_decode:
+                        # Only decode steps double-buffer their host staging.
+                        self._finish_pending(pending, watched_count)
+                        pending = None
+                    launched = self.runner.launch(plan, header)
+                    if pending is not None:
+                        # The GPU already has this step queued behind the pending one.
+                        self._finish_pending(pending, watched_count)
+                        pending = None
+                    if header.flags & STEP_FLAG_NEXT_PREPUBLISHED:
+                        pending = (header.step_id, launched)
+                        continue
+                    self._finish_pending((header.step_id, launched), watched_count)
                 recompiled = [
                     f"{name}={spy.call_count}" for name, spy in spies if spy.call_count != 0
                 ]

@@ -22,9 +22,13 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 from pathlib import Path
 import struct
+import tempfile
+import threading
 
 import pytest
 
@@ -34,6 +38,9 @@ from zstep_worker.shm_bridge import (
     SEQ_STEP_OUTPUT_BYTES,
     SHM_SUPERBLOCK_REGION_BYTES,
     SHM_SUPERBLOCK_STRUCT_BYTES,
+    STEP_FLAG_DECODE_ONLY,
+    STEP_FLAG_DEVICE_TOKENS,
+    STEP_FLAG_NEXT_PREPUBLISHED,
     STEP_HEADER_BYTES,
     STEP_HEADER_FLAGS_OFFSET,
     STEP_RESULT_HEADER_BYTES,
@@ -51,6 +58,7 @@ from zstep_worker.shm_bridge import (
     WORKER_PID_OFFSET,
     WORKER_SM_ARCH_OFFSET,
     WORKER_STATE_BYTES,
+    WORKER_STATES_OFFSET,
     WORKER_STATES_REGION_BYTES,
     WORKER_STATUS_OFFSET,
     WORKER_TOTAL_VRAM_OFFSET,
@@ -306,6 +314,9 @@ def test_superblock_binary_roundtrip_and_pad_isolation() -> None:
 
 def test_select_decode_bucket_never_clamps_overflow() -> None:
     assert MAX_DECODE_GRAPH_SEQS == 128
+    assert STEP_FLAG_DECODE_ONLY == (1 << 0)
+    assert STEP_FLAG_DEVICE_TOKENS == (1 << 1)
+    assert STEP_FLAG_NEXT_PREPUBLISHED == (1 << 2)
     assert select_decode_bucket(1, 128) == 1
     assert select_decode_bucket(3, 128) == 4
     assert select_decode_bucket(65, 128) == 128
@@ -315,6 +326,278 @@ def test_select_decode_bucket_never_clamps_overflow() -> None:
         select_decode_bucket(33, 32)
     with pytest.raises(ValueError, match="outside supported CUDA Graph range"):
         select_decode_bucket(0, 128)
+
+
+def _make_runtime_loop_fixture(runner: object) -> tuple[object, ShmBridge, int, int, Path]:
+    from zstep_worker.numa_pin import DeviceNumaTopology
+    from zstep_worker.runtime_loop import RuntimeLoop
+
+    golden_path = Path(__file__).resolve().parent / "fixtures" / "shm_layout_golden.json"
+    sb_offsets = json.loads(golden_path.read_text(encoding="utf-8"))["pod_offsets"][
+        "ShmSuperblock"
+    ]
+    geom = ShmGeometry(
+        world_size=1,
+        max_seqs=8,
+        max_step_tokens=64,
+        max_decoder_rows=64,
+        max_pages_per_seq=16,
+        page_block_tokens=64,
+        spec_verify_width=1,
+    )
+    layout = StepPlanLayout.compute(geom)
+    result_stride = compute_result_slot_stride(geom.max_seqs)
+    layout_hash = compute_layout_hash(layout, result_stride)
+    plans_base = SHM_SUPERBLOCK_REGION_BYTES + WORKER_STATES_REGION_BYTES
+    results_base = plans_base + 2 * layout.total_slot_bytes
+    total_bytes = results_base + 2 * result_stride
+
+    fd, raw_path = tempfile.mkstemp(prefix="zstep_rtloop_")
+    shm_path = Path(raw_path)
+    os.ftruncate(fd, total_bytes)
+    buf = bytearray(SHM_SUPERBLOCK_REGION_BYTES)
+    struct.pack_into("<Q", buf, sb_offsets["magic"], ZSTEP_SHM_MAGIC)
+    struct.pack_into("<I", buf, sb_offsets["protocol_version"], ZSTEP_PROTOCOL_VERSION)
+    struct.pack_into("<I", buf, sb_offsets["world_size"], geom.world_size)
+    struct.pack_into("<I", buf, sb_offsets["max_seqs"], geom.max_seqs)
+    struct.pack_into("<I", buf, sb_offsets["max_step_tokens"], geom.max_step_tokens)
+    struct.pack_into("<I", buf, sb_offsets["max_decoder_rows"], geom.max_decoder_rows)
+    struct.pack_into("<I", buf, sb_offsets["max_pages_per_seq"], geom.max_pages_per_seq)
+    struct.pack_into("<I", buf, sb_offsets["page_block_tokens"], geom.page_block_tokens)
+    struct.pack_into("<I", buf, sb_offsets["spec_verify_width"], geom.spec_verify_width)
+    struct.pack_into("<I", buf, sb_offsets["master_pid"], os.getpid())
+    struct.pack_into("<Q", buf, sb_offsets["total_shm_bytes"], total_bytes)
+    struct.pack_into(
+        "<2Q",
+        buf,
+        sb_offsets["plan_slot_offsets"],
+        plans_base,
+        plans_base + layout.total_slot_bytes,
+    )
+    struct.pack_into("<Q", buf, sb_offsets["plan_slot_stride"], layout.total_slot_bytes)
+    struct.pack_into(
+        "<2Q",
+        buf,
+        sb_offsets["result_slot_offsets"],
+        results_base,
+        results_base + result_stride,
+    )
+    struct.pack_into("<Q", buf, sb_offsets["result_slot_stride"], result_stride)
+    struct.pack_into("<Q", buf, sb_offsets["layout_hash"], layout_hash)
+    struct.pack_into("<I", buf, sb_offsets["max_decode_graph_seqs"], 8)
+    os.pwrite(fd, bytes(buf), 0)
+
+    master_fd = os.dup(fd)
+    worker_bridge = ShmBridge(name="zstep_rtloop_test", shm_fd=fd)
+    master_bridge = ShmBridge(name="zstep_rtloop_test", shm_fd=master_fd)
+    plan_fd = os.eventfd(0)
+    done_fd = os.eventfd(0)
+
+    loop = RuntimeLoop.__new__(RuntimeLoop)
+    loop.args = argparse.Namespace(
+        rank=0,
+        plan_fd=plan_fd,
+        done_fd=done_fd,
+        model_dir="",
+    )
+    loop.numa_topology = DeviceNumaTopology(
+        device_index=0,
+        pci_bus_id="0000:00:00.0",
+        numa_node=0,
+        pinned_cpus=(0,),
+    )
+    loop.bridge = worker_bridge
+    loop.runner = runner
+    loop.model_type = ""
+    loop._watchdog_stop = threading.Event()
+    loop._watchdog_thread = threading.Thread(target=lambda: None)
+    loop._free_vram_mb = 1024
+    loop._total_vram_mb = 2048
+    loop.current_step = 0
+    loop.last_step = 0
+    loop._pending_plan_signals = 0
+    return loop, master_bridge, plan_fd, done_fd, shm_path
+
+
+def _publish_test_step(
+    bridge: ShmBridge,
+    *,
+    step_id: int,
+    opcode: int,
+    flags: int = 0,
+    num_seqs: int = 1,
+) -> None:
+    plan = bridge.plan(step_id)
+    fields = struct.pack(
+        "<12I",
+        opcode,
+        num_seqs,
+        num_seqs,
+        num_seqs,
+        num_seqs,
+        num_seqs,
+        num_seqs,
+        0,
+        flags,
+        0,
+        0,
+        0,
+    )
+    bridge._mapping[plan.base + 8 : plan.base + 56] = fields
+    bridge.store_u64(plan.base, step_id)
+
+
+@pytest.mark.skipif(not hasattr(os, "eventfd"), reason="Linux eventfd required")
+def test_runtime_loop_pipelined_prepublished_burst_and_tail_step() -> None:
+    from zstep_worker.runtime_loop import OPCODE_NORMAL_STEP, OPCODE_SHUTDOWN
+    from zstep_worker.shm_bridge import SeqResult
+
+    events: list[str] = []
+
+    class _FakePipelinedRunner:
+        def launch(self, _plan: object, header: object) -> int:
+            events.append(f"launch:{header.step_id}:{header.flags}")
+            return header.step_id
+
+        def finish(self, launched_step_id: int) -> tuple[list[SeqResult], int]:
+            events.append(f"finish:{launched_step_id}")
+            return (
+                [
+                    SeqResult(
+                        req_slot=0,
+                        accepted_token=100 + launched_step_id,
+                        accepted_logprob_bits=0,
+                    )
+                ],
+                10,
+            )
+
+        def close(self, *, abort: bool = False) -> None:
+            pass
+
+    loop, master, plan_fd, done_fd, shm_path = _make_runtime_loop_fixture(_FakePipelinedRunner())
+    worker_exc: list[BaseException] = []
+    worker_rc: list[int] = []
+
+    def _run_worker() -> None:
+        try:
+            worker_rc.append(loop.run())
+        except BaseException as exc:
+            worker_exc.append(exc)
+
+    thread = threading.Thread(target=_run_worker, daemon=True)
+    thread.start()
+    try:
+        # Drain initial ready signal (`step 0`).
+        assert os.eventfd_read(done_fd) == 1
+        # Publish step 1 (seed pre-published) + step 2 (device tokens + pre-published) together.
+        _publish_test_step(
+            master,
+            step_id=1,
+            opcode=OPCODE_NORMAL_STEP,
+            flags=STEP_FLAG_DECODE_ONLY | STEP_FLAG_NEXT_PREPUBLISHED,
+        )
+        _publish_test_step(
+            master,
+            step_id=2,
+            opcode=OPCODE_NORMAL_STEP,
+            flags=STEP_FLAG_DECODE_ONLY | STEP_FLAG_DEVICE_TOKENS | STEP_FLAG_NEXT_PREPUBLISHED,
+        )
+        os.eventfd_write(plan_fd, 2)
+        # Step 1 finishes only after step 2 is launched behind it.
+        assert os.eventfd_read(done_fd) == 1
+        assert events[:3] == [
+            f"launch:1:{STEP_FLAG_DECODE_ONLY | STEP_FLAG_NEXT_PREPUBLISHED}",
+            f"launch:2:{STEP_FLAG_DECODE_ONLY | STEP_FLAG_DEVICE_TOKENS | STEP_FLAG_NEXT_PREPUBLISHED}",
+            "finish:1",
+        ]
+        # Publish tail step 3 (`promise == False`): worker launches 3, finishes 2, and finishes 3.
+        _publish_test_step(
+            master,
+            step_id=3,
+            opcode=OPCODE_NORMAL_STEP,
+            flags=STEP_FLAG_DECODE_ONLY | STEP_FLAG_DEVICE_TOKENS,
+        )
+        os.eventfd_write(plan_fd, 1)
+        drained = 0
+        while drained < 2:
+            drained += os.eventfd_read(done_fd)
+        assert drained == 2
+        assert master.load_u64(WORKER_STATES_OFFSET) == 3
+
+        _publish_test_step(master, step_id=4, opcode=OPCODE_SHUTDOWN, flags=0, num_seqs=0)
+        os.eventfd_write(plan_fd, 1)
+        assert os.eventfd_read(done_fd) == 1
+        thread.join(timeout=5.0)
+        assert not worker_exc
+        assert worker_rc == [0]
+        assert events == [
+            f"launch:1:{STEP_FLAG_DECODE_ONLY | STEP_FLAG_NEXT_PREPUBLISHED}",
+            f"launch:2:{STEP_FLAG_DECODE_ONLY | STEP_FLAG_DEVICE_TOKENS | STEP_FLAG_NEXT_PREPUBLISHED}",
+            "finish:1",
+            f"launch:3:{STEP_FLAG_DECODE_ONLY | STEP_FLAG_DEVICE_TOKENS}",
+            "finish:2",
+            "finish:3",
+        ]
+    finally:
+        master.close()
+        loop.close(abort=True)
+        shm_path.unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(not hasattr(os, "eventfd"), reason="Linux eventfd required")
+@pytest.mark.parametrize(
+    ("pipelined", "step1_opcode", "step1_flags", "step2_opcode", "expected_match"),
+    [
+        (False, 1, STEP_FLAG_DECODE_ONLY | STEP_FLAG_DEVICE_TOKENS, None, "non-pipelined runner"),
+        (True, 1, STEP_FLAG_DEVICE_TOKENS, None, "non-decode step"),
+        (
+            True,
+            1,
+            STEP_FLAG_DECODE_ONLY | STEP_FLAG_NEXT_PREPUBLISHED,
+            99,
+            "was still pending",
+        ),
+    ],
+)
+def test_runtime_loop_rejects_invalid_overlap_flags(
+    pipelined: bool,
+    step1_opcode: int,
+    step1_flags: int,
+    step2_opcode: int | None,
+    expected_match: str,
+) -> None:
+    class _NonPipelinedRunner:
+        def execute(self, _plan: object, _header: object) -> tuple[list, int]:
+            return [], 1
+
+        def close(self, *, abort: bool = False) -> None:
+            pass
+
+    class _PipelinedRunner:
+        def launch(self, _plan: object, header: object) -> int:
+            return header.step_id
+
+        def finish(self, _launched: int) -> tuple[list, int]:
+            return [], 1
+
+        def close(self, *, abort: bool = False) -> None:
+            pass
+
+    runner = _PipelinedRunner() if pipelined else _NonPipelinedRunner()
+    loop, master, plan_fd, _done_fd, shm_path = _make_runtime_loop_fixture(runner)
+    try:
+        _publish_test_step(master, step_id=1, opcode=step1_opcode, flags=step1_flags)
+        os.eventfd_write(plan_fd, 1)
+        if step2_opcode is not None:
+            _publish_test_step(master, step_id=2, opcode=step2_opcode, flags=0, num_seqs=0)
+            os.eventfd_write(plan_fd, 1)
+        with pytest.raises(RuntimeError, match=expected_match):
+            loop.run()
+    finally:
+        master.close()
+        loop.close(abort=True)
+        shm_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

@@ -51,6 +51,13 @@ pub const WORKER_STATUS_ERROR: u32 = 99;
 /// [`StepHeader::flags`] bit indicating all active sequences have `q_len == 1` and
 /// execute through a pre-captured decode CUDA Graph bucket.
 pub const STEP_FLAG_DECODE_ONLY: u32 = 1 << 0;
+/// [`StepHeader::flags`] bit for decode-only steps: each row's input token is the token the
+/// worker sampled for that `req_slot_id` in the previous decode step, kept on the GPU, and
+/// `token_ids` is ignored. Lets the master publish a step before reading the previous result.
+pub const STEP_FLAG_DEVICE_TOKENS: u32 = 1 << 1;
+/// [`StepHeader::flags`] bit promising that the master publishes step `step_id + 1` before it
+/// waits for this step's result, so a worker may launch that next step before completing this one.
+pub const STEP_FLAG_NEXT_PREPUBLISHED: u32 = 1 << 2;
 /// Canonical CUDA Graph batch buckets for decode-only steps.
 pub const DECODE_GRAPH_BUCKETS: [u32; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 /// Maximum active decode sequences supported by pre-captured decode CUDA Graphs.
@@ -336,6 +343,8 @@ impl StepPlanLayout {
             SUPERBLOCK_ABORT_OFFSET as u64,
             WORKER_STATES_OFFSET as u64,
             STEP_FLAG_DECODE_ONLY as u64,
+            STEP_FLAG_DEVICE_TOKENS as u64,
+            STEP_FLAG_NEXT_PREPUBLISHED as u64,
             MAX_DECODE_GRAPH_SEQS as u64,
             std::mem::offset_of!(ShmSuperblock, total_shm_bytes) as u64,
             std::mem::offset_of!(ShmSuperblock, plan_slot_offsets) as u64,

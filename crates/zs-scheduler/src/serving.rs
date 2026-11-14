@@ -32,7 +32,8 @@ use std::time::Instant;
 
 use zs_kv::{BlockLease, BlockPool, CacheGroupKind};
 use zs_wire::{
-    DECODE_GRAPH_BUCKETS, MAX_DECODE_GRAPH_SEQS, STEP_FLAG_DECODE_ONLY, StepHeader, StepOpcode,
+    DECODE_GRAPH_BUCKETS, MAX_DECODE_GRAPH_SEQS, STEP_FLAG_DECODE_ONLY, STEP_FLAG_DEVICE_TOKENS,
+    STEP_FLAG_NEXT_PREPUBLISHED, StepHeader, StepOpcode,
 };
 
 use crate::mode_b::{ModeBConfig, ModeBCoordinator, ModeBError, Result};
@@ -655,6 +656,8 @@ pub struct ModeBServingEngine {
     worker_numa_nodes: Vec<i32>,
     max_mixed_step_tokens: Option<usize>,
     max_prefill_coalesce_wait_ms: u64,
+    device_token_overlap: bool,
+    poisoned: bool,
     last_generation_schedule: GenerationScheduleStats,
 }
 
@@ -670,6 +673,21 @@ fn validate_serving_max_seqs(max_seqs: u32) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Whether every active sequence is prompt-complete and still needs a decode step after the
+/// step being planned, given `in_flight` earlier steps whose tokens are not harvested yet.
+fn decode_continues_for_all(
+    active: &[ActiveSequence],
+    waiting_permitted: &VecDeque<PendingRequest>,
+    in_flight: usize,
+) -> bool {
+    waiting_permitted.is_empty()
+        && !active.is_empty()
+        && active.iter().all(|seq| {
+            seq.prefilled_tokens == seq.prompt_tokens.len()
+                && seq.generated_tokens.len() + in_flight + 1 < seq.target_output_len
+        })
 }
 
 fn sync_dirty_page_table_rows(
@@ -724,6 +742,8 @@ impl ModeBServingEngine {
             worker_numa_nodes,
             max_mixed_step_tokens: None,
             max_prefill_coalesce_wait_ms: DEFAULT_PREFILL_COALESCE_WAIT_MS,
+            device_token_overlap: false,
+            poisoned: false,
             last_generation_schedule: GenerationScheduleStats::default(),
         })
     }
@@ -756,6 +776,24 @@ impl ModeBServingEngine {
 
     pub fn set_max_prefill_coalesce_wait_ms(&mut self, wait_ms: u64) {
         self.max_prefill_coalesce_wait_ms = wait_ms;
+    }
+
+    /// Publish decode steps before the previous step's result is read.
+    ///
+    /// Workers must implement `launch`/`finish`, `STEP_FLAG_DEVICE_TOKENS`, and
+    /// `STEP_FLAG_NEXT_PREPUBLISHED`, and must not rely on host-updated `engram_prev_window`
+    /// during overlapped decode bursts (enable only for models without host Engram lookback).
+    pub fn set_device_token_overlap(&mut self, enabled: bool) {
+        self.device_token_overlap = enabled;
+    }
+
+    fn plan_flags(&mut self, step_id: u64) -> Result<u32> {
+        Ok(self.coordinator.plan_slot_mut(step_id)?.header_mut()?.flags)
+    }
+
+    fn or_plan_flags(&mut self, step_id: u64, bits: u32) -> Result<()> {
+        self.coordinator.plan_slot_mut(step_id)?.header_mut()?.flags |= bits;
+        Ok(())
     }
 
     /// Generate exact greedy completions for `prompts` (`target_output_len` new tokens each).
@@ -970,6 +1008,12 @@ impl ModeBServingEngine {
         steps_out: &mut u64,
         overlapped_out: &mut u64,
     ) -> Result<()> {
+        if self.poisoned {
+            return Err(ModeBError::Protocol(
+                "serving engine is poisoned after a failed in-flight step".to_owned(),
+            ));
+        }
+        self.poisoned = true;
         let geometry = self.coordinator.config().geometry;
         let max_seqs = geometry.max_seqs as usize;
         let max_step_tokens = geometry.max_step_tokens as usize;
@@ -981,9 +1025,17 @@ impl ModeBServingEngine {
         let mut slot_to_active: Vec<usize> = vec![usize::MAX; max_seqs];
         let mut consecutive_prefills = 0usize;
         let mut prestaged_step_id: Option<u64> = None;
+        // A decode step published before its predecessor's result was read, and whether its
+        // plan promised that the step after it is also published ahead.
+        let mut published_ahead: Option<(u64, bool)> = None;
 
         while !active.is_empty() || !waiting_permitted.is_empty() || !unpermitted_pool.is_empty() {
-            let step_id = if let Some(ready_step) = prestaged_step_id.take() {
+            let mut ahead_promise = None;
+            let step_id = if let Some((ahead_step, promise)) = published_ahead.take() {
+                *overlapped_out += 1;
+                ahead_promise = Some(promise);
+                ahead_step
+            } else if let Some(ready_step) = prestaged_step_id.take() {
                 *overlapped_out += 1;
                 ready_step
             } else {
@@ -1102,13 +1154,51 @@ impl ModeBServingEngine {
                 sid
             };
 
-            self.coordinator.publish_step(step_id)?;
-            *steps_out += 1;
+            let publish_next = match ahead_promise {
+                Some(promise) => promise,
+                None => {
+                    let promise = self.device_token_overlap
+                        && self.plan_flags(step_id)? & STEP_FLAG_DECODE_ONLY != 0
+                        && decode_continues_for_all(&active, waiting_permitted, 0);
+                    if promise {
+                        self.or_plan_flags(step_id, STEP_FLAG_NEXT_PREPUBLISHED)?;
+                    }
+                    self.coordinator.publish_step(step_id)?;
+                    *steps_out += 1;
+                    promise
+                }
+            };
+
+            // Device-token overlap: while the GPUs run `step_id`, publish the next decode step
+            // from known sequence lengths. Workers take its input tokens from the tokens they
+            // sampled on the GPU, so the GPUs never wait for this loop to read `step_id`'s result.
+            if publish_next {
+                let next_sid = self.step_cursor + 1;
+                self.step_cursor = next_sid;
+                self.last_generation_schedule.decode_steps += 1;
+                self.stage_decode_step(
+                    next_sid,
+                    &mut active,
+                    page_block_tokens,
+                    max_pages_per_seq,
+                    true,
+                )?;
+                let promise = decode_continues_for_all(&active, waiting_permitted, 1);
+                let mut flags = STEP_FLAG_DEVICE_TOKENS;
+                if promise {
+                    flags |= STEP_FLAG_NEXT_PREPUBLISHED;
+                }
+                self.or_plan_flags(next_sid, flags)?;
+                self.coordinator.publish_step(next_sid)?;
+                *steps_out += 1;
+                published_ahead = Some((next_sid, promise));
+            }
 
             // `in_flight_depth = 1` overlap: if no prefills are waiting and every active
             // sequence still needs >= 2 tokens (so none retires after `step_id`), pre-allocate
             // pages and pre-write `plan_slot(step_id + 1)` while the 8 GPUs execute `step_id`.
-            let can_overlap_next = waiting_permitted.is_empty()
+            let can_overlap_next = !publish_next
+                && waiting_permitted.is_empty()
                 && !active.is_empty()
                 && active.iter().all(|seq| {
                     seq.prefilled_tokens == seq.prompt_tokens.len()
@@ -1193,6 +1283,12 @@ impl ModeBServingEngine {
                 }
             }
 
+            // `decode_continues_for_all` guaranteed that no sequence retires after `step_id`.
+            if published_ahead.is_some() {
+                consecutive_prefills = 0;
+                continue;
+            }
+
             if let Some(next_sid) = prestaged_step_id {
                 self.step_cursor = next_sid;
                 {
@@ -1260,6 +1356,7 @@ impl ModeBServingEngine {
                 }
             }
         }
+        self.poisoned = false;
         Ok(())
     }
 
@@ -1837,12 +1934,24 @@ impl ModeBServingEngine {
     }
 
     pub fn shutdown(mut self) -> Result<()> {
+        if self.poisoned {
+            return Err(ModeBError::Protocol(
+                "cannot gracefully shut down engine after failed in-flight step; cluster aborted"
+                    .to_owned(),
+            ));
+        }
         self.step_cursor += 1;
         let stop_step = self.step_cursor;
         self.coordinator.shutdown_and_wait(stop_step)
     }
 
     pub fn shutdown_with_stats(mut self) -> Result<(u32, u32)> {
+        if self.poisoned {
+            return Err(ModeBError::Protocol(
+                "cannot gracefully shut down engine after failed in-flight step; cluster aborted"
+                    .to_owned(),
+            ));
+        }
         self.step_cursor += 1;
         let stop_step = self.step_cursor;
         self.coordinator.shutdown_and_wait_with_stats(stop_step)
@@ -2305,5 +2414,56 @@ mod tests {
         seq.generated_tokens.push(203);
         assert_eq!(seq.lookback_window(4), [102, 201, 202]);
         assert_eq!(seq.lookback_window(5), [201, 202, 203]);
+    }
+
+    #[test]
+    fn decode_continues_for_all_respects_inflight_prefill_and_waiting() {
+        let slot_pool = SlotPool::new(2);
+        let now = Instant::now();
+        let make_seq = |slot_pool: &SlotPool, prefilled: usize, generated: usize, target: usize| {
+            ActiveSequence {
+                request_id: 0,
+                slot_lease: slot_pool.allocate().expect("slot"),
+                kv_leases: Vec::new(),
+                page_ids: Vec::new(),
+                prompt_tokens: vec![10, 20, 30, 40],
+                prefilled_tokens: prefilled,
+                current_seq_len: prefilled + generated.saturating_sub(1),
+                last_token: 99,
+                generated_tokens: vec![99; generated],
+                generated_top2: Vec::new(),
+                target_output_len: target,
+                permit_time: now,
+                submit_time: now,
+                first_token_time: None,
+                last_token_time: None,
+            }
+        };
+
+        let empty_waiting = VecDeque::new();
+        assert!(!decode_continues_for_all(&[], &empty_waiting, 0));
+
+        // 1 generated out of 4: in_flight=0 -> 1+0+1=2 < 4 (true); in_flight=1 -> 1+1+1=3 < 4 (true);
+        // in_flight=2 -> 1+2+1=4 < 4 (false, retires right after planned step).
+        let active = vec![make_seq(&slot_pool, 4, 1, 4)];
+        assert!(decode_continues_for_all(&active, &empty_waiting, 0));
+        assert!(decode_continues_for_all(&active, &empty_waiting, 1));
+        assert!(!decode_continues_for_all(&active, &empty_waiting, 2));
+
+        // Waiting permitted request blocks overlap so prefill interleaving is not starved.
+        let mut non_empty_waiting = VecDeque::new();
+        non_empty_waiting.push_back(PendingRequest {
+            request_id: 1,
+            prompt_tokens: vec![1, 2],
+            target_output_len: 4,
+            permit_time: now,
+            submit_time: now,
+        });
+        assert!(!decode_continues_for_all(&active, &non_empty_waiting, 0));
+        drop(active);
+
+        // Partial prefill sequence in `active` blocks decode-only pre-publishing.
+        let partial = vec![make_seq(&slot_pool, 2, 0, 4)];
+        assert!(!decode_continues_for_all(&partial, &empty_waiting, 0));
     }
 }

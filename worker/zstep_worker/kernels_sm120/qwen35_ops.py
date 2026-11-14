@@ -75,6 +75,91 @@ void launch_tp8_argmax_gather_shm_cuda(
     int vocab_per_rank,
     std::uintptr_t stream_handle);
 
+void launch_decode_select_tokens_cuda(
+    int32_t* tokens,
+    const int32_t* last_tokens,
+    const int32_t* req_slot_ids,
+    const int32_t* mode,
+    int64_t num_rows,
+    int64_t active_slots,
+    std::uintptr_t stream_handle);
+
+void launch_decode_publish_tokens_cuda(
+    int32_t* last_tokens,
+    const int32_t* req_slot_ids,
+    const int32_t* top2_tokens,
+    int64_t num_rows,
+    int64_t active_slots,
+    std::uintptr_t stream_handle);
+
+void launch_decode_select_tokens(
+    torch::Tensor tokens,
+    torch::Tensor last_tokens,
+    torch::Tensor req_slot_ids,
+    torch::Tensor mode,
+    int64_t num_rows,
+    int64_t active_slots,
+    std::uintptr_t stream_handle) {
+    TORCH_CHECK(
+        tokens.is_cuda() && last_tokens.is_cuda() && req_slot_ids.is_cuda() && mode.is_cuda(),
+        "decode_select_tokens tensors must be CUDA");
+    TORCH_CHECK(
+        tokens.is_contiguous() && last_tokens.is_contiguous()
+            && req_slot_ids.is_contiguous() && mode.is_contiguous(),
+        "decode_select_tokens tensors must be contiguous");
+    TORCH_CHECK(
+        tokens.scalar_type() == torch::kInt32 && last_tokens.scalar_type() == torch::kInt32
+            && req_slot_ids.scalar_type() == torch::kInt32 && mode.scalar_type() == torch::kInt32,
+        "decode_select_tokens tensors must be int32");
+    TORCH_CHECK(mode.numel() >= 1, "decode_select_tokens mode tensor must be non-empty");
+    TORCH_CHECK(
+        num_rows >= 0 && num_rows <= tokens.numel() && num_rows <= req_slot_ids.numel(),
+        "num_rows out of range for decode token buffers");
+    TORCH_CHECK(
+        active_slots >= 0 && active_slots <= last_tokens.numel(),
+        "active_slots out of range for last_tokens");
+    launch_decode_select_tokens_cuda(
+        tokens.data_ptr<int32_t>(),
+        last_tokens.data_ptr<int32_t>(),
+        req_slot_ids.data_ptr<int32_t>(),
+        mode.data_ptr<int32_t>(),
+        num_rows,
+        active_slots,
+        stream_handle);
+}
+
+void launch_decode_publish_tokens(
+    torch::Tensor last_tokens,
+    torch::Tensor req_slot_ids,
+    torch::Tensor top2_tokens,
+    int64_t num_rows,
+    int64_t active_slots,
+    std::uintptr_t stream_handle) {
+    TORCH_CHECK(
+        last_tokens.is_cuda() && req_slot_ids.is_cuda() && top2_tokens.is_cuda(),
+        "decode_publish_tokens tensors must be CUDA");
+    TORCH_CHECK(
+        last_tokens.is_contiguous() && req_slot_ids.is_contiguous() && top2_tokens.is_contiguous(),
+        "decode_publish_tokens tensors must be contiguous");
+    TORCH_CHECK(
+        last_tokens.scalar_type() == torch::kInt32 && req_slot_ids.scalar_type() == torch::kInt32
+            && top2_tokens.scalar_type() == torch::kInt32,
+        "decode_publish_tokens tensors must be int32");
+    TORCH_CHECK(
+        num_rows >= 0 && num_rows <= req_slot_ids.numel() && num_rows * 2 <= top2_tokens.numel(),
+        "num_rows out of range for decode token buffers");
+    TORCH_CHECK(
+        active_slots >= 0 && active_slots <= last_tokens.numel(),
+        "active_slots out of range for last_tokens");
+    launch_decode_publish_tokens_cuda(
+        last_tokens.data_ptr<int32_t>(),
+        req_slot_ids.data_ptr<int32_t>(),
+        top2_tokens.data_ptr<int32_t>(),
+        num_rows,
+        active_slots,
+        stream_handle);
+}
+
 void launch_moe_align_block_size(
     torch::Tensor topk_ids,
     torch::Tensor sorted_pair_ids,
@@ -492,12 +577,15 @@ __global__ void moe_align_block_size_256_kernel(
     int32_t* __restrict__ num_valid_tiles_out,
     int64_t num_pairs,
     int64_t max_padded_slots) {
+    constexpr int kNumWarps = kNumExperts / 32;
     __shared__ int s_counts[kNumExperts];
-    __shared__ int s_tiles[kNumExperts];
+    __shared__ int s_warp_tiles[kNumWarps];
     __shared__ int s_tile_offsets[kNumExperts + 1];
     __shared__ int s_write_cursor[kNumExperts];
 
     const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
     s_counts[tid] = 0;
     __syncthreads();
 
@@ -509,18 +597,31 @@ __global__ void moe_align_block_size_256_kernel(
     }
     __syncthreads();
 
-    const int count = s_counts[tid];
-    s_tiles[tid] = (count + kBlockM - 1) / kBlockM;
+    // Block-wide exclusive scan of per-expert tile counts (one expert per thread).
+    const int tiles = (s_counts[tid] + kBlockM - 1) / kBlockM;
+    int incl = tiles;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const int up = __shfl_up_sync(0xffffffffu, incl, off);
+        if (lane >= off) incl += up;
+    }
+    if (lane == 31) s_warp_tiles[warp] = incl;
     __syncthreads();
-
-    if (tid == 0) {
-        int running = 0;
-        for (int e = 0; e < kNumExperts; ++e) {
-            s_tile_offsets[e] = running;
-            running += s_tiles[e];
+    if (warp == 0) {
+        int w = lane < kNumWarps ? s_warp_tiles[lane] : 0;
+#pragma unroll
+        for (int off = 1; off < kNumWarps; off <<= 1) {
+            const int up = __shfl_up_sync(0xffffffffu, w, off);
+            if (lane >= off) w += up;
         }
-        s_tile_offsets[kNumExperts] = running;
-        *num_valid_tiles_out = running;
+        if (lane < kNumWarps) s_warp_tiles[lane] = w;
+    }
+    __syncthreads();
+    const int excl = incl - tiles + (warp > 0 ? s_warp_tiles[warp - 1] : 0);
+    s_tile_offsets[tid] = excl;
+    if (tid == kNumExperts - 1) {
+        s_tile_offsets[kNumExperts] = excl + tiles;
+        *num_valid_tiles_out = excl + tiles;
     }
     __syncthreads();
 
@@ -724,7 +825,8 @@ __global__ void tp8_argmax_gather_shm_kernel(
         return;
     }
 
-    if (rank == 0) {
+    // Every rank merges so each GPU holds the sampled tokens for device-resident decode inputs.
+    {
         for (int64_t r = threadIdx.x; r < num_rows; r += blockDim.x) {
             Top2Acc acc{-1.0e38f, -1, -1.0e38f, -1};
             for (int peer = 0; peer < world_size; ++peer) {
@@ -1451,7 +1553,78 @@ __global__ void gdn_rmsnorm_gated_silu_cuda_kernel(
     *reinterpret_cast<uint2*>(gated_out + row * 512 + base_off) = packed_out;
 }
 
+// When `*mode` is non-zero, each decode row takes the token sampled for its request slot in the
+// previous decode step instead of the host-provided one. Padding rows (`slot >= active_slots`)
+// receive token 0 rather than reading or racing on `dummy_slot`.
+__global__ void decode_select_tokens_kernel(
+    int32_t* __restrict__ tokens,
+    const int32_t* __restrict__ last_tokens,
+    const int32_t* __restrict__ req_slot_ids,
+    const int32_t* __restrict__ mode,
+    int64_t num_rows,
+    int64_t active_slots) {
+    if (*mode == 0) {
+        return;
+    }
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < num_rows) {
+        const int32_t slot = req_slot_ids[i];
+        tokens[i] = (slot >= 0 && slot < active_slots) ? last_tokens[slot] : 0;
+    }
+}
+
+__global__ void decode_publish_tokens_kernel(
+    int32_t* __restrict__ last_tokens,
+    const int32_t* __restrict__ req_slot_ids,
+    const int32_t* __restrict__ top2_tokens,
+    int64_t num_rows,
+    int64_t active_slots) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < num_rows) {
+        const int32_t slot = req_slot_ids[i];
+        const int32_t tok = top2_tokens[i * 2];
+        if (slot >= 0 && slot < active_slots && tok >= 0) {
+            last_tokens[slot] = tok;
+        }
+    }
+}
+
 }  // namespace
+
+void launch_decode_select_tokens_cuda(
+    int32_t* tokens,
+    const int32_t* last_tokens,
+    const int32_t* req_slot_ids,
+    const int32_t* mode,
+    int64_t num_rows,
+    int64_t active_slots,
+    std::uintptr_t stream_handle) {
+    if (num_rows == 0) {
+        return;
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    const unsigned int blocks = static_cast<unsigned int>((num_rows + 127) / 128);
+    decode_select_tokens_kernel<<<blocks, 128, 0, stream>>>(
+        tokens, last_tokens, req_slot_ids, mode, num_rows, active_slots);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_decode_publish_tokens_cuda(
+    int32_t* last_tokens,
+    const int32_t* req_slot_ids,
+    const int32_t* top2_tokens,
+    int64_t num_rows,
+    int64_t active_slots,
+    std::uintptr_t stream_handle) {
+    if (num_rows == 0) {
+        return;
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    const unsigned int blocks = static_cast<unsigned int>((num_rows + 127) / 128);
+    decode_publish_tokens_kernel<<<blocks, 128, 0, stream>>>(
+        last_tokens, req_slot_ids, top2_tokens, num_rows, active_slots);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
 
 void launch_moe_align_block_size_cuda(
     const int32_t* topk_ids,
@@ -1732,7 +1905,7 @@ def get_qwen35_cuda_ext():
     if _QWEN35_EXT is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _QWEN35_EXT = load_inline(
-            name="zstep_qwen35_ops_sm120_v7_ext",
+            name="zstep_qwen35_ops_sm120_v10_ext",
             cpp_sources=[_MOE_ALIGN_CPP],
             cuda_sources=[_MOE_ALIGN_CUDA],
             functions=[
@@ -1742,6 +1915,8 @@ def get_qwen35_cuda_ext():
                 "launch_gdn_decode_cluster2_vk",
                 "launch_gdn_decode_split_vk",
                 "launch_gdn_prefill_vk",
+                "launch_decode_select_tokens",
+                "launch_decode_publish_tokens",
             ],
             extra_cflags=["-O3"],
             extra_cuda_cflags=["-O3", "-gencode=arch=compute_120,code=sm_120"],

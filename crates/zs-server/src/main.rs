@@ -756,6 +756,9 @@ fn run_mode_b(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         };
         let mut engine = ModeBServingEngine::launch(config)?;
         engine.set_max_mixed_step_tokens(mixed_step_tokens);
+        engine.set_device_token_overlap(
+            !is_dsv41 && std::env::var("ZSTEP_DECODE_DEVICE_TOKENS").map_or(true, |v| v != "0"),
+        );
 
         if let Some(reference_path) = args.verify_greedy_json {
             let output_path = args
