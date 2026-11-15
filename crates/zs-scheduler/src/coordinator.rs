@@ -42,6 +42,68 @@ const INHERITED_SHM_FD_BASE: i32 = 300;
 /// Default maximum duration a live worker rank's `heartbeat_ns` may remain frozen mid-step.
 pub const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpeculativeMethod {
+    #[default]
+    None,
+    Ngram,
+    Mtp,
+    Dspark,
+}
+
+impl SpeculativeMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Ngram => "ngram",
+            Self::Mtp => "mtp",
+            Self::Dspark => "dspark",
+        }
+    }
+
+    pub fn is_neural(self) -> bool {
+        matches!(self, Self::Mtp | Self::Dspark)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SpeculativeConfig {
+    pub method: SpeculativeMethod,
+    pub num_speculative_tokens: usize,
+    pub prompt_lookup_max: usize,
+    pub prompt_lookup_min: usize,
+}
+
+impl Default for SpeculativeConfig {
+    fn default() -> Self {
+        Self {
+            method: SpeculativeMethod::None,
+            num_speculative_tokens: 0,
+            prompt_lookup_max: 5,
+            prompt_lookup_min: 2,
+        }
+    }
+}
+
+impl SpeculativeConfig {
+    pub fn enabled(&self) -> bool {
+        self.method != SpeculativeMethod::None
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !self.enabled() {
+            return Ok(());
+        }
+        if !(1..=7).contains(&self.num_speculative_tokens) {
+            return Err("num_speculative_tokens must be in 1..=7".to_owned());
+        }
+        if self.prompt_lookup_min == 0 || self.prompt_lookup_max < self.prompt_lookup_min {
+            return Err("prompt lookup bounds must satisfy 1 <= min <= max".to_owned());
+        }
+        Ok(())
+    }
+}
+
 /// Explicit Python worker and micro-step / real-model launch parameters.
 #[derive(Debug, Clone)]
 pub struct WorkerLaunchConfig {
@@ -69,6 +131,7 @@ pub struct EngineConfig {
     pub steps: u64,
     pub token_counts: Vec<u32>,
     pub launch: WorkerLaunchConfig,
+    pub speculative: SpeculativeConfig,
     pub ready_timeout: Duration,
     pub step_timeout: Duration,
     pub heartbeat_timeout: Duration,
@@ -746,6 +809,12 @@ fn spawn_workers(
                 config.launch.num_recurrent_checkpoints.to_string(),
             );
         }
+        command
+            .env("ZSTEP_SPEC_METHOD", config.speculative.method.as_str())
+            .env(
+                "ZSTEP_NUM_SPEC_TOKENS",
+                config.speculative.num_speculative_tokens.to_string(),
+            );
         // SAFETY: the closure only calls async-signal-safe `prctl` and `dup2`; the targets are
         // disjoint from normal descriptors and `dup2` clears CLOEXEC on the inherited descriptors.
         unsafe {
@@ -775,6 +844,21 @@ fn spawn_workers(
 }
 
 fn validate_config(config: &EngineConfig) -> Result<()> {
+    config
+        .speculative
+        .validate()
+        .map_err(EngineError::Protocol)?;
+    let expected_width = if config.speculative.enabled() {
+        config.speculative.num_speculative_tokens + 1
+    } else {
+        6
+    };
+    if config.geometry.spec_verify_width as usize != expected_width {
+        return Err(EngineError::Protocol(format!(
+            "spec_verify_width={} does not match speculative K+1={expected_width}",
+            config.geometry.spec_verify_width
+        )));
+    }
     if config.max_prefill_chunk == 0 {
         return Err(EngineError::Protocol(
             "max_prefill_chunk must be positive".to_owned(),

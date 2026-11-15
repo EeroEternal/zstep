@@ -142,6 +142,7 @@ void launch_tp8_argmax_gather_shm_cuda(
     int rank,
     int world_size,
     int vocab_per_rank,
+    int write_all_ranks,
     std::uintptr_t stream_handle);
 
 std::uintptr_t register_mapped_host(std::uintptr_t host_address, int64_t bytes) {
@@ -388,6 +389,7 @@ void launch_tp8_argmax_gather_shm(
     int64_t rank,
     int64_t world_size,
     int64_t vocab_per_rank,
+    int64_t write_all_ranks,
     std::uintptr_t stream_handle) {
     TORCH_CHECK(num_rows <= max_rows_per_step, "num_rows exceeds max_rows_per_step");
     TORCH_CHECK(local_top2_vals.is_contiguous() && local_top2_vals.numel() >= num_rows * 2,
@@ -410,6 +412,7 @@ void launch_tp8_argmax_gather_shm(
         static_cast<int>(rank),
         static_cast<int>(world_size),
         static_cast<int>(vocab_per_rank),
+        static_cast<int>(write_all_ranks),
         stream_handle);
 }
 """
@@ -1846,7 +1849,8 @@ __global__ void tp8_argmax_gather_shm_kernel(
     int64_t max_rows_per_step,
     int rank,
     int world_size,
-    int vocab_per_rank) {
+    int vocab_per_rank,
+    int write_all_ranks) {
     uint64_t* ready_flags = reinterpret_cast<uint64_t*>(host_base);
     uint64_t* done_flags = reinterpret_cast<uint64_t*>(host_base + 64);
     const uint64_t* abort_flag =
@@ -1908,7 +1912,7 @@ __global__ void tp8_argmax_gather_shm_kernel(
         return;
     }
 
-    if (rank == 0) {
+    if (rank == 0 || write_all_ranks != 0) {
         for (int64_t r = threadIdx.x; r < num_rows; r += blockDim.x) {
             Top2Acc acc{-1.0e38f, -1, -1.0e38f, -1};
             for (int peer = 0; peer < world_size; ++peer) {
@@ -1963,6 +1967,7 @@ void launch_tp8_argmax_gather_shm_cuda(
     int rank,
     int world_size,
     int vocab_per_rank,
+    int write_all_ranks,
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     tp8_argmax_gather_shm_kernel<<<1, 128, 0, stream>>>(
@@ -1976,7 +1981,8 @@ void launch_tp8_argmax_gather_shm_cuda(
         max_rows_per_step,
         rank,
         world_size,
-        vocab_per_rank);
+        vocab_per_rank,
+        write_all_ranks);
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 """
@@ -1994,7 +2000,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v10_ext",
+            name="zstep_shm_allreduce_sm120_v11_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -2594,6 +2600,7 @@ class HostMappedShmArgmax:
         out_tokens: torch.Tensor,
         out_logprob_bits: torch.Tensor,
         vocab_per_rank: int,
+        all_ranks: bool = False,
     ) -> None:
         num_rows = int(local_logits_bf16.shape[0])
         if num_rows <= 0:
@@ -2618,6 +2625,7 @@ class HostMappedShmArgmax:
             self.rank,
             self.world_size,
             vocab_per_rank,
+            1 if all_ranks else 0,
             stream_handle,
         )
 

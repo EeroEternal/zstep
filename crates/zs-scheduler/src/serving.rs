@@ -36,7 +36,9 @@ use zs_wire::{
     STEP_FLAG_NEXT_PREPUBLISHED, StepHeader, StepOpcode,
 };
 
-use crate::coordinator::{EngineConfig, EngineError, Result, WorkerCoordinator};
+use crate::coordinator::{
+    EngineConfig, EngineError, Result, SpeculativeConfig, SpeculativeMethod, WorkerCoordinator,
+};
 use crate::select_graph_bucket;
 
 struct SlotPoolInner {
@@ -139,6 +141,16 @@ pub struct StepTop2Logits {
 
 /// Generated token IDs paired with per-step Top-2 logit diagnostics for a batch of prompts.
 pub type GreedyTop2Batch = (Vec<Vec<i32>>, Vec<Vec<StepTop2Logits>>);
+
+#[derive(Debug, Clone)]
+struct HarvestedOutput {
+    req_slot: u32,
+    accepted_tokens: Vec<i32>,
+    accepted_logprobs_bits: Vec<u32>,
+    next_draft_tokens: Vec<i32>,
+    runner_up_token: i32,
+    runner_up_logprob_bits: u32,
+}
 
 /// Per-tier continuous-batching throughput and latency metrics for one repeat.
 #[derive(Debug, Clone)]
@@ -569,6 +581,8 @@ struct ActiveSequence {
     last_token: i32,
     generated_tokens: Vec<i32>,
     generated_top2: Vec<StepTop2Logits>,
+    pending_draft_tokens: Vec<i32>,
+    staged_verify: Option<(usize, usize)>,
     target_output_len: usize,
     /// KV pages promised at admission for the whole request; only part may be allocated yet.
     reserved_pages: usize,
@@ -694,6 +708,77 @@ impl ActiveSequence {
         self.current_seq_len += 1;
         (token, lookback)
     }
+
+    fn refresh_draft_tokens(&mut self, neural_drafts: &[i32], config: &SpeculativeConfig) {
+        self.pending_draft_tokens.clear();
+        match config.method {
+            SpeculativeMethod::None => {}
+            SpeculativeMethod::Mtp | SpeculativeMethod::Dspark => {
+                self.pending_draft_tokens.extend(
+                    neural_drafts
+                        .iter()
+                        .copied()
+                        .filter(|&token| token >= 0)
+                        .take(config.num_speculative_tokens),
+                );
+            }
+            SpeculativeMethod::Ngram => {
+                let history: Vec<i32> = self
+                    .prompt_tokens
+                    .iter()
+                    .chain(&self.generated_tokens)
+                    .copied()
+                    .collect();
+                self.pending_draft_tokens = ngram_draft_tokens(&history, config);
+            }
+        }
+    }
+}
+
+fn rewind_rejected_suffix_pages(
+    seq: &mut ActiveSequence,
+    verified_len: usize,
+    page_block_tokens: usize,
+    max_pages_per_seq: usize,
+    dummy_page: i32,
+    shadow_page_table: &mut [i32],
+    dirty_pt_slots: &mut [u128; 2],
+) {
+    let needed_pages = verified_len.div_ceil(page_block_tokens);
+    if needed_pages >= seq.page_ids.len() {
+        return;
+    }
+    let slot = seq.slot_lease.id() as usize;
+    let row_base = slot * max_pages_per_seq;
+    shadow_page_table[row_base + needed_pages..row_base + seq.page_ids.len()].fill(dummy_page);
+    seq.page_ids.truncate(needed_pages);
+    let prefix_pages = seq
+        .prefix_lease
+        .as_ref()
+        .map_or(0, |lease| lease.block_ids().len());
+    seq.kv_leases
+        .truncate(needed_pages.saturating_sub(prefix_pages));
+    let dirty_bit = 1u128 << slot;
+    dirty_pt_slots[0] |= dirty_bit;
+    dirty_pt_slots[1] |= dirty_bit;
+}
+
+fn ngram_draft_tokens(history: &[i32], config: &SpeculativeConfig) -> Vec<i32> {
+    if history.len() < 2 || config.num_speculative_tokens == 0 {
+        return Vec::new();
+    }
+    let max_n = config.prompt_lookup_max.min(history.len() - 1);
+    for n in (config.prompt_lookup_min..=max_n).rev() {
+        let suffix = &history[history.len() - n..];
+        for start in (0..=history.len() - n - 1).rev() {
+            if &history[start..start + n] == suffix {
+                let draft_start = start + n;
+                let draft_end = (draft_start + config.num_speculative_tokens).min(history.len());
+                return history[draft_start..draft_end].to_vec();
+            }
+        }
+    }
+    Vec::new()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -724,6 +809,7 @@ pub struct ServingEngine {
     max_mixed_step_tokens: Option<usize>,
     max_prefill_coalesce_wait_ms: u64,
     device_token_overlap: bool,
+    speculative: SpeculativeConfig,
     poisoned: bool,
     last_generation_schedule: GenerationScheduleStats,
 }
@@ -862,6 +948,8 @@ fn admit_request_into_sequence(
         last_token,
         generated_tokens: Vec::with_capacity(req.target_output_len),
         generated_top2: Vec::new(),
+        pending_draft_tokens: Vec::new(),
+        staged_verify: None,
         target_output_len: req.target_output_len,
         reserved_pages: demand_pages,
         permit_time: req.permit_time,
@@ -872,10 +960,12 @@ fn admit_request_into_sequence(
 }
 
 /// Promote newly completed full prompt prefix nodes of `active` into `prefix_tree`.
+#[allow(clippy::too_many_arguments)]
 fn promote_completed_prefixes_in_batch(
     active: &mut [ActiveSequence],
     mut prefix_tree: Option<&mut PrefixTree>,
     has_recurrent_pool: bool,
+    hold_incomplete_tail_token: bool,
     pages_per_node: usize,
     max_pages_per_seq: usize,
     shadow_page_table: &mut [i32],
@@ -894,7 +984,13 @@ fn promote_completed_prefixes_in_batch(
             .prefix_lease
             .as_ref()
             .map_or(0, PrefixLease::matched_nodes);
-        let total_completed_nodes = seq.computed_prompt_tokens / node_tokens;
+        let promotable_prompt_tokens =
+            if hold_incomplete_tail_token && seq.computed_prompt_tokens < seq.prompt_tokens.len() {
+                seq.computed_prompt_tokens.saturating_sub(1)
+            } else {
+                seq.computed_prompt_tokens
+            };
+        let total_completed_nodes = promotable_prompt_tokens / node_tokens;
         if total_completed_nodes <= already_promoted_nodes {
             continue;
         }
@@ -1091,6 +1187,7 @@ impl ServingEngine {
         validate_serving_max_seqs(geometry.max_seqs)?;
         let num_kv_pages = config.launch.num_kv_pages as usize;
         let dummy_page = config.launch.num_kv_pages as i32;
+        let speculative = config.speculative.clone();
         let mut coordinator = WorkerCoordinator::launch(config)?;
         let (init_wall_us, worker_numa_nodes) = coordinator.wait_workers_ready()?;
 
@@ -1120,6 +1217,7 @@ impl ServingEngine {
             max_mixed_step_tokens: None,
             max_prefill_coalesce_wait_ms: DEFAULT_PREFILL_COALESCE_WAIT_MS,
             device_token_overlap: false,
+            speculative,
             poisoned: false,
             last_generation_schedule: GenerationScheduleStats::default(),
         })
@@ -1190,6 +1288,7 @@ impl ServingEngine {
             active,
             self.prefix_tree.as_mut(),
             self.recurrent_pool.is_some(),
+            self.speculative.method == SpeculativeMethod::Mtp,
             self.pages_per_prefix_node,
             max_pages_per_seq,
             &mut self.shadow_page_table,
@@ -1234,6 +1333,46 @@ impl ServingEngine {
     /// during overlapped decode bursts (enable only for models without host Engram lookback).
     pub fn set_device_token_overlap(&mut self, enabled: bool) {
         self.device_token_overlap = enabled;
+    }
+
+    fn harvested_outputs(&mut self, step_id: u64) -> Result<Vec<HarvestedOutput>> {
+        let result = self.coordinator.result_slot(step_id)?;
+        if result.completed_step_id()? != step_id {
+            return Err(EngineError::Protocol(format!(
+                "completed_step_id mismatch on step {step_id}"
+            )));
+        }
+        let header = result.header()?;
+        if header.status_code != 0 {
+            return Err(EngineError::Protocol(format!(
+                "worker failed step {step_id} with status {}",
+                header.status_code
+            )));
+        }
+        result.outputs()?[..header.num_seq_results as usize]
+            .iter()
+            .map(|output| {
+                let count = output.num_accepted as usize;
+                if count == 0 || count > output.accepted_tokens.len() {
+                    return Err(EngineError::Protocol(format!(
+                        "invalid num_accepted={count} on step {step_id}"
+                    )));
+                }
+                Ok(HarvestedOutput {
+                    req_slot: output.req_slot,
+                    accepted_tokens: output.accepted_tokens[..count].to_vec(),
+                    accepted_logprobs_bits: output.accepted_logprobs_bits[..count].to_vec(),
+                    next_draft_tokens: output
+                        .next_draft_tokens
+                        .iter()
+                        .copied()
+                        .filter(|&token| token >= 0)
+                        .collect(),
+                    runner_up_token: output.accepted_tokens[1],
+                    runner_up_logprob_bits: output.accepted_logprobs_bits[1],
+                })
+            })
+            .collect()
     }
 
     fn plan_flags(&mut self, step_id: u64) -> Result<u32> {
@@ -1548,7 +1687,9 @@ impl ServingEngine {
                     .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
                     .count();
                 let has_partial_prefill = decode_active_count != active.len();
-                if let Some(mixed_cap) = self.max_mixed_step_tokens {
+                if !self.speculative.enabled()
+                    && let Some(mixed_cap) = self.max_mixed_step_tokens
+                {
                     let can_attempt_mixed = has_partial_prefill || waiting_admissible;
                     if can_attempt_mixed {
                         match self.stage_mixed_step(
@@ -1713,6 +1854,7 @@ impl ServingEngine {
             // sequence still needs >= 2 tokens (so none retires after `step_id`), pre-allocate
             // pages and pre-write `plan_slot(step_id + 1)` while the 8 GPUs execute `step_id`.
             let can_overlap_next = !publish_next
+                && !self.speculative.enabled()
                 && decode_continues_for_all(&active, waiting_admissible, 0, has_prefix_cache);
 
             if can_overlap_next {
@@ -1731,43 +1873,37 @@ impl ServingEngine {
             self.coordinator.wait_step_completed(step_id)?;
             let now = Instant::now();
 
-            // Harvest accepted tokens and Top-2 logits from rank 0's ResultSlot
-            let emitted: Vec<(u32, i32, i32, u32, u32)> = {
-                let result = self.coordinator.result_slot(step_id)?;
-                if result.completed_step_id()? != step_id {
-                    return Err(EngineError::Protocol(format!(
-                        "completed_step_id mismatch on step {step_id}"
-                    )));
-                }
-                let header = result.header()?;
-                if header.status_code != 0 {
-                    return Err(EngineError::Protocol(format!(
-                        "worker failed step {step_id} with status {}",
-                        header.status_code
-                    )));
-                }
-                let outputs = result.outputs()?;
-                outputs[..header.num_seq_results as usize]
-                    .iter()
-                    .map(|o| {
-                        (
-                            o.req_slot,
-                            o.accepted_tokens[0],
-                            o.accepted_tokens[1],
-                            o.accepted_logprobs_bits[0],
-                            o.accepted_logprobs_bits[1],
-                        )
-                    })
-                    .collect()
-            };
+            let emitted = self.harvested_outputs(step_id)?;
 
             self.promote_completed_prefixes(&mut active, max_pages_per_seq)?;
 
             let collect_top2 = completed_top2.is_some();
-            for (req_slot, tok, tok2, lp1_bits, lp2_bits) in emitted {
-                let idx = *slot_to_active.get(req_slot as usize).unwrap_or(&usize::MAX);
-                if idx < active.len() {
-                    let seq = &mut active[idx];
+            for output in emitted {
+                let idx = *slot_to_active
+                    .get(output.req_slot as usize)
+                    .unwrap_or(&usize::MAX);
+                if idx >= active.len() {
+                    continue;
+                }
+                let seq = &mut active[idx];
+                let mut accepted = output.accepted_tokens;
+                accepted.truncate(
+                    seq.target_output_len
+                        .saturating_sub(seq.generated_tokens.len()),
+                );
+                if let Some((start_pos, _)) = seq.staged_verify.take() {
+                    seq.current_seq_len = start_pos + accepted.len();
+                    rewind_rejected_suffix_pages(
+                        seq,
+                        seq.current_seq_len,
+                        page_block_tokens,
+                        max_pages_per_seq,
+                        self.coordinator.config().launch.num_kv_pages as i32,
+                        &mut self.shadow_page_table,
+                        &mut self.dirty_pt_slots,
+                    );
+                }
+                for (accepted_idx, tok) in accepted.into_iter().enumerate() {
                     if let Some(prev_t) = seq.last_token_time {
                         let itl = now.duration_since(prev_t).as_micros() as u64;
                         itls_us.push(itl);
@@ -1782,17 +1918,24 @@ impl ServingEngine {
                     seq.last_token = tok;
                     seq.generated_tokens.push(tok);
                     if collect_top2 {
-                        let top1_logit = f32::from_bits(lp1_bits);
-                        let top2_logit = f32::from_bits(lp2_bits);
+                        let top1_logit = f32::from_bits(
+                            output
+                                .accepted_logprobs_bits
+                                .get(accepted_idx)
+                                .copied()
+                                .unwrap_or(0),
+                        );
+                        let top2_logit = f32::from_bits(output.runner_up_logprob_bits);
                         seq.generated_top2.push(StepTop2Logits {
                             top1_token: tok,
                             top1_logit,
-                            top2_token: tok2,
+                            top2_token: output.runner_up_token,
                             top2_logit,
                             top1_minus_top2_margin: top1_logit - top2_logit,
                         });
                     }
                 }
+                seq.refresh_draft_tokens(&output.next_draft_tokens, &self.speculative);
             }
 
             // `decode_continues_for_all` guaranteed that no sequence retires after `step_id`.
@@ -2019,7 +2162,7 @@ impl ServingEngine {
             num_decoder_rows: token_cursor as u32,
             decoder_graph_bucket: 0,
             num_sample_rows: num_sample_rows as u32,
-            is_dspark_verify: 0,
+            is_dspark_verify: u32::from(self.speculative.method.is_neural()),
             flags: 0,
             _reserved: [0; 3],
         };
@@ -2295,7 +2438,7 @@ impl ServingEngine {
             num_decoder_rows: token_cursor as u32,
             decoder_graph_bucket: bucket,
             num_sample_rows: num_sample_rows as u32,
-            is_dspark_verify: 0,
+            is_dspark_verify: u32::from(self.speculative.method.is_neural()),
             flags,
             _reserved: [0; 3],
         };
@@ -2420,6 +2563,109 @@ impl ServingEngine {
         Ok(())
     }
 
+    fn stage_speculative_decode_step(
+        &mut self,
+        step_id: u64,
+        active: &mut [ActiveSequence],
+        page_block_tokens: usize,
+        max_pages_per_seq: usize,
+    ) -> Result<()> {
+        let config = self.speculative.clone();
+        let mut staged_tokens = Vec::new();
+        let mut staged_positions = Vec::new();
+        let mut staged_slots = Vec::new();
+        let mut staged_lookbacks = Vec::new();
+        let mut staged_seq_lens = Vec::new();
+        let mut query_start_loc = vec![0i32];
+        let mut num_seqs = 0usize;
+
+        for seq in active
+            .iter_mut()
+            .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
+        {
+            let start_pos = seq.current_seq_len;
+            let remaining = seq
+                .target_output_len
+                .saturating_sub(seq.generated_tokens.len());
+            let k_eff = seq
+                .pending_draft_tokens
+                .len()
+                .min(config.num_speculative_tokens)
+                .min(remaining.saturating_sub(1));
+            let mut rows = Vec::with_capacity(k_eff + 1);
+            rows.push(seq.last_token);
+            rows.extend_from_slice(&seq.pending_draft_tokens[..k_eff]);
+            let target_len = start_pos + rows.len();
+            seq.ensure_kv_pages_with_cache(
+                target_len,
+                page_block_tokens,
+                max_pages_per_seq,
+                &self.kv_pool,
+                self.prefix_tree.as_mut(),
+                &mut self.prefix_cache_evictions_pages,
+                &mut self.shadow_page_table,
+                &mut self.dirty_pt_slots,
+            )?;
+
+            for (row, &token) in rows.iter().enumerate() {
+                staged_tokens.push(token);
+                staged_positions.push((start_pos + row) as i32);
+                staged_slots.push(seq.slot_lease.id() as i32);
+            }
+            staged_lookbacks.extend_from_slice(&seq.lookback_window(start_pos));
+            staged_seq_lens.push(target_len as i32);
+            query_start_loc.push(staged_tokens.len() as i32);
+            seq.staged_verify = Some((start_pos, k_eff));
+            seq.current_seq_len = target_len;
+            num_seqs += 1;
+        }
+
+        if num_seqs == 0 {
+            return Err(EngineError::Protocol(
+                "speculative decode scheduled zero prompt-complete sequences".to_owned(),
+            ));
+        }
+        let total_tokens = staged_tokens.len();
+        let mut plan = self.coordinator.plan_slot_mut(step_id)?;
+        plan.token_ids_mut()?[..total_tokens].copy_from_slice(&staged_tokens);
+        plan.positions_mut()?[..total_tokens].copy_from_slice(&staged_positions);
+        plan.req_slot_ids_mut()?[..total_tokens].copy_from_slice(&staged_slots);
+        plan.engram_prev_window_mut()?[..num_seqs * 3].copy_from_slice(&staged_lookbacks);
+        plan.seq_lens_mut()?[..num_seqs].copy_from_slice(&staged_seq_lens);
+        plan.query_start_loc_mut()?[..=num_seqs].copy_from_slice(&query_start_loc);
+        {
+            let sample_rows = plan.sample_row_indices_mut()?;
+            for (row, dst) in sample_rows[..total_tokens].iter_mut().enumerate() {
+                *dst = row as i32;
+            }
+        }
+        if self.recurrent_pool.is_some() {
+            plan.compressor_slot_ids_mut()?[..num_seqs].fill(-1);
+            plan.replay_mask_mut()?[..total_tokens].fill(0xFF);
+        }
+        sync_dirty_page_table_rows(
+            &mut plan,
+            step_id,
+            max_pages_per_seq,
+            &self.shadow_page_table,
+            &mut self.dirty_pt_slots,
+        )?;
+        *plan.header_mut()? = StepHeader {
+            step_id: AtomicU64::new(0),
+            opcode: StepOpcode::NormalStep as u32,
+            num_seqs: num_seqs as u32,
+            num_encoder_tokens: total_tokens as u32,
+            encoder_graph_bucket: 0,
+            num_decoder_rows: total_tokens as u32,
+            decoder_graph_bucket: 0,
+            num_sample_rows: total_tokens as u32,
+            is_dspark_verify: 1,
+            flags: 0,
+            _reserved: [0; 3],
+        };
+        Ok(())
+    }
+
     fn stage_decode_step(
         &mut self,
         step_id: u64,
@@ -2428,6 +2674,27 @@ impl ServingEngine {
         max_pages_per_seq: usize,
         commit_tokens_immediately: bool,
     ) -> Result<()> {
+        let has_drafts = active.iter().any(|seq| {
+            seq.prefilled_tokens == seq.prompt_tokens.len()
+                && !seq.pending_draft_tokens.is_empty()
+                && seq.generated_tokens.len() + 1 < seq.target_output_len
+        });
+        if self.speculative.enabled() {
+            if !commit_tokens_immediately {
+                return Err(EngineError::Protocol(
+                    "speculative decode cannot be pre-staged before drafts are harvested"
+                        .to_owned(),
+                ));
+            }
+            if has_drafts {
+                return self.stage_speculative_decode_step(
+                    step_id,
+                    active,
+                    page_block_tokens,
+                    max_pages_per_seq,
+                );
+            }
+        }
         let num_seqs = active
             .iter()
             .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
@@ -2736,6 +3003,8 @@ mod tests {
                 last_token: 42,
                 generated_tokens: Vec::new(),
                 generated_top2: Vec::new(),
+                pending_draft_tokens: Vec::new(),
+                staged_verify: None,
                 target_output_len: 10,
                 reserved_pages: 0,
                 permit_time: Instant::now(),
@@ -2810,6 +3079,8 @@ mod tests {
             last_token: 13,
             generated_tokens: Vec::new(),
             generated_top2: Vec::new(),
+            pending_draft_tokens: Vec::new(),
+            staged_verify: None,
             target_output_len: 4,
             reserved_pages: 0,
             permit_time: now,
@@ -3016,6 +3287,8 @@ mod tests {
             last_token: 201,
             generated_tokens: vec![201, 202],
             generated_top2: Vec::new(),
+            pending_draft_tokens: Vec::new(),
+            staged_verify: None,
             target_output_len: 8,
             reserved_pages: 0,
             permit_time: Instant::now(),
@@ -3035,6 +3308,21 @@ mod tests {
         seq.generated_tokens.push(203);
         assert_eq!(seq.lookback_window(4), [102, 201, 202]);
         assert_eq!(seq.lookback_window(5), [201, 202, 203]);
+    }
+
+    #[test]
+    fn ngram_drafter_uses_latest_longest_suffix_and_respects_width() {
+        let config = SpeculativeConfig {
+            method: SpeculativeMethod::Ngram,
+            num_speculative_tokens: 3,
+            prompt_lookup_min: 2,
+            prompt_lookup_max: 4,
+        };
+        let history = [1, 2, 3, 4, 9, 1, 2, 3, 4, 8, 7, 1, 2, 3, 4];
+        assert_eq!(ngram_draft_tokens(&history, &config), vec![8, 7, 1]);
+
+        let no_match = [1, 2, 3, 4, 5, 6, 7, 8];
+        assert!(ngram_draft_tokens(&no_match, &config).is_empty());
     }
 
     #[test]
@@ -3059,6 +3347,8 @@ mod tests {
                 last_token: 99,
                 generated_tokens: vec![99; generated],
                 generated_top2: Vec::new(),
+                pending_draft_tokens: Vec::new(),
+                staged_verify: None,
                 target_output_len: target,
                 reserved_pages: 0,
                 permit_time: now,
@@ -3133,6 +3423,8 @@ mod tests {
             last_token: 1,
             generated_tokens: Vec::new(),
             generated_top2: Vec::new(),
+            pending_draft_tokens: Vec::new(),
+            staged_verify: None,
             target_output_len: 65,
             reserved_pages: request_kv_page_demand(32, 65, 16),
             permit_time: now,
@@ -3227,6 +3519,8 @@ mod tests {
                 last_token: 1,
                 generated_tokens: vec![99],
                 generated_top2: Vec::new(),
+                pending_draft_tokens: Vec::new(),
+                staged_verify: None,
                 target_output_len: 33, // demand = ceil((16 + 32) / 16) = 3 pages
                 reserved_pages: request_kv_page_demand(16, 33, 16),
                 permit_time: now,
@@ -3527,6 +3821,7 @@ mod tests {
             &mut active,
             Some(&mut tree),
             false,
+            false,
             1,
             8,
             &mut shadow_pt,
@@ -3555,6 +3850,7 @@ mod tests {
         promote_completed_prefixes_in_batch(
             &mut active,
             Some(&mut tree),
+            false,
             false,
             1,
             8,
@@ -3626,6 +3922,7 @@ mod tests {
             &mut h_active,
             Some(&mut hybrid_tree),
             true,
+            false,
             4,
             16,
             &mut hybrid_pt,
@@ -3667,6 +3964,213 @@ mod tests {
         assert_eq!(hybrid_tree.evict_lru(2), 2);
         assert_eq!(kv_hybrid.available(), 16);
         assert_eq!(ckpt_pool.available(), 4);
+    }
+
+    #[test]
+    fn rewind_rejected_suffix_pages_reclaims_exclusive_pages_after_prefix_promotion() {
+        let slot_pool = SlotPool::new(2);
+        let kv_pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 8);
+        let mut tree = PrefixTree::with_pages_per_node(16, 1).expect("prefix tree");
+        let mut shadow_pt = vec![99i32; 2 * 8];
+        let mut dirty = [0u128; 2];
+        let mut queries = 0u64;
+        let mut hits = 0u64;
+        let mut evictions = 0u64;
+        let now = Instant::now();
+
+        // Cold 30-token prompt: 1 full 16-token prefix node + 14-token tail (2 KV pages total).
+        let prompt: Vec<i32> = (0..30).map(|i| 500 + i).collect();
+        let mut seq = admit_request_into_sequence(
+            PendingRequest {
+                request_id: 21,
+                prompt_tokens: prompt,
+                target_output_len: 16,
+                permit_time: now,
+                submit_time: now,
+            },
+            slot_pool.allocate().expect("slot"),
+            4,
+            8,
+            Some(&mut tree),
+            false,
+            &mut queries,
+            &mut hits,
+            &mut shadow_pt,
+            &mut dirty,
+        )
+        .expect("admit cold sequence");
+        assert_eq!(seq.cached_prefix_tokens, 0);
+
+        seq.prefilled_tokens = 30;
+        seq.current_seq_len = 30;
+        seq.ensure_kv_pages_with_cache(
+            30,
+            16,
+            8,
+            &kv_pool,
+            Some(&mut tree),
+            &mut evictions,
+            &mut shadow_pt,
+            &mut dirty,
+        )
+        .expect("alloc 2 prompt pages");
+        assert_eq!(kv_pool.available(), 6);
+
+        let mut active = vec![seq];
+        promote_completed_prefixes_in_batch(
+            &mut active,
+            Some(&mut tree),
+            false,
+            false,
+            1,
+            8,
+            &mut shadow_pt,
+            &mut dirty,
+        )
+        .expect("promote 16-token prefix node");
+        // Node 0 moved from `kv_leases` into `prefix_lease`, while `cached_prefix_tokens` stays 0.
+        assert_eq!(active[0].cached_prefix_tokens, 0);
+        assert_eq!(
+            active[0].prefix_lease.as_ref().unwrap().block_ids().len(),
+            1
+        );
+        assert_eq!(active[0].kv_leases.len(), 1);
+        assert_eq!(active[0].page_ids.len(), 2);
+
+        // Speculative verify stages 5 tokens (1 anchor + 4 drafts) up to seq_len = 35 -> 3 pages.
+        active[0]
+            .ensure_kv_pages_with_cache(
+                35,
+                16,
+                8,
+                &kv_pool,
+                Some(&mut tree),
+                &mut evictions,
+                &mut shadow_pt,
+                &mut dirty,
+            )
+            .expect("alloc 3rd page for cross-boundary draft");
+        assert_eq!(kv_pool.available(), 5);
+        assert_eq!(active[0].kv_leases.len(), 2);
+        assert_eq!(active[0].page_ids.len(), 3);
+
+        // Reject drafts back to verified_len = 31 (still within 2 pages: `31.div_ceil(16) == 2`).
+        dirty = [0, 0];
+        rewind_rejected_suffix_pages(&mut active[0], 31, 16, 8, 99, &mut shadow_pt, &mut dirty);
+        let prefix_pages = active[0].prefix_lease.as_ref().unwrap().block_ids().len();
+        assert_eq!(active[0].page_ids.len(), 2);
+        assert_eq!(active[0].kv_leases.len(), 1);
+        assert_eq!(
+            active[0].page_ids.len(),
+            prefix_pages + active[0].kv_leases.len()
+        );
+        // The rejected 3rd page must be returned to `kv_pool` immediately, not leaked until EOS.
+        assert_eq!(kv_pool.available(), 6);
+        let slot = active[0].slot_lease.id() as usize;
+        assert_eq!(shadow_pt[slot * 8 + 2], 99);
+        assert_ne!(dirty[0] & (1u128 << slot), 0);
+    }
+
+    #[test]
+    fn promote_completed_prefixes_holds_incomplete_mtp_chunk_boundary_until_next_chunk() {
+        let slot_pool = SlotPool::new(2);
+        let kv_pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 16);
+        let ckpt_pool = BlockPool::new(CacheGroupKind::RecurrentState, 4);
+        let mut tree = PrefixTree::with_pages_per_node(64, 4).expect("hybrid tree");
+        let mut shadow_pt = vec![-1i32; 2 * 16];
+        let mut dirty = [0u128; 2];
+        let mut queries = 0u64;
+        let mut hits = 0u64;
+        let mut evictions = 0u64;
+        let now = Instant::now();
+
+        let prompt: Vec<i32> = (0..128).map(|i| 900 + i).collect();
+        let mut seq = admit_request_into_sequence(
+            PendingRequest {
+                request_id: 31,
+                prompt_tokens: prompt,
+                target_output_len: 4,
+                permit_time: now,
+                submit_time: now,
+            },
+            slot_pool.allocate().expect("slot"),
+            8,
+            16,
+            Some(&mut tree),
+            true,
+            &mut queries,
+            &mut hits,
+            &mut shadow_pt,
+            &mut dirty,
+        )
+        .expect("admit mtp sequence");
+
+        // Chunk 1 computes `0..64` (`prefilled_tokens < prompt_tokens.len()`): MTP KV at pos 63
+        // is deferred until Chunk 2 provides `prompt[64]`, so node 0 must NOT be promoted yet.
+        seq.prefilled_tokens = 64;
+        seq.current_seq_len = 64;
+        seq.ensure_kv_pages_with_cache(
+            64,
+            16,
+            16,
+            &kv_pool,
+            Some(&mut tree),
+            &mut evictions,
+            &mut shadow_pt,
+            &mut dirty,
+        )
+        .expect("alloc chunk 1 pages");
+        seq.pending_checkpoints
+            .push((64, ckpt_pool.allocate(1).expect("ckpt 64")));
+        let mut active = vec![seq];
+        promote_completed_prefixes_in_batch(
+            &mut active,
+            Some(&mut tree),
+            true,
+            true,
+            4,
+            16,
+            &mut shadow_pt,
+            &mut dirty,
+        )
+        .expect("hold incomplete mtp chunk");
+        assert_eq!(active[0].prefix_lease.as_ref().unwrap().matched_nodes(), 0);
+        assert_eq!(active[0].kv_leases.len(), 4);
+        assert_eq!(active[0].pending_checkpoints.len(), 1);
+
+        // Chunk 2 completes `64..128` (`prefilled_tokens == prompt_tokens.len()`): both nodes
+        // (`0..64` and `64..128`) now have complete MTP KV and promote cleanly.
+        active[0].prefilled_tokens = 128;
+        active[0].current_seq_len = 128;
+        active[0]
+            .ensure_kv_pages_with_cache(
+                128,
+                16,
+                16,
+                &kv_pool,
+                Some(&mut tree),
+                &mut evictions,
+                &mut shadow_pt,
+                &mut dirty,
+            )
+            .expect("alloc chunk 2 pages");
+        active[0]
+            .pending_checkpoints
+            .push((128, ckpt_pool.allocate(1).expect("ckpt 128")));
+        promote_completed_prefixes_in_batch(
+            &mut active,
+            Some(&mut tree),
+            true,
+            true,
+            4,
+            16,
+            &mut shadow_pt,
+            &mut dirty,
+        )
+        .expect("promote completed mtp prompt");
+        assert_eq!(active[0].prefix_lease.as_ref().unwrap().matched_nodes(), 2);
+        assert!(active[0].kv_leases.is_empty());
+        assert!(active[0].pending_checkpoints.is_empty());
     }
 }
 

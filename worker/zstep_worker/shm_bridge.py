@@ -346,6 +346,9 @@ class SeqResult:
     accepted_logprob_bits: int
     runner_up_token: int = -1
     runner_up_logprob_bits: int = 0
+    accepted_tokens: list[int] | None = None
+    accepted_logprobs_bits: list[int] | None = None
+    next_draft_tokens: list[int] | None = None
 
 
 _ATOMIC_OPS: tuple[Any, Any, Any, Any] | None = None
@@ -711,16 +714,30 @@ class StepResultView:
         )
         self.bridge._mapping[self.base : self.base + STEP_RESULT_HEADER_BYTES] = header
         for index, output in enumerate(outputs):
-            accepted = [output.accepted_token, output.runner_up_token] + [-1] * 6
-            drafts = [-1] * 8
-            logprobs = [
-                output.accepted_logprob_bits,
-                output.runner_up_logprob_bits,
-            ] + [0] * 6
+            if output.accepted_tokens is None:
+                accepted = [output.accepted_token, output.runner_up_token] + [-1] * 6
+                logprobs = [
+                    output.accepted_logprob_bits,
+                    output.runner_up_logprob_bits,
+                ] + [0] * 6
+                num_accepted = 1
+            else:
+                if not 1 <= len(output.accepted_tokens) <= 8:
+                    raise ValueError("accepted_tokens must contain 1..=8 token IDs")
+                accepted = output.accepted_tokens + [-1] * (8 - len(output.accepted_tokens))
+                supplied_logprobs = output.accepted_logprobs_bits or []
+                if len(supplied_logprobs) > len(output.accepted_tokens):
+                    raise ValueError("more accepted logprobs than accepted tokens")
+                logprobs = supplied_logprobs + [0] * (8 - len(supplied_logprobs))
+                num_accepted = len(output.accepted_tokens)
+            drafts_source = output.next_draft_tokens or []
+            if len(drafts_source) > 8:
+                raise ValueError("next_draft_tokens cannot exceed 8 entries")
+            drafts = drafts_source + [-1] * (8 - len(drafts_source))
             packed = struct.pack(
                 "<II8i8i8I",
                 output.req_slot,
-                1,
+                num_accepted,
                 *accepted,
                 *drafts,
                 *logprobs,

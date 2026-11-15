@@ -152,6 +152,7 @@ pub struct SeqStepOutput {
 | :--- | :---: | :--- |
 | `ShmSuperblock` (`layout_hash`, `result_slot_stride`, `max_decode_graph_seqs`, `SUPERBLOCK_ABORT_OFFSET`) | **已启用** | Rust/Python 双端强校验 + Golden JSON 跨语言单测锁定 |
 | `StepPlanSlot`：`token_ids`, `positions`, `req_slot_ids`, `sample_row_indices`, `seq_lens`, `query_start_loc`, `global_kv_page_table`（脏行增量同步）, `engram_prev_window` | **已启用** | Phase 2 (`Qwen3.5-35B-A3B`) 与 Phase 3.6 (`DeepSeek-V4.1-Flash` + `b12x`) 生产路径使用 |
-| `SeqStepOutput`：Top-1 / Top-2 token 与原始 BF16 logit 回传 | **已启用** | `accepted_tokens[0]` + `next_draft_tokens[0]` 承载确定性全局 Top-2 贪心审计 |
+| `SeqStepOutput`：`num_accepted`、`accepted_tokens`、`accepted_logprobs_bits`、`next_draft_tokens` | **已启用** | 非投机路径保持 Top-1 / Top-2 兼容布局；投机路径回传有序接受 Token、逐 Token logit 与下一轮神经草稿 |
 | `StepOpcode::WarmupCaptureGraphs` / `ReloadForward`、`ControlPayloadArena` | **预留** | Warmup 与 CUDA Graph 捕获目前在 Worker 初始化阶段直接完成 |
-| `is_dspark_verify`、`narrow_keep_indices`、`replay_mask`、`swa_page_table`、`compressor_slot_ids`、`temperatures`（随机采样） | **预留** | 面向后续 DSpark 投机验证、CED 层间窄化、SWA 前缀重放与非贪心采样预留定长偏移（SWA/Compressor 页映射当前由 `DeepSeekV41StepRunner` 从 `global_kv_page_table` 与 `req_slot_ids` 无损派生） |
+| `is_dspark_verify`、`replay_mask`、`compressor_slot_ids` | **已启用** | ngram / MTP / DSpark varlen 验证、APC GDN 快照与投机 GDN scratch 回滚；SHM 字节偏移保持不变 |
+| `narrow_keep_indices`、`swa_page_table`、`temperatures`（随机采样） | **预留** | CED 层间窄化、显式 SWA 前缀映射与非贪心采样后续演进字段（SWA/Compressor 页映射当前由 `DeepSeekV41StepRunner` 从 `global_kv_page_table` 与 `req_slot_ids` 无损派生） |
