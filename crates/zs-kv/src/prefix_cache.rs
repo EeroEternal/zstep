@@ -18,13 +18,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Deterministic block-granular Radix prefix cache with RAII pin leases (`RadixLease`),
-//! cascading LRU leaf eviction, and four-group FlatKV request admission (`RequestKvHandle`).
-//!
-//! [`PrefixTree`] and [`KvCacheManager`] are currently standalone for pure-attention paged KV
-//! caches. They are intentionally not enabled for `Qwen3.5-35B-A3B` until block-boundary
-//! recurrent-state (`conv_state` and `ssm_state`) snapshotting is implemented for its 30
-//! `GatedDeltaNet` layers.
+//! Deterministic block-granular Automatic Prefix Cache (APC) with RAII pin leases (`PrefixLease`),
+//! optional co-owned recurrent checkpoint slots (`aux_lease`), cascading LRU leaf eviction, and
+//! four-group FlatKV request admission (`RequestKvHandle`).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -32,10 +28,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::{BlockLease, BlockPool, CacheGroupKind, plan_bounded_replay};
 
-/// Errors produced during Radix prefix admission or block promotion.
+/// Errors produced during Automatic Prefix Cache admission or block promotion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KvError {
-    /// Block token granularity or SWA window parameter is zero or misaligned.
+    /// Block token granularity, pages-per-node, or SWA window parameter is zero or misaligned.
     InvalidGeometry(String),
     /// Physical cache group ran out of free blocks even after evicting unpinned cached leaves.
     OutOfBlocks {
@@ -43,7 +39,7 @@ pub enum KvError {
         requested: usize,
         available: usize,
     },
-    /// Token slice or lease count does not align with the tree's `block_tokens`.
+    /// Token slice or lease count does not align with the tree's `block_tokens` / `pages_per_node`.
     MisalignedPromotion(String),
 }
 
@@ -68,11 +64,12 @@ impl fmt::Display for KvError {
 
 impl std::error::Error for KvError {}
 
-struct RadixNode {
+struct PrefixNode {
     parent: usize,
     token_key: Box<[i32]>,
     children: HashMap<Box<[i32]>, usize>,
     lease: Option<BlockLease>,
+    aux_lease: Option<BlockLease>,
     pin_count: usize,
     last_access_tick: u64,
     evicted: bool,
@@ -80,7 +77,8 @@ struct RadixNode {
 
 struct PrefixTreeInner {
     block_tokens: usize,
-    nodes: Vec<RadixNode>,
+    pages_per_node: usize,
+    nodes: Vec<PrefixNode>,
     free_node_slots: Vec<usize>,
     cached_blocks: usize,
     access_clock: u64,
@@ -92,7 +90,7 @@ impl PrefixTreeInner {
         self.access_clock
     }
 
-    fn alloc_node(&mut self, node: RadixNode) -> usize {
+    fn alloc_node(&mut self, node: PrefixNode) -> usize {
         if let Some(slot) = self.free_node_slots.pop() {
             self.nodes[slot] = node;
             slot
@@ -124,9 +122,12 @@ impl PrefixTreeInner {
             let parent_idx = self.nodes[victim_idx].parent;
             let key = self.nodes[victim_idx].token_key.clone();
             self.nodes[parent_idx].children.remove(&key);
-            // Dropping `lease` returns the physical block ID directly to `BlockPool`.
+            // Dropping `lease` and `aux_lease` returns physical KV pages and recurrent checkpoint
+            // slots directly to their respective `BlockPool`s.
             let dropped_lease = self.nodes[victim_idx].lease.take();
+            let dropped_aux = self.nodes[victim_idx].aux_lease.take();
             drop(dropped_lease);
+            drop(dropped_aux);
             self.nodes[victim_idx].evicted = true;
             self.free_node_slots.push(victim_idx);
             self.cached_blocks = self.cached_blocks.saturating_sub(1);
@@ -136,7 +137,8 @@ impl PrefixTreeInner {
     }
 }
 
-/// Thread-safe Radix prefix tree over `CacheGroupKind::GlobalAndIndex` blocks.
+/// Thread-safe block-aligned prefix cache tree over physical KV pages and optional recurrent
+/// checkpoint slots.
 #[derive(Clone)]
 pub struct PrefixTree {
     inner: Arc<Mutex<PrefixTreeInner>>,
@@ -144,16 +146,31 @@ pub struct PrefixTree {
 
 impl PrefixTree {
     pub fn new(block_tokens: u32) -> Result<Self, KvError> {
+        Self::with_pages_per_node(block_tokens, 1)
+    }
+
+    pub fn with_pages_per_node(block_tokens: u32, pages_per_node: usize) -> Result<Self, KvError> {
         if block_tokens == 0 {
             return Err(KvError::InvalidGeometry(
                 "block_tokens must be positive".to_owned(),
             ));
         }
-        let root = RadixNode {
+        if pages_per_node == 0 {
+            return Err(KvError::InvalidGeometry(
+                "pages_per_node must be positive".to_owned(),
+            ));
+        }
+        if (block_tokens as usize) % pages_per_node != 0 {
+            return Err(KvError::InvalidGeometry(format!(
+                "block_tokens ({block_tokens}) must be a multiple of pages_per_node ({pages_per_node})"
+            )));
+        }
+        let root = PrefixNode {
             parent: 0,
             token_key: Box::new([]),
             children: HashMap::new(),
             lease: None,
+            aux_lease: None,
             pin_count: 1,
             last_access_tick: 0,
             evicted: false,
@@ -161,6 +178,7 @@ impl PrefixTree {
         Ok(Self {
             inner: Arc::new(Mutex::new(PrefixTreeInner {
                 block_tokens: block_tokens as usize,
+                pages_per_node,
                 nodes: vec![root],
                 free_node_slots: Vec::new(),
                 cached_blocks: 0,
@@ -177,7 +195,15 @@ impl PrefixTree {
         guard.block_tokens as u32
     }
 
-    /// Total physical blocks currently retained in the Radix tree.
+    pub fn pages_per_node(&self) -> usize {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.pages_per_node
+    }
+
+    /// Total cached prefix nodes currently retained in the tree.
     pub fn cached_blocks(&self) -> usize {
         let guard = self
             .inner
@@ -186,7 +212,16 @@ impl PrefixTree {
         guard.cached_blocks
     }
 
-    /// Number of currently unpinned blocks eligible for LRU eviction.
+    /// Total physical KV pages currently retained in the tree (`cached_blocks * pages_per_node`).
+    pub fn cached_kv_pages(&self) -> usize {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.cached_blocks * guard.pages_per_node
+    }
+
+    /// Number of currently unpinned nodes eligible for LRU eviction.
     pub fn evictable_blocks(&self) -> usize {
         let guard = self
             .inner
@@ -200,9 +235,54 @@ impl PrefixTree {
             .count()
     }
 
+    /// Number of physical KV pages held by currently unpinned nodes (`evictable_blocks * pages_per_node`).
+    pub fn evictable_kv_pages(&self) -> usize {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let unpinned_nodes = guard
+            .nodes
+            .iter()
+            .skip(1)
+            .filter(|node| !node.evicted && node.pin_count == 0)
+            .count();
+        unpinned_nodes * guard.pages_per_node
+    }
+
+    /// Inspect how many nodes and currently-unpinned nodes match up to `max_nodes` full
+    /// `block_tokens` chunks without mutating `pin_count` or `last_access_tick`.
+    pub fn peek_prefix_bounded(&self, tokens: &[i32], max_nodes: usize) -> (usize, usize) {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let block_tokens = guard.block_tokens;
+        let mut current = 0usize;
+        let mut matched_nodes = 0usize;
+        let mut unpinned_matched_nodes = 0usize;
+        for chunk in tokens.chunks_exact(block_tokens).take(max_nodes) {
+            let Some(&child_idx) = guard.nodes[current].children.get(chunk) else {
+                break;
+            };
+            matched_nodes += 1;
+            if guard.nodes[child_idx].pin_count == 0 {
+                unpinned_matched_nodes += 1;
+            }
+            current = child_idx;
+        }
+        (matched_nodes, unpinned_matched_nodes)
+    }
+
     /// Match as many full `block_tokens` chunks from the start of `tokens` as exist in the tree,
-    /// pinning every matched ancestor via the returned RAII [`RadixLease`].
-    pub fn match_prefix(&self, tokens: &[i32]) -> RadixLease {
+    /// pinning every matched ancestor via the returned RAII [`PrefixLease`].
+    pub fn match_prefix(&self, tokens: &[i32]) -> PrefixLease {
+        self.match_prefix_bounded(tokens, usize::MAX)
+    }
+
+    /// Match up to `max_nodes` full `block_tokens` chunks from the start of `tokens`,
+    /// pinning every matched ancestor via the returned RAII [`PrefixLease`].
+    pub fn match_prefix_bounded(&self, tokens: &[i32], max_nodes: usize) -> PrefixLease {
         let mut guard = self
             .inner
             .lock()
@@ -210,8 +290,10 @@ impl PrefixTree {
         let block_tokens = guard.block_tokens;
         let mut current = 0usize;
         let mut block_ids = Vec::new();
+        let mut matched_nodes = 0usize;
+        let mut leaf_aux_id = None;
 
-        for chunk in tokens.chunks_exact(block_tokens) {
+        for chunk in tokens.chunks_exact(block_tokens).take(max_nodes) {
             let next_idx = guard.nodes[current].children.get(chunk).copied();
             let Some(child_idx) = next_idx else {
                 break;
@@ -220,95 +302,142 @@ impl PrefixTree {
             let child = &mut guard.nodes[child_idx];
             child.pin_count += 1;
             child.last_access_tick = tick;
-            let block_id = child
+            let ids = child
                 .lease
                 .as_ref()
-                .expect("live radix node owns a physical block")
-                .ids()[0];
-            block_ids.push(block_id);
+                .expect("live prefix node owns physical KV pages")
+                .ids();
+            block_ids.extend_from_slice(ids);
+            leaf_aux_id = child.aux_lease.as_ref().map(|aux| aux.ids()[0]);
+            matched_nodes += 1;
             current = child_idx;
         }
 
-        let matched_tokens = (block_ids.len() * block_tokens) as u32;
-        RadixLease {
+        let matched_tokens = (matched_nodes * block_tokens) as u32;
+        PrefixLease {
             tree: Arc::clone(&self.inner),
             leaf_node: current,
             block_ids,
+            matched_nodes,
             matched_tokens,
+            leaf_aux_id,
         }
     }
 
     /// Insert or deduplicate full `block_tokens` chunks starting after `existing_lease`,
-    /// consuming `new_single_blocks` (one single-block [`BlockLease`] per new chunk) and
-    /// returning an extended [`RadixLease`] covering the full prefix.
+    /// consuming `new_node_blocks` (one [`BlockLease`] of `pages_per_node` pages per new chunk)
+    /// and returning an extended [`PrefixLease`] covering the full prefix.
     ///
-    /// If another request concurrently inserted any of the same blocks, the duplicate
-    /// [`BlockLease`] in `new_single_blocks` drops immediately and returns its physical ID
+    /// If another request concurrently inserted any of the same nodes, the duplicate
+    /// [`BlockLease`] in `new_node_blocks` drops immediately and returns its physical IDs
     /// to [`BlockPool`].
     pub fn extend_prefix(
         &self,
-        existing_lease: RadixLease,
+        existing_lease: PrefixLease,
         extension_tokens: &[i32],
-        new_single_blocks: Vec<BlockLease>,
-    ) -> Result<RadixLease, KvError> {
+        new_node_blocks: Vec<BlockLease>,
+    ) -> Result<PrefixLease, KvError> {
+        self.extend_prefix_with_aux(existing_lease, extension_tokens, new_node_blocks, None)
+    }
+
+    /// Insert or deduplicate full `block_tokens` chunks with optional 1:1 auxiliary recurrent
+    /// checkpoint leases (`new_aux_leases`).
+    pub fn extend_prefix_with_aux(
+        &self,
+        existing_lease: PrefixLease,
+        extension_tokens: &[i32],
+        new_node_blocks: Vec<BlockLease>,
+        new_aux_leases: Option<Vec<BlockLease>>,
+    ) -> Result<PrefixLease, KvError> {
         let mut guard = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let block_tokens = guard.block_tokens;
-        if extension_tokens.len() != new_single_blocks.len() * block_tokens {
+        let pages_per_node = guard.pages_per_node;
+        if extension_tokens.len() != new_node_blocks.len() * block_tokens {
             return Err(KvError::MisalignedPromotion(format!(
-                "extension_tokens len {} != {} blocks * {}",
+                "extension_tokens len {} != {} nodes * {}",
                 extension_tokens.len(),
-                new_single_blocks.len(),
+                new_node_blocks.len(),
                 block_tokens
             )));
         }
-        for lease in &new_single_blocks {
-            if lease.ids().len() != 1 {
-                return Err(KvError::MisalignedPromotion(
-                    "each promoted BlockLease must own exactly 1 block".to_owned(),
-                ));
+        for lease in &new_node_blocks {
+            if lease.ids().len() != pages_per_node {
+                return Err(KvError::MisalignedPromotion(format!(
+                    "each promoted BlockLease must own {pages_per_node} pages, got {}",
+                    lease.ids().len()
+                )));
+            }
+        }
+        if let Some(ref aux_vec) = new_aux_leases {
+            if aux_vec.len() != new_node_blocks.len() {
+                return Err(KvError::MisalignedPromotion(format!(
+                    "new_aux_leases len {} != new_node_blocks len {}",
+                    aux_vec.len(),
+                    new_node_blocks.len()
+                )));
+            }
+            for aux in aux_vec {
+                if aux.ids().len() != 1 {
+                    return Err(KvError::MisalignedPromotion(
+                        "each promoted aux BlockLease must own exactly 1 slot".to_owned(),
+                    ));
+                }
             }
         }
 
         let mut current = existing_lease.leaf_node;
         let mut block_ids = existing_lease.block_ids.clone();
+        let mut matched_nodes = existing_lease.matched_nodes;
+        let mut leaf_aux_id = existing_lease.leaf_aux_id;
         // Consume `existing_lease` without decrementing the ancestor pins we are extending.
         let mut transferred = existing_lease;
         transferred.leaf_node = 0;
         transferred.block_ids.clear();
         drop(transferred);
 
-        for (chunk, block_lease) in extension_tokens
+        let aux_items: Vec<Option<BlockLease>> = match new_aux_leases {
+            Some(vec) => vec.into_iter().map(Some).collect(),
+            None => (0..new_node_blocks.len()).map(|_| None).collect(),
+        };
+
+        for ((chunk, block_lease), aux_lease) in extension_tokens
             .chunks_exact(block_tokens)
-            .zip(new_single_blocks)
+            .zip(new_node_blocks)
+            .zip(aux_items)
         {
             let existing_child = guard.nodes[current].children.get(chunk).copied();
             if let Some(child_idx) = existing_child {
-                // Another request already cached this exact block: drop `block_lease` so its
-                // physical block returns immediately to `BlockPool`, and pin the canonical node.
+                // Another request already cached this exact node: drop redundant KV and aux
+                // leases so their physical IDs return immediately to their `BlockPool`s.
                 drop(block_lease);
+                drop(aux_lease);
                 let tick = guard.next_tick();
                 let child = &mut guard.nodes[child_idx];
                 child.pin_count += 1;
                 child.last_access_tick = tick;
-                let block_id = child
+                let ids = child
                     .lease
                     .as_ref()
-                    .expect("live radix node owns a physical block")
-                    .ids()[0];
-                block_ids.push(block_id);
+                    .expect("live prefix node owns physical KV pages")
+                    .ids();
+                block_ids.extend_from_slice(ids);
+                leaf_aux_id = child.aux_lease.as_ref().map(|aux| aux.ids()[0]);
+                matched_nodes += 1;
                 current = child_idx;
             } else {
-                let block_id = block_lease.ids()[0];
+                block_ids.extend_from_slice(block_lease.ids());
+                leaf_aux_id = aux_lease.as_ref().map(|aux| aux.ids()[0]);
                 let tick = guard.next_tick();
                 let key: Box<[i32]> = chunk.into();
-                let node = RadixNode {
+                let node = PrefixNode {
                     parent: current,
                     token_key: key.clone(),
                     children: HashMap::new(),
                     lease: Some(block_lease),
+                    aux_lease,
                     pin_count: 1,
                     last_access_tick: tick,
                     evicted: false,
@@ -316,21 +445,23 @@ impl PrefixTree {
                 let child_idx = guard.alloc_node(node);
                 guard.nodes[current].children.insert(key, child_idx);
                 guard.cached_blocks += 1;
-                block_ids.push(block_id);
+                matched_nodes += 1;
                 current = child_idx;
             }
         }
 
-        let matched_tokens = (block_ids.len() * block_tokens) as u32;
-        Ok(RadixLease {
+        let matched_tokens = (matched_nodes * block_tokens) as u32;
+        Ok(PrefixLease {
             tree: Arc::clone(&self.inner),
             leaf_node: current,
             block_ids,
+            matched_nodes,
             matched_tokens,
+            leaf_aux_id,
         })
     }
 
-    /// Evict up to `target_blocks` unpinned leaf blocks in strict LRU order.
+    /// Evict up to `target_blocks` unpinned leaf nodes in strict LRU order.
     pub fn evict_lru(&self, target_blocks: usize) -> usize {
         let mut guard = self
             .inner
@@ -340,28 +471,38 @@ impl PrefixTree {
     }
 }
 
-/// RAII handle pinning a matched chain of blocks inside [`PrefixTree`].
+/// RAII handle pinning a matched chain of prefix nodes inside [`PrefixTree`].
 ///
-/// Dropping `RadixLease` decrements `pin_count` along the ancestor chain without panicking
+/// Dropping `PrefixLease` decrements `pin_count` along the ancestor chain without panicking
 /// even if a thread unwinds.
-pub struct RadixLease {
+pub struct PrefixLease {
     tree: Arc<Mutex<PrefixTreeInner>>,
     leaf_node: usize,
     block_ids: Vec<i32>,
+    matched_nodes: usize,
     matched_tokens: u32,
+    leaf_aux_id: Option<i32>,
 }
 
-impl RadixLease {
+impl PrefixLease {
     pub fn block_ids(&self) -> &[i32] {
         &self.block_ids
+    }
+
+    pub fn matched_nodes(&self) -> usize {
+        self.matched_nodes
     }
 
     pub fn matched_tokens(&self) -> u32 {
         self.matched_tokens
     }
+
+    pub fn leaf_aux_id(&self) -> Option<i32> {
+        self.leaf_aux_id
+    }
 }
 
-impl Drop for RadixLease {
+impl Drop for PrefixLease {
     fn drop(&mut self) {
         if self.leaf_node == 0 {
             return;
@@ -402,12 +543,12 @@ pub struct PrefillSchedule {
 }
 
 /// Composite RAII handle owning every cache resource for one active request:
-/// pinned Radix prefix blocks, uncached `GlobalAndIndex` tail blocks, private `SwaWindow`
+/// pinned APC prefix blocks, uncached `GlobalAndIndex` tail blocks, private `SwaWindow`
 /// ring pages, and private `CompressorTail` state slot.
 pub struct RequestKvHandle {
     prefix_tree: PrefixTree,
     global_pool: BlockPool,
-    radix_lease: Option<RadixLease>,
+    prefix_lease: Option<PrefixLease>,
     tail_global_blocks: Vec<BlockLease>,
     swa_lease: BlockLease,
     compressor_lease: BlockLease,
@@ -421,17 +562,17 @@ impl RequestKvHandle {
     }
 
     pub fn matched_prefix_tokens(&self) -> u32 {
-        self.radix_lease
+        self.prefix_lease
             .as_ref()
-            .map_or(0, RadixLease::matched_tokens)
+            .map_or(0, PrefixLease::matched_tokens)
     }
 
     /// Assemble the complete ordered `GlobalAndIndex` page table (pinned prefix + tail blocks).
     pub fn global_page_table(&self) -> Vec<i32> {
         let prefix_ids = self
-            .radix_lease
+            .prefix_lease
             .as_ref()
-            .map_or(&[][..], RadixLease::block_ids);
+            .map_or(&[][..], PrefixLease::block_ids);
         let mut table = Vec::with_capacity(prefix_ids.len() + self.tail_global_blocks.len());
         table.extend_from_slice(prefix_ids);
         for block in &self.tail_global_blocks {
@@ -451,11 +592,11 @@ impl RequestKvHandle {
     }
 
     /// Allocate additional `GlobalAndIndex` tail blocks as decode grows past the current page
-    /// boundary, evicting unpinned Radix leaves on demand if needed.
+    /// boundary, evicting unpinned prefix cache leaves on demand if needed.
     pub fn ensure_capacity_for_seq_len(&mut self, seq_len_tokens: usize) -> Result<(), KvError> {
         let needed_total = seq_len_tokens.div_ceil(self.block_tokens as usize);
         let current_total = self
-            .radix_lease
+            .prefix_lease
             .as_ref()
             .map_or(0, |lease| lease.block_ids().len())
             + self.tail_global_blocks.len();
@@ -476,7 +617,7 @@ impl RequestKvHandle {
     ) -> Result<usize, KvError> {
         let block_tokens = self.block_tokens as usize;
         let prefix_blocks = self
-            .radix_lease
+            .prefix_lease
             .as_ref()
             .map_or(0, |lease| lease.block_ids().len());
         let total_full_blocks = full_sequence_tokens.len() / block_tokens;
@@ -492,20 +633,20 @@ impl RequestKvHandle {
         let promoted_blocks: Vec<BlockLease> =
             self.tail_global_blocks.drain(..promotable).collect();
         let previous_lease = self
-            .radix_lease
+            .prefix_lease
             .take()
-            .expect("RequestKvHandle always holds a RadixLease");
+            .expect("RequestKvHandle always holds a PrefixLease");
         match self.prefix_tree.extend_prefix(
             previous_lease,
             &full_sequence_tokens[token_start..token_end],
             promoted_blocks,
         ) {
             Ok(updated_lease) => {
-                self.radix_lease = Some(updated_lease);
+                self.prefix_lease = Some(updated_lease);
                 Ok(promotable)
             }
             Err(err) => {
-                self.radix_lease = Some(
+                self.prefix_lease = Some(
                     self.prefix_tree
                         .match_prefix(&full_sequence_tokens[..token_start]),
                 );
@@ -524,8 +665,10 @@ fn allocate_with_eviction(
         return Ok(lease);
     }
     let available_before = global_pool.available();
-    let deficit = count.saturating_sub(available_before);
-    prefix_tree.evict_lru(deficit);
+    let deficit_pages = count.saturating_sub(available_before);
+    let pages_per_node = prefix_tree.pages_per_node();
+    let target_nodes = deficit_pages.div_ceil(pages_per_node);
+    prefix_tree.evict_lru(target_nodes);
     global_pool
         .allocate(count)
         .ok_or_else(|| KvError::OutOfBlocks {
@@ -535,7 +678,7 @@ fn allocate_with_eviction(
         })
 }
 
-/// Unified four-group FlatKV allocator + Radix prefix cache manager.
+/// Unified four-group FlatKV allocator + Automatic Prefix Cache manager.
 #[derive(Clone)]
 pub struct KvCacheManager {
     global_pool: BlockPool,
@@ -602,17 +745,17 @@ impl KvCacheManager {
                 "prompt_tokens must not be empty".to_owned(),
             ));
         }
-        let radix_lease = self.prefix_tree.match_prefix(prompt_tokens);
-        let matched_blocks = radix_lease.block_ids().len();
+        let prefix_lease = self.prefix_tree.match_prefix(prompt_tokens);
+        let matched_blocks = prefix_lease.block_ids().len();
         let total_blocks = prompt_tokens.len().div_ceil(self.block_tokens as usize);
         let uncached_blocks = total_blocks.saturating_sub(matched_blocks);
 
         // When the entire prompt is an exact multiple of `block_tokens` and matched 100% in the
-        // Radix tree (`matched_tokens_raw == prompt_tokens.len()`), `swa_window >= 1` guarantees
+        // prefix tree (`matched_tokens_raw == prompt_tokens.len()`), `swa_window >= 1` guarantees
         // `replay_tokens = matched_tokens_raw.min(swa_window) >= 1` ending at `prompt_len - 1`,
         // so next-token logits and private SWA/Compressor state are produced with `replay_mask = 1`
-        // without ever overwriting any shared `GlobalAndIndex` Radix page (`fresh_tokens = 0`).
-        let matched_tokens_raw = radix_lease.matched_tokens();
+        // without ever overwriting any shared `GlobalAndIndex` cached page (`fresh_tokens = 0`).
+        let matched_tokens_raw = prefix_lease.matched_tokens();
         let (skipped_tokens, replay_tokens) =
             plan_bounded_replay(matched_tokens_raw, self.swa_window);
         let fresh_tokens = prompt_tokens.len() as u32 - matched_tokens_raw;
@@ -669,7 +812,7 @@ impl KvCacheManager {
         Ok(RequestKvHandle {
             prefix_tree: self.prefix_tree.clone(),
             global_pool: self.global_pool.clone(),
-            radix_lease: Some(radix_lease),
+            prefix_lease: Some(prefix_lease),
             tail_global_blocks,
             swa_lease,
             compressor_lease,

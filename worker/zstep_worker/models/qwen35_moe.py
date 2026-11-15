@@ -470,6 +470,35 @@ class Qwen35MoeStepRunner:
         self.ssm_states: torch.Tensor = torch.zeros(
             (30, total_slots, 4, 128, 128), dtype=torch.float32, device=self.device
         )
+        # Optional block-boundary recurrent state checkpoints for Automatic Prefix Caching (APC).
+        # Slot IDs `0..255` are conveyed via `compressor_slot_ids` (int32, -1 = none) for restore
+        # and `replay_mask` (uint8, 0xFF = none) for per-row snapshot.
+        self.num_recurrent_checkpoints: int = int(
+            os.environ.get("ZSTEP_NUM_RECURRENT_CHECKPOINTS", "0")
+        )
+        if self.num_recurrent_checkpoints < 0 or self.num_recurrent_checkpoints > 255:
+            raise ValueError(
+                "ZSTEP_NUM_RECURRENT_CHECKPOINTS must be in 0..=255 "
+                f"(got {self.num_recurrent_checkpoints})"
+            )
+        self.cached_conv_states: torch.Tensor | None = (
+            torch.zeros(
+                (30, self.num_recurrent_checkpoints, 1024, 3),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            if self.num_recurrent_checkpoints > 0
+            else None
+        )
+        self.cached_ssm_states: torch.Tensor | None = (
+            torch.zeros(
+                (30, self.num_recurrent_checkpoints, 4, 128, 128),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if self.num_recurrent_checkpoints > 0
+            else None
+        )
         # 10 full-attention layers paged KV cache (+1 scratch page for dummy slot)
         self.k_caches: torch.Tensor = torch.zeros(
             (10, self.num_kv_pages + 1, 16, 256), dtype=torch.bfloat16, device=self.device
@@ -493,6 +522,16 @@ class Qwen35MoeStepRunner:
             ms + 1, dtype=torch.int32, device=self.device
         )
         self.sample_rows_gpu: torch.Tensor = torch.zeros(ms, dtype=torch.int64, device=self.device)
+        self.restore_slot_ids_gpu: torch.Tensor | None = (
+            torch.full((ms,), -1, dtype=torch.int32, device=self.device)
+            if self.num_recurrent_checkpoints > 0
+            else None
+        )
+        self.save_slot_ids_gpu: torch.Tensor | None = (
+            torch.full((mt,), 0xFF, dtype=torch.uint8, device=self.device)
+            if self.num_recurrent_checkpoints > 0
+            else None
+        )
         # Decode inputs and the shared page table live in one packed int32 buffer so a decode
         # step uploads them with a single H2D copy:
         # [token_ids | positions | req_slot_ids | seq_lens] (max_graph_bucket each), the
@@ -546,6 +585,26 @@ class Qwen35MoeStepRunner:
         self._req_slot_ids_np: np.ndarray = self.req_slot_ids_cpu.numpy()
         self._seq_lens_np: np.ndarray = self.seq_lens_cpu.numpy()
         self._query_start_loc_np: np.ndarray = self.query_start_loc_cpu.numpy()
+        self.restore_slot_ids_cpu: torch.Tensor | None = (
+            torch.full((2, ms), -1, dtype=torch.int32, pin_memory=True)
+            if self.num_recurrent_checkpoints > 0
+            else None
+        )
+        self.save_slot_ids_cpu: torch.Tensor | None = (
+            torch.full((2, mt), 0xFF, dtype=torch.uint8, pin_memory=True)
+            if self.num_recurrent_checkpoints > 0
+            else None
+        )
+        self._restore_slot_ids_np: list[np.ndarray] | None = (
+            [self.restore_slot_ids_cpu[p].numpy() for p in range(2)]
+            if self.restore_slot_ids_cpu is not None
+            else None
+        )
+        self._save_slot_ids_np: list[np.ndarray] | None = (
+            [self.save_slot_ids_cpu[p].numpy() for p in range(2)]
+            if self.save_slot_ids_cpu is not None
+            else None
+        )
         # Sampled tokens and logprob bits share one buffer so rank 0 needs a single D2H copy.
         # Indexed by step parity first, like `dec_io_cpu`.
         self.out_io_cpu: torch.Tensor = torch.zeros(
@@ -1107,6 +1166,26 @@ class Qwen35MoeStepRunner:
                     num_seqs=num_seqs,
                     eps=eps,
                     qk_norm_buf=self.lin_qk_norm_buf[:total_tokens],
+                    cached_conv_state=(
+                        self.cached_conv_states[lw.state_layer_idx]
+                        if self.cached_conv_states is not None
+                        else None
+                    ),
+                    cached_ssm_state=(
+                        self.cached_ssm_states[lw.state_layer_idx]
+                        if self.cached_ssm_states is not None
+                        else None
+                    ),
+                    restore_slot_ids=(
+                        self.restore_slot_ids_gpu[:num_seqs]
+                        if self.restore_slot_ids_gpu is not None
+                        else None
+                    ),
+                    save_slot_ids=(
+                        self.save_slot_ids_gpu[:total_tokens]
+                        if self.save_slot_ids_gpu is not None
+                        else None
+                    ),
                 )
                 torch.matmul(gated, lw.w_out_proj.t(), out=proj_local)
             else:
@@ -1276,6 +1355,10 @@ class Qwen35MoeStepRunner:
         # Clear dummy state after capture
         self.conv_states.zero_()
         self.ssm_states.zero_()
+        if self.cached_conv_states is not None:
+            self.cached_conv_states.zero_()
+        if self.cached_ssm_states is not None:
+            self.cached_ssm_states.zero_()
         torch.cuda.synchronize(self.device)
         dist.barrier(group=self.exchange_group)
 
@@ -1365,6 +1448,25 @@ class Qwen35MoeStepRunner:
             if num_sample > 0:
                 self.sample_rows_gpu[:num_sample].copy_(
                     self.sample_rows_cpu[:num_sample], non_blocking=True
+                )
+            if (
+                self.num_recurrent_checkpoints > 0
+                and self.restore_slot_ids_cpu is not None
+                and self.save_slot_ids_cpu is not None
+                and self.restore_slot_ids_gpu is not None
+                and self.save_slot_ids_gpu is not None
+                and self._restore_slot_ids_np is not None
+                and self._save_slot_ids_np is not None
+            ):
+                restore_np = plan.compressor_slot_ids(num_seqs)
+                save_np = plan.replay_mask(total_tokens)
+                np.copyto(self._restore_slot_ids_np[parity][:num_seqs], restore_np)
+                np.copyto(self._save_slot_ids_np[parity][:total_tokens], save_np)
+                self.restore_slot_ids_gpu[:num_seqs].copy_(
+                    self.restore_slot_ids_cpu[parity, :num_seqs], non_blocking=True
+                )
+                self.save_slot_ids_gpu[:total_tokens].copy_(
+                    self.save_slot_ids_cpu[parity, :total_tokens], non_blocking=True
                 )
 
             q_lens = q_start_np[1:] - q_start_np[:-1]

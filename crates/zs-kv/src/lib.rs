@@ -18,29 +18,32 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Four-group FlatKV block allocator with RAII ownership (`BlockLease`),
-//! Radix prefix cache (`PrefixTree`, `RadixLease`, `KvCacheManager`), and
+//! Physical cache block allocator with RAII ownership (`BlockLease`),
+//! Automatic Prefix Cache (`PrefixTree`, `PrefixLease`, `KvCacheManager`), and
 //! SWA 128-token bounded replay planning.
 
-mod radix;
+mod prefix_cache;
 
 use std::sync::{Arc, Mutex};
 
-pub use radix::{
-    KvCacheManager, KvError, PrefillSchedule, PrefixTree, RadixLease, RequestKvHandle,
+pub use prefix_cache::{
+    KvCacheManager, KvError, PrefillSchedule, PrefixLease, PrefixTree, RequestKvHandle,
 };
 
-/// Physical cache groups used by `DeepSeek-V4.1-Flash` FlatKV attention.
+/// Physical cache groups managed by `zs-kv`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheGroupKind {
-    /// 512D NVFP4 (`E2M1/E4M3`, 288B/row) + 128D MXFP4 Index (`E2M1/E8M0`, 68B/row),
-    /// co-allocated 1:1 and eligible for Radix prefix caching.
+    /// Paged attention KV blocks (`GlobalAndIndex` on `DeepSeek-V4.1-Flash` or paged KV on
+    /// `Qwen3.5`), eligible for Automatic Prefix Caching.
     GlobalAndIndex,
-    /// 512D MXFP8 (`E4M3/E8M0`, 528B/row) sliding window; private per request,
-    /// regenerated on prefix hit via 128-token bounded replay.
+    /// 512D MXFP8 (`E4M3/E8M0`, 528B/row) sliding window; private per request when using
+    /// SWA bounded replay.
     SwaWindow,
     /// Private compressor tail state slot; never prefix-cached.
     CompressorTail,
+    /// Recurrent state (`conv_state` + `ssm_state`) checkpoint slots for hybrid models
+    /// (such as `Qwen3.5-35B-A3B` `GatedDeltaNet` layers), co-owned with prefix tree nodes.
+    RecurrentState,
 }
 
 struct PoolInner {
@@ -126,15 +129,45 @@ impl BlockLease {
 
     /// Split a multi-block lease into single-block [`BlockLease`] handles without releasing
     /// or duplicating ownership of any physical block ID.
-    pub fn split_individual(mut self) -> Vec<Self> {
+    pub fn split_individual(self) -> Vec<Self> {
+        self.split_chunks(1)
+    }
+
+    /// Split a lease into chunks of up to `chunk_size` physical block IDs without releasing
+    /// or duplicating ownership.
+    pub fn split_chunks(mut self, chunk_size: usize) -> Vec<Self> {
+        assert!(chunk_size > 0, "chunk_size must be positive");
         let owned_ids = std::mem::take(&mut self.ids);
         owned_ids
-            .into_iter()
-            .map(|id| Self {
+            .chunks(chunk_size)
+            .map(|chunk| Self {
                 pool: Arc::clone(&self.pool),
-                ids: vec![id],
+                ids: chunk.to_vec(),
             })
             .collect()
+    }
+
+    /// Merge multiple [`BlockLease`] handles from the same [`BlockPool`] into a single
+    /// [`BlockLease`] preserving block ID order.
+    ///
+    /// Returns `None` if `leases` is empty or if the leases belong to different pools.
+    pub fn merge(mut leases: Vec<Self>) -> Option<Self> {
+        let first_pool = Arc::clone(&leases.first()?.pool);
+        if !leases
+            .iter()
+            .all(|lease| Arc::ptr_eq(&first_pool, &lease.pool))
+        {
+            return None;
+        }
+        let total_ids: usize = leases.iter().map(|lease| lease.ids.len()).sum();
+        let mut merged_ids = Vec::with_capacity(total_ids);
+        for lease in &mut leases {
+            merged_ids.append(&mut lease.ids);
+        }
+        Some(Self {
+            pool: first_pool,
+            ids: merged_ids,
+        })
     }
 }
 
@@ -181,6 +214,29 @@ mod tests {
     }
 
     #[test]
+    fn block_lease_split_and_merge_roundtrip_preserves_order_and_ownership() {
+        let pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 12);
+        let original = pool.allocate(8).expect("allocate 8");
+        let expected_ids = original.ids().to_vec();
+        assert_eq!(pool.available(), 4);
+
+        let singles = original.split_individual();
+        assert_eq!(singles.len(), 8);
+        assert_eq!(pool.available(), 4);
+
+        let mut quad_leases = Vec::new();
+        let mut iter = singles.into_iter();
+        for _ in 0..2 {
+            let group: Vec<BlockLease> = iter.by_ref().take(4).collect();
+            quad_leases.push(BlockLease::merge(group).expect("same pool merge"));
+        }
+        assert_eq!(quad_leases[0].ids(), &expected_ids[..4]);
+        assert_eq!(quad_leases[1].ids(), &expected_ids[4..]);
+        drop(quad_leases);
+        assert_eq!(pool.available(), 12);
+    }
+
+    #[test]
     fn swa_bounded_replay_rewinds_at_most_window() {
         assert_eq!(plan_bounded_replay(0, 128), (0, 0));
         assert_eq!(plan_bounded_replay(64, 128), (0, 64));
@@ -188,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn radix_prefix_hit_plans_128_token_bounded_replay_and_shares_pages() {
+    fn prefix_hit_plans_128_token_bounded_replay_and_shares_pages() {
         let manager = KvCacheManager::new(32, 16, 8, 64, 128, 4).expect("valid manager");
         let prompt_a: Vec<i32> = (0..350).map(|idx| idx + 1000).collect();
 
@@ -235,7 +291,7 @@ mod tests {
         assert_ne!(handle_a.compressor_slot_id(), handle_b.compressor_slot_id());
     }
 
-    /// An exact block-aligned Radix prefix hit (`matched_tokens == prompt_len`) must replay only
+    /// An exact block-aligned prefix hit (`matched_tokens == prompt_len`) must replay only
     /// the trailing `min(matched_tokens, swa_window)` tokens with `replay_mask = 1` (rebuilding
     /// private `SwaWindow` + `CompressorTail` and computing next-token logits at `prompt_len - 1`)
     /// while performing **zero** `replay_mask = 0` writes to any shared `GlobalAndIndex` page.
@@ -250,7 +306,7 @@ mod tests {
         let pages = repeat.global_page_table();
         assert_eq!(
             pages, shared,
-            "exact hit shares all 4 immutable Radix GlobalAndIndex pages"
+            "exact hit shares all 4 immutable cached GlobalAndIndex pages"
         );
         let block_tokens = 64usize;
         let mut aliased_writes = 0usize;
@@ -266,7 +322,7 @@ mod tests {
         }
         assert_eq!(
             aliased_writes, 0,
-            "shared Radix pages must never be scheduled with replay_mask = 0"
+            "shared cached pages must never be scheduled with replay_mask = 0"
         );
         assert_eq!(
             repeat.schedule().scheduled_positions.last().copied(),
@@ -334,7 +390,7 @@ mod tests {
             let mut first = manager.admit_request(&prompt).expect("admit first");
             assert_eq!(first.commit_completed_blocks(&prompt).expect("commit"), 4);
         }
-        // Re-sending the exact 256-token prompt matches all 256 tokens in the Radix tree:
+        // Re-sending the exact 256-token prompt matches all 256 tokens in the prefix tree:
         // skips 128, replays the trailing 128 tokens (`128..256`) with `replay_mask = 1`
         // so `pos = 255` produces next-token logits without writing shared GlobalAndIndex pages.
         let repeat = manager.admit_request(&prompt).expect("admit repeat");
@@ -436,6 +492,65 @@ mod tests {
         );
         assert_eq!(manager.global_pool().available(), 8);
         assert_eq!(h1.global_page_table(), h2.global_page_table());
+    }
+
+    #[test]
+    fn hybrid_multi_page_prefix_tree_manages_aux_checkpoints_bounded_match_and_eviction() {
+        let kv_pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 24);
+        let aux_pool = BlockPool::new(CacheGroupKind::RecurrentState, 6);
+        let tree = PrefixTree::with_pages_per_node(64, 4).expect("64-token node, 4 pages/node");
+        let tokens: Vec<i32> = (0..192).map(|i| i + 700).collect(); // 3 nodes * 64 tokens
+
+        let base = tree.match_prefix_bounded(&tokens, 2);
+        assert_eq!(base.matched_nodes(), 0);
+        assert_eq!(base.matched_tokens(), 0);
+        assert_eq!(base.leaf_aux_id(), None);
+
+        // Promote 3 nodes (12 KV pages + 3 recurrent checkpoint slots) for request 1,
+        // and simulate concurrent duplicate promotion by request 2.
+        let kv_1 = kv_pool.allocate(12).expect("kv_1").split_chunks(4);
+        let aux_1 = aux_pool.allocate(3).expect("aux_1").split_individual();
+        let kv_2 = kv_pool.allocate(12).expect("kv_2").split_chunks(4);
+        let aux_2 = aux_pool.allocate(3).expect("aux_2").split_individual();
+        assert_eq!(kv_pool.available(), 0);
+        assert_eq!(aux_pool.available(), 0);
+
+        let lease_1 = tree
+            .extend_prefix_with_aux(base, &tokens, kv_1, Some(aux_1))
+            .expect("extend 1");
+        assert_eq!(lease_1.matched_nodes(), 3);
+        assert_eq!(lease_1.matched_tokens(), 192);
+        assert_eq!(lease_1.block_ids().len(), 12);
+        assert!(lease_1.leaf_aux_id().is_some());
+        assert_eq!(tree.cached_blocks(), 3);
+        assert_eq!(tree.cached_kv_pages(), 12);
+
+        // Concurrent duplicate promotion must return BOTH kv_2 (12 pages) and aux_2 (3 slots)!
+        let base_2 = tree.match_prefix_bounded(&[], 0);
+        let lease_2 = tree
+            .extend_prefix_with_aux(base_2, &tokens, kv_2, Some(aux_2))
+            .expect("dedup extend 2");
+        assert_eq!(kv_pool.available(), 12);
+        assert_eq!(aux_pool.available(), 3);
+        assert_eq!(lease_1.block_ids(), lease_2.block_ids());
+        assert_eq!(lease_1.leaf_aux_id(), lease_2.leaf_aux_id());
+
+        // Bounded match with `max_nodes = 2` leaves the final 64-token block uncached so the
+        // caller can still execute suffix prefill to produce logits.
+        let bounded = tree.match_prefix_bounded(&tokens, 2);
+        assert_eq!(bounded.matched_nodes(), 2);
+        assert_eq!(bounded.matched_tokens(), 128);
+        assert_eq!(bounded.block_ids(), &lease_1.block_ids()[..8]);
+        assert_ne!(bounded.leaf_aux_id(), lease_1.leaf_aux_id());
+
+        drop(bounded);
+        drop(lease_1);
+        drop(lease_2);
+        assert_eq!(tree.evictable_blocks(), 3);
+        assert_eq!(tree.evictable_kv_pages(), 12);
+        assert_eq!(tree.evict_lru(3), 3);
+        assert_eq!(kv_pool.available(), 24);
+        assert_eq!(aux_pool.available(), 6);
     }
 
     #[test]

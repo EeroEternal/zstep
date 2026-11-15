@@ -58,7 +58,8 @@ Usage: zstep serve --model-dir <PATH> [OPTIONS]\n\
   --num-kv-pages N               Explicit physical KV pages per GPU (overrides calibration)\n\
   --kv-cache-dtype DTYPE         KV dtype auto|fp8|bf16 (default: auto)\n\
   --tokenizer-mode MODE          auto | deepseek_v41 | chatml (default: auto)\n\
-  --no-enable-prefix-caching     Explicitly disable prefix caching (default in P0)\n\
+  --enable-prefix-caching        Enable Automatic Prefix Caching (APC, default: enabled)\n\
+  --no-enable-prefix-caching     Disable Automatic Prefix Caching (APC)\n\
   --max-waiting-requests N       Bounded HTTP waiting queue depth (default: 1024)\n\
   --drain-timeout-secs N         SIGTERM drain grace period in seconds (default: 30)\n\
   --python PATH                  Python executable for GPU workers\n\
@@ -90,6 +91,7 @@ pub struct ServeArgs {
     pub num_kv_pages: Option<u32>,
     pub kv_cache_dtype: String,
     pub tokenizer_mode: String,
+    pub enable_prefix_caching: bool,
     pub max_waiting_requests: usize,
     pub drain_timeout: Duration,
     pub python: String,
@@ -162,14 +164,14 @@ pub fn validate_known_flags(argv: &[String]) -> Result<BTreeMap<String, String>,
     while index < argv.len() {
         let flag = argv[index].as_str();
         if flag == "--no-enable-prefix-caching" {
+            values.insert("--enable-prefix-caching".to_owned(), "false".to_owned());
             index += 1;
             continue;
         }
         if flag == "--enable-prefix-caching" {
-            return Err(
-                "--enable-prefix-caching is not supported in P0 online serving; pass --no-enable-prefix-caching"
-                    .to_owned(),
-            );
+            values.insert("--enable-prefix-caching".to_owned(), "true".to_owned());
+            index += 1;
+            continue;
         }
         if !flag.starts_with("--") {
             return Err(format!("unexpected positional argument `{flag}`"));
@@ -289,6 +291,9 @@ impl ServeArgs {
         if !matches!(tokenizer_mode.as_str(), "auto" | "deepseek_v41" | "chatml") {
             return Err(format!("unsupported --tokenizer-mode `{tokenizer_mode}`"));
         }
+        let enable_prefix_caching = values
+            .get("--enable-prefix-caching")
+            .is_none_or(|raw| raw == "true");
         let max_waiting_requests: usize =
             parse_map_number(&values, "--max-waiting-requests", 1024)?;
         if max_waiting_requests == 0 {
@@ -300,7 +305,7 @@ impl ServeArgs {
         if ready_timeout_secs == 0 || step_timeout_secs == 0 {
             return Err("--ready-timeout-secs and --step-timeout-secs must be positive".to_owned());
         }
-        Ok(Self {
+        let args = Self {
             model_dir,
             served_model_name,
             host: values
@@ -318,6 +323,7 @@ impl ServeArgs {
             num_kv_pages,
             kv_cache_dtype,
             tokenizer_mode,
+            enable_prefix_caching,
             max_waiting_requests,
             drain_timeout: Duration::from_secs(drain_timeout_secs),
             python: values
@@ -337,7 +343,33 @@ impl ServeArgs {
                 .map_err(|_| "--max-mixed-step-tokens must be an integer".to_owned())?,
             allreduce_blocks: parse_map_number(&values, "--allreduce-blocks", 8u32)?,
             allreduce_threads: parse_map_number(&values, "--allreduce-threads", 256u32)?,
-        })
+        };
+        let _ = args.resolved_apc_geometry()?;
+        Ok(args)
+    }
+
+    /// Resolve `(pages_per_prefix_node, num_recurrent_checkpoints)` for Automatic Prefix Caching.
+    pub fn resolved_apc_geometry(&self) -> Result<(usize, u32), String> {
+        if !self.enable_prefix_caching {
+            return Ok((0, 0));
+        }
+        if is_deepseek_v41_dir(&self.model_dir) {
+            if self.page_block_tokens != 128 {
+                return Err(format!(
+                    "--enable-prefix-caching on deepseek_v41 requires --page-block-tokens 128 (got {})",
+                    self.page_block_tokens
+                ));
+            }
+            Ok((1, 0))
+        } else {
+            if self.page_block_tokens > 64 || 64 % self.page_block_tokens != 0 {
+                return Err(format!(
+                    "--enable-prefix-caching on hybrid GDN runner requires --page-block-tokens dividing 64 (got {})",
+                    self.page_block_tokens
+                ));
+            }
+            Ok(((64 / self.page_block_tokens) as usize, 255))
+        }
     }
 
     pub fn resolved_num_kv_pages(&self) -> u32 {
@@ -361,6 +393,7 @@ impl ServeArgs {
     fn engine_config(&self, cancel_flag: Option<Arc<AtomicBool>>) -> EngineConfig {
         let max_pages_per_seq = self.resolved_max_pages_per_seq();
         let num_kv_pages = self.resolved_num_kv_pages();
+        let (_, num_recurrent_checkpoints) = self.resolved_apc_geometry().unwrap_or((0, 0));
         EngineConfig {
             shm_name: unique_shm_name(&self.served_model_name),
             geometry: ShmGeometry {
@@ -386,6 +419,7 @@ impl ServeArgs {
                 allreduce_threads: self.allreduce_threads,
                 model_dir: Some(self.model_dir.clone()),
                 num_kv_pages,
+                num_recurrent_checkpoints,
                 max_model_len: Some(self.max_model_len),
                 cancel_flag,
             },
@@ -434,6 +468,7 @@ struct AppState {
     tokenizer: Tokenizer,
     served_model_name: String,
     tokenizer_mode: String,
+    enable_prefix_caching: bool,
     max_model_len: usize,
     page_block_tokens: usize,
     max_pages_per_seq: usize,
@@ -645,6 +680,21 @@ fn append_histogram<const N: usize>(
     out.push_str(&format!("{name}_count {count}\n"));
 }
 
+fn append_prefix_cache_counters(out: &mut String, queries: u64, hits: u64, evictions: u64) {
+    out.push_str(
+        "# HELP zstep:prefix_cache_queries_total Prompt tokens queried against Automatic Prefix Caching (APC)\n# TYPE zstep:prefix_cache_queries_total counter\n",
+    );
+    out.push_str(&format!("zstep:prefix_cache_queries_total {queries}\n"));
+    out.push_str(
+        "# HELP zstep:prefix_cache_hits_total Prompt tokens served from Automatic Prefix Caching (APC)\n# TYPE zstep:prefix_cache_hits_total counter\n",
+    );
+    out.push_str(&format!("zstep:prefix_cache_hits_total {hits}\n"));
+    out.push_str(
+        "# HELP zstep:prefix_cache_evictions_total Cached KV pages evicted from Automatic Prefix Caching (APC)\n# TYPE zstep:prefix_cache_evictions_total counter\n",
+    );
+    out.push_str(&format!("zstep:prefix_cache_evictions_total {evictions}\n"));
+}
+
 fn render_metrics(state: &AppState) -> String {
     let mut out = String::new();
     let Some(metrics) = state.metrics() else {
@@ -660,6 +710,9 @@ fn render_metrics(state: &AppState) -> String {
         out.push_str(
             "# HELP zstep:num_preemptions_total Sequence preemptions\n# TYPE zstep:num_preemptions_total counter\nzstep:num_preemptions_total 0\n",
         );
+        if state.enable_prefix_caching {
+            append_prefix_cache_counters(&mut out, 0, 0, 0);
+        }
         out.push_str(
             "# HELP zstep:triton_recompilations_total Runtime Triton JIT recompilations\n# TYPE zstep:triton_recompilations_total gauge\nzstep:triton_recompilations_total 0\n",
         );
@@ -692,6 +745,14 @@ fn render_metrics(state: &AppState) -> String {
         "zstep:num_preemptions_total {}\n",
         metrics.preemptions.load(Ordering::Relaxed)
     ));
+    if state.enable_prefix_caching {
+        append_prefix_cache_counters(
+            &mut out,
+            metrics.prefix_cache_queries.load(Ordering::Relaxed),
+            metrics.prefix_cache_hits.load(Ordering::Relaxed),
+            metrics.prefix_cache_evictions.load(Ordering::Relaxed),
+        );
+    }
     let outcomes = [
         ("finished", metrics.finished.load(Ordering::Relaxed)),
         ("cancelled", metrics.cancelled.load(Ordering::Relaxed)),
@@ -1707,6 +1768,7 @@ pub fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         tokenizer,
         served_model_name: args.served_model_name.clone(),
         tokenizer_mode: args.tokenizer_mode.clone(),
+        enable_prefix_caching: args.enable_prefix_caching,
         max_model_len: args.max_model_len,
         page_block_tokens: args.page_block_tokens as usize,
         max_pages_per_seq,
@@ -1724,7 +1786,7 @@ pub fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(address).await?;
         let bound = listener.local_addr()?;
         println!(
-            "zstep_serve git_sha={git_sha} listening={bound} model={} model_dir={} world_size={} page_block_tokens={} num_kv_pages={num_kv_pages} max_model_len={} max_seqs={} max_step_tokens={} kv_cache_dtype={}",
+            "zstep_serve git_sha={git_sha} listening={bound} model={} model_dir={} world_size={} page_block_tokens={} num_kv_pages={num_kv_pages} max_model_len={} max_seqs={} max_step_tokens={} kv_cache_dtype={} enable_prefix_caching={}",
             args.served_model_name,
             args.model_dir.display(),
             args.world_size,
@@ -1733,6 +1795,7 @@ pub fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             args.max_seqs,
             args.max_step_tokens,
             args.kv_cache_dtype,
+            args.enable_prefix_caching,
         );
 
         // Launch GPU workers after HTTP listener binds so Nebula observes `Starting`
@@ -1819,10 +1882,24 @@ fn launch_engine(
         None => None,
     };
     let eos_token_ids = state.tokenizer.eos_token_ids().to_vec();
+    let (apc_pages_per_node, apc_recurrent_checkpoints) =
+        args.resolved_apc_geometry().unwrap_or((0, 0));
     match ServingEngine::launch(config) {
         Ok(mut engine) => {
             if state.shutdown_requested.load(Ordering::Acquire) {
                 let _ = engine.shutdown();
+                let _ = launch_done_tx.send(());
+                return;
+            }
+            if apc_pages_per_node > 0
+                && let Err(error) = engine
+                    .enable_prefix_caching(apc_pages_per_node, apc_recurrent_checkpoints as usize)
+            {
+                let _ = engine.shutdown();
+                if !state.shutdown_requested.load(Ordering::Acquire) {
+                    eprintln!("zstep_serve prefix caching initialization failed: {error}");
+                    state.set_phase(EngineState::Faulted);
+                }
                 let _ = launch_done_tx.send(());
                 return;
             }
@@ -1833,7 +1910,10 @@ fn launch_engine(
             };
             let handle = spawn_serve_loop_with_state(engine, online, Arc::clone(&state.phase));
             publish_launched_handle(&state, handle);
-            println!("zstep_serve engine ready (mixed_step_tokens={mixed:?})");
+            println!(
+                "zstep_serve engine ready (mixed_step_tokens={mixed:?}, enable_prefix_caching={}, apc_pages_per_node={apc_pages_per_node}, apc_recurrent_checkpoints={apc_recurrent_checkpoints})",
+                args.enable_prefix_caching
+            );
             let _ = launch_done_tx.send(());
             // Release `Arc<AppState>` before keeping this spawning thread alive until shutdown
             // completes (`PR_SET_PDEATHSIG` on Linux tracks the spawning thread's lifetime).
@@ -1935,6 +2015,7 @@ mod tests {
             tokenizer: test_tokenizer(),
             served_model_name: "zstep-test".to_owned(),
             tokenizer_mode: "auto".to_owned(),
+            enable_prefix_caching: false,
             max_model_len: 4096,
             page_block_tokens: 16,
             max_pages_per_seq: 256,
@@ -2007,12 +2088,12 @@ mod tests {
         };
         assert!(parse(&["--model-dir"]).is_err(), "missing value must fail");
         assert!(
-            parse(&["--model-dir", "/tmp/m", "--enable-prefix-caching"]).is_err(),
-            "enable-prefix-caching must be rejected in P0"
-        );
-        assert!(
             parse(&["--model-dir", "/tmp/m", "--page-block-tokens", "0"]).is_err(),
             "zero page_block_tokens must fail"
+        );
+        assert!(
+            parse(&["--model-dir", "/tmp/m", "--page-block-tokens", "24"]).is_err(),
+            "hybrid APC requires page_block_tokens dividing 64"
         );
         assert!(
             parse(&["--model-dir", "/tmp/m", "--world-size", "16"]).is_err(),
@@ -2022,9 +2103,21 @@ mod tests {
             parse(&["--model-dir", "/tmp/qwen35", "--kv-cache-dtype", "fp8",]).is_err(),
             "fp8 kv_cache_dtype must fail loudly on BF16 model runner"
         );
+        let default_apc = parse(&["--model-dir", "/tmp/qwen35"]).expect("default qwen args");
+        assert!(default_apc.enable_prefix_caching);
+        assert_eq!(default_apc.resolved_apc_geometry().expect("apc"), (4, 255));
+        assert_eq!(
+            default_apc
+                .engine_config(None)
+                .launch
+                .num_recurrent_checkpoints,
+            255
+        );
+
         let ok = parse(&[
             "--model-dir",
             "/tmp/qwen35",
+            "--enable-prefix-caching",
             "--no-enable-prefix-caching",
             "--kv-cache-dtype",
             "bf16",
@@ -2034,9 +2127,21 @@ mod tests {
             "0.95",
         ])
         .expect("valid qwen args");
+        assert!(!ok.enable_prefix_caching);
+        assert_eq!(ok.resolved_apc_geometry().expect("disabled apc"), (0, 0));
         assert_eq!(ok.page_block_tokens, 16);
         assert_eq!(ok.resolved_num_kv_pages(), 49_152);
         assert_eq!(ok.engine_config(None).launch.max_model_len, Some(16_384));
+        assert_eq!(ok.engine_config(None).launch.num_recurrent_checkpoints, 0);
+
+        let reenabled = parse(&[
+            "--model-dir",
+            "/tmp/qwen35",
+            "--no-enable-prefix-caching",
+            "--enable-prefix-caching",
+        ])
+        .expect("last flag wins");
+        assert!(reenabled.enable_prefix_caching);
 
         let dsv41_dir = TempModelDir(
             std::env::temp_dir().join(format!("zstep_dsv41_cfg_{}", std::process::id())),
@@ -2052,9 +2157,15 @@ mod tests {
             parse(&["--model-dir", dsv41_path, "--kv-cache-dtype", "bf16"]).is_err(),
             "bf16 kv_cache_dtype must fail loudly on deepseek_v41 runner"
         );
+        assert!(
+            parse(&["--model-dir", dsv41_path, "--page-block-tokens", "64"]).is_err(),
+            "deepseek_v41 APC requires 128-token pages"
+        );
         let dsv41_ok =
             parse(&["--model-dir", dsv41_path, "--kv-cache-dtype", "fp8"]).expect("dsv41 fp8 ok");
+        assert!(dsv41_ok.enable_prefix_caching);
         assert_eq!(dsv41_ok.page_block_tokens, 128);
+        assert_eq!(dsv41_ok.resolved_apc_geometry().expect("dsv41 apc"), (1, 0));
         assert_eq!(dsv41_ok.resolved_num_kv_pages(), 2_560);
     }
 
@@ -2117,6 +2228,7 @@ mod tests {
             tokenizer: test_tokenizer(),
             served_model_name: "zstep-test".to_owned(),
             tokenizer_mode: "auto".to_owned(),
+            enable_prefix_caching: false,
             max_model_len: 4096,
             page_block_tokens: 16,
             max_pages_per_seq: 256,
@@ -2425,6 +2537,53 @@ mod tests {
         assert!(
             saw_429,
             "expected at least one 429 response under saturation"
+        );
+
+        handle.shutdown();
+        let _ = handle.join(Duration::from_secs(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_exposes_apc_counters_iff_prefix_caching_is_enabled() {
+        let handle = zs_scheduler::spawn_mock(zs_scheduler::MockScript::default());
+        let metrics = handle.metrics();
+        metrics.prefix_cache_queries.store(1024, Ordering::Relaxed);
+        metrics.prefix_cache_hits.store(768, Ordering::Relaxed);
+        metrics.prefix_cache_evictions.store(16, Ordering::Relaxed);
+
+        let apc_state = Arc::new(AppState {
+            phase: handle.state_arc(),
+            handle: Mutex::new(Some(handle.clone())),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            tokenizer: test_tokenizer(),
+            served_model_name: "zstep-test".to_owned(),
+            tokenizer_mode: "auto".to_owned(),
+            enable_prefix_caching: true,
+            max_model_len: 4096,
+            page_block_tokens: 16,
+            max_pages_per_seq: 256,
+            num_kv_pages: 4096,
+            created_at: 0,
+            started: Instant::now(),
+            request_counter: AtomicU64::new(0),
+        });
+        let address = spawn_server(apc_state).await;
+        let (status, _, prom) =
+            tokio::task::spawn_blocking(move || http(address, "GET", "/metrics", None, &[]))
+                .await
+                .expect("join");
+        assert_eq!(status, 200);
+        assert!(
+            prom.contains("zstep:prefix_cache_queries_total 1024\n"),
+            "{prom}"
+        );
+        assert!(
+            prom.contains("zstep:prefix_cache_hits_total 768\n"),
+            "{prom}"
+        );
+        assert!(
+            prom.contains("zstep:prefix_cache_evictions_total 16\n"),
+            "{prom}"
         );
 
         handle.shutdown();

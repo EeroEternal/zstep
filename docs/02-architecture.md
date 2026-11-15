@@ -15,7 +15,7 @@ flowchart TD
     subgraph Master["Rust 控制面进程 (CPU Only, Zero Python/CUDA)"]
         Server --> Tok["Tokenizer + Engram 3-gram 归一化哈希器"]
         Tok --> Sched["zs-scheduler: 统一连续批处理调度器"]
-        Sched <--> KV["zs-kv: FlatKV 四组 RAII 页分配器 + Radix Prefix Cache"]
+        Sched <--> KV["zs-kv: FlatKV 四组 RAII 页分配器 + Automatic Prefix Cache (APC)"]
         Sched --> Loop["Overlap Event Loop (in_flight_depth = 1)"]
     end
 
@@ -72,12 +72,12 @@ sequenceDiagram
 
 | 缓存组 ID | 物理页布局（每页 64 行） | `sm_120` 存储格式 | Prefix Cache 策略 | 生命周期特征 |
 | :--- | :--- | :--- | :--- | :--- |
-| **Group 0: `GlobalKV`** | `uint8 [P, 64, 288]` | 512D **NVFP4** (`E2M1` + `E4M3`/16) | **参与** Radix 前缀复用 | 随上下文线性增长，跨请求只读共享（COW） |
-| **Group 1: `IndexKey`** | `uint8 [P, 64, 68]` | 128D **MXFP4** (`E2M1` + `E8M0`/32) | **参与** Radix 前缀复用 | 与 `GlobalKV` 同步分配，供稀疏选块打分 |
-| **Group 2: `SwaWindow`** | `uint8 [P, 64, 528]` (+ DSpark BF16 视图) | 512D **MXFP8** (`E4M3` + `E8M0`/32) | **不进前缀池（Replayable）** | 环形覆盖，每个请求固定最多持有 3 页（覆盖 128 窗口 + 投机步） |
-| **Group 3: `CompressorTail`** | 压缩状态尾槽 | 模型指定紧凑精度 | **不进前缀池（Replayable）** | 请求私有定长槽位，随请求释放立即回收 |
+| **Group 0: `GlobalKV`** | `uint8 [P, 64, 288]` | 512D **NVFP4** (`E2M1` + `E4M3`/16) | **参与** APC 前缀复用 | 随上下文线性增长，跨请求只读共享（COW） |
+| **Group 1: `IndexKey`** | `uint8 [P, 64, 68]` | 128D **MXFP4** (`E2M1` + `E8M0`/32) | **参与** APC 前缀复用 | 与 `GlobalKV` 同步分配，供稀疏选块打分 |
+| **Group 2: `SwaWindow`** | `uint8 [P, 64, 528]` (+ DSpark BF16 视图) | 512D **MXFP8** (`E4M3` + `E8M0`/32) | **页内对齐直存（128-token 页边界无跨页残余状态）** | 按 128-token 物理页拆分为 2 个 64-token 半页，在 128-token 节点边界随页共享 |
+| **Group 3: `CompressorTail`** | 压缩状态尾槽 | 模型指定紧凑精度 | **128-token 偶数边界零残余** | 仅缓存未闭合的 2-token 奇偶组；在 128-token 页边界全部已落盘，零跨节点状态 |
 
-* **SWA 有界重放（Bounded Replay）**：当新请求在 Radix Tree 命中长度为 $L$ 的缓存前缀时，`zs-scheduler` 自动将有效命中前缀回退 $\min(L, 128)$ 个 Token，并在 `StepPlan` 中标记这些重放行的 `replay_mask = 1`——使第 0~20 层为该请求重新生成私有的 `SwaWindow` 与 `CompressorTail`，同时屏蔽对共享 `GlobalKV` / `IndexKey` 页的重复写入。
+* **混合模型递推状态快照（Hybrid Recurrent Checkpointing）**：对于纯分页注意力与 128-token 页内自包含的 `DeepSeek-V4.1-Flash`（`pages_per_node = 1`），命中 `PrefixTree` 前缀节点即可直接复用；对于包含 30 层 `GatedDeltaNet` 线性注意力的 `Qwen3.5-35B-A3B`，`zs-scheduler` 将每 4 个 16-token 页（`64` tokens/node）与 `CacheGroupKind::RecurrentState` 槽位配对，在 Prefill 跨过 64-token 边界时快照 `(conv_state, ssm_state_vk)`，命中时通过 `StepPlan` 的 `compressor_slot_ids` 恢复末端快照并仅计算未命中后缀。
 
 ### 3. 数据面显式四阶段前向与分段 CUDA Graph
 在 `worker/zstep_worker/models/deepseek_v41.py` 中，完全摒弃多层 Wrapper，每个 Worker 进程启动时预分配**地址永久不变的静态输入/中间张量池（Static Device Workspace）**，并将 `DeepSeek-V4.1-Flash` 明确组织为四个显式阶段：
@@ -112,7 +112,7 @@ sequenceDiagram
 
 这带来三条直接的工程约束（已在代码中固化）：
 1. **硬件验证边界区分**：
-   * **Verified (`8 × 32 GB`)**：完整验证算子形状/吞吐、`zs-shm` 协议、双缓冲重叠、Radix 前缀缓存，以及 **`Qwen3.5-35B-A3B` (`67 GB` BF16, `~8.4 GB/GPU`)** 真权重端到端并发服务；
+   * **Verified (`8 × 32 GB`)**：完整验证算子形状/吞吐、`zs-shm` 协议、双缓冲重叠、Automatic Prefix Caching（APC）前缀树，以及 **`Qwen3.5-35B-A3B` (`67 GB` BF16, `~8.4 GB/GPU`)** 真权重端到端并发服务；
    * **Unverified (`84 GB RTX 6000D` 中国特供版 / `96 GB RTX PRO 6000` 国际版)**：`510 GB` 满血 `DeepSeek-V4.1-Flash`（`63.75 GB/GPU`）在 `8 × 32 GB` 上无法端到端装入显存，所有大显存池几何通过 `ShmGeometry::from_vram_budget` 按设备实测显存动态推导，不硬编码未验证卡型的容量魔数。
 2. **Worker NUMA 亲和绑定与 First-Touch 分页**：
    * [`WorkerSlotState`](../crates/zs-wire/src/lib.rs) 显式记录每个 Worker 的 `numa_node`；[`numa_pin.py`](../worker/zstep_worker/numa_pin.py) 在进程触碰共享内存或初始化 CUDA 前读取 `/sys/bus/pci/devices/<bdf>/numa_node` 并将进程绑定至本地 NUMA CPU 核；

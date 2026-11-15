@@ -11,7 +11,7 @@
 ### 1.1 启发一（决定性发现）：Phase 3 初始 `vLLM 0.31.0` 基线存在 APC 前缀缓存跨轮污染
 
 PR `#1` 在 `8 × RTX 5090`（Phase 2，`Qwen3.5-35B-A3B`）上定位到两个叠加的基准失真源：
-1. `vLLM V1` 默认启用 **Automatic Prefix Caching（APC）**，而 `zstep` 当前仅启用 [`BlockPool`](../crates/zs-kv/src/lib.rs) 物理页分配（[`radix.rs`](../crates/zs-kv/src/radix.rs) 未接入 serving，前缀缓存命中率为 `0%`）；
+1. `vLLM V1` 默认启用 **Automatic Prefix Caching（APC）**，而 `zstep` 离线 `--bench-tiers` 评测路径仅启用 [`BlockPool`](../crates/zs-kv/src/lib.rs) 物理页分配（[`prefix_cache.rs`](../crates/zs-kv/src/prefix_cache.rs) 未在离线基准中开启，前缀缓存命中率为 `0%`）；
 2. 初始采集脚本固定传入同一个 `--seed 20261112`，不仅跨 `Round 0 -> Round 1 -> Round 2` 生成**逐 token 完全相同的随机 Prompt**，而且同一 `input_len` 下小规模档位生成的 Prompt 序列恰为大规模档位的**严格前缀子集**，导致初始 `vLLM 0.31.0` 在 Round 1/2 命中 APC 跳过 Prefill、吞吐虚增 `+14%..+28%` 且跨轮标准差高达 `±57.96..±149.60 tok/s`。
 
 在 Phase 3.5 为 `vllm serve` 强制加上 **`--no-enable-prefix-caching`** 并统一采用 `(round, tier)` 隔离随机种子后，`vLLM 0.31.0` 的跨轮标准差从 `±149.60 tok/s` 骤降至 **`±4.26 tok/s`**（降低 **`35×`**），还原了完全对称的零缓存物理基线。
