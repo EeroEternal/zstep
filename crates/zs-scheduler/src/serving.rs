@@ -695,14 +695,14 @@ fn decode_continues_for_all(
 
 /// KV pages a request occupies at its longest. The last sampled token is never fed back,
 /// so its KV row is never written.
-fn request_kv_page_demand(
+pub fn request_kv_page_demand(
     prompt_len: usize,
     target_output_len: usize,
     page_block_tokens: usize,
 ) -> usize {
     prompt_len
         .saturating_add(target_output_len.saturating_sub(1))
-        .div_ceil(page_block_tokens)
+        .div_ceil(page_block_tokens.max(1))
 }
 
 /// Pages promised to active sequences but not allocated yet.
@@ -2791,3 +2791,11 @@ mod tests {
         ));
     }
 }
+
+#[path = "serve_loop.rs"]
+pub mod serve_loop;
+pub use serve_loop::{
+    EngineState, EventSink, LoopEvent, LoopFinishReason, MockScript, OnlineConfig, OnlineMetrics,
+    ServeLoopHandle, SubmitError, SubmitRequest, TPOT_BUCKET_BOUNDS_SECS, TTFT_BUCKET_BOUNDS_SECS,
+    spawn as spawn_serve_loop, spawn_mock, spawn_with_state as spawn_serve_loop_with_state,
+};

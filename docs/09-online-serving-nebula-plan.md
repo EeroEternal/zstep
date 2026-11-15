@@ -1,6 +1,6 @@
 # 09 — 在线 OpenAI HTTP 服务演进与 Nebula 跨仓联调开发计划（对应 Issue `#7`）
 
-> **状态**：待执行（供独立编码 Agent / DeepSeek 按切片 PR 推进）  
+> **状态**：Slice Z1–Z4 已实现（`zs-tokenizer`、`zs-scheduler::serve_loop`、`zs-server::serve`，支持 `zstep serve` / `zs-server serve`）  
 > **需求基线**：`EeroEternal/zstep#7`（从 Benchmark CLI 演进为可长期运行的 OpenAI HTTP 服务）  
 > **对端契约**：`EeroEternal/nebula#92` 及 `docs/dev/zstep.md` / `docs/dev/zstep-plan.md`（`engine_type = "zstep"`）
 

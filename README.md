@@ -21,8 +21,9 @@ zstep/
 │   ├── zs-wire/                      # #[repr(C)] SHM layout, geometry & result ring
 │   ├── zs-shm/                       # RAII shm_open + mmap + eventfd transport
 │   ├── zs-kv/                        # BlockPool and standalone pure-attention Radix KV
-│   ├── zs-scheduler/                 # WorkerCoordinator + mixed continuous-batching ServingEngine
-│   └── zs-server/                    # zstep synthetic/parity/benchmark binary
+│   ├── zs-tokenizer/                 # HF / DeepSeek-V4.1 / ChatML tokenizer & streaming detokenizer
+│   ├── zs-scheduler/                 # WorkerCoordinator, ServingEngine & persistent online ServeLoop
+│   └── zs-server/                    # zstep / zs-server CLI: online OpenAI HTTP/SSE, parity & benchmarks
 ├── worker/
 │   ├── zstep_worker/
 │   │   ├── numa_pin.py               # PCIe BDF -> NUMA discovery and CPU pinning
@@ -116,3 +117,4 @@ Unified reproduction commands (including `git archive` source trees without `.gi
 * **[06 — Phase 2 Qwen3.5](docs/06-phase2-qwen35-benchmark.md)**: `Qwen3.5-35B-A3B` (`8 × RTX 5090`) no-APC serving design, statistical comparison, and Top-2 correctness boundaries.
 * **[07 — Phase 3 / 3.5 DeepSeek-V4.1-Flash](docs/07-phase3-dsv41-6000d-benchmark.md)**: `DeepSeek-V4.1-Flash` (`8 × RTX 6000D`) `shm_v5` + size-aware collectives, piggyback mixed batching, SM120 SWA/TMA architecture, and no-APC `vLLM 0.31.0` `10/10` comparison.
 * **[08 — Phase 3.5 Optimization Plan & Results](docs/08-phase3-dsv41-optimization-plan.md)**: PR `#1` APC metrology alignment & deterministic Top-2 logit audit, piggyback mixed decode + chunked-prefill scheduling, size-aware collectives, and measured before/after impact.
+* **[09 — Online OpenAI Serving & Nebula Integration](docs/09-online-serving-nebula-plan.md)**: `zstep serve` / `zs-server serve` OpenAI HTTP/SSE server, four-state operational probes, step-boundary RAII cancellation, and Nebula `engine_type = "zstep"` contract.

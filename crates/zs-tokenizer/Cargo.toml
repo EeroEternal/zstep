@@ -1,0 +1,19 @@
+[package]
+name = "zs-tokenizer"
+description = "HuggingFace / DeepSeek-V4.1 / ChatML tokenizer and incremental streaming detokenizer for zstep online serving"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokenizers = { version = "0.21", default-features = false, features = ["onig", "progressbar"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

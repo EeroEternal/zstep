@@ -32,6 +32,8 @@ use zs_scheduler::{
 };
 use zs_wire::{MAX_DECODE_GRAPH_SEQS, ShmGeometry};
 
+mod serve;
+
 #[derive(Debug, Deserialize)]
 struct GreedyReference {
     vllm_version: String,
@@ -172,7 +174,11 @@ struct GreedyParityReport {
 }
 
 const USAGE: &str = "zstep master\n\
-Usage: zstep [run] [OPTIONS]\n\
+Usage:\n\
+  zstep [run] [OPTIONS]      Run micro-step / Top-2 greedy parity / benchmark suite\n\
+  zstep serve [OPTIONS]      Start persistent OpenAI-compatible HTTP/SSE server (`zstep serve --help`)\n\
+\n\
+Run options:\n\
   --world-size N             GPU workers, 1..=8 (default: 8)\n\
   --steps N                  Overlapped micro-steps when --model-dir is omitted (default: 200)\n\
   --token-counts LIST        Runtime rows, comma separated (default: 6,48,192)\n\
@@ -289,8 +295,22 @@ impl Default for Arguments {
     }
 }
 
-fn main() -> ExitCode {
+pub fn cli_main() -> ExitCode {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args.first().map(String::as_str) == Some("serve") {
+        let serve_args = &raw_args[1..];
+        if serve_args.iter().any(|arg| arg == "--help" || arg == "-h") {
+            print!("{}", serve::SERVE_USAGE);
+            return ExitCode::SUCCESS;
+        }
+        return match serve::run(serve_args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("zstep serve failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if raw_args.is_empty() || raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
@@ -729,6 +749,8 @@ fn run_engine(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             allreduce_threads: args.allreduce_threads,
             model_dir: args.model_dir.clone(),
             num_kv_pages,
+            max_model_len: None,
+            cancel_flag: None,
         },
         ready_timeout: Duration::from_secs(args.ready_timeout_secs),
         step_timeout: Duration::from_secs(args.step_timeout_secs),
