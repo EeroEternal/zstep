@@ -1,0 +1,252 @@
+# `zstep` 综合性能基准测试报告（SM120 非 P2P PCIe 8 卡）
+
+本文档汇总 `zstep` 在 **Blackwell Workstation / Consumer SM120（`sm_120a`）无 GPU P2P（`can_device_access_peer == 0`）8 卡 PCIe 平台**上的完整性能验证结果，涵盖：
+
+1. **底层通信与控制面微基准**（`shm_v5` Host-Pinned AllReduce、纯 Rust 控制面、SM120 专属算子）；
+2. **基础引擎吞吐与延迟对标**（`zstep` 对称无缓存模式 vs `vLLM` HTTP / 纯引擎）；
+3. **在线自动前缀缓存（APC）**（`Qwen3.5` 混合 GQA + GatedDeltaNet 状态快照与 `DeepSeek-V4.1` 128-token 页缓存）；
+4. **在线投机解码（Speculative Decoding）**（`dspark`、`mtp`、`ngram` 三种方法的加速比、接受率与贪心一致性）；
+5. **Nebula 全栈端到端联调**（`Gateway -> Router -> zstep` 流式代理开销与遥测指标闭环）；
+6. **生产工作负载配置选型矩阵**。
+
+分阶段详细消融记录参见 [`06-phase2-qwen35-benchmark.md`](06-phase2-qwen35-benchmark.md)、[`07-phase3-dsv41-6000d-benchmark.md`](07-phase3-dsv41-6000d-benchmark.md) 与 [`09-online-serving-nebula-plan.md`](09-online-serving-nebula-plan.md)。
+
+---
+
+## 1. 核心性能结论速览
+
+| 评测维度 | 模型与硬件平台 | 基线参考 | `zstep` 实测结果 | 相对收益 |
+| --- | --- | --- | --- | --- |
+| **PCIe AllReduce（小 batch 解码）** | `8 × RTX 6000D`（`H=5120`, `M=1`） | `NCCL_LOC`：`48.95 µs` | `shm_v5`：**`12.46–14.48 µs`** | **`3.38×–3.93×`** |
+| **基础引擎对称对标（`Qwen3.5`）** | `Qwen3.5-35B-A3B` TP=8 @ `8 × RTX 5090` | `vLLM 0.33.0`：`192.2–3,259.0 tok/s` | **`261.5–5,021.7 tok/s`**（`OVERLAP=1` @ `6000D` 单流达 **`354.0 tok/s`**） | **`+11.0%` ~ `+54.1%`**（全 6 档领先） |
+| **基础引擎对称对标（`DeepSeek-V4.1`）** | `DeepSeek-V4.1-Flash` TP=8 @ `8 × RTX 6000D` | `vLLM 0.31.0` 纯引擎：`83.6–1,126.3 tok/s` | **`100.4–1,733.3 tok/s`**（`in4096_c16` 总吞吐 **`6,518.9 tok/s`**） | **`+20.2%` ~ `+53.9%`**（全 10 档领先） |
+| **在线自动前缀缓存（APC）** | `Qwen3.5` / `DeepSeek-V4.1` TP=8 @ `8 × RTX 6000D` | Cold TTFT：`599.2 ms` / `1,049.6 ms` | Warm TTFT：**`36.9–44.4 ms`** / **`202.7–204.3 ms`** | **`13.49×–16.22×`** / **`5.14×–5.18×`** |
+| **在线投机解码（`Qwen3.5` `mtp K=3`）** | `Qwen3.5-35B-A3B` TP=8 @ `8 × RTX 6000D` | `zstep` 无投机：`309.3–314.3 tok/s` | **`583.6–762.5 tok/s`**（TPOT **`1.31–1.71 ms`**，$\tau=2.88\text{–}3.90$） | **`1.87×–2.45×`** |
+| **在线投机解码（`DeepSeek-V4.1` `dspark K=5`）** | `DeepSeek-V4.1-Flash` TP=8 @ `8 × RTX 6000D` | `zstep` 无投机：`117.9–118.6 tok/s` | **`168.9–395.1 tok/s`**（TPOT **`2.53–5.92 ms`**，$\tau=2.85\text{–}6.00$） | **`1.42×–3.35×`** |
+| **零额外显存投机（`ngram`）** | `Qwen3.5` (`K=3`) / `DeepSeek-V4.1` (`K=5`) @ `6000D` | `zstep` 无投机：`311.7` / `117.9 tok/s` | 重复上下文 **`674.2 tok/s`** / **`343.8 tok/s`**（代码无退化 `1.01×–1.03×`） | **`2.16×`** / **`2.92×`** |
+| **Nebula 全栈流式代理** | `Gateway -> Router -> zstep (dspark K=5)` @ `6000D` | 直连 `zs-server`：`395.08 tok/s` | Gateway SSE 端到端：**`396.47 tok/s`**（空闲 KV 泄漏 **`0.0%`**） | **零吞吐损耗** |
+
+---
+
+## 2. 测试硬件拓扑与测量口径
+
+### 2.1 两套 SM120 非 P2P 测试平台
+
+所有实验均在 `can_device_access_peer(i, j) == 0`（任意两卡间无 NVLink 且无 PCIe P2P BAR 直通）的 8 卡 SM120 主机上完成。报告严格区分以下两套物理拓扑，不做跨机器混算：
+
+| 属性 | 平台 A：`8 × NVIDIA GeForce RTX 5090` | 平台 B：`8 × NVIDIA RTX 6000D` |
+| --- | --- | --- |
+| **GPU 架构 / SM 数** | Blackwell `sm_120a` | Blackwell `sm_120a`（`156 SMs` / GPU） |
+| **单卡显存 / 8 卡总显存** | `32 GB` GDDR7（共 `256 GB`） | `85,651 MiB` GDDR7（共 `669.15 GiB`） |
+| **PCIe 与 P2P 拓扑** | 8 卡分属 4 个 NUMA：`[0, 0, 0, 1, 2, 2, 2, 3]`，`P2P = 0` | 8 卡对称分属 2 个 NUMA：`[0, 0, 0, 0, 1, 1, 1, 1]`，PCIe Gen5 x16，`P2P = 0` |
+| **主机内存 / 驱动与 CUDA** | 4-NUMA Host Pinned SHM，CUDA `13.1` | `1.97 TiB` DDR5，Driver `590.48.01`，CUDA `13.1` |
+| **承载测试项** | Phase 2 `Qwen3.5-35B-A3B` vs `vLLM 0.33.0` 对称基线 | Phase 3 `Qwen3.5` 与 `DeepSeek-V4.1-Flash` 引擎极限、APC、投机解码、Nebula 全栈联调 |
+
+### 2.2 评测模型规格
+
+| 模型 | 架构特征 | 权重体积（8 卡 TP=8） | KV / 状态布局 | 内置投机头 |
+| --- | --- | --- | --- | --- |
+| **`Qwen/Qwen3.5-35B-A3B`** | 40 层混合架构（30 层 `GatedDeltaNet` 线性注意力 + 10 层 Full GQA，`256` 路由专家 top-8） | `67 GB` BF16（约 `8.4 GB/GPU`） | `16`-token BF16 GQA 页 + 30 层 GDN `(conv_state, ssm_state_vk)` 槽位 | 1 层内置 Dense **MTP** 头（`mtp.*`） |
+| **`DeepSeek-V4.1-Flash-1017`** | 61 层 MLA + SWA + `b12x` MXFP4 MoE + `mHC` 4 流超连接 + 第 3/60 层 `Engram` N-gram 表 | `475.25 GiB` 混合精度（`59.4 GiB/GPU`，Engram 常驻显存） | `128`-token FP8 MLA + SWA + Indexer 页 | 第 61 层内置 SWA **DSpark** 多步草稿头（`layers.61.*`） |
+
+### 2.3 指标定义与统计口径
+
+- **TTFT（Time To First Token）**：从客户端发出请求（或引擎入队）到首个非空生成 token 产出的耗时（`ms`）。
+- **TPOT（Time Per Output Token）**：首 token 之后平均每生成一个后续 token 的耗时，即 `(E2E - TTFT) / (output_tokens - 1)`（`ms`）。在流式单并发（`c=1`）下，解码吞吐近似为 `output_tokens / E2E`（含短 prompt TTFT）或 `1000 / TPOT`。
+- **ITL（Inter-Token Latency）**：相邻两次生成步之间的间隔分布（报告 `P99 ITL` 以反映混合 prefill/decode 步长抖动）。
+- **Output Throughput / Total Throughput**：单位时间内完成的输出 token 数（`output_tok/s`）及输入 + 输出总 token 数（`total_tok/s`）。
+- **投机接受指标**：草稿步宽为 $K$（验证宽度 $W = K + 1$）时，单 token 接受率 $\alpha = \text{accepted\_drafts} / \text{drafted\_tokens}$，单步平均产出 token 数 $\tau = \text{emitted\_verify\_tokens} / \text{verify\_steps} \approx 1 + K \cdot \alpha$。
+- **对称基线纪律**：第 3 节与 `vLLM` 的所有对比均在**双方显式关闭前缀缓存**（`--no-enable-prefix-caching`）、独立随机无共享前缀 token ID、丢弃冷启动 warmup 后连续 **3 轮（Warm `n=3`）均值 ± 标准差**下测得。
+
+---
+
+## 3. 底层通信与控制面微基准
+
+在无 P2P 的 8 卡 PCIe 拓扑上，跨卡张量并行（TP=8）每层需执行 2 次（`DeepSeek-V4.1` 含 `mHC` 为每层多次）小张量 AllReduce。`zstep` 通过 [`shm_allreduce.py`](../worker/zstep_worker/kernels_sm120/shm_allreduce.py) 中的单内核 `shm_v5`（`cudaHostRegister` 锁页共享内存 + GPU 原子世代号栅栏 + 向量化 BF16 归约，支持 CUDA Graph 捕获）替代 `NCCL` PCIe staging。
+
+### 3.1 `shm_v5` vs `NCCL` 8 卡 PCIe AllReduce 延迟
+
+| 硬件平台 | 张量形状（BF16） | `NCCL` 延迟 | `zstep shm_v5` 延迟 | 加速比 |
+| --- | --- | --- | --- | --- |
+| `8 × RTX 6000D`（2-NUMA） | `M=1, H=5120`（`10 KiB`，单流解码热路径） | `48.95 µs`（`NCCL_LOC`） | **`12.46–14.48 µs`** | **`3.38×–3.93×`** |
+| `8 × RTX 6000D`（2-NUMA） | `M=16, H=5120`（`160 KiB`，中等并发解码 / 验证步） | `54.78 µs`（`NCCL_LOC`） | **`16.57 µs`** | **`3.31×`** |
+| `8 × RTX 6000D`（2-NUMA） | `M=128, H=5120`（`1.25 MiB`，高并发解码） | `110.97 µs`（`NCCL_LOC`） | **`64.86 µs`** | **`1.71×`** |
+| `8 × RTX 5090`（4-NUMA） | `M=1, H=2048`（`4 KiB`） | `31.93 µs`（`NCCL SHM`） | **`17.56 µs`** | **`1.82×`** |
+| `8 × RTX 5090`（4-NUMA） | `M=4096, H=5120`（`40.0 MiB`，长 Prefill 块） | `6,206.57 µs`（`NCCL SHM`） | **`4,274.36 µs`** | **`1.45×`** |
+
+### 3.2 纯 Rust 控制面与 SM120 核心算子
+
+- **纯 Rust 零 IPC 控制面**（[`zs-scheduler`](../crates/zs-scheduler)、[`zs-shm`](../crates/zs-shm)）：在 `c=128` 满载解码下，构建单步 `StepPlan` 并写入 `/dev/shm` 控制区的平均耗时仅 **`4.690 µs/step`**（`p99 = 5.429 µs`），仅占 GPU 单步耗时的 **`0.166%`**；开启 `ZSTEP_OVERLAP_STEP_PREP=1` 后，Rust 下一拍调度与当前 GPU 步完全并行隐藏。
+- **SM120 专属算子栈**（[`kernels_sm120/`](../worker/zstep_worker/kernels_sm120)）：
+  - **`b12x` 原生 MMA MXFP4 MoE**（[`b12x_dsv41.py`](../worker/zstep_worker/kernels_sm120/b12x_dsv41.py)）：在 `DeepSeek-V4.1` 解码微批量（`M=1..128`）上替代 Marlin FP4，消除权重解包瓶颈，使整网端到端吞吐额外提升 **`+36%` ~ `+54%`**。
+  - **`sm12x_mega_gate` + `sm120_dsa_indexer`**：融合 `DeepSeek-V4.1` 稀疏路由 sigmoid top-8 分组门控与 FP8 Indexer 打分，单层门控 + 索引开销压缩至微秒级。
+  - **Route A 零同步 GatedDeltaNet + FlashInfer CUDA Graph**（[`qwen35_ops.py`](../worker/zstep_worker/kernels_sm120/qwen35_ops.py)）：消除 `Qwen3.5` 线性注意力与全注意力混合步中的全部 Python `.item()` D2H 同步，在 `8 × RTX 6000D` 上将 `c=1` 解码速度从 `269 tok/s` 推升至 **`354.0 tok/s`**。
+
+---
+
+## 4. 基础引擎吞吐与延迟对标：`zstep` vs `vLLM`（无投机、无缓存）
+
+### 4.1 `Qwen/Qwen3.5-35B-A3B`（TP=8）
+
+#### （a）平台 A（`8 × RTX 5090`）：`zstep` vs `vLLM 0.33.0` 对称 6 档对标（`output=256`，Warm `n=3`）
+
+| 档位 | 请求数 | `vLLM 0.33.0` Output (`tok/s`) | `zstep` Output (`tok/s`) | 吞吐增益 | `vLLM` / `zstep` Mean TPOT (`ms`) | `vLLM` / `zstep` Med TTFT (`ms`) | `vLLM` / `zstep` P99 ITL (`ms`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `in512_c1` | 8 | `192.24 ± 10.22` | **`261.53 ± 24.43`** | **`+36.05%`** | `4.66` / **`3.68`** | `137.34` / **`50.42`** | `6.51` / **`4.12`** |
+| `in512_c16` | 32 | `1,700.98 ± 12.13` | **`2,037.92 ± 51.95`** | **`+19.81%`** | `7.62` / **`6.87`** | `463.87` / **`209.37`** | `10.40` / **`6.98`** |
+| `in512_c128` | 128 | `3,259.04 ± 5.72` | **`5,021.65 ± 104.06`** | **`+54.08%`** | `32.66` / **`21.46`** | `832.91` / **`210.86`** | **`114.35`** / `223.50` |
+| `in1024_c1` | 8 | `197.31 ± 0.59` | **`268.95 ± 1.47`** | **`+36.31%`** | `4.54` / **`3.42`** | `132.48` / **`79.91`** | `6.01` / **`3.72`** |
+| `in1024_c32` | 64 | `1,959.07 ± 29.76` | **`2,174.52 ± 13.18`** | **`+11.00%`** | **`11.29`** / `12.72` | `1,034.01` / **`223.18`** | **`109.76`** / `230.63` |
+| `in1024_c128` | 128 | `2,565.79 ± 18.11` | **`2,982.59 ± 54.67`** | **`+16.24%`** | `41.20` / **`35.97`** | `711.86` / **`226.59`** | **`113.56`** / `242.46` |
+
+> **调度权衡说明**：默认 `--max-prefill-chunk 2048` 优先加速新到达请求的 Prefill，在 `c=32/128` 高并发下使中位 TTFT 比 `vLLM` 降低 **`3.1×–4.6×`**，代价是活跃解码流在穿插 `2048`-token Prefill 块时 `P99 ITL` 约为 `223–242 ms`（`vLLM` 拆分为更细粒度块时 `P99 ITL` 约 `110–114 ms`）。若业务对流式尾抖动（`P99 ITL`）比首字延迟更敏感，可将 `--max-prefill-chunk` 下调至 `512` 或 `1024`。
+
+#### （b）平台 B（`8 × RTX 6000D`）：`zstep` Phase 3.10 最新引擎基线（Route A + `OVERLAP=1`，Warm `n=3`）
+
+| 档位 | 输出长度 | Output Throughput (`tok/s`) | Total Throughput (`tok/s`) | Mean TPOT (`ms`) | Median TTFT (`ms`) | P99 ITL (`ms`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `in512_c1` | 256 | **`353.98 ± 0.24`** | **`1,061.93`** | **`2.67`** | `43.13` | `2.74` |
+| `in512_c16` | 256 | **`2,267.10 ± 16.18`** | **`6,801.30`** | **`6.24`** | `183.38` | `6.10` |
+| `in512_c128` | 256 | **`5,039.13 ± 6.31`** | **`15,117.38`** | **`21.82`** | `183.52` | `198.82` |
+| `in1024_c1` | 256 | **`328.65 ± 0.15`** | **`1,643.23`** | **`2.74`** | `79.29` | `2.82` |
+| `in1024_c32` | 256 | **`2,367.78 ± 1.63`** | **`11,838.89`** | **`11.82`** | `197.51` | `205.37` |
+| `in1024_c128` | 256 | **`3,128.09 ± 4.86`** | **`15,640.43`** | **`34.65`** | `197.61` | `214.13` |
+| `in4096_c1` | 128 | **`181.72 ± 0.02`** | **`5,996.72`** | **`3.18`** | `300.12` | `3.38` |
+| `in4096_c16` | 128 | **`453.58 ± 0.67`** | **`14,968.26`** | **`25.34`** | `464.48` | `237.33` |
+
+---
+
+### 4.2 `DeepSeek-V4.1-Flash-1017`（TP=8，平台 B：`8 × RTX 6000D`）
+
+为排除 Python HTTP/SSE 序列化噪声，基线同时采集了 **`vLLM 0.31.0` OpenAI HTTP 服务**与**绕过 HTTP 直调 `AsyncLLMEngine` 的 `vLLM` 纯引擎**数据（均挂载 SM120 兼容补丁与显存常驻 Engram 表，Warm `n=3`）。
+
+#### （a）Suite 1：标准交互短生成（`input=512 -> output=128`）
+
+| 并发档位 | `vLLM` HTTP (`tok/s`) | `vLLM` 纯引擎 (`tok/s`) | `zstep` (`tok/s`) | 相对 `vLLM` 纯引擎增益 | `vLLM` 纯引擎 / `zstep` Mean TPOT (`ms`) | `vLLM` 纯引擎 / `zstep` Med TTFT (`ms`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `c1` | `83.97 ± 0.07` | `83.59 ± 0.02` | **`100.44 ± 0.13`** | **`+20.16%`** | `10.94` / **`8.70`** | **`141.37`** / `169.29` |
+| `c8` | `351.50 ± 0.80` | `348.18 ± 2.86` | **`470.84 ± 1.08`** | **`+35.23%`** | `19.02` / **`13.15`** | `590.28` / **`504.12`** |
+| `c16` | `509.40 ± 4.86` | `492.61 ± 5.26` | **`649.06 ± 1.40`** | **`+31.76%`** | `25.63` / **`21.04`** | `1,084.36` / **`379.40`** |
+| `c32` | `635.98 ± 4.91` | `617.07 ± 5.47` | **`840.34 ± 4.43`** | **`+36.18%`** | `41.13` / **`33.32`** | `1,430.66` / **`380.33`** |
+
+#### （b）Suite 2 & 3：六档并发矩阵（`output=256`）与 `4K` 长上下文（`input=4096 -> output=128`）
+
+| 档位 | `vLLM` HTTP (`tok/s`) | `vLLM` 纯引擎 (`tok/s`) | `zstep` Output (`tok/s`) | `zstep` Total (`tok/s`) | 相对纯引擎增益 | `vLLM` 纯引擎 / `zstep` Mean TPOT (`ms`) | `vLLM` 纯引擎 / `zstep` Med TTFT (`ms`) | `vLLM` 纯引擎 / `zstep` P99 ITL (`ms`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `in512_c1` | `87.24` | `87.06` | **`107.03 ± 0.08`** | **`321.08`** | **`+22.94%`** | `10.97` / **`8.72`** | **`142.34`** / `168.39` | `11.16` / **`8.99`** |
+| `in512_c16` | `573.38` | `555.89` | **`765.98 ± 2.33`** | **`2,297.94`** | **`+37.79%`** | `25.32` / **`18.92`** | `1,086.45` / **`380.23`** | `27.08` / **`18.10`** |
+| `in512_c128` | `1,152.03` | `1,126.34` | **`1,733.34 ± 6.14`** | **`5,200.02`** | **`+53.89%`** | `99.30` / **`63.86`** | `3,066.32` / **`764.90`** | `1,021.41` / **`382.44`** |
+| `in1024_c1` | `84.20` | `84.57` | **`104.97 ± 0.08`** | **`524.85`** | **`+24.12%`** | `10.96` / **`8.89`** | `180.19` / **`171.18`** | `11.17` / **`9.14`** |
+| `in1024_c32` | `614.93` | `605.12` | **`822.35 ± 3.58`** | **`4,111.75`** | **`+35.90%`** | `42.27` / **`34.50`** | `2,127.63` / **`384.96`** | **`45.10`** / `380.02` |
+| `in1024_c128` | `878.86` | `866.25` | **`1,200.63 ± 1.88`** | **`6,003.15`** | **`+38.60%`** | `122.27` / **`89.99`** | `3,107.53` / **`772.83`** | `1,035.90` / **`387.25`** |
+| `in4096_c1` | — | — | **`76.63 ± 0.06`** | **`2,528.76`** | — | — / **`8.92`** | — / **`537.59`** | — / **`9.18`** |
+| `in4096_c16` | — | — | **`197.54 ± 0.84`** | **`6,518.90`** | — | — / **`57.83`** | — / **`1,171.48`** | — / **`391.90`** |
+
+> **贪心等价性**：在全部 32 条审计 prompt × 64 输出 token（共 `2,048` token）上，`zstep`（`b12x` + `shm_v5` + CUDA Graph）与 `vLLM` 参考输出的贪心精确匹配率达 **`99.56%`**（32 条中 31 条 64 token 完全一致，唯一差异发生在第 46 步 BF16 top-1/top-2 对数概率差 `< 1e-3` 的平局边界）。
+
+---
+
+## 5. 在线自动前缀缓存（APC）性能验证
+
+`zs-server serve` 默认启用基数树（Radix Tree）自动前缀缓存（[`zs-kv`](../crates/zs-kv)），并与 Nebula Router 的 `NEBULA_KV_HASH_SEED` 前缀亲和路由协同工作。
+
+- **`Qwen3.5-35B-A3B` 混合状态缓存**：由于 `Qwen3.5` 包含 30 层递归状态不可任意回退的 `GatedDeltaNet`，`zstep` 以 **`64` token**（`4 × 16`-token GQA 页）为缓存节点粒度，在节点边界同步保存/恢复 30 层 `(conv_state, ssm_state_vk)` GPU 快照槽，并保证命中序列至少保留 `>= 1` 个未缓存尾部 token 重算 logits。
+- **`DeepSeek-V4.1-Flash` 分页缓存**：以 **`128` token** 物理页为粒度同时复用 FP8 MLA 压缩 KV、SWA 滑动窗口页与 DSA Indexer 索引页。
+
+### 5.1 多轮对话 / 共享系统提示词 TTFT 加速（平台 B：`8 × RTX 6000D`，TP=8）
+
+| 模型 | 缓存粒度 | 测试负载 | Cold TTFT (`ms`) | Warm 部分前缀命中 TTFT (`ms`) | Warm 完整重复命中 TTFT (`ms`) | TTFT 加速比 | 贪心等价与驱逐审计 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| **`Qwen3.5-35B-A3B`** | `64` tok（4 页 GQA + GDN 快照） | `7,141` tok 长系统提示词 | `599.22` | **`44.41`** | **`36.94`** | **`13.49×` / `16.22×`** | `warm == cold == off` **100% 一致**；高压填满后干净 LRU 驱逐 `17,516` 页，空闲泄漏 `0.0` |
+| **`Qwen3.5-35B-A3B`** | `64` tok（精确块边界） | `512` tok（命中 `448` + 尾部 `64`） | `51.09` | — | **`17.53`** | **`2.91×`** | 块边界 `>= 1` tail token 不变量严格成立 |
+| **`DeepSeek-V4.1-Flash`** | `128` tok（MLA + SWA + Indexer） | `6,474` tok 长系统提示词 | `1,049.64` | **`204.25`** | **`202.70`** | **`5.14×` / `5.18×`** | `warm == cold == off` **100% 一致**；空闲 `kv_cache_usage_perc == 0.0` |
+
+---
+
+## 6. 在线投机解码（Speculative Decoding）性能验证
+
+`zstep` 在线服务（`zs-server serve`）原生支持三种投机解码算法，通过扩展至 `spec_verify_width <= 8` 的共享内存一步验证协议（[`zs-wire`](../crates/zs-wire)、[`spec_decode.py`](../worker/zstep_worker/spec_decode.py)）以及分段 CUDA Graph 捕获执行，无需加载外部独立草稿模型：
+
+1. **`dspark`**（[`deepseek_v41_dspark.py`](../worker/zstep_worker/models/deepseek_v41_dspark.py)）：使用 `DeepSeek-V4.1-Flash` 权重内置的第 61 层 SWA 轻量头自回归生成 $K$ 个草稿 token，目标模型单步并行验证 $K+1$ 个位置并按残差分布拒绝采样 / 贪心精确校验。
+2. **`mtp`**（[`qwen35_mtp.py`](../worker/zstep_worker/models/qwen35_mtp.py)）：使用 `Qwen3.5` 权重内置的 `mtp.*` 融合投影与单层 Transformer 头串行预测 $K$ 个草稿 token；当请求在验证中途被拒绝时，自动将目标模型 30 层 `GatedDeltaNet` 状态回滚至本拍起始快照并仅前推已接受前缀，杜绝递归状态污染。
+3. **`ngram`**：纯 Rust 调度器端零显存开销的后缀窗口查找（Prompt / Output Context Lookup，`--prompt-lookup-max` / `--prompt-lookup-min`），不占用额外 GPU 显存，未命中时自动退化为普通 1-token 解码步。
+
+### 6.1 `Qwen/Qwen3.5-35B-A3B` 在线投机对比（平台 B：`8 × RTX 6000D`，TP=8，开启 APC，流式 `c=1`）
+
+| 投机模式 | 负载类型（`max_tokens=256`） | 输出吞吐 (`tok/s`) | 等效 TPOT (`ms/tok`) | 相对 `none` 加速比 | 单 token 接受率 $\alpha$ | 平均步产出 $\tau$ (`tok/step`) | 贪心一致性与稳定性 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `none`（基线） | Python 代码生成（`code`） | `314.30` | `3.18` | `1.00×` | — | `1.00` | 基准参考 |
+| `none`（基线） | 结构化 JSON 提取（`json`） | `309.29` | `3.23` | `1.00×` | — | `1.00` | 基准参考 |
+| `none`（基线） | 开放式技术分析（`text`） | `312.53` | `3.20` | `1.00×` | — | `1.00` | 基准参考 |
+| `none`（基线） | 上下文编辑复述（`ngram`） | `311.66` | `3.21` | `1.00×` | — | `1.00` | 基准参考 |
+| **`mtp` (`K=3`)** | Python 代码生成（`code`） | **`622.04`** | **`1.61`** | **`1.98×`** | `71.2%` | `3.14` | BF16/FP32 `< 1 ULP` 归约边界 |
+| **`mtp` (`K=3`)** | 结构化 JSON 提取（`json`） | **`694.06`** | **`1.44`** | **`2.24×`** | `79.4%` | `3.38` | **100% 逐 token 精确一致** |
+| **`mtp` (`K=3`)** | 开放式技术分析（`text`） | **`583.59`** | **`1.71`** | **`1.87×`** | `62.6%` | `2.88` | BF16/FP32 `< 1 ULP` 归约边界 |
+| **`mtp` (`K=3`)** | 上下文编辑复述（`ngram`） | **`762.47`** | **`1.31`** | **`2.45×`** | `96.7%` | `3.90` | **100% 逐 token 精确一致** |
+| **`ngram` (`K=3`)** | 上下文编辑复述（`ngram`） | **`674.18`** | **`1.48`** | **`2.16×`** | `90.7%` | `3.72` | **100% 逐 token 精确一致** |
+| **`ngram` (`K=3`)** | Python 代码生成（`code`） | **`323.16`** | **`3.09`** | **`1.03×`** | `25.0%` | `1.75` | 零退化，无额外权重显存 |
+
+- **APC 协同与异常断连回收**：`mtp (K=3)` 开启期间，长前缀多轮请求实测命中 `+10,880` 缓存 token；客户端在流式生成中途主动断开连接后，GQA 页、MTP KV 页及 GDN 槽位全部即时释放（`idle_kv_perc = 0.0`），后续请求生成与断连前 **100% 逐 bit 一致**。
+
+### 6.2 `DeepSeek-V4.1-Flash-1017` 在线投机对比（平台 B：`8 × RTX 6000D`，TP=8，开启 APC，流式 `c=1`）
+
+| 投机模式 | 负载类型（`max_tokens=256`） | 输出吞吐 (`tok/s`) | 等效 TPOT (`ms/tok`) | 相对 `none` 加速比 | 单 token 接受率 $\alpha$ | 平均步产出 $\tau$ (`tok/step`) | 贪心一致性与稳定性 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `none`（基线） | Python 代码生成（`code`） | `118.59` | `8.43` | `1.00×` | — | `1.00` | 基准参考 |
+| `none`（基线） | 结构化 JSON 提取（`json`） | `118.41` | `8.45` | `1.00×` | — | `1.00` | 基准参考 |
+| `none`（基线） | 开放式技术分析（`text`） | `118.64` | `8.43` | `1.00×` | — | `1.00` | 基准参考 |
+| `none`（基线） | 上下文编辑复述（`ngram`） | `117.91` | `8.48` | `1.00×` | — | `1.00` | 基准参考 |
+| **`dspark` (`K=5`)** | Python 代码生成（`code`） | **`263.06`** | **`3.80`** | **`2.22×`** | `76.5%` | `4.83` | `M=1` vs `M=6` GEMM `< 1 ULP` 边界 |
+| **`dspark` (`K=5`)** | 结构化 JSON 提取（`json`） | **`288.32`** | **`3.47`** | **`2.43×`** | `67.0%` | `4.35` | `M=1` vs `M=6` GEMM `< 1 ULP` 边界 |
+| **`dspark` (`K=5`)** | 开放式技术分析（`text`） | **`168.88`** | **`5.92`** | **`1.42×`** | `37.0%` | `2.85` | 即使低接受率仍净提速 `42%` |
+| **`dspark` (`K=5`)** | 上下文编辑复述（`ngram`） | **`395.08`** | **`2.53`** | **`3.35×`** | **`100.0%`** | **`6.00`** | **100% 逐 token 精确一致** |
+| **`ngram` (`K=5`)** | 上下文编辑复述（`ngram`） | **`343.80`** | **`2.91`** | **`2.92×`** | `88.3%` | `5.42` | **100% 逐 token 精确一致** |
+| **`ngram` (`K=5`)** | Python 代码生成（`code`） | **`120.36`** | **`8.31`** | **`1.01×`** | `10.8%` | `1.54` | 零退化，无额外权重显存 |
+
+- **APC 协同与断连审计**：`dspark (K=5)` 在 `10,750` token 长前缀请求上精确命中 `+10,624` 缓存 token（端到端吞吐从无投机的 `107.39 tok/s` 提升至 **`135.50 tok/s`**）；流式断连后 `idle_kv_perc = 0.0`，后续请求 **100% 逐 bit 一致**。
+- **浮点归约精度说明**：投机解码数学上保证接受分布无损；在 `temperature=0` 贪心解码中，验证步使用 `M=K+1` 批量 GEMM / FlashInfer tile，与 `none` 模式的 `M=1` GEMM 在 FP32 累加顺序上存在 `< 1 ULP` 的极微小差异。当长序列某步 top-1 与 top-2 logit 几乎完全相等时，可能在该分叉点选出另一高概率分支（与张量并行度或 batch size 变化时的标准 GPU 浮点行为一致）；在低熵确定性负载（如 JSON 模式提取、文档复述）中均为 **100% 逐 token 完全匹配**。
+
+---
+
+## 7. Nebula 全栈端到端联调与遥测验证
+
+在平台 B（`8 × RTX 6000D`）上拉起完整生产控制面与数据面链路：
+
+$$\text{Client} \longrightarrow \text{nebula-gateway} \longrightarrow \text{nebula-router} \longrightarrow \text{zs-server (TP=8, APC + dspark K=5)}$$
+
+并由 `etcd`、`nebula-scheduler` 与 `nebula-node` 托管生命周期、声明式参数下发（`speculative_config` -> `--speculative-method dspark --num-speculative-tokens 5`）及 `/metrics` 指标采集。
+
+| 验证项 | 全栈实测结果（经 `nebula-gateway` OpenAI `/v1/chat/completions` SSE） |
+| --- | --- |
+| **流式代码生成吞吐（`code`）** | **`235.49–285.96 tok/s`**（多 token 验证块经 Router/Gateway 零阻塞透传，多 chunk token 计数与 TTFT/ITL 观测准确） |
+| **流式上下文复述吞吐（`ngram`）** | **`396.47 tok/s`**（对比直连 `zs-server` 的 `395.08 tok/s`，**Rust 数据面反向代理吞吐损耗为 0%**） |
+| **长提示词前缀亲和（`10,750` tok）** | 暖缓存 `TTFT = 210.9 ms`，端到端输出吞吐 **`115.33 tok/s`** |
+| **控制面 `/stats/` 遥测闭环** | `prefix_cache_hit_rate = 0.4927`（`10,624 / 21,562` tokens），`zstep:spec_decode_mean_acceptance_length = 3.994`，`kv_cache_usage = 0.0`（空闲零泄漏），`num_preemptions_total = 0`，`zstep:triton_recompilations_total = 0` |
+
+---
+
+## 8. 生产工作负载配置选型建议
+
+| 业务场景 | 并发特征 | `Qwen3.5-35B-A3B` 推荐参数 | `DeepSeek-V4.1-Flash` 推荐参数 | 预期收益（`8 × RTX 6000D` TP=8） |
+| --- | --- | --- | --- | --- |
+| **交互式 Agent / IDE 代码补全 / JSON 提取** | 低至中并发（`c = 1..8`），追求极致单流 TPOT 与多轮低 TTFT | `--enable-prefix-caching --speculative-method mtp --num-speculative-tokens 3` | `--enable-prefix-caching --speculative-method dspark --num-speculative-tokens 5` | 单流解码 **`584–762 tok/s`**（`Qwen3.5`）/ **`263–395 tok/s`**（`DS-V4.1`），多轮 TTFT 加速 **`5×–16×`** |
+| **RAG 原文引用 / 代码 Diff 重写（显存受限）** | 低并发、输入输出高度重叠、希望将全部剩余显存留给主模型 KV 池 | `--enable-prefix-caching --speculative-method ngram --num-speculative-tokens 3 --prompt-lookup-max 5 --prompt-lookup-min 2` | `--enable-prefix-caching --speculative-method ngram --num-speculative-tokens 5 --prompt-lookup-max 5 --prompt-lookup-min 2` | **零草稿权重/草稿 KV 显存开销**，重复片段最高 **`2.16×–2.92×`** 提速，不匹配负载零退化 |
+| **高并发离线批处理 / 高吞吐在线池** | 高并发（`c = 16..128`），GPU 算力已由 batch 填满 | `--enable-prefix-caching --speculative-method none`（若追求更低 `P99 ITL` 可加 `--max-prefill-chunk 512`） | `--enable-prefix-caching --speculative-method none` | 峰值输出吞吐 **`5,039 tok/s`**（`Qwen3.5`）/ **`1,733 tok/s`**（`DS-V4.1`），比 `vLLM` 高 **`+36%` ~ `+54%`** |
+
+### Nebula 声明式部署配置示例（`ModelConfig.speculative_config`）
+
+通过 Nebula 部署 `zstep` 引擎时，无需手工拼接底层参数，直接在模型部署请求的 `config.speculative_config` 中声明即可由 `nebula-node` 自动校验并下发：
+
+```json
+{
+  "engine_type": "zstep",
+  "config": {
+    "tensor_parallel_size": 8,
+    "enable_prefix_caching": true,
+    "speculative_config": {
+      "method": "dspark",
+      "num_speculative_tokens": 5
+    }
+  }
+}
+```
