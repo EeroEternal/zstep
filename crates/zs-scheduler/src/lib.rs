@@ -27,8 +27,8 @@ mod coordinator;
 mod serving;
 
 pub use coordinator::{
-    CoordinatorMetrics, DEFAULT_HEARTBEAT_TIMEOUT, EngineConfig, EngineError, WorkerCoordinator,
-    WorkerLaunchConfig,
+    CoordinatorMetrics, DEFAULT_HEARTBEAT_TIMEOUT, EngineConfig, EngineError, SpeculativeConfig,
+    SpeculativeMethod, WorkerCoordinator, WorkerLaunchConfig,
 };
 pub use serving::{
     AggregateMetric, BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierResult,

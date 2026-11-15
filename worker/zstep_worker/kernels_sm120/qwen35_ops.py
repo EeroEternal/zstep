@@ -306,7 +306,7 @@ void launch_gdn_prefill_vk_cuda(
     void* cached_conv_state_ptr,
     float* cached_ssm_state_vk_ptr,
     const int32_t* restore_slot_ids_ptr,
-    const uint8_t* save_slot_ids_ptr,
+    const int32_t* save_slot_ids_ptr,
     int64_t stride_qkvzba_row,
     int64_t stride_conv_slot,
     int64_t stride_ssm_slot,
@@ -536,7 +536,7 @@ void launch_gdn_prefill_vk(
     void* cached_conv_ptr = nullptr;
     float* cached_ssm_ptr = nullptr;
     const int32_t* restore_ids_ptr = nullptr;
-    const uint8_t* save_ids_ptr = nullptr;
+    const int32_t* save_ids_ptr = nullptr;
     int64_t stride_cached_conv_slot = 0;
     int64_t stride_cached_ssm_slot = 0;
     int64_t stride_cached_ssm_head = 0;
@@ -570,13 +570,13 @@ void launch_gdn_prefill_vk(
                 r_ids.is_contiguous() && r_ids.numel() >= num_seqs,
             "restore_slot_ids must be contiguous CUDA int32 [>=num_seqs]");
         TORCH_CHECK(
-            s_ids.is_cuda() && s_ids.scalar_type() == torch::kByte &&
+            s_ids.is_cuda() && s_ids.scalar_type() == torch::kInt32 &&
                 s_ids.is_contiguous() && s_ids.numel() >= rows,
-            "save_slot_ids must be contiguous CUDA uint8 [>=rows]");
+            "save_slot_ids must be contiguous CUDA int32 [>=rows]");
         cached_conv_ptr = c_conv.data_ptr();
         cached_ssm_ptr = c_ssm.data_ptr<float>();
         restore_ids_ptr = r_ids.data_ptr<int32_t>();
-        save_ids_ptr = s_ids.data_ptr<uint8_t>();
+        save_ids_ptr = s_ids.data_ptr<int32_t>();
         stride_cached_conv_slot = c_conv.stride(0);
         stride_cached_ssm_slot = c_ssm.stride(0);
         stride_cached_ssm_head = c_ssm.stride(1);
@@ -1424,7 +1424,7 @@ __global__ void gdn_conv1d_prefill_varlen_cuda_kernel(
     __nv_bfloat16* __restrict__ v_conv_out,
     __nv_bfloat16* __restrict__ cached_conv_state,
     const int32_t* __restrict__ restore_slot_ids,
-    const uint8_t* __restrict__ save_slot_ids,
+    const int32_t* __restrict__ save_slot_ids,
     int64_t stride_in_row,
     int64_t stride_state_slot,
     int64_t stride_cached_conv_slot,
@@ -1474,8 +1474,8 @@ __global__ void gdn_conv1d_prefill_varlen_cuda_kernel(
         s1 = s2;
         s2 = x;
         if (save_slot_ids != nullptr && cached_conv_state != nullptr) {
-            const uint8_t save_slot = save_slot_ids[row];
-            if (save_slot != 0xFFU && static_cast<int>(save_slot) < num_cached_slots) {
+            const int32_t save_slot = save_slot_ids[row];
+            if (save_slot >= 0 && save_slot < num_cached_slots) {
                 __nv_bfloat16* cst =
                     cached_conv_state + static_cast<int64_t>(save_slot) * stride_cached_conv_slot + c * 3;
                 cst[0] = __float2bfloat16_rn(s0);
@@ -1530,7 +1530,7 @@ __global__ void gdn_prefill_recurrent_vk_kernel(
     __nv_bfloat16* __restrict__ raw_out,
     float* __restrict__ cached_ssm_state_vk,
     const int32_t* __restrict__ restore_slot_ids,
-    const uint8_t* __restrict__ save_slot_ids,
+    const int32_t* __restrict__ save_slot_ids,
     int64_t stride_qkvzba_row,
     int64_t stride_ssm_slot,
     int64_t stride_ssm_head,
@@ -1618,8 +1618,8 @@ __global__ void gdn_prefill_recurrent_vk_kernel(
         }
 
         if (save_slot_ids != nullptr && cached_ssm_state_vk != nullptr) {
-            const uint8_t save_slot = save_slot_ids[row];
-            if (save_slot != 0xFFU && static_cast<int>(save_slot) < num_cached_slots) {
+            const int32_t save_slot = save_slot_ids[row];
+            if (save_slot >= 0 && save_slot < num_cached_slots) {
                 float4* cached_base4 = reinterpret_cast<float4*>(
                     cached_ssm_state_vk
                     + static_cast<int64_t>(save_slot) * stride_cached_ssm_slot
@@ -1971,7 +1971,7 @@ void launch_gdn_prefill_vk_cuda(
     void* cached_conv_state_ptr,
     float* cached_ssm_state_vk_ptr,
     const int32_t* restore_slot_ids_ptr,
-    const uint8_t* save_slot_ids_ptr,
+    const int32_t* save_slot_ids_ptr,
     int64_t stride_qkvzba_row,
     int64_t stride_conv_slot,
     int64_t stride_ssm_slot,
@@ -2056,7 +2056,7 @@ def get_qwen35_cuda_ext():
     if _QWEN35_EXT is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _QWEN35_EXT = load_inline(
-            name="zstep_qwen35_ops_sm120_v11_ext",
+            name="zstep_qwen35_ops_sm120_v12_ext",
             cpp_sources=[_MOE_ALIGN_CPP],
             cuda_sources=[_MOE_ALIGN_CUDA],
             functions=[
@@ -3478,7 +3478,7 @@ def _skinny_linear_kernel(
 
 
 SKINNY_LINEAR_MAX_ROWS = 16
-MOE_GEMV_MAX_ROWS = 2
+MOE_GEMV_MAX_ROWS = 4
 
 
 def skinny_linear(x: torch.Tensor, w: torch.Tensor, *, out: torch.Tensor) -> torch.Tensor:
@@ -3541,8 +3541,8 @@ def sparse_moe_tp8_forward(
 ) -> torch.Tensor:
     """Execute Qwen3_5MoeSparseMoeBlock local TP=8 shard (CUDA-Graph-safe, zero CPU sync)."""
     rows = normed_x.shape[0]
-    # cuBLAS is already near-optimal for this N=392 projection except at M=2.
-    if rows == 2:
+    # cuBLAS is already near-optimal for this N=392 projection except at small multi-row buckets.
+    if 2 <= rows <= MOE_GEMV_MAX_ROWS:
         skinny_linear(normed_x, w_router_shared_gu, out=router_shared_buf[:rows])
     else:
         torch.matmul(normed_x, w_router_shared_gu.t(), out=router_shared_buf[:rows])
@@ -3559,7 +3559,7 @@ def sparse_moe_tp8_forward(
     torch.matmul(shared_inter_buf[:rows], w_shared_down.t(), out=shared_out_buf[:rows])
 
     if rows <= MOE_GEMV_MAX_ROWS:
-        # With <= 16 routed pairs every 16-row expert tile holds one valid row, so the tiled
+        # With <= 32 routed pairs every 16-row expert tile holds ~1 valid row, so the tiled
         # path wastes most of each tile and launches too few CTAs; per-pair GEMVs skip the
         # align pass and fuse down-projection with the top-8 + shared-expert combine.
         _moe_gate_up_silu_gemv_kernel[(rows * 8, 64 // 4)](

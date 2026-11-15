@@ -26,8 +26,9 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use zs_scheduler::{
     DEFAULT_HEARTBEAT_TIMEOUT, EngineConfig, EngineState, LoopEvent, LoopFinishReason,
-    OnlineConfig, OnlineMetrics, ServeLoopHandle, ServingEngine, SubmitError, SubmitRequest,
-    TPOT_BUCKET_BOUNDS_SECS, TTFT_BUCKET_BOUNDS_SECS, WorkerLaunchConfig, request_kv_page_demand,
+    OnlineConfig, OnlineMetrics, ServeLoopHandle, ServingEngine, SpeculativeConfig,
+    SpeculativeMethod, SubmitError, SubmitRequest, TPOT_BUCKET_BOUNDS_SECS,
+    TTFT_BUCKET_BOUNDS_SECS, WorkerLaunchConfig, request_kv_page_demand,
     spawn_serve_loop_with_state,
 };
 use zs_tokenizer::{
@@ -68,7 +69,11 @@ Usage: zstep serve --model-dir <PATH> [OPTIONS]\n\
   --step-timeout-secs N          Per-step timeout (default: 300)\n\
   --max-mixed-step-tokens N      Piggyback mixed-step cap (default: 3072 on deepseek_v41, 0=off)\n\
   --allreduce-blocks N           SHM AllReduce CUDA blocks (default: 8)\n\
-  --allreduce-threads N          SHM AllReduce threads/block (default: 256)\n";
+  --allreduce-threads N          SHM AllReduce threads/block (default: 256)\n\
+  --speculative-method METHOD    none | ngram | mtp | dspark (default: none)\n\
+  --num-speculative-tokens K     Draft tokens per verify step, 1..=7\n\
+  --prompt-lookup-max N          Maximum ngram suffix window (default: 5)\n\
+  --prompt-lookup-min N          Minimum ngram suffix window (default: 2)\n";
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -101,6 +106,7 @@ pub struct ServeArgs {
     pub max_mixed_step_tokens: Option<usize>,
     pub allreduce_blocks: u32,
     pub allreduce_threads: u32,
+    pub speculative: SpeculativeConfig,
 }
 
 fn default_python_executable() -> String {
@@ -158,6 +164,10 @@ pub fn validate_known_flags(argv: &[String]) -> Result<BTreeMap<String, String>,
         "--max-mixed-step-tokens",
         "--allreduce-blocks",
         "--allreduce-threads",
+        "--speculative-method",
+        "--num-speculative-tokens",
+        "--prompt-lookup-max",
+        "--prompt-lookup-min",
     ];
     let mut values = BTreeMap::new();
     let mut index = 0;
@@ -305,6 +315,65 @@ impl ServeArgs {
         if ready_timeout_secs == 0 || step_timeout_secs == 0 {
             return Err("--ready-timeout-secs and --step-timeout-secs must be positive".to_owned());
         }
+        let speculative_method = match values
+            .get("--speculative-method")
+            .map(String::as_str)
+            .unwrap_or("none")
+        {
+            "none" => SpeculativeMethod::None,
+            "ngram" => SpeculativeMethod::Ngram,
+            "mtp" => SpeculativeMethod::Mtp,
+            "dspark" => SpeculativeMethod::Dspark,
+            other => return Err(format!("unsupported --speculative-method `{other}`")),
+        };
+        if speculative_method == SpeculativeMethod::None
+            && values.contains_key("--num-speculative-tokens")
+        {
+            return Err(
+                "--num-speculative-tokens requires --speculative-method dspark, mtp, or ngram"
+                    .to_owned(),
+            );
+        }
+        if speculative_method != SpeculativeMethod::Ngram
+            && (values.contains_key("--prompt-lookup-max")
+                || values.contains_key("--prompt-lookup-min"))
+        {
+            return Err(
+                "--prompt-lookup-max and --prompt-lookup-min require --speculative-method ngram"
+                    .to_owned(),
+            );
+        }
+        let default_k = match speculative_method {
+            SpeculativeMethod::None => 0,
+            SpeculativeMethod::Dspark => 5,
+            SpeculativeMethod::Ngram => 3,
+            SpeculativeMethod::Mtp => 1,
+        };
+        let speculative = SpeculativeConfig {
+            method: speculative_method,
+            num_speculative_tokens: parse_map_number(
+                &values,
+                "--num-speculative-tokens",
+                default_k,
+            )?,
+            prompt_lookup_max: parse_map_number(&values, "--prompt-lookup-max", 5)?,
+            prompt_lookup_min: parse_map_number(&values, "--prompt-lookup-min", 2)?,
+        };
+        speculative.validate()?;
+        if speculative_method == SpeculativeMethod::Dspark && !is_dsv41 {
+            return Err("--speculative-method dspark requires a deepseek_v41 model".to_owned());
+        }
+        if speculative_method == SpeculativeMethod::Mtp && is_dsv41 {
+            return Err("--speculative-method mtp requires the Qwen3.5 runner".to_owned());
+        }
+        if speculative.enabled()
+            && max_step_tokens < max_seqs * (speculative.num_speculative_tokens as u32 + 1)
+        {
+            return Err(
+                "--max-step-tokens must be at least max-seqs * (num-speculative-tokens + 1)"
+                    .to_owned(),
+            );
+        }
         let args = Self {
             model_dir,
             served_model_name,
@@ -343,6 +412,7 @@ impl ServeArgs {
                 .map_err(|_| "--max-mixed-step-tokens must be an integer".to_owned())?,
             allreduce_blocks: parse_map_number(&values, "--allreduce-blocks", 8u32)?,
             allreduce_threads: parse_map_number(&values, "--allreduce-threads", 256u32)?,
+            speculative,
         };
         let _ = args.resolved_apc_geometry()?;
         Ok(args)
@@ -403,11 +473,16 @@ impl ServeArgs {
                 max_decoder_rows: self.max_step_tokens,
                 max_pages_per_seq,
                 page_block_tokens: self.page_block_tokens,
-                spec_verify_width: 6,
+                spec_verify_width: if self.speculative.enabled() {
+                    self.speculative.num_speculative_tokens as u32 + 1
+                } else {
+                    6
+                },
             },
             max_prefill_chunk: self.max_prefill_chunk,
             steps: 1,
             token_counts: vec![1],
+            speculative: self.speculative.clone(),
             launch: WorkerLaunchConfig {
                 python_executable: PathBuf::from(&self.python),
                 worker_root: self.worker_root.clone(),
@@ -469,6 +544,7 @@ struct AppState {
     served_model_name: String,
     tokenizer_mode: String,
     enable_prefix_caching: bool,
+    speculative_enabled: bool,
     max_model_len: usize,
     page_block_tokens: usize,
     max_pages_per_seq: usize,
@@ -695,6 +771,31 @@ fn append_prefix_cache_counters(out: &mut String, queries: u64, hits: u64, evict
     out.push_str(&format!("zstep:prefix_cache_evictions_total {evictions}\n"));
 }
 
+fn append_spec_decode_metrics(out: &mut String, metrics: &OnlineMetrics) {
+    let drafts = metrics.spec_decode_num_drafts.load(Ordering::Relaxed);
+    let draft_tokens = metrics.spec_decode_num_draft_tokens.load(Ordering::Relaxed);
+    let accepted = metrics
+        .spec_decode_num_accepted_tokens
+        .load(Ordering::Relaxed);
+    out.push_str("# HELP zstep:spec_decode_num_drafts_total Speculative verification steps\n# TYPE zstep:spec_decode_num_drafts_total counter\n");
+    out.push_str(&format!("zstep:spec_decode_num_drafts_total {drafts}\n"));
+    out.push_str("# HELP zstep:spec_decode_num_draft_tokens_total Proposed draft tokens\n# TYPE zstep:spec_decode_num_draft_tokens_total counter\n");
+    out.push_str(&format!(
+        "zstep:spec_decode_num_draft_tokens_total {draft_tokens}\n"
+    ));
+    out.push_str("# HELP zstep:spec_decode_num_accepted_tokens_total Accepted draft tokens excluding bonus tokens\n# TYPE zstep:spec_decode_num_accepted_tokens_total counter\n");
+    out.push_str(&format!(
+        "zstep:spec_decode_num_accepted_tokens_total {accepted}\n"
+    ));
+    if drafts > 0 {
+        let mean_acceptance = 1.0 + accepted as f64 / drafts as f64;
+        out.push_str("# HELP zstep:spec_decode_mean_acceptance_length Mean accepted tokens per verification step\n# TYPE zstep:spec_decode_mean_acceptance_length gauge\n");
+        out.push_str(&format!(
+            "zstep:spec_decode_mean_acceptance_length {mean_acceptance}\n"
+        ));
+    }
+}
+
 fn render_metrics(state: &AppState) -> String {
     let mut out = String::new();
     let Some(metrics) = state.metrics() else {
@@ -712,6 +813,9 @@ fn render_metrics(state: &AppState) -> String {
         );
         if state.enable_prefix_caching {
             append_prefix_cache_counters(&mut out, 0, 0, 0);
+        }
+        if state.speculative_enabled {
+            append_spec_decode_metrics(&mut out, &OnlineMetrics::default());
         }
         out.push_str(
             "# HELP zstep:triton_recompilations_total Runtime Triton JIT recompilations\n# TYPE zstep:triton_recompilations_total gauge\nzstep:triton_recompilations_total 0\n",
@@ -752,6 +856,9 @@ fn render_metrics(state: &AppState) -> String {
             metrics.prefix_cache_hits.load(Ordering::Relaxed),
             metrics.prefix_cache_evictions.load(Ordering::Relaxed),
         );
+    }
+    if state.speculative_enabled {
+        append_spec_decode_metrics(&mut out, &metrics);
     }
     let outcomes = [
         ("finished", metrics.finished.load(Ordering::Relaxed)),
@@ -1769,6 +1876,7 @@ pub fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         served_model_name: args.served_model_name.clone(),
         tokenizer_mode: args.tokenizer_mode.clone(),
         enable_prefix_caching: args.enable_prefix_caching,
+        speculative_enabled: args.speculative.enabled(),
         max_model_len: args.max_model_len,
         page_block_tokens: args.page_block_tokens as usize,
         max_pages_per_seq,
@@ -2016,6 +2124,7 @@ mod tests {
             served_model_name: "zstep-test".to_owned(),
             tokenizer_mode: "auto".to_owned(),
             enable_prefix_caching: false,
+            speculative_enabled: false,
             max_model_len: 4096,
             page_block_tokens: 16,
             max_pages_per_seq: 256,
@@ -2229,6 +2338,7 @@ mod tests {
             served_model_name: "zstep-test".to_owned(),
             tokenizer_mode: "auto".to_owned(),
             enable_prefix_caching: false,
+            speculative_enabled: false,
             max_model_len: 4096,
             page_block_tokens: 16,
             max_pages_per_seq: 256,
@@ -2559,6 +2669,7 @@ mod tests {
             served_model_name: "zstep-test".to_owned(),
             tokenizer_mode: "auto".to_owned(),
             enable_prefix_caching: true,
+            speculative_enabled: false,
             max_model_len: 4096,
             page_block_tokens: 16,
             max_pages_per_seq: 256,
@@ -2584,6 +2695,209 @@ mod tests {
         assert!(
             prom.contains("zstep:prefix_cache_evictions_total 16\n"),
             "{prom}"
+        );
+
+        handle.shutdown();
+        let _ = handle.join(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn speculative_cli_validation_rejects_mismatched_knobs() {
+        let tmp = std::env::temp_dir().join(format!(
+            "zstep_serve_cli_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let qwen_dir = tmp.join("qwen35");
+        let ds_dir = tmp.join("deepseek_v41");
+        std::fs::create_dir_all(&qwen_dir).expect("mkdir qwen");
+        std::fs::create_dir_all(&ds_dir).expect("mkdir ds");
+        std::fs::write(
+            qwen_dir.join("config.json"),
+            r#"{"model_type":"qwen3_5_moe"}"#,
+        )
+        .expect("write qwen config");
+        std::fs::write(
+            ds_dir.join("config.json"),
+            r#"{"model_type":"deepseek_v41"}"#,
+        )
+        .expect("write ds config");
+
+        let parse = |dir: &std::path::Path, extra: &[&str]| {
+            let mut argv = vec!["--model-dir".to_owned(), dir.display().to_string()];
+            argv.extend(extra.iter().map(|item| (*item).to_owned()));
+            ServeArgs::parse(&argv)
+        };
+
+        // Explicit `--num-speculative-tokens` without `--speculative-method` (or with `none`) must fail.
+        assert!(
+            parse(&qwen_dir, &["--num-speculative-tokens", "3"])
+                .unwrap_err()
+                .contains("--num-speculative-tokens requires --speculative-method")
+        );
+        assert!(
+            parse(
+                &qwen_dir,
+                &[
+                    "--speculative-method",
+                    "none",
+                    "--num-speculative-tokens",
+                    "0"
+                ]
+            )
+            .unwrap_err()
+            .contains("--num-speculative-tokens requires --speculative-method")
+        );
+
+        // `--prompt-lookup-max` / `--prompt-lookup-min` require `ngram`.
+        assert!(
+            parse(
+                &qwen_dir,
+                &["--speculative-method", "mtp", "--prompt-lookup-max", "4"]
+            )
+            .unwrap_err()
+            .contains("require --speculative-method ngram")
+        );
+        assert!(
+            parse(
+                &ds_dir,
+                &["--speculative-method", "dspark", "--prompt-lookup-min", "2"]
+            )
+            .unwrap_err()
+            .contains("require --speculative-method ngram")
+        );
+
+        // Model-family compatibility checks.
+        assert!(
+            parse(&qwen_dir, &["--speculative-method", "dspark"])
+                .unwrap_err()
+                .contains("requires a deepseek_v41 model")
+        );
+        assert!(
+            parse(&ds_dir, &["--speculative-method", "mtp"])
+                .unwrap_err()
+                .contains("requires the Qwen3.5 runner")
+        );
+
+        // Valid configurations parse cleanly with expected defaults and overrides.
+        let mtp = parse(
+            &qwen_dir,
+            &[
+                "--speculative-method",
+                "mtp",
+                "--num-speculative-tokens",
+                "3",
+                "--worker-root",
+                "/opt/zstep/worker",
+            ],
+        )
+        .expect("valid mtp");
+        assert_eq!(mtp.speculative.method, SpeculativeMethod::Mtp);
+        assert_eq!(mtp.speculative.num_speculative_tokens, 3);
+        assert_eq!(mtp.worker_root, std::path::Path::new("/opt/zstep/worker"));
+
+        let dspark = parse(&ds_dir, &["--speculative-method", "dspark"]).expect("valid dspark");
+        assert_eq!(dspark.speculative.method, SpeculativeMethod::Dspark);
+        assert_eq!(dspark.speculative.num_speculative_tokens, 5);
+
+        let ngram = parse(
+            &qwen_dir,
+            &[
+                "--speculative-method",
+                "ngram",
+                "--num-speculative-tokens",
+                "4",
+                "--prompt-lookup-max",
+                "6",
+                "--prompt-lookup-min",
+                "2",
+            ],
+        )
+        .expect("valid ngram");
+        assert_eq!(ngram.speculative.method, SpeculativeMethod::Ngram);
+        assert_eq!(ngram.speculative.num_speculative_tokens, 4);
+        assert_eq!(ngram.speculative.prompt_lookup_max, 6);
+        assert_eq!(ngram.speculative.prompt_lookup_min, 2);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn metrics_exposes_spec_decode_three_state_contract() {
+        let handle = zs_scheduler::spawn_mock(zs_scheduler::MockScript::default());
+
+        // 1) `speculative_enabled == false`: strictly omit `zstep:spec_decode_*`.
+        let disabled_state = test_state(EngineState::Ready, Some(handle.clone()));
+        let prom_disabled = render_metrics(&disabled_state);
+        assert!(
+            !prom_disabled.contains("zstep:spec_decode_"),
+            "{prom_disabled}"
+        );
+
+        // 2) `speculative_enabled == true` with `drafts == 0`: emit zero counters, omit gauge `tau`.
+        let idle_spec_state = AppState {
+            phase: handle.state_arc(),
+            handle: Mutex::new(Some(handle.clone())),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            tokenizer: test_tokenizer(),
+            served_model_name: "zstep-test".to_owned(),
+            tokenizer_mode: "auto".to_owned(),
+            enable_prefix_caching: false,
+            speculative_enabled: true,
+            max_model_len: 4096,
+            page_block_tokens: 16,
+            max_pages_per_seq: 256,
+            num_kv_pages: 4096,
+            created_at: 0,
+            started: Instant::now(),
+            request_counter: AtomicU64::new(0),
+        };
+        let prom_idle = render_metrics(&idle_spec_state);
+        assert!(
+            prom_idle.contains("zstep:spec_decode_num_drafts_total 0\n"),
+            "{prom_idle}"
+        );
+        assert!(
+            prom_idle.contains("zstep:spec_decode_num_draft_tokens_total 0\n"),
+            "{prom_idle}"
+        );
+        assert!(
+            prom_idle.contains("zstep:spec_decode_num_accepted_tokens_total 0\n"),
+            "{prom_idle}"
+        );
+        assert!(
+            !prom_idle.contains("zstep:spec_decode_mean_acceptance_length"),
+            "{prom_idle}"
+        );
+
+        // 3) `speculative_enabled == true` with `drafts > 0`: emit `1 + accepted / drafts`.
+        let metrics = handle.metrics();
+        metrics.spec_decode_num_drafts.store(10, Ordering::Relaxed);
+        metrics
+            .spec_decode_num_draft_tokens
+            .store(30, Ordering::Relaxed);
+        metrics
+            .spec_decode_num_accepted_tokens
+            .store(24, Ordering::Relaxed);
+        let prom_active = render_metrics(&idle_spec_state);
+        assert!(
+            prom_active.contains("zstep:spec_decode_num_drafts_total 10\n"),
+            "{prom_active}"
+        );
+        assert!(
+            prom_active.contains("zstep:spec_decode_num_draft_tokens_total 30\n"),
+            "{prom_active}"
+        );
+        assert!(
+            prom_active.contains("zstep:spec_decode_num_accepted_tokens_total 24\n"),
+            "{prom_active}"
+        );
+        assert!(
+            prom_active.contains("zstep:spec_decode_mean_acceptance_length 3.4\n"),
+            "{prom_active}"
         );
 
         handle.shutdown();

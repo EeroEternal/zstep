@@ -1,6 +1,6 @@
 # 09 — 在线 OpenAI HTTP 服务演进与 Nebula 跨仓联调开发计划（对应 Issue `#7`）
 
-> **状态**：Slice Z1–Z5 已实现（`zs-tokenizer`、`zs-scheduler::serve_loop`、`zs-server::serve` 及在线 Automatic Prefix Caching，支持 `zstep serve` / `zs-server serve`）  
+> **状态**：Slice Z1–Z6 已实现（`zs-tokenizer`、`zs-scheduler::serve_loop`、`zs-server::serve`、在线 Automatic Prefix Caching 及 `dspark` / `mtp` / `ngram` 投机解码，支持 `zstep serve` / `zs-server serve`）  
 > **需求基线**：`EeroEternal/zstep#7`（从 Benchmark CLI 演进为可长期运行的 OpenAI HTTP 服务）  
 > **对端契约**：`EeroEternal/nebula#92` 及 `docs/dev/zstep.md` / `docs/dev/zstep-plan.md`（`engine_type = "zstep"`）
 
@@ -37,6 +37,10 @@
 | `--max-prefill-chunk <N>` | Chunked Prefill 块上限（默认 `2048`） |
 | `--page-block-tokens <N>` | 物理 KV 页大小（`deepseek_v41` 默认 `128`，其余默认 `16`） |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | 启停在线 Automatic Prefix Caching（APC，默认开启） |
+| `--speculative-method <METHOD>` | `none`（默认）/ `dspark`（`deepseek_v41`）/ `mtp`（`Qwen3.5`）/ `ngram`（模型无关） |
+| `--num-speculative-tokens <K>` | 每步草稿 Token 数（`1..=7`；默认 `dspark=5`、`ngram=3`、`mtp=1`；未开启投机解码时显式传入返参数错误） |
+| `--prompt-lookup-max <N>` / `--prompt-lookup-min <N>` | N-gram 历史窗口上下界（默认 `5` / `2`；仅 `--speculative-method ngram` 允许传入） |
+| `--worker-root <PATH>` | Python `zstep_worker` 目录覆盖路径（未指定时读取 `ZSTEP_WORKER_ROOT` 或源码相对目录） |
 | `--tokenizer-mode <MODE>` | `auto` / `deepseek_v41` / `chatml` |
 | `--max-waiting-requests <N>` | HTTP/调度有界等待队列上限（满载返 `429`） |
 | `--drain-timeout-secs <N>` | 收到 `SIGTERM` 后等待在途请求完成的最大秒数 |
@@ -68,7 +72,8 @@
 - `zstep:time_to_first_token_seconds` / `zstep:time_per_output_token_seconds`（Histogram）
 - `zstep:request_outcomes_total{outcome="finished|cancelled|rejected_overloaded|failed"}`（Counter）
 - `zstep:triton_recompilations_total`（Gauge/Counter：稳态必须为 `0`）
-- **三态规则**：启用 `--enable-prefix-caching`（默认开启）时，`/metrics` 暴露 `zstep:prefix_cache_queries_total`、`zstep:prefix_cache_hits_total` 与 `zstep:prefix_cache_evictions_total`（且 `zstep:kv_cache_usage_perc` 按不可驱逐占用页 `capacity - reclaimable_kv_pages()` 统计）；显式传入 `--no-enable-prefix-caching` 时省略上述前缀缓存计数器，使 Nebula 解析为 `prefix_cache_hit_rate = None`。
+- `zstep:spec_decode_num_drafts_total` / `zstep:spec_decode_num_draft_tokens_total` / `zstep:spec_decode_num_accepted_tokens_total` / `zstep:spec_decode_mean_acceptance_length`（仅当 `--speculative-method` 为 `dspark` / `mtp` / `ngram` 时暴露；`none` 时严格省略）
+- **三态规则**：启用 `--enable-prefix-caching`（默认开启）时，`/metrics` 暴露 `zstep:prefix_cache_queries_total`、`zstep:prefix_cache_hits_total` 与 `zstep:prefix_cache_evictions_total`（且 `zstep:kv_cache_usage_perc` 按不可驱逐占用页 `capacity - reclaimable_kv_pages()` 统计）；显式传入 `--no-enable-prefix-caching` 时省略上述前缀缓存计数器，使 Nebula 解析为 `prefix_cache_hit_rate = None`；同理，`--speculative-method none` 时省略 `zstep:spec_decode_*`，使 Nebula 解析为 `spec_decode_mean_acceptance_length = None`。
 
 ---
 
@@ -79,4 +84,20 @@
 3. **PR-Z3（P0-3 `zs-server serve` HTTP/SSE & 四态探针）**：在 [`crates/zs-server`](../crates/zs-server/) 新增 `serve.rs`，打通 `/v1/models`、`/v1/chat/completions`（流式/非流式）、四态探针、`429` 背压与 `x-nebula-request-id` 追踪。
 4. **PR-Z4（P1 Metrics & `SIGTERM` Drain）**：补齐 `GET /metrics`、`SIGTERM` 优雅排空退出（`/dev/shm` 零残留）及与离线引擎的同 Trace 性能回归核验，随后与 Nebula `Slice N1/N2` 进行多副本真机合龙。
 5. **PR-Z5（已落地：在线 Automatic Prefix Caching / APC）**：将 [`PrefixTree` / `PrefixLease`](../crates/zs-kv/src/prefix_cache.rs) 接入 `ServingEngine` 与 `ServeLoop`，同时支持 `DeepSeek-V4.1-Flash` 128-token 页级复用与 `Qwen3.5-35B-A3B` 64-token 节点 + 30 层 `GatedDeltaNet` `(conv_state, ssm_state_vk)` 递推状态快照，打通 Nebula `enable_prefix_caching` 与 `prefix_cache_hit_rate`。
-6. **PR-ZN6（后续演进：非贪心采样 + Nebula 跨副本 KV 事件）**：扩展 GPU 侧 `temperature/top_p/top_k/seed` 采样；按 `NEBULA_KV_HASH_SEED` 发布块事件接通 `nebula-indexd` 跨副本前缀亲和。
+6. **PR-Z6（已落地：在线投机解码 `dspark` / `mtp` / `ngram`）**：在不改动 SHM 偏移的前提下打通 `ServingEngine` / `ServeLoop` 多 Token 验证推进、拒绝草稿 KV 页回退、30 层 GDN scratch 状态回滚、目标模型验证 CUDA Graph 与 DSpark/MTP 神经草稿 CUDA Graph，并向 Nebula 暴露 `zstep:spec_decode_*` 指标。
+7. **PR-ZN7（后续演进：非贪心采样 + Nebula 跨副本 KV 事件）**：扩展 GPU 侧 `temperature/top_p/top_k/seed` 采样；按 `NEBULA_KV_HASH_SEED` 发布块事件接通 `nebula-indexd` 跨副本前缀亲和。
+
+---
+
+## 4. 8× RTX 6000D（SM120, TP=8）投机解码真机验证结果（2026-11-15）
+
+- **`Qwen3.5-35B-A3B`（`--num-kv-pages 4096`，开启 APC，单并发流式）**：
+  - `none` 基线：`309.3–314.3 tok/s`（零退化）；
+  - `mtp`（`K=3`）：`code` **`622.0 tok/s`**（**`1.98×`**，$\tau \approx 3.14$）、`json` **`694.1 tok/s`**（**`2.24×`**，$\tau \approx 3.38$，与 `none` 100% 逐字符一致）、`text` **`583.6 tok/s`**（**`1.87×`**，$\tau \approx 2.88$）、`ngram` **`762.5 tok/s`**（**`2.45×`**，$\tau \approx 3.90$，与 `none` 100% 逐字符一致）；APC 命中 `+10,880` Token，流式断连后 `kv_cache_usage_perc = 0.0` 且后续请求与断连前 100% 逐位一致；
+  - `ngram`（`K=3`）：`ngram` **`674.2 tok/s`**（**`2.16×`**，与 `none` 100% 一致）、`code` **`323.2 tok/s`**（**`1.03×`**）。
+- **`DeepSeek-V4.1-Flash-1017`（`--num-kv-pages 1024`，`b12x` + FP8 MLA，开启 APC，单并发流式）**：
+  - `none` 基线：`117.9–118.6 tok/s`（零退化）；
+  - `dspark`（`K=5`）：`code` **`263.1 tok/s`**（**`2.22×`**，$\tau \approx 4.83$）、`json` **`288.3 tok/s`**（**`2.43×`**，$\tau \approx 4.35$）、`text` **`168.9 tok/s`**（**`1.42×`**，$\tau \approx 2.85$）、`ngram` **`395.1 tok/s`**（**`3.35×`**，$\tau = 6.00$，与 `none` 100% 逐字符一致）；APC 命中 `+10,624` Token，流式断连后 `kv_cache_usage_perc = 0.0`；
+  - `ngram`（`K=5`）：`ngram` **`343.8 tok/s`**（**`2.92×`**，与 `none` 100% 一致）、`code` **`120.4 tok/s`**（**`1.01×`**）。
+- **Nebula 全栈合龙**：`etcd` + `scheduler` + `node` + `router` + `gateway` 部署 `zstep` `dspark K=5`，经 Gateway 流式实测 `code` `235.5 tok/s`、`ngram` `396.5 tok/s`，`/stats/` 上报 `prefix_cache_hit_rate = 0.4927`、引擎 `spec_decode_mean_acceptance_length = 3.994`。
+- **数值精度说明**：`M=1` GEMV/Decode Attention 与 `M=K+1` Tensor Core/varlen Attention 在 `< 1 ULP` BF16/FP8 平局词处存在形状级浮点归约差异；每步吐出的 Token 均严格等于 `M=K+1` 目标前向的精确 `argmax`。

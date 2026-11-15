@@ -738,6 +738,7 @@ fn run_engine(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         max_prefill_chunk: args.max_prefill_chunk,
         steps: args.steps,
         token_counts: args.token_counts,
+        speculative: Default::default(),
         launch: WorkerLaunchConfig {
             python_executable: args.python,
             worker_root: args.worker_root,

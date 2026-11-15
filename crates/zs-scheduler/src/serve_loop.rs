@@ -132,6 +132,9 @@ pub struct OnlineMetrics {
     pub prefix_cache_hits: AtomicU64,
     pub prefix_cache_evictions: AtomicU64,
     pub triton_recompilations: AtomicU64,
+    pub spec_decode_num_drafts: AtomicU64,
+    pub spec_decode_num_draft_tokens: AtomicU64,
+    pub spec_decode_num_accepted_tokens: AtomicU64,
     pub max_active: AtomicU64,
 }
 
@@ -854,7 +857,9 @@ fn online_step(
             .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
             .count();
         let has_partial_prefill = decode_active_count != online.active.len();
-        if let Some(mixed_cap) = engine.max_mixed_step_tokens {
+        if !engine.speculative.enabled()
+            && let Some(mixed_cap) = engine.max_mixed_step_tokens
+        {
             let can_attempt_mixed = has_partial_prefill || waiting_admissible;
             if can_attempt_mixed {
                 match engine.stage_mixed_step(
@@ -931,12 +936,13 @@ fn online_step(
         max_seqs,
         page_block_tokens,
     );
-    let can_overlap_next = decode_continues_for_all(
-        &online.active,
-        post_admit_waiting_admissible,
-        0,
-        engine.has_prefix_cache(),
-    );
+    let can_overlap_next = !engine.speculative.enabled()
+        && decode_continues_for_all(
+            &online.active,
+            post_admit_waiting_admissible,
+            0,
+            engine.has_prefix_cache(),
+        );
     if can_overlap_next {
         let next_sid = engine.step_cursor + 1;
         engine.stage_decode_step(
@@ -952,59 +958,85 @@ fn online_step(
     engine.coordinator.wait_step_completed(step_id)?;
     let now = Instant::now();
 
-    let emitted: Vec<(u32, i32)> = {
-        let result = engine.coordinator.result_slot(step_id)?;
-        if result.completed_step_id()? != step_id {
-            return Err(EngineError::Protocol(format!(
-                "completed_step_id mismatch on step {step_id}"
-            )));
-        }
-        let header = result.header()?;
-        if header.status_code != 0 {
-            return Err(EngineError::Protocol(format!(
-                "worker failed step {step_id} with status {}",
-                header.status_code
-            )));
-        }
-        result.outputs()?[..header.num_seq_results as usize]
-            .iter()
-            .map(|output| (output.req_slot, output.accepted_tokens[0]))
-            .collect()
-    };
+    let emitted = engine.harvested_outputs(step_id)?;
 
     engine.promote_completed_prefixes(&mut online.active, max_pages_per_seq)?;
 
-    for (req_slot, token) in emitted {
+    let eos_tokens = online.eos_tokens.clone();
+    for output in emitted {
         let idx = *online
             .slot_to_active
-            .get(req_slot as usize)
+            .get(output.req_slot as usize)
             .unwrap_or(&usize::MAX);
         if idx >= online.active.len() {
             continue;
         }
-        let request_id = {
-            let seq = &mut online.active[idx];
-            if seq.first_token_time.is_none() {
-                let (ttft_us, _) = first_token_latency_us(seq.permit_time, seq.submit_time, now);
-                metrics.observe_ttft_us(ttft_us);
-                seq.first_token_time = Some(now);
-            } else {
-                let prev = seq.last_token_time.unwrap_or(now);
-                let itl_us = now.duration_since(prev).as_micros() as u64;
-                metrics.observe_tpot_us(itl_us);
-            }
-            seq.last_token_time = Some(now);
-            seq.last_token = token;
-            seq.generated_tokens.push(token);
-            seq.request_id as u64
-        };
-        emit(
-            online,
-            LoopEvent::Token {
-                request_id,
-                token: token as u32,
-            },
+        let seq = &mut online.active[idx];
+        let staged = seq.staged_verify.take();
+        let mut accepted = output.accepted_tokens;
+        accepted.truncate(
+            seq.target_output_len
+                .saturating_sub(seq.generated_tokens.len()),
         );
+        let generated_before = seq.generated_tokens.len();
+        let mut token_events = Vec::new();
+        for token in accepted {
+            let request_id = {
+                if seq.first_token_time.is_none() {
+                    let (ttft_us, _) =
+                        first_token_latency_us(seq.permit_time, seq.submit_time, now);
+                    metrics.observe_ttft_us(ttft_us);
+                    seq.first_token_time = Some(now);
+                } else {
+                    let prev = seq.last_token_time.unwrap_or(now);
+                    let itl_us = now.duration_since(prev).as_micros() as u64;
+                    metrics.observe_tpot_us(itl_us);
+                }
+                seq.last_token_time = Some(now);
+                seq.last_token = token;
+                seq.generated_tokens.push(token);
+                seq.request_id as u64
+            };
+            token_events.push((request_id, token));
+            if eos_tokens.contains(&(token as u32)) {
+                break;
+            }
+        }
+        if let Some((start_pos, num_drafts)) = staged {
+            let effective_accepted = seq.generated_tokens.len() - generated_before;
+            seq.current_seq_len = start_pos + effective_accepted;
+            rewind_rejected_suffix_pages(
+                seq,
+                seq.current_seq_len,
+                page_block_tokens,
+                max_pages_per_seq,
+                dummy_page_value(engine),
+                &mut engine.shadow_page_table,
+                &mut engine.dirty_pt_slots,
+            );
+            if num_drafts > 0 {
+                metrics
+                    .spec_decode_num_drafts
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .spec_decode_num_draft_tokens
+                    .fetch_add(num_drafts as u64, Ordering::Relaxed);
+                metrics.spec_decode_num_accepted_tokens.fetch_add(
+                    effective_accepted.saturating_sub(1) as u64,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        seq.refresh_draft_tokens(&output.next_draft_tokens, &engine.speculative);
+        for (request_id, token) in token_events {
+            emit(
+                online,
+                LoopEvent::Token {
+                    request_id,
+                    token: token as u32,
+                },
+            );
+        }
     }
 
     let dummy_page = dummy_page_value(engine);
@@ -1401,6 +1433,8 @@ mod tests {
                     prompt_tokens: req.prompt_tokens,
                     generated_tokens: Vec::new(),
                     generated_top2: Vec::new(),
+                    pending_draft_tokens: Vec::new(),
+                    staged_verify: None,
                     target_output_len: req.target_output_len,
                     reserved_pages: demand,
                     permit_time: req.permit_time,
@@ -1569,6 +1603,8 @@ mod tests {
             last_token: 151645,
             generated_tokens: vec![151645],
             generated_top2: Vec::new(),
+            pending_draft_tokens: Vec::new(),
+            staged_verify: None,
             target_output_len: 64,
             reserved_pages: 5,
             permit_time: Instant::now(),
@@ -1768,6 +1804,7 @@ mod tests {
                 &mut online.active,
                 Some(&mut tree),
                 true,
+                false,
                 pages_per_node,
                 max_pages_per_seq,
                 &mut shadow_pt,

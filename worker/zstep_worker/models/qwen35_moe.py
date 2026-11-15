@@ -61,6 +61,7 @@ from zstep_worker.kernels_sm120.shm_allreduce import (
     HostMappedShmAllReduce,
     get_host_mapped_allreduce_extension,
 )
+from zstep_worker.spec_decode import VerifiedSequence, seq_results, verify_batch
 from zstep_worker.shm_bridge import (
     DECODE_GRAPH_BUCKETS,
     STEP_FLAG_DECODE_ONLY,
@@ -362,6 +363,11 @@ class _LaunchedStep:
     # read this step's result.
     sample_rows_np: np.ndarray
     slot_np: np.ndarray
+    token_ids_np: np.ndarray
+    positions_np: np.ndarray
+    query_start_np: np.ndarray
+    is_speculative: bool
+    restored_seq_indices: frozenset[int] = frozenset()
 
 
 class Qwen35MoeStepRunner:
@@ -401,6 +407,13 @@ class Qwen35MoeStepRunner:
         self.max_pages_per_seq: int = self.geometry.max_pages_per_seq
         self.num_kv_pages: int = num_kv_pages
         self.dummy_page: int = num_kv_pages
+        self.spec_method: str = os.environ.get("ZSTEP_SPEC_METHOD", "none")
+        self.num_spec_tokens: int = int(os.environ.get("ZSTEP_NUM_SPEC_TOKENS", "0"))
+        if self.spec_method not in {"none", "ngram", "mtp"}:
+            raise ValueError(f"Qwen3.5 does not support speculative method {self.spec_method}")
+        if self.spec_method != "none" and not 1 <= self.num_spec_tokens <= 7:
+            raise ValueError("ZSTEP_NUM_SPEC_TOKENS must be in 1..=7")
+        self.mtp_drafter: Any = None
 
         os.environ.setdefault("NCCL_P2P_DISABLE", "1")
         os.environ.setdefault("NCCL_P2P_LEVEL", "LOC")
@@ -444,7 +457,7 @@ class Qwen35MoeStepRunner:
             world_size=self.world_size,
             device=self.device,
             exchange_group=self.exchange_group,
-            max_rows_per_step=max(512, self.max_seqs),
+            max_rows_per_step=max(512, self.max_step_tokens, self.max_seqs),
         )
 
         # Load TP=8 weight slices directly from safetensors mmap
@@ -481,22 +494,25 @@ class Qwen35MoeStepRunner:
                 "ZSTEP_NUM_RECURRENT_CHECKPOINTS must be in 0..=255 "
                 f"(got {self.num_recurrent_checkpoints})"
             )
+        self.num_cached_recurrent_slots: int = self.num_recurrent_checkpoints + (
+            self.max_seqs * 8 if self.spec_method != "none" else 0
+        )
         self.cached_conv_states: torch.Tensor | None = (
             torch.zeros(
-                (30, self.num_recurrent_checkpoints, 1024, 3),
+                (30, self.num_cached_recurrent_slots, 1024, 3),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
-            if self.num_recurrent_checkpoints > 0
+            if self.num_cached_recurrent_slots > 0
             else None
         )
         self.cached_ssm_states: torch.Tensor | None = (
             torch.zeros(
-                (30, self.num_recurrent_checkpoints, 4, 128, 128),
+                (30, self.num_cached_recurrent_slots, 4, 128, 128),
                 dtype=torch.float32,
                 device=self.device,
             )
-            if self.num_recurrent_checkpoints > 0
+            if self.num_cached_recurrent_slots > 0
             else None
         )
         # 10 full-attention layers paged KV cache (+1 scratch page for dummy slot)
@@ -510,6 +526,11 @@ class Qwen35MoeStepRunner:
         # Static execution workspaces sized for max_step_tokens
         mt = self.max_step_tokens
         ms = total_slots
+        sc = (
+            ms
+            if self.spec_method == "none"
+            else max(ms, min(mt, self.max_seqs * (self.num_spec_tokens + 1)))
+        )
         max_tiles = max_moe_tiles_for_rows(mt)
 
         self.token_ids_gpu: torch.Tensor = torch.zeros(mt, dtype=torch.int32, device=self.device)
@@ -521,15 +542,15 @@ class Qwen35MoeStepRunner:
         self.query_start_loc_gpu: torch.Tensor = torch.zeros(
             ms + 1, dtype=torch.int32, device=self.device
         )
-        self.sample_rows_gpu: torch.Tensor = torch.zeros(ms, dtype=torch.int64, device=self.device)
+        self.sample_rows_gpu: torch.Tensor = torch.zeros(sc, dtype=torch.int64, device=self.device)
         self.restore_slot_ids_gpu: torch.Tensor | None = (
             torch.full((ms,), -1, dtype=torch.int32, device=self.device)
-            if self.num_recurrent_checkpoints > 0
+            if self.num_cached_recurrent_slots > 0
             else None
         )
         self.save_slot_ids_gpu: torch.Tensor | None = (
-            torch.full((mt,), 0xFF, dtype=torch.uint8, device=self.device)
-            if self.num_recurrent_checkpoints > 0
+            torch.full((mt,), -1, dtype=torch.int32, device=self.device)
+            if self.num_cached_recurrent_slots > 0
             else None
         )
         # Decode inputs and the shared page table live in one packed int32 buffer so a decode
@@ -573,7 +594,7 @@ class Qwen35MoeStepRunner:
         self.query_start_loc_cpu: torch.Tensor = torch.zeros(
             ms + 1, dtype=torch.int32, pin_memory=True
         )
-        self.sample_rows_cpu: torch.Tensor = torch.zeros(ms, dtype=torch.int64, pin_memory=True)
+        self.sample_rows_cpu: torch.Tensor = torch.zeros(sc, dtype=torch.int64, pin_memory=True)
         self.page_table_cpu: list[torch.Tensor] = [
             self.dec_io_cpu[p, self._dec_pt_offset :].view(ms, self.max_pages_per_seq)
             for p in range(2)
@@ -587,12 +608,12 @@ class Qwen35MoeStepRunner:
         self._query_start_loc_np: np.ndarray = self.query_start_loc_cpu.numpy()
         self.restore_slot_ids_cpu: torch.Tensor | None = (
             torch.full((2, ms), -1, dtype=torch.int32, pin_memory=True)
-            if self.num_recurrent_checkpoints > 0
+            if self.num_cached_recurrent_slots > 0
             else None
         )
         self.save_slot_ids_cpu: torch.Tensor | None = (
-            torch.full((2, mt), 0xFF, dtype=torch.uint8, pin_memory=True)
-            if self.num_recurrent_checkpoints > 0
+            torch.full((2, mt), -1, dtype=torch.int32, pin_memory=True)
+            if self.num_cached_recurrent_slots > 0
             else None
         )
         self._restore_slot_ids_np: list[np.ndarray] | None = (
@@ -608,7 +629,7 @@ class Qwen35MoeStepRunner:
         # Sampled tokens and logprob bits share one buffer so rank 0 needs a single D2H copy.
         # Indexed by step parity first, like `dec_io_cpu`.
         self.out_io_cpu: torch.Tensor = torch.zeros(
-            (2, 2, ms, 2), dtype=torch.int32, pin_memory=True
+            (2, 2, sc, 2), dtype=torch.int32, pin_memory=True
         )
         self.req_slots_sample_cpu: list[int] = [0] * ms
 
@@ -702,19 +723,19 @@ class Qwen35MoeStepRunner:
 
         # LM head + sampling buffers
         self.sample_hidden_buf: torch.Tensor = torch.empty(
-            (ms, 2048), dtype=torch.bfloat16, device=self.device
+            (sc, 2048), dtype=torch.bfloat16, device=self.device
         )
         self.logits_local_buf: torch.Tensor = torch.empty(
-            (ms, self.vocab_per_rank), dtype=torch.bfloat16, device=self.device
+            (sc, self.vocab_per_rank), dtype=torch.bfloat16, device=self.device
         )
         self.local_max_vals_buf: torch.Tensor = torch.empty(
-            (ms, 2), dtype=torch.float32, device=self.device
+            (sc, 2), dtype=torch.float32, device=self.device
         )
         self.local_max_ids_buf: torch.Tensor = torch.empty(
-            (ms, 2), dtype=torch.int32, device=self.device
+            (sc, 2), dtype=torch.int32, device=self.device
         )
         self.out_io_gpu: torch.Tensor = torch.zeros(
-            (2, ms, 2), dtype=torch.int32, device=self.device
+            (2, sc, 2), dtype=torch.int32, device=self.device
         )
         self.out_tokens_gpu: torch.Tensor = self.out_io_gpu[0]
         self.out_logprobs_gpu: torch.Tensor = self.out_io_gpu[1]
@@ -726,6 +747,25 @@ class Qwen35MoeStepRunner:
             torch.cuda.Event(enable_timing=True) for _ in range(2)
         ]
         self.decode_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.verify_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        verify_width = self.num_spec_tokens + 1
+        self.verify_qsl_gpu: torch.Tensor = (
+            torch.arange(ms + 1, dtype=torch.int32, device=self.device) * verify_width
+        )
+        max_verify_rows = min(320, self.max_step_tokens, sc)
+        self.verify_buckets: list[int] = (
+            [
+                b
+                for b in DECODE_GRAPH_BUCKETS
+                if b <= self.max_graph_bucket and b * verify_width <= max_verify_rows
+            ]
+            if self.spec_method != "none"
+            else []
+        )
+        if self.spec_method == "mtp":
+            from zstep_worker.models.qwen35_mtp import Qwen35MtpDrafter
+
+            self.mtp_drafter = Qwen35MtpDrafter(self)
         self._warmup_and_capture_decode_graphs()
 
     def _load_tp8_weights(self) -> None:
@@ -1129,6 +1169,8 @@ class Qwen35MoeStepRunner:
         num_seqs: int,
         num_sample_rows: int,
         max_q_len: int,
+        qsl_gpu: torch.Tensor | None = None,
+        sample_all_rows_direct: bool = False,
     ) -> None:
         eps = self.config.rms_norm_eps
         sm_scale = self.config.head_dim**-0.5
@@ -1137,6 +1179,7 @@ class Qwen35MoeStepRunner:
         normed = self.normed_buf[:total_tokens]
         proj_local = self.proj_local_buf[:total_tokens]
         reduced = self.reduced_buf[:total_tokens]
+        qsl = qsl_gpu if qsl_gpu is not None else self.query_start_loc_gpu[: num_seqs + 1]
 
         torch.index_select(
             self.embed_weight, 0, self.token_ids_gpu[:total_tokens], out=hidden
@@ -1157,7 +1200,7 @@ class Qwen35MoeStepRunner:
                     lw.dt_bias,
                     self.ssm_states[lw.state_layer_idx],
                     lw.gated_norm_w,
-                    self.query_start_loc_gpu[: num_seqs + 1],
+                    qsl,
                     self.positions_gpu[:total_tokens],
                     self.req_slot_ids_gpu[:total_tokens],
                     qkv_conv_buf=self.qkv_conv_buf[:total_tokens],
@@ -1215,7 +1258,7 @@ class Qwen35MoeStepRunner:
                     self.k_caches[lw.kv_layer_idx],
                     self.v_caches[lw.kv_layer_idx],
                     self.page_table_gpu,
-                    self.query_start_loc_gpu[: num_seqs + 1],
+                    qsl,
                     self.seq_lens_gpu[:num_seqs],
                     self.req_slot_ids_gpu[:total_tokens],
                     out=attn_out,
@@ -1269,10 +1312,13 @@ class Qwen35MoeStepRunner:
             )
 
         if num_sample_rows > 0:
-            sampled_normed = self.sample_hidden_buf[:num_sample_rows]
-            torch.index_select(
-                normed, 0, self.sample_rows_gpu[:num_sample_rows], out=sampled_normed
-            )
+            if sample_all_rows_direct:
+                sampled_normed = normed
+            else:
+                sampled_normed = self.sample_hidden_buf[:num_sample_rows]
+                torch.index_select(
+                    normed, 0, self.sample_rows_gpu[:num_sample_rows], out=sampled_normed
+                )
             logits = self.logits_local_buf[:num_sample_rows]
             torch.matmul(sampled_normed, self.lm_head_weight.t(), out=logits)
             self.argmax_channel.gather_argmax(
@@ -1288,7 +1334,12 @@ class Qwen35MoeStepRunner:
         # Warm up all 3 Triton integer-specialization buckets (==1, >1 & %16!=0, %16==0)
         # for prefill before RuntimeLoop activates zero-recompilation enforcement.
         self.page_table_gpu.fill_(self.dummy_page)
-        for warm_tokens in (1, 5, 16):
+        warm_sizes = [1, 5, 16]
+        if self.spec_method != "none":
+            verify_w = self.num_spec_tokens + 1
+            if verify_w not in warm_sizes:
+                warm_sizes.append(verify_w)
+        for warm_tokens in warm_sizes:
             self.token_ids_gpu[:warm_tokens].zero_()
             self.positions_gpu[:warm_tokens].copy_(
                 torch.arange(warm_tokens, dtype=torch.int32, device=self.device)
@@ -1352,6 +1403,51 @@ class Qwen35MoeStepRunner:
             dist.barrier(group=self.exchange_group)
             self.decode_graphs[b] = g
 
+        if self.verify_buckets and os.environ.get("ZSTEP_DISABLE_VERIFY_GRAPHS", "0") != "1":
+            width = self.num_spec_tokens + 1
+            for b in self.verify_buckets:
+                rows = b * width
+                self.token_ids_gpu[:rows].zero_()
+                self.positions_gpu[:rows].copy_(
+                    torch.arange(rows, dtype=torch.int32, device=self.device) % width
+                )
+                self.req_slot_ids_gpu[:rows].fill_(self.dummy_slot)
+                self.seq_lens_gpu[:b].fill_(width)
+                if self.restore_slot_ids_gpu is not None:
+                    self.restore_slot_ids_gpu[:b].fill_(-1)
+                if self.save_slot_ids_gpu is not None:
+                    self.save_slot_ids_gpu[:rows].fill_(-1)
+                qsl_b = self.verify_qsl_gpu[: b + 1]
+                with torch.cuda.stream(capture_stream):
+                    for _ in range(2):
+                        self._run_prefill_varlen_forward(
+                            total_tokens=rows,
+                            num_seqs=b,
+                            num_sample_rows=rows,
+                            max_q_len=width,
+                            qsl_gpu=qsl_b,
+                            sample_all_rows_direct=True,
+                        )
+                capture_stream.synchronize()
+                dist.barrier(group=self.exchange_group)
+
+                vg = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(vg, pool=graph_pool, stream=capture_stream):
+                    self._run_prefill_varlen_forward(
+                        total_tokens=rows,
+                        num_seqs=b,
+                        num_sample_rows=rows,
+                        max_q_len=width,
+                        qsl_gpu=qsl_b,
+                        sample_all_rows_direct=True,
+                    )
+                capture_stream.synchronize()
+                dist.barrier(group=self.exchange_group)
+                self.verify_graphs[b] = vg
+
+        if self.mtp_drafter is not None:
+            self.mtp_drafter.capture_graphs(graph_pool, capture_stream)
+
         # Clear dummy state after capture
         self.conv_states.zero_()
         self.ssm_states.zero_()
@@ -1359,11 +1455,15 @@ class Qwen35MoeStepRunner:
             self.cached_conv_states.zero_()
         if self.cached_ssm_states is not None:
             self.cached_ssm_states.zero_()
+        for kc in self.k_caches:
+            kc.zero_()
+        for vc in self.v_caches:
+            vc.zero_()
         torch.cuda.synchronize(self.device)
         dist.barrier(group=self.exchange_group)
 
     def _copy_out_io_to_host(self, rows: int, parity: int) -> None:
-        # out_io is [tokens(ms,2) | logprob_bits(ms,2)]; one contiguous prefix covers
+        # out_io is [tokens(sc,2) | logprob_bits(sc,2)]; one contiguous prefix covers
         # all token rows plus the first `rows` logprob rows.
         n = self.out_tokens_gpu.numel() + 2 * rows
         self.out_io_cpu[parity].view(-1)[:n].copy_(
@@ -1396,6 +1496,7 @@ class Qwen35MoeStepRunner:
         sample_rows_np = plan.sample_row_indices(num_sample)
 
         is_decode = (header.flags & STEP_FLAG_DECODE_ONLY) != 0
+        restored_seq_indices: frozenset[int] = frozenset()
         pt_end = max_slot_end * self.max_pages_per_seq
         np.copyto(self._page_table_np[parity][:max_slot_end], pt_np)
 
@@ -1424,61 +1525,151 @@ class Qwen35MoeStepRunner:
             self.page_table_gpu[:max_slot_end].copy_(
                 self.page_table_cpu[parity][:max_slot_end], non_blocking=True
             )
-            np.copyto(self._token_ids_np[:total_tokens], tok_np)
-            np.copyto(self._positions_np[:total_tokens], pos_np)
-            np.copyto(self._req_slot_ids_np[:total_tokens], slot_np)
-            np.copyto(self._seq_lens_np[:num_seqs], seq_lens_np)
-            np.copyto(self._query_start_loc_np[: num_seqs + 1], q_start_np)
-            if num_sample > 0:
-                self.sample_rows_cpu[:num_sample].copy_(torch.from_numpy(sample_rows_np.astype(np.int64)))
-
-            self.token_ids_gpu[:total_tokens].copy_(
-                self.token_ids_cpu[:total_tokens], non_blocking=True
-            )
-            self.positions_gpu[:total_tokens].copy_(
-                self.positions_cpu[:total_tokens], non_blocking=True
-            )
-            self.req_slot_ids_gpu[:total_tokens].copy_(
-                self.req_slot_ids_cpu[:total_tokens], non_blocking=True
-            )
-            self.seq_lens_gpu[:num_seqs].copy_(self.seq_lens_cpu[:num_seqs], non_blocking=True)
-            self.query_start_loc_gpu[: num_seqs + 1].copy_(
-                self.query_start_loc_cpu[: num_seqs + 1], non_blocking=True
-            )
-            if num_sample > 0:
-                self.sample_rows_gpu[:num_sample].copy_(
-                    self.sample_rows_cpu[:num_sample], non_blocking=True
-                )
-            if (
-                self.num_recurrent_checkpoints > 0
-                and self.restore_slot_ids_cpu is not None
-                and self.save_slot_ids_cpu is not None
-                and self.restore_slot_ids_gpu is not None
-                and self.save_slot_ids_gpu is not None
-                and self._restore_slot_ids_np is not None
-                and self._save_slot_ids_np is not None
-            ):
-                restore_np = plan.compressor_slot_ids(num_seqs)
-                save_np = plan.replay_mask(total_tokens)
-                np.copyto(self._restore_slot_ids_np[parity][:num_seqs], restore_np)
-                np.copyto(self._save_slot_ids_np[parity][:total_tokens], save_np)
-                self.restore_slot_ids_gpu[:num_seqs].copy_(
-                    self.restore_slot_ids_cpu[parity, :num_seqs], non_blocking=True
-                )
-                self.save_slot_ids_gpu[:total_tokens].copy_(
-                    self.save_slot_ids_cpu[parity, :total_tokens], non_blocking=True
-                )
-
             q_lens = q_start_np[1:] - q_start_np[:-1]
-            max_q_len = int(q_lens.max()) if num_seqs > 0 else 1
-            self._run_prefill_varlen_forward(
-                total_tokens=total_tokens,
-                num_seqs=num_seqs,
-                num_sample_rows=num_sample,
-                max_q_len=max_q_len,
+            width = self.num_spec_tokens + 1
+            v_bucket = (
+                select_decode_bucket(num_seqs, self.verify_buckets[-1])
+                if (
+                    header.is_dspark_verify != 0
+                    and self.verify_graphs
+                    and num_seqs <= self.verify_buckets[-1]
+                    and num_sample == total_tokens
+                    and total_tokens == num_seqs * width
+                    and bool(np.all(q_lens == width))
+                )
+                else 0
             )
-            if self.rank == 0 and num_sample > 0:
+            if v_bucket in self.verify_graphs:
+                rows = v_bucket * width
+                np.copyto(self._token_ids_np[:total_tokens], tok_np)
+                np.copyto(self._positions_np[:total_tokens], pos_np)
+                np.copyto(self._req_slot_ids_np[:total_tokens], slot_np)
+                np.copyto(self._seq_lens_np[:num_seqs], seq_lens_np)
+                if rows > total_tokens:
+                    self._token_ids_np[total_tokens:rows] = 0
+                    self._positions_np[total_tokens:rows] = (
+                        np.arange(rows - total_tokens, dtype=np.int32) % width
+                    )
+                    self._req_slot_ids_np[total_tokens:rows] = self.dummy_slot
+                    self._seq_lens_np[num_seqs:v_bucket] = width
+                self.token_ids_gpu[:rows].copy_(self.token_ids_cpu[:rows], non_blocking=True)
+                self.positions_gpu[:rows].copy_(self.positions_cpu[:rows], non_blocking=True)
+                self.req_slot_ids_gpu[:rows].copy_(
+                    self.req_slot_ids_cpu[:rows], non_blocking=True
+                )
+                self.seq_lens_gpu[:v_bucket].copy_(
+                    self.seq_lens_cpu[:v_bucket], non_blocking=True
+                )
+                if (
+                    self.num_cached_recurrent_slots > 0
+                    and self.restore_slot_ids_cpu is not None
+                    and self.save_slot_ids_cpu is not None
+                    and self.restore_slot_ids_gpu is not None
+                    and self.save_slot_ids_gpu is not None
+                    and self._restore_slot_ids_np is not None
+                    and self._save_slot_ids_np is not None
+                ):
+                    self._restore_slot_ids_np[parity][:v_bucket].fill(-1)
+                    save_dest = self._save_slot_ids_np[parity][:rows]
+                    save_dest.fill(-1)
+                    for seq_idx in range(num_seqs):
+                        begin = seq_idx * width
+                        for rel in range(width - 1):
+                            save_dest[begin + rel] = (
+                                self.num_recurrent_checkpoints + seq_idx * 8 + rel
+                            )
+                    self.restore_slot_ids_gpu[:v_bucket].copy_(
+                        self.restore_slot_ids_cpu[parity, :v_bucket], non_blocking=True
+                    )
+                    self.save_slot_ids_gpu[:rows].copy_(
+                        self.save_slot_ids_cpu[parity, :rows], non_blocking=True
+                    )
+                self.verify_graphs[v_bucket].replay()
+                # `tp8_argmax_gather_shm_kernel` in `qwen35_ops.py` merges Top-2 on ALL ranks,
+                # so every rank copies its own verified tokens without any `dist.broadcast`.
                 self._copy_out_io_to_host(num_sample, parity)
+            else:
+                np.copyto(self._token_ids_np[:total_tokens], tok_np)
+                np.copyto(self._positions_np[:total_tokens], pos_np)
+                np.copyto(self._req_slot_ids_np[:total_tokens], slot_np)
+                np.copyto(self._seq_lens_np[:num_seqs], seq_lens_np)
+                np.copyto(self._query_start_loc_np[: num_seqs + 1], q_start_np)
+                if num_sample > 0:
+                    self.sample_rows_cpu[:num_sample].copy_(
+                        torch.from_numpy(sample_rows_np.astype(np.int64))
+                    )
+
+                self.token_ids_gpu[:total_tokens].copy_(
+                    self.token_ids_cpu[:total_tokens], non_blocking=True
+                )
+                self.positions_gpu[:total_tokens].copy_(
+                    self.positions_cpu[:total_tokens], non_blocking=True
+                )
+                self.req_slot_ids_gpu[:total_tokens].copy_(
+                    self.req_slot_ids_cpu[:total_tokens], non_blocking=True
+                )
+                self.seq_lens_gpu[:num_seqs].copy_(
+                    self.seq_lens_cpu[:num_seqs], non_blocking=True
+                )
+                self.query_start_loc_gpu[: num_seqs + 1].copy_(
+                    self.query_start_loc_cpu[: num_seqs + 1], non_blocking=True
+                )
+                if num_sample > 0:
+                    self.sample_rows_gpu[:num_sample].copy_(
+                        self.sample_rows_cpu[:num_sample], non_blocking=True
+                    )
+                is_spec_verify = (
+                    header.is_dspark_verify != 0
+                    and num_sample == total_tokens
+                    and total_tokens > num_seqs
+                )
+                if (
+                    self.num_cached_recurrent_slots > 0
+                    and self.restore_slot_ids_cpu is not None
+                    and self.save_slot_ids_cpu is not None
+                    and self.restore_slot_ids_gpu is not None
+                    and self.save_slot_ids_gpu is not None
+                    and self._restore_slot_ids_np is not None
+                    and self._save_slot_ids_np is not None
+                ):
+                    save_dest = self._save_slot_ids_np[parity][:total_tokens]
+                    if is_spec_verify:
+                        save_dest.fill(-1)
+                        self._restore_slot_ids_np[parity][:num_seqs].fill(-1)
+                        for seq_idx in range(num_seqs):
+                            begin = int(q_start_np[seq_idx])
+                            end = int(q_start_np[seq_idx + 1])
+                            for row in range(begin, end - 1):
+                                save_dest[row] = (
+                                    self.num_recurrent_checkpoints + seq_idx * 8 + row - begin
+                                )
+                    elif self.num_recurrent_checkpoints > 0:
+                        restore_np = plan.compressor_slot_ids(num_seqs)
+                        np.copyto(self._restore_slot_ids_np[parity][:num_seqs], restore_np)
+                        restored_seq_indices = frozenset(
+                            int(i) for i in np.flatnonzero(restore_np >= 0)
+                        )
+                        save_np = plan.replay_mask(total_tokens).astype(np.int32)
+                        save_dest[:] = np.where(save_np == 0xFF, -1, save_np)
+                    else:
+                        self._restore_slot_ids_np[parity][:num_seqs].fill(-1)
+                        save_dest.fill(-1)
+                    self.restore_slot_ids_gpu[:num_seqs].copy_(
+                        self.restore_slot_ids_cpu[parity, :num_seqs], non_blocking=True
+                    )
+                    self.save_slot_ids_gpu[:total_tokens].copy_(
+                        self.save_slot_ids_cpu[parity, :total_tokens], non_blocking=True
+                    )
+
+                max_q_len = int(q_lens.max()) if num_seqs > 0 else 1
+                self._run_prefill_varlen_forward(
+                    total_tokens=total_tokens,
+                    num_seqs=num_seqs,
+                    num_sample_rows=num_sample,
+                    max_q_len=max_q_len,
+                )
+                if (self.rank == 0 or header.is_dspark_verify != 0) and num_sample > 0:
+                    self._copy_out_io_to_host(num_sample, parity)
 
         self.end_events[parity].record()
         return _LaunchedStep(
@@ -1486,7 +1677,59 @@ class Qwen35MoeStepRunner:
             num_sample=num_sample,
             sample_rows_np=sample_rows_np,
             slot_np=slot_np,
+            token_ids_np=tok_np,
+            positions_np=pos_np,
+            query_start_np=q_start_np,
+            is_speculative=header.is_dspark_verify != 0,
+            restored_seq_indices=restored_seq_indices,
         )
+
+    def _rollback_recurrent_states(self, verified: list[VerifiedSequence]) -> None:
+        if self.cached_conv_states is None or self.cached_ssm_states is None:
+            raise RuntimeError("speculative verification requires recurrent scratch states")
+        for sequence in verified:
+            num_drafts = len(sequence.rows) - 1
+            num_accepted = len(sequence.accepted_tokens)
+            if num_drafts <= 0 or num_accepted > num_drafts:
+                continue
+            scratch_slot = (
+                self.num_recurrent_checkpoints
+                + sequence.batch_index * 8
+                + num_accepted
+                - 1
+            )
+            self.conv_states[:, sequence.req_slot].copy_(
+                self.cached_conv_states[:, scratch_slot]
+            )
+            self.ssm_states[:, sequence.req_slot].copy_(
+                self.cached_ssm_states[:, scratch_slot]
+            )
+
+    def _speculative_results(
+        self, step: _LaunchedStep
+    ) -> list[SeqResult]:
+        sampled = self.out_io_cpu[step.parity, :, : step.num_sample].numpy()
+        verified = verify_batch(
+            predictions=sampled[0, :, 0],
+            logprob_bits=sampled[1, :, 0],
+            token_ids=step.token_ids_np,
+            sample_rows=step.sample_rows_np,
+            query_start_loc=step.query_start_np,
+            req_slot_ids=step.slot_np,
+        )
+        self._rollback_recurrent_states(verified)
+        drafts: dict[int, list[int]] = {}
+        if self.mtp_drafter is not None:
+            drafts = self.mtp_drafter.draft(
+                verified,
+                token_ids=step.token_ids_np,
+                positions=step.positions_np,
+                req_slot_ids=step.slot_np,
+                query_start_loc=step.query_start_np,
+                target_hidden=self.normed_buf,
+                apc_restored_seq_indices=step.restored_seq_indices,
+            )
+        return seq_results(verified, drafts) if self.rank == 0 else []
 
     def finish(self, step: _LaunchedStep | None) -> tuple[list[SeqResult], int]:
         """Wait for a step from `launch` and collect rank 0's sampled tokens."""
@@ -1497,12 +1740,12 @@ class Qwen35MoeStepRunner:
         sample_rows_np = step.sample_rows_np
         slot_np = step.slot_np
         self.end_events[parity].synchronize()
-        gpu_exec_us = max(
-            1, int(self.start_events[parity].elapsed_time(self.end_events[parity]) * 1000.0)
-        )
-
         outputs: list[SeqResult] = []
-        if self.rank == 0 and num_sample > 0:
+        if step.is_speculative:
+            outputs = self._speculative_results(step)
+            self.end_events[parity].record()
+            self.end_events[parity].synchronize()
+        elif self.rank == 0 and num_sample > 0:
             toks_out = self.out_io_cpu[parity, 0, :num_sample].tolist()
             lps_out = self.out_io_cpu[parity, 1, :num_sample].tolist()
             for i in range(num_sample):
@@ -1517,6 +1760,9 @@ class Qwen35MoeStepRunner:
                         runner_up_logprob_bits=int(lps_out[i][1]) & 0xFFFF_FFFF,
                     )
                 )
+        gpu_exec_us = max(
+            1, int(self.start_events[parity].elapsed_time(self.end_events[parity]) * 1000.0)
+        )
         return outputs, gpu_exec_us
 
     def signal_abort(self) -> None:
@@ -1527,6 +1773,10 @@ class Qwen35MoeStepRunner:
         if abort:
             self.signal_abort()
         self.decode_graphs.clear()
+        self.verify_graphs.clear()
+        if self.mtp_drafter is not None:
+            self.mtp_drafter.close()
+            self.mtp_drafter = None
         self.argmax_channel.close(abort=abort)
         self.communicator.close(abort=abort)
         self.nccl_group = None
