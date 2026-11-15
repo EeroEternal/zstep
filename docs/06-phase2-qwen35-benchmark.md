@@ -30,7 +30,7 @@ NVLink: 无；can_device_access_peer(i, j) == 0 (8x8 全 0)
 ## 2. Phase 2 端到端架构组件
 
 1. **纯 Rust 控制面连续批处理与 `in_flight_depth = 1` 重叠调度**：
-   * [`crates/zs-kv/src/radix.rs`](../crates/zs-kv/src/radix.rs)：提供基于 16-token 块粒度的 `PrefixTree`、引用计数 `RadixLease` 与 `KvCacheManager`（LRU 零引用驱逐 + RAII 块回收）。**该组件目前是独立的纯注意力 KV 组件，尚未接入 `Qwen3.5-35B-A3B` serving**；混合模型包含 `GatedDeltaNet`，必须先实现 block 边界的 recurrent state 快照，才能安全复用前缀状态。当前 serving 只使用 `zs_kv::BlockPool` 做物理页 RAII 管理，不声称启用了 Radix 前缀命中。
+   * [`crates/zs-kv/src/prefix_cache.rs`](../crates/zs-kv/src/prefix_cache.rs)：提供 `PrefixTree`、引用计数 `PrefixLease` 与 `KvCacheManager`（LRU 零引用驱逐 + RAII 块回收）。在 Phase 2 离线吞吐评测时尚未接入 `Qwen3.5-35B-A3B` serving（后续在线 `zstep serve` 已通过 64-token 节点 + 30 层 `GatedDeltaNet` 递推快照接入 APC）；本报告归档的离线 `--bench-tiers` 评测仅启用 `zs_kv::BlockPool` 物理页分配以保持零缓存对称口径。
    * [`crates/zs-scheduler/src/serving.rs`](../crates/zs-scheduler/src/serving.rs)：实现 `SlotPool`（RAII `SlotLease`）与 `ServingEngine`。在 8 张 GPU 执行第 `N` 步解码 CUDA Graph 的同时，Rust 主控在双缓冲的另一槽位预分配第 `N + 1` 步所需的 16-token KV 页并预写 `positions`、`req_slot_ids`、`seq_lens`、`global_kv_page_table` 与 `StepHeader`；待 `eventfd` 唤醒收割第 `N` 步采样出的 token 后，仅原地回填 `token_ids[0..num_seqs]`（`<= 512 B`）即刻发布第 `N + 1` 步。
 2. **`sm_120` 显式单路径 `Qwen3.5-35B-A3B` 执行器**：
    * [`worker/zstep_worker/kernels_sm120/qwen35_ops.py`](../worker/zstep_worker/kernels_sm120/qwen35_ops.py)：零中心 `(1 + w)` RMSNorm、融合 64 维部分 RoPE `theta=1e7` + 16-token 分页 KV 写入 prologue、`Split-K=16` 分页门控 GQA 解码与变长 FlashAttention-2 Prefill、`BLOCK_C=32` 因果深度可分离卷积 + `BLOCK_V=4` 寄存器递推 `GatedDeltaNet`、无全局回读的寄存器内 Top-8 路由 + 共享内存 `moe_align_block_size` + Triton Tensor Core 分组专家 GEMM、以及确定性 `local_top2_bf16_kernel`（按 `(logit DESC, token_id ASC)` 打破平局）+ 256 KiB 锁免共享内存 `tp8_argmax_gather`（跨 8 卡归约全局 Top-2 `(logit, token_id)` 并通过零膨胀 wire 槽位回传 Rust 控制面）。运行时审计明确监视 **`WATCHED_KERNELS=17`** 个 Triton kernel，要求 **`TRITON_RECOMPILATIONS=0`**；CUDA C++ JIT 扩展不计入这 17 个 Triton kernel。
@@ -42,7 +42,7 @@ NVLink: 无；can_device_access_peer(i, j) == 0 (8x8 全 0)
 
 | 测试项 | 覆盖内容 | 结果 |
 | :--- | :--- | :--- |
-| `cargo test --workspace` + `clippy -D warnings` | `zs-wire` 动态容量属性断言、`zs-shm`、`zs-kv` Radix 前缀树与 RAII 回收、`zs-scheduler` 连续批处理重叠状态机、按 `(round, tier)` 独立 SplitMix64 种子与 TTFT 聚合 | **28 passed, 0 warnings** |
+| `cargo test --workspace` + `clippy -D warnings` | `zs-wire` 动态容量属性断言、`zs-shm`、`zs-kv` `PrefixTree` 前缀树与 RAII 回收、`zs-scheduler` 连续批处理重叠状态机、按 `(round, tier)` 独立 SplitMix64 种子与 TTFT 聚合 | **28 passed, 0 warnings** |
 | [`test_qwen35_ops_sm120.py`](../worker/tests/phase2/test_qwen35_ops_sm120.py) | 零中心 RMSNorm + 零重编译断言、`GatedDeltaNet` 变长 Prefill 与单步递推逐位对齐、分页门控 GQA 对齐、**`530,000` 页（`8.6 GB`，偏移 `> 2^31` 元素）`int64` 寻址防溢出测试**、毒化初值下 256 专家 MoE 对齐、TP=8 全局 Top-2 精确平局打破与容量守卫 | **7 passed**（连同 `test_shm_layout_parity.py` 1 项与 `test_qwen35_e2e_tp8.py` 1 项共 **9 passed**） |
 | [`test_qwen35_e2e_tp8.py`](../worker/tests/phase2/test_qwen35_e2e_tp8.py) | 8 卡真权重对 5 个 vLLM 贪心参考（含 128-token 无循环结构化算术表）执行单序列、5 序列批处理（`bucket=8`）与 `--max-prefill-chunk 24`；逐分歧步断言双端 Top-2 logit margin `<= 0.25`（`<= 2` 个 BF16 ULP），并核对 17 个 Triton kernel 零重编译及 `/dev/shm` RAII 清理 | **1 passed**；**token 分歧与 Top-2 margin 如实保留，见下表** |
 

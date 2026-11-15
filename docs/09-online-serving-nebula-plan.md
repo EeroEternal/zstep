@@ -1,6 +1,6 @@
 # 09 — 在线 OpenAI HTTP 服务演进与 Nebula 跨仓联调开发计划（对应 Issue `#7`）
 
-> **状态**：Slice Z1–Z4 已实现（`zs-tokenizer`、`zs-scheduler::serve_loop`、`zs-server::serve`，支持 `zstep serve` / `zs-server serve`）  
+> **状态**：Slice Z1–Z5 已实现（`zs-tokenizer`、`zs-scheduler::serve_loop`、`zs-server::serve` 及在线 Automatic Prefix Caching，支持 `zstep serve` / `zs-server serve`）  
 > **需求基线**：`EeroEternal/zstep#7`（从 Benchmark CLI 演进为可长期运行的 OpenAI HTTP 服务）  
 > **对端契约**：`EeroEternal/nebula#92` 及 `docs/dev/zstep.md` / `docs/dev/zstep-plan.md`（`engine_type = "zstep"`）
 
@@ -35,8 +35,9 @@
 | `--max-seqs <N>` | 最大并发槽位数（`1..=128`，对齐 [`MAX_DECODE_GRAPH_SEQS`](../crates/zs-wire/src/lib.rs)） |
 | `--max-step-tokens <N>` | 单步最大 Token 容量（`ShmGeometry.max_step_tokens`） |
 | `--max-prefill-chunk <N>` | Chunked Prefill 块上限（默认 `2048`） |
-| `--page-block-tokens <N>` | 物理 KV 页大小（默认 `16`） |
-| `--tokenizer-mode <MODE>` | `auto` / `deepseek_v41`（强制走专用 `encode_messages`） |
+| `--page-block-tokens <N>` | 物理 KV 页大小（`deepseek_v41` 默认 `128`，其余默认 `16`） |
+| `--enable-prefix-caching` / `--no-enable-prefix-caching` | 启停在线 Automatic Prefix Caching（APC，默认开启） |
+| `--tokenizer-mode <MODE>` | `auto` / `deepseek_v41` / `chatml` |
 | `--max-waiting-requests <N>` | HTTP/调度有界等待队列上限（满载返 `429`） |
 | `--drain-timeout-secs <N>` | 收到 `SIGTERM` 后等待在途请求完成的最大秒数 |
 
@@ -67,7 +68,7 @@
 - `zstep:time_to_first_token_seconds` / `zstep:time_per_output_token_seconds`（Histogram）
 - `zstep:request_outcomes_total{outcome="finished|cancelled|rejected_overloaded|failed"}`（Counter）
 - `zstep:triton_recompilations_total`（Gauge/Counter：稳态必须为 `0`）
-- **三态规则**：P0/P1 未在线接入 [`radix.rs`](../crates/zs-kv/src/radix.rs) 前，**禁止输出** `zstep:prefix_cache_hits_total` / `zstep:prefix_cache_queries_total`（P2 接入后再暴露）。
+- **三态规则**：启用 `--enable-prefix-caching`（默认开启）时，`/metrics` 暴露 `zstep:prefix_cache_queries_total`、`zstep:prefix_cache_hits_total` 与 `zstep:prefix_cache_evictions_total`（且 `zstep:kv_cache_usage_perc` 按不可驱逐占用页 `capacity - reclaimable_kv_pages()` 统计）；显式传入 `--no-enable-prefix-caching` 时省略上述前缀缓存计数器，使 Nebula 解析为 `prefix_cache_hit_rate = None`。
 
 ---
 
@@ -77,4 +78,5 @@
 2. **PR-Z2（P0-2 常驻 `ServeLoop`）**：在 [`crates/zs-scheduler`](../crates/zs-scheduler/) 新增 `serve_loop.rs`，实现动态连续批处理（保留稳态 Decode `in_flight_depth = 1` 与混合步）、安全 Step 边界取消与 Worker 故障传染熔断；单测验证 50% 随机取消下 `SlotPool` 与 `BlockPool` 零泄漏。
 3. **PR-Z3（P0-3 `zs-server serve` HTTP/SSE & 四态探针）**：在 [`crates/zs-server`](../crates/zs-server/) 新增 `serve.rs`，打通 `/v1/models`、`/v1/chat/completions`（流式/非流式）、四态探针、`429` 背压与 `x-nebula-request-id` 追踪。
 4. **PR-Z4（P1 Metrics & `SIGTERM` Drain）**：补齐 `GET /metrics`、`SIGTERM` 优雅排空退出（`/dev/shm` 零残留）及与离线引擎的同 Trace 性能回归核验，随后与 Nebula `Slice N1/N2` 进行多副本真机合龙。
-5. **PR-ZN3（P2 采样 + 在线 Radix + Nebula KV 事件）**：扩展 GPU 侧 `temperature/top_p/top_k/seed` 采样；将 [`KvCacheManager`](../crates/zs-kv/src/radix.rs) 接入 `ServeLoop`；按 `NEBULA_KV_HASH_SEED` 实现 16-token `sha256_cbor` 块哈希与 ZMQ `BlockStored`/`BlockRemoved` 事件发布，接通 `nebula-indexd` 跨副本前缀亲和。
+5. **PR-Z5（已落地：在线 Automatic Prefix Caching / APC）**：将 [`PrefixTree` / `PrefixLease`](../crates/zs-kv/src/prefix_cache.rs) 接入 `ServingEngine` 与 `ServeLoop`，同时支持 `DeepSeek-V4.1-Flash` 128-token 页级复用与 `Qwen3.5-35B-A3B` 64-token 节点 + 30 层 `GatedDeltaNet` `(conv_state, ssm_state_vk)` 递推状态快照，打通 Nebula `enable_prefix_caching` 与 `prefix_cache_hit_rate`。
+6. **PR-ZN6（后续演进：非贪心采样 + Nebula 跨副本 KV 事件）**：扩展 GPU 侧 `temperature/top_p/top_k/seed` 采样；按 `NEBULA_KV_HASH_SEED` 发布块事件接通 `nebula-indexd` 跨副本前缀亲和。

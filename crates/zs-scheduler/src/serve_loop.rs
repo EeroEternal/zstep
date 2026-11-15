@@ -128,6 +128,9 @@ pub struct OnlineMetrics {
     pub tpot_count: AtomicU64,
     pub tpot_micros: AtomicU64,
     pub tpot_buckets: [AtomicU64; 10],
+    pub prefix_cache_queries: AtomicU64,
+    pub prefix_cache_hits: AtomicU64,
+    pub prefix_cache_evictions: AtomicU64,
     pub triton_recompilations: AtomicU64,
     pub max_active: AtomicU64,
 }
@@ -582,9 +585,17 @@ fn update_gauges(engine: &ServingEngine, online: &OnlineState, metrics: &OnlineM
         .kv_pages_capacity
         .store(capacity as u64, Ordering::Relaxed);
     metrics.kv_pages_used.store(
-        capacity.saturating_sub(engine.kv_pool.available()) as u64,
+        capacity.saturating_sub(engine.reclaimable_kv_pages()) as u64,
         Ordering::Relaxed,
     );
+    let (queries, hits, evictions) = engine.prefix_cache_counters();
+    metrics
+        .prefix_cache_queries
+        .store(queries, Ordering::Relaxed);
+    metrics.prefix_cache_hits.store(hits, Ordering::Relaxed);
+    metrics
+        .prefix_cache_evictions
+        .store(evictions, Ordering::Relaxed);
     metrics.triton_recompilations.store(
         u64::from(engine.coordinator.current_triton_recompilations()),
         Ordering::Relaxed,
@@ -920,12 +931,12 @@ fn online_step(
         max_seqs,
         page_block_tokens,
     );
-    let can_overlap_next = !post_admit_waiting_admissible
-        && !online.active.is_empty()
-        && online.active.iter().all(|seq| {
-            seq.prefilled_tokens == seq.prompt_tokens.len()
-                && seq.generated_tokens.len() + 1 < seq.target_output_len
-        });
+    let can_overlap_next = decode_continues_for_all(
+        &online.active,
+        post_admit_waiting_admissible,
+        0,
+        engine.has_prefix_cache(),
+    );
     if can_overlap_next {
         let next_sid = engine.step_cursor + 1;
         engine.stage_decode_step(
@@ -960,6 +971,8 @@ fn online_step(
             .map(|output| (output.req_slot, output.accepted_tokens[0]))
             .collect()
     };
+
+    engine.promote_completed_prefixes(&mut online.active, max_pages_per_seq)?;
 
     for (req_slot, token) in emitted {
         let idx = *online
@@ -1359,6 +1372,7 @@ mod tests {
                 &online.waiting,
                 &slot_pool,
                 &kv_pool,
+                None,
                 max_seqs,
                 page_block_tokens,
             ) {
@@ -1373,9 +1387,15 @@ mod tests {
                 let mut seq = ActiveSequence {
                     request_id: req.request_id,
                     slot_lease,
+                    prefix_lease: None,
                     kv_leases: Vec::new(),
                     page_ids: Vec::new(),
                     prefilled_tokens: req.prompt_tokens.len() / 2,
+                    computed_prompt_tokens: req.prompt_tokens.len() / 2,
+                    cached_prefix_tokens: 0,
+                    restore_checkpoint_id: -1,
+                    pending_checkpoints: Vec::new(),
+                    checkpoint_alloc_stopped: false,
                     current_seq_len: req.prompt_tokens.len() / 2,
                     last_token: 11,
                     prompt_tokens: req.prompt_tokens,
@@ -1535,10 +1555,16 @@ mod tests {
         online.active.push(ActiveSequence {
             request_id: 1,
             slot_lease: slot,
+            prefix_lease: None,
             kv_leases: vec![page_lease],
             page_ids: vec![page_id],
             prompt_tokens: vec![10, 11],
             prefilled_tokens: 2,
+            computed_prompt_tokens: 2,
+            cached_prefix_tokens: 0,
+            restore_checkpoint_id: -1,
+            pending_checkpoints: Vec::new(),
+            checkpoint_alloc_stopped: false,
             current_seq_len: 2,
             last_token: 151645,
             generated_tokens: vec![151645],
@@ -1609,5 +1635,222 @@ mod tests {
         handle.shutdown();
         assert!(handle.join(Duration::from_secs(2)));
         assert_eq!(handle.state(), EngineState::Draining);
+    }
+
+    #[test]
+    fn apc_hybrid_cancellation_across_prefill_and_decode_leaks_zero_kv_or_checkpoint_slots() {
+        let max_seqs = 6usize;
+        let max_pages_per_seq = 16usize;
+        let page_block_tokens = 16usize;
+        let pages_per_node = 4usize; // 64 tokens per hybrid node
+        let kv_capacity = 64usize;
+        let ckpt_capacity = 12usize;
+        let dummy_page = kv_capacity as i32;
+
+        let slot_pool = SlotPool::new(max_seqs as u32);
+        let kv_pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, kv_capacity);
+        let ckpt_pool = BlockPool::new(CacheGroupKind::RecurrentState, ckpt_capacity);
+        let mut tree = PrefixTree::with_pages_per_node(64, pages_per_node).expect("tree");
+        let mut shadow_pt = vec![dummy_page; max_seqs * max_pages_per_seq];
+        let mut dirty_pt_slots = [0u128; 2];
+        let pending = Arc::new(AtomicU64::new(0));
+        let metrics = OnlineMetrics::default();
+        let mut queries = 0u64;
+        let mut hits = 0u64;
+        let mut evictions = 0u64;
+
+        let mut online = OnlineState {
+            waiting: VecDeque::new(),
+            active: Vec::new(),
+            slot_to_active: vec![usize::MAX; max_seqs],
+            meta: HashMap::new(),
+            cancelled: HashSet::new(),
+            completed_stops: HashSet::new(),
+            eos_tokens: vec![2],
+            next_request_id: 1,
+            max_waiting: 64,
+            pre_staged: None,
+            consecutive_prefills: 0,
+            steps: 0,
+            pending: Arc::clone(&pending),
+        };
+
+        let mut rng = 0xCAFE_BABE_1234_5678u64;
+        for _ in 0..120u64 {
+            rng = splitmix64(rng);
+            let arrivals = (rng % 3) + 1;
+            for _ in 0..arrivals {
+                let id = online.next_request_id;
+                online.next_request_id += 1;
+                rng = splitmix64(rng);
+                let prefix_family = (rng % 3) as i32;
+                let suffix_len = 8 + (rng as usize % 24);
+                let mut prompt = vec![100 + prefix_family; 64];
+                prompt.extend(std::iter::repeat_n(200 + (id as i32 % 7), suffix_len));
+                let target_out = 4 + (rng as usize % 16);
+                pending.fetch_add(1, Ordering::Relaxed);
+                online.meta.insert(
+                    id,
+                    OnlineSequenceMeta {
+                        sink: Arc::new(|_| {}),
+                    },
+                );
+                online.waiting.push_back(PendingRequest {
+                    request_id: id as usize,
+                    prompt_tokens: prompt,
+                    target_output_len: target_out,
+                    permit_time: Instant::now(),
+                    submit_time: Instant::now(),
+                });
+            }
+
+            while front_request_admissible_in_pools(
+                &online.active,
+                &online.waiting,
+                &slot_pool,
+                &kv_pool,
+                Some(&tree),
+                max_seqs,
+                page_block_tokens,
+            ) {
+                let req = online.waiting.pop_front().expect("front");
+                let slot_lease = slot_pool.allocate().expect("slot");
+                let slot_id = slot_lease.id() as usize;
+                let demand = request_kv_page_demand(
+                    req.prompt_tokens.len(),
+                    req.target_output_len,
+                    page_block_tokens,
+                );
+                let mut seq = admit_request_into_sequence(
+                    req,
+                    slot_lease,
+                    demand,
+                    max_pages_per_seq,
+                    Some(&mut tree),
+                    true,
+                    &mut queries,
+                    &mut hits,
+                    &mut shadow_pt,
+                    &mut dirty_pt_slots,
+                )
+                .expect("admit");
+                let first_end = if seq.prefilled_tokens == 0 {
+                    64
+                } else {
+                    seq.prompt_tokens.len()
+                };
+                seq.prefilled_tokens = first_end;
+                seq.current_seq_len = first_end;
+                seq.ensure_kv_pages_with_cache(
+                    first_end,
+                    page_block_tokens,
+                    max_pages_per_seq,
+                    &kv_pool,
+                    Some(&mut tree),
+                    &mut evictions,
+                    &mut shadow_pt,
+                    &mut dirty_pt_slots,
+                )
+                .expect("initial prefill pages");
+                if first_end == 64 && seq.cached_prefix_tokens == 0 {
+                    if ckpt_pool.available() == 0 {
+                        let _ = tree.evict_lru(1);
+                    }
+                    if let Some(ckpt) = ckpt_pool.allocate(1) {
+                        seq.pending_checkpoints.push((64, ckpt));
+                    }
+                }
+                online.slot_to_active[slot_id] = online.active.len();
+                online.active.push(seq);
+            }
+
+            promote_completed_prefixes_in_batch(
+                &mut online.active,
+                Some(&mut tree),
+                true,
+                pages_per_node,
+                max_pages_per_seq,
+                &mut shadow_pt,
+                &mut dirty_pt_slots,
+            )
+            .expect("promote completed prefixes");
+
+            for seq in &mut online.active {
+                if seq.prefilled_tokens < seq.prompt_tokens.len() {
+                    seq.prefilled_tokens = seq.prompt_tokens.len();
+                    seq.current_seq_len = seq.prompt_tokens.len();
+                } else {
+                    seq.current_seq_len += 1;
+                    seq.generated_tokens.push(42);
+                    seq.last_token = 42;
+                }
+                seq.ensure_kv_pages_with_cache(
+                    seq.current_seq_len,
+                    page_block_tokens,
+                    max_pages_per_seq,
+                    &kv_pool,
+                    Some(&mut tree),
+                    &mut evictions,
+                    &mut shadow_pt,
+                    &mut dirty_pt_slots,
+                )
+                .expect("step kv growth");
+            }
+
+            for seq in &online.active {
+                rng = splitmix64(rng);
+                if rng & 1 == 0 {
+                    online.cancelled.insert(seq.request_id as u64);
+                }
+            }
+            for req in &online.waiting {
+                rng = splitmix64(rng);
+                if rng & 1 == 0 {
+                    online.cancelled.insert(req.request_id as u64);
+                }
+            }
+
+            reclaim_stopped_and_cancelled(
+                &mut shadow_pt,
+                &mut dirty_pt_slots,
+                max_pages_per_seq,
+                dummy_page,
+                &mut online,
+                &metrics,
+            );
+            retire_completed_sequences(
+                &mut shadow_pt,
+                &mut dirty_pt_slots,
+                max_pages_per_seq,
+                dummy_page,
+                &mut online,
+                &metrics,
+            );
+        }
+
+        for req in &online.waiting {
+            online.cancelled.insert(req.request_id as u64);
+        }
+        for seq in &online.active {
+            online.cancelled.insert(seq.request_id as u64);
+        }
+        reclaim_stopped_and_cancelled(
+            &mut shadow_pt,
+            &mut dirty_pt_slots,
+            max_pages_per_seq,
+            dummy_page,
+            &mut online,
+            &metrics,
+        );
+
+        assert!(online.active.is_empty());
+        assert!(online.waiting.is_empty());
+        assert_eq!(slot_pool.available(), max_seqs);
+        assert_eq!(tree.cached_kv_pages(), tree.evictable_kv_pages());
+        assert_eq!(kv_pool.available() + tree.cached_kv_pages(), kv_capacity);
+        let _ = tree.evict_lru(usize::MAX);
+        assert_eq!(kv_pool.available(), kv_capacity);
+        assert_eq!(ckpt_pool.available(), ckpt_capacity);
+        assert!(hits > 0, "expected warm APC prefix hits across 120 steps");
     }
 }

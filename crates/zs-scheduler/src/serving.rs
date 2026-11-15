@@ -30,7 +30,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use zs_kv::{BlockLease, BlockPool, CacheGroupKind};
+use zs_kv::{BlockLease, BlockPool, CacheGroupKind, PrefixLease, PrefixTree};
 use zs_wire::{
     DECODE_GRAPH_BUCKETS, MAX_DECODE_GRAPH_SEQS, STEP_FLAG_DECODE_ONLY, STEP_FLAG_DEVICE_TOKENS,
     STEP_FLAG_NEXT_PREPUBLISHED, StepHeader, StepOpcode,
@@ -548,10 +548,23 @@ struct PendingRequest {
 struct ActiveSequence {
     request_id: usize,
     slot_lease: SlotLease,
+    /// Pinned prefix nodes reused or promoted into `PrefixTree` (`0..cached_pages`).
+    prefix_lease: Option<PrefixLease>,
+    /// Exclusively owned single-page `BlockLease`s for `cached_pages..page_ids.len()`.
     kv_leases: Vec<BlockLease>,
     page_ids: Vec<i32>,
     prompt_tokens: Vec<i32>,
     prefilled_tokens: usize,
+    /// Prompt tokens whose GPU prefill step has completed (`<= prefilled_tokens`).
+    computed_prompt_tokens: usize,
+    /// Prefix tokens satisfied from `PrefixTree` at admission (`< prompt_tokens.len()`).
+    cached_prefix_tokens: usize,
+    /// Hybrid recurrent checkpoint slot ID to restore on the first prefill chunk (`-1` = none).
+    restore_checkpoint_id: i32,
+    /// Pending `(end_tokens, recurrent_slot_lease)` checkpoints staged for the in-flight prefill.
+    pending_checkpoints: Vec<(usize, BlockLease)>,
+    /// Stops further checkpoint slot allocation for this sequence once a boundary misses.
+    checkpoint_alloc_stopped: bool,
     current_seq_len: usize,
     last_token: i32,
     generated_tokens: Vec<i32>,
@@ -565,13 +578,56 @@ struct ActiveSequence {
     last_token_time: Option<Instant>,
 }
 
+fn allocate_kv_pages_with_eviction(
+    delta: usize,
+    kv_pool: &BlockPool,
+    prefix_tree: Option<&mut PrefixTree>,
+    evictions_pages: &mut u64,
+) -> Option<BlockLease> {
+    if kv_pool.available() < delta
+        && let Some(tree) = prefix_tree
+    {
+        let shortfall = delta - kv_pool.available();
+        let nodes_needed = shortfall.div_ceil(tree.pages_per_node());
+        let evicted_nodes = tree.evict_lru(nodes_needed);
+        *evictions_pages += (evicted_nodes * tree.pages_per_node()) as u64;
+    }
+    kv_pool.allocate(delta)
+}
+
 impl ActiveSequence {
+    #[cfg(test)]
     fn ensure_kv_pages(
         &mut self,
         target_seq_len: usize,
         page_block_tokens: usize,
         max_pages_per_seq: usize,
         kv_pool: &BlockPool,
+        shadow_page_table: &mut [i32],
+        dirty_pt_slots: &mut [u128; 2],
+    ) -> Result<()> {
+        let mut ignored_evictions = 0u64;
+        self.ensure_kv_pages_with_cache(
+            target_seq_len,
+            page_block_tokens,
+            max_pages_per_seq,
+            kv_pool,
+            None,
+            &mut ignored_evictions,
+            shadow_page_table,
+            dirty_pt_slots,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_kv_pages_with_cache(
+        &mut self,
+        target_seq_len: usize,
+        page_block_tokens: usize,
+        max_pages_per_seq: usize,
+        kv_pool: &BlockPool,
+        prefix_tree: Option<&mut PrefixTree>,
+        evictions_pages: &mut u64,
         shadow_page_table: &mut [i32],
         dirty_pt_slots: &mut [u128; 2],
     ) -> Result<()> {
@@ -583,12 +639,14 @@ impl ActiveSequence {
         }
         if needed_pages > self.page_ids.len() {
             let delta = needed_pages - self.page_ids.len();
-            let lease = kv_pool.allocate(delta).ok_or_else(|| {
-                EngineError::Protocol(format!(
-                    "KV BlockPool exhausted allocating {delta} pages (free={})",
-                    kv_pool.available()
-                ))
-            })?;
+            let lease =
+                allocate_kv_pages_with_eviction(delta, kv_pool, prefix_tree, evictions_pages)
+                    .ok_or_else(|| {
+                        EngineError::Protocol(format!(
+                            "KV BlockPool exhausted allocating {delta} pages (free={})",
+                            kv_pool.available()
+                        ))
+                    })?;
             let slot_id = self.slot_lease.id() as usize;
             let slot_row_base = slot_id * max_pages_per_seq;
             for &pid in lease.ids() {
@@ -599,7 +657,7 @@ impl ActiveSequence {
             let dirty_bit = 1u128 << slot_id;
             dirty_pt_slots[0] |= dirty_bit;
             dirty_pt_slots[1] |= dirty_bit;
-            self.kv_leases.push(lease);
+            self.kv_leases.extend(lease.split_individual());
         }
         Ok(())
     }
@@ -652,6 +710,12 @@ pub struct ServingEngine {
     coordinator: WorkerCoordinator,
     slot_pool: SlotPool,
     kv_pool: BlockPool,
+    prefix_tree: Option<PrefixTree>,
+    recurrent_pool: Option<BlockPool>,
+    pages_per_prefix_node: usize,
+    prefix_cache_queries_tokens: u64,
+    prefix_cache_hits_tokens: u64,
+    prefix_cache_evictions_pages: u64,
     shadow_page_table: Vec<i32>,
     dirty_pt_slots: [u128; 2],
     step_cursor: u64,
@@ -684,13 +748,235 @@ fn decode_continues_for_all(
     active: &[ActiveSequence],
     waiting_admissible: bool,
     in_flight: usize,
+    has_prefix_cache: bool,
 ) -> bool {
     !waiting_admissible
         && !active.is_empty()
         && active.iter().all(|seq| {
             seq.prefilled_tokens == seq.prompt_tokens.len()
+                && (!has_prefix_cache || seq.computed_prompt_tokens == seq.prompt_tokens.len())
                 && seq.generated_tokens.len() + in_flight + 1 < seq.target_output_len
         })
+}
+
+/// Peek prefix-cache reuse and reservation headroom without mutating LRU ticks or pins.
+///
+/// Returns `(demand_pages, cached_prefix_tokens, extra_demand_pages, reclaimable_after_pin)`.
+fn peek_request_admission(
+    prompt_tokens: &[i32],
+    target_output_len: usize,
+    page_block_tokens: usize,
+    kv_pool: &BlockPool,
+    prefix_tree: Option<&PrefixTree>,
+) -> (usize, usize, usize, usize) {
+    let demand_pages =
+        request_kv_page_demand(prompt_tokens.len(), target_output_len, page_block_tokens);
+    if let Some(tree) = prefix_tree {
+        let node_tokens = tree.block_tokens() as usize;
+        let max_reusable_nodes = prompt_tokens.len().saturating_sub(1) / node_tokens;
+        let (matched_nodes, unpinned_matched_nodes) =
+            tree.peek_prefix_bounded(prompt_tokens, max_reusable_nodes);
+        let pages_per_node = tree.pages_per_node();
+        let matched_pages = matched_nodes * pages_per_node;
+        let newly_pinned_pages = unpinned_matched_nodes * pages_per_node;
+        let reclaimable_after_pin =
+            kv_pool.available() + tree.evictable_kv_pages().saturating_sub(newly_pinned_pages);
+        let extra_demand = demand_pages.saturating_sub(matched_pages);
+        (
+            demand_pages,
+            matched_nodes * node_tokens,
+            extra_demand,
+            reclaimable_after_pin,
+        )
+    } else {
+        (demand_pages, 0, demand_pages, kv_pool.available())
+    }
+}
+
+/// Admit `req` into `ActiveSequence`, pinning any matched prefix nodes in `prefix_tree`.
+#[allow(clippy::too_many_arguments)]
+fn admit_request_into_sequence(
+    req: PendingRequest,
+    slot_lease: SlotLease,
+    demand_pages: usize,
+    max_pages_per_seq: usize,
+    prefix_tree: Option<&mut PrefixTree>,
+    has_recurrent_pool: bool,
+    queries_tokens: &mut u64,
+    hits_tokens: &mut u64,
+    shadow_page_table: &mut [i32],
+    dirty_pt_slots: &mut [u128; 2],
+) -> Result<ActiveSequence> {
+    let slot_id = slot_lease.id() as usize;
+    let last_token = *req.prompt_tokens.last().unwrap_or(&0);
+    let mut prefix_lease = None;
+    let mut page_ids = Vec::new();
+    let mut cached_tokens = 0usize;
+    let mut restore_checkpoint_id = -1i32;
+
+    if let Some(tree) = prefix_tree {
+        *queries_tokens += req.prompt_tokens.len() as u64;
+        let node_tokens = tree.block_tokens() as usize;
+        let max_reusable_nodes = req.prompt_tokens.len().saturating_sub(1) / node_tokens;
+        let lease = tree.match_prefix_bounded(&req.prompt_tokens, max_reusable_nodes);
+        cached_tokens = lease.matched_tokens() as usize;
+        *hits_tokens += cached_tokens as u64;
+        if cached_tokens > 0 {
+            if lease.block_ids().len() > max_pages_per_seq {
+                return Err(EngineError::Protocol(format!(
+                    "matched prefix pages {} exceed max_pages_per_seq {max_pages_per_seq}",
+                    lease.block_ids().len()
+                )));
+            }
+            if has_recurrent_pool {
+                restore_checkpoint_id = lease.leaf_aux_id().ok_or_else(|| {
+                    EngineError::Protocol(
+                        "hybrid prefix node missing recurrent checkpoint slot".to_owned(),
+                    )
+                })?;
+            }
+            page_ids.extend_from_slice(lease.block_ids());
+            let row_base = slot_id * max_pages_per_seq;
+            shadow_page_table[row_base..row_base + page_ids.len()].copy_from_slice(&page_ids);
+            let dirty_bit = 1u128 << slot_id;
+            dirty_pt_slots[0] |= dirty_bit;
+            dirty_pt_slots[1] |= dirty_bit;
+        }
+        prefix_lease = Some(lease);
+    }
+
+    Ok(ActiveSequence {
+        request_id: req.request_id,
+        slot_lease,
+        prefix_lease,
+        kv_leases: Vec::new(),
+        page_ids,
+        prompt_tokens: req.prompt_tokens,
+        prefilled_tokens: cached_tokens,
+        computed_prompt_tokens: cached_tokens,
+        cached_prefix_tokens: cached_tokens,
+        restore_checkpoint_id,
+        pending_checkpoints: Vec::new(),
+        checkpoint_alloc_stopped: false,
+        current_seq_len: cached_tokens,
+        last_token,
+        generated_tokens: Vec::with_capacity(req.target_output_len),
+        generated_top2: Vec::new(),
+        target_output_len: req.target_output_len,
+        reserved_pages: demand_pages,
+        permit_time: req.permit_time,
+        submit_time: req.submit_time,
+        first_token_time: None,
+        last_token_time: None,
+    })
+}
+
+/// Promote newly completed full prompt prefix nodes of `active` into `prefix_tree`.
+fn promote_completed_prefixes_in_batch(
+    active: &mut [ActiveSequence],
+    mut prefix_tree: Option<&mut PrefixTree>,
+    has_recurrent_pool: bool,
+    pages_per_node: usize,
+    max_pages_per_seq: usize,
+    shadow_page_table: &mut [i32],
+    dirty_pt_slots: &mut [u128; 2],
+) -> Result<()> {
+    for seq in active.iter_mut() {
+        if seq.computed_prompt_tokens >= seq.prefilled_tokens {
+            continue;
+        }
+        seq.computed_prompt_tokens = seq.prefilled_tokens;
+        let Some(tree) = prefix_tree.as_deref_mut() else {
+            continue;
+        };
+        let node_tokens = tree.block_tokens() as usize;
+        let already_promoted_nodes = seq
+            .prefix_lease
+            .as_ref()
+            .map_or(0, PrefixLease::matched_nodes);
+        let total_completed_nodes = seq.computed_prompt_tokens / node_tokens;
+        if total_completed_nodes <= already_promoted_nodes {
+            continue;
+        }
+
+        let mut aux_leases = Vec::new();
+        let promotable_nodes = if has_recurrent_pool {
+            let mut count = 0usize;
+            for node_idx in already_promoted_nodes..total_completed_nodes {
+                let expected_end = (node_idx + 1) * node_tokens;
+                if seq
+                    .pending_checkpoints
+                    .first()
+                    .is_some_and(|(end, _)| *end == expected_end)
+                {
+                    let (_, ckpt_lease) = seq.pending_checkpoints.remove(0);
+                    aux_leases.push(ckpt_lease);
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            count
+        } else {
+            total_completed_nodes - already_promoted_nodes
+        };
+        if promotable_nodes == 0 {
+            continue;
+        }
+
+        let promote_pages = promotable_nodes * pages_per_node;
+        if seq.kv_leases.len() < promote_pages {
+            return Err(EngineError::Protocol(format!(
+                "sequence {} holds {} exclusive KV leases, fewer than {} promotable prefix pages",
+                seq.request_id,
+                seq.kv_leases.len(),
+                promote_pages
+            )));
+        }
+        let drained: Vec<BlockLease> = seq.kv_leases.drain(..promote_pages).collect();
+        let mut node_kv_leases = Vec::with_capacity(promotable_nodes);
+        let mut iter = drained.into_iter();
+        for _ in 0..promotable_nodes {
+            let chunk: Vec<BlockLease> = iter.by_ref().take(pages_per_node).collect();
+            let merged = BlockLease::merge(chunk).ok_or_else(|| {
+                EngineError::Protocol("failed to merge per-node KV BlockLeases".to_owned())
+            })?;
+            node_kv_leases.push(merged);
+        }
+
+        let start_tokens = already_promoted_nodes * node_tokens;
+        let target_tokens = (already_promoted_nodes + promotable_nodes) * node_tokens;
+        let existing_lease = seq
+            .prefix_lease
+            .take()
+            .unwrap_or_else(|| tree.match_prefix_bounded(&[], 0));
+        let new_aux = if has_recurrent_pool {
+            Some(aux_leases)
+        } else {
+            None
+        };
+        let new_prefix_lease = tree
+            .extend_prefix_with_aux(
+                existing_lease,
+                &seq.prompt_tokens[start_tokens..target_tokens],
+                node_kv_leases,
+                new_aux,
+            )
+            .map_err(|err| EngineError::Protocol(err.to_string()))?;
+        let canonical_pages = new_prefix_lease.block_ids();
+        let slot_id = seq.slot_lease.id() as usize;
+        let row_base = slot_id * max_pages_per_seq;
+        if seq.page_ids[..canonical_pages.len()] != *canonical_pages {
+            seq.page_ids[..canonical_pages.len()].copy_from_slice(canonical_pages);
+            shadow_page_table[row_base..row_base + canonical_pages.len()]
+                .copy_from_slice(canonical_pages);
+            let dirty_bit = 1u128 << slot_id;
+            dirty_pt_slots[0] |= dirty_bit;
+            dirty_pt_slots[1] |= dirty_bit;
+        }
+        seq.prefix_lease = Some(new_prefix_lease);
+    }
+    Ok(())
 }
 
 /// KV pages a request occupies at its longest. The last sampled token is never fed back,
@@ -724,21 +1010,26 @@ fn front_request_admissible_in_pools(
     waiting_permitted: &VecDeque<PendingRequest>,
     slot_pool: &SlotPool,
     kv_pool: &BlockPool,
+    prefix_tree: Option<&PrefixTree>,
     max_seqs: usize,
     page_block_tokens: usize,
 ) -> bool {
     waiting_permitted.front().is_some_and(|req| {
-        active.len() < max_seqs
-            && slot_pool.available() > 0
-            && kv_demand_fits(
-                kv_pool.available(),
-                outstanding_reserved_pages(active),
-                request_kv_page_demand(
-                    req.prompt_tokens.len(),
-                    req.target_output_len,
-                    page_block_tokens,
-                ),
-            )
+        if active.len() >= max_seqs || slot_pool.available() == 0 {
+            return false;
+        }
+        let (_, _, extra_demand, reclaimable_after_pin) = peek_request_admission(
+            &req.prompt_tokens,
+            req.target_output_len,
+            page_block_tokens,
+            kv_pool,
+            prefix_tree,
+        );
+        kv_demand_fits(
+            reclaimable_after_pin,
+            outstanding_reserved_pages(active),
+            extra_demand,
+        )
     })
 }
 
@@ -815,6 +1106,12 @@ impl ServingEngine {
             coordinator,
             slot_pool: SlotPool::new(geometry.max_seqs),
             kv_pool: BlockPool::new(CacheGroupKind::GlobalAndIndex, num_kv_pages),
+            prefix_tree: None,
+            recurrent_pool: None,
+            pages_per_prefix_node: 1,
+            prefix_cache_queries_tokens: 0,
+            prefix_cache_hits_tokens: 0,
+            prefix_cache_evictions_pages: 0,
             shadow_page_table,
             dirty_pt_slots: [0, 0],
             step_cursor: 0,
@@ -826,6 +1123,78 @@ impl ServingEngine {
             poisoned: false,
             last_generation_schedule: GenerationScheduleStats::default(),
         })
+    }
+
+    /// Enable Automatic Prefix Caching (APC) across requests.
+    ///
+    /// - Pure paged attention (`DeepSeek-V4.1-Flash`): `pages_per_node = 1` (128 tok/node),
+    ///   `num_recurrent_checkpoints = 0`.
+    /// - Hybrid `GatedDeltaNet` (`Qwen3.5-35B-A3B`): `pages_per_node = 4` (64 tok/node),
+    ///   `num_recurrent_checkpoints = 255` (slot IDs `0..=254` in SHM `replay_mask`).
+    pub fn enable_prefix_caching(
+        &mut self,
+        pages_per_node: usize,
+        num_recurrent_checkpoints: usize,
+    ) -> Result<()> {
+        if pages_per_node == 0 {
+            return Err(EngineError::Protocol(
+                "pages_per_node must be positive".to_owned(),
+            ));
+        }
+        if num_recurrent_checkpoints > 255 {
+            return Err(EngineError::Protocol(format!(
+                "num_recurrent_checkpoints={num_recurrent_checkpoints} exceeds uint8 SHM limit 255"
+            )));
+        }
+        let page_block_tokens = self.coordinator.config().geometry.page_block_tokens;
+        let node_tokens = page_block_tokens
+            .checked_mul(pages_per_node as u32)
+            .ok_or_else(|| EngineError::Protocol("prefix node_tokens overflow".to_owned()))?;
+        let tree = PrefixTree::with_pages_per_node(node_tokens, pages_per_node)
+            .map_err(|err| EngineError::Protocol(err.to_string()))?;
+        self.prefix_tree = Some(tree);
+        self.pages_per_prefix_node = pages_per_node;
+        self.recurrent_pool = (num_recurrent_checkpoints > 0)
+            .then(|| BlockPool::new(CacheGroupKind::RecurrentState, num_recurrent_checkpoints));
+        Ok(())
+    }
+
+    pub fn has_prefix_cache(&self) -> bool {
+        self.prefix_tree.is_some()
+    }
+
+    /// Free physical KV pages plus unpinned `PrefixTree` pages reclaimable via LRU eviction.
+    pub fn reclaimable_kv_pages(&self) -> usize {
+        self.kv_pool.available()
+            + self
+                .prefix_tree
+                .as_ref()
+                .map_or(0, PrefixTree::evictable_kv_pages)
+    }
+
+    /// Cumulative `(queries_tokens, hits_tokens, evicted_kv_pages)` counters.
+    pub fn prefix_cache_counters(&self) -> (u64, u64, u64) {
+        (
+            self.prefix_cache_queries_tokens,
+            self.prefix_cache_hits_tokens,
+            self.prefix_cache_evictions_pages,
+        )
+    }
+
+    fn promote_completed_prefixes(
+        &mut self,
+        active: &mut [ActiveSequence],
+        max_pages_per_seq: usize,
+    ) -> Result<()> {
+        promote_completed_prefixes_in_batch(
+            active,
+            self.prefix_tree.as_mut(),
+            self.recurrent_pool.is_some(),
+            self.pages_per_prefix_node,
+            max_pages_per_seq,
+            &mut self.shadow_page_table,
+            &mut self.dirty_pt_slots,
+        )
     }
 
     pub fn worker_numa_nodes(&self) -> &[i32] {
@@ -889,6 +1258,7 @@ impl ServingEngine {
             waiting_permitted,
             &self.slot_pool,
             &self.kv_pool,
+            self.prefix_tree.as_ref(),
             max_seqs,
             page_block_tokens,
         )
@@ -1243,7 +1613,7 @@ impl ServingEngine {
                         );
                     if run_prefill {
                         let continued_chunk = active.iter().any(|seq| {
-                            seq.prefilled_tokens > 0
+                            seq.prefilled_tokens > seq.cached_prefix_tokens
                                 && seq.prefilled_tokens < seq.prompt_tokens.len()
                         });
                         self.stage_prefill_step(
@@ -1292,12 +1662,18 @@ impl ServingEngine {
                 page_block_tokens,
             );
 
+            let has_prefix_cache = self.has_prefix_cache();
             let publish_next = match ahead_promise {
                 Some(promise) => promise,
                 None => {
                     let promise = self.device_token_overlap
                         && self.plan_flags(step_id)? & STEP_FLAG_DECODE_ONLY != 0
-                        && decode_continues_for_all(&active, waiting_admissible, 0);
+                        && decode_continues_for_all(
+                            &active,
+                            waiting_admissible,
+                            0,
+                            has_prefix_cache,
+                        );
                     if promise {
                         self.or_plan_flags(step_id, STEP_FLAG_NEXT_PREPUBLISHED)?;
                     }
@@ -1321,7 +1697,8 @@ impl ServingEngine {
                     max_pages_per_seq,
                     true,
                 )?;
-                let promise = decode_continues_for_all(&active, waiting_admissible, 1);
+                let promise =
+                    decode_continues_for_all(&active, waiting_admissible, 1, has_prefix_cache);
                 let mut flags = STEP_FLAG_DEVICE_TOKENS;
                 if promise {
                     flags |= STEP_FLAG_NEXT_PREPUBLISHED;
@@ -1336,12 +1713,7 @@ impl ServingEngine {
             // sequence still needs >= 2 tokens (so none retires after `step_id`), pre-allocate
             // pages and pre-write `plan_slot(step_id + 1)` while the 8 GPUs execute `step_id`.
             let can_overlap_next = !publish_next
-                && !waiting_admissible
-                && !active.is_empty()
-                && active.iter().all(|seq| {
-                    seq.prefilled_tokens == seq.prompt_tokens.len()
-                        && seq.generated_tokens.len() + 1 < seq.target_output_len
-                });
+                && decode_continues_for_all(&active, waiting_admissible, 0, has_prefix_cache);
 
             if can_overlap_next {
                 let next_sid = self.step_cursor + 1;
@@ -1388,6 +1760,8 @@ impl ServingEngine {
                     })
                     .collect()
             };
+
+            self.promote_completed_prefixes(&mut active, max_pages_per_seq)?;
 
             let collect_top2 = completed_top2.is_some();
             for (req_slot, tok, tok2, lp1_bits, lp2_bits) in emitted {
@@ -1448,7 +1822,7 @@ impl ServingEngine {
             let mut idx = 0;
             while idx < active.len() {
                 if active[idx].generated_tokens.len() >= active[idx].target_output_len {
-                    let finished = active.swap_remove(idx);
+                    let mut finished = active.swap_remove(idx);
                     let freed_slot = finished.slot_lease.id() as usize;
                     slot_to_active[freed_slot] = usize::MAX;
                     let row_start = freed_slot * max_pages_per_seq;
@@ -1470,12 +1844,12 @@ impl ServingEngine {
                         let denom = (finished.generated_tokens.len() - 1) as u64;
                         tpots_us.push(span_us / denom);
                     }
-                    completed[finished.request_id] = finished.generated_tokens;
+                    completed[finished.request_id] = std::mem::take(&mut finished.generated_tokens);
                     if let Some(top2_out) = completed_top2.as_deref_mut() {
-                        top2_out[finished.request_id] = finished.generated_top2;
+                        top2_out[finished.request_id] =
+                            std::mem::take(&mut finished.generated_top2);
                     }
-                    drop(finished.kv_leases);
-                    drop(finished.slot_lease);
+                    drop(finished);
 
                     // Release concurrency permit immediately to next waiting request
                     if let Some((req_id, prompt, target_out, submit_time)) =
@@ -1555,21 +1929,27 @@ impl ServingEngine {
                     "prompt length must be positive".to_owned(),
                 ));
             }
+            let (demand_pages, cached_tokens, extra_demand, reclaimable_after_pin) =
+                peek_request_admission(
+                    &front.prompt_tokens,
+                    front.target_output_len,
+                    page_block_tokens,
+                    &self.kv_pool,
+                    self.prefix_tree.as_ref(),
+                );
             let Some((chunk_start, chunk_end)) = prefill_chunk_range(
                 prompt_len,
-                0,
+                cached_tokens,
                 max_step_tokens - token_cursor,
                 max_prefill_chunk,
             ) else {
                 break;
             };
-            let demand_pages =
-                request_kv_page_demand(prompt_len, front.target_output_len, page_block_tokens);
             if self.slot_pool.available() == 0
                 || !kv_demand_fits(
-                    self.kv_pool.available(),
+                    reclaimable_after_pin,
                     outstanding_reserved_pages(active),
-                    demand_pages,
+                    extra_demand,
                 )
             {
                 break;
@@ -1581,25 +1961,18 @@ impl ServingEngine {
                 EngineError::Protocol("SlotPool unexpectedly exhausted".to_owned())
             })?;
             let slot_id = slot_lease.id() as usize;
-            let last_token = *req.prompt_tokens.last().unwrap_or(&0);
-            let mut seq = ActiveSequence {
-                request_id: req.request_id,
+            let mut seq = admit_request_into_sequence(
+                req,
                 slot_lease,
-                kv_leases: Vec::new(),
-                page_ids: Vec::new(),
-                prompt_tokens: req.prompt_tokens,
-                prefilled_tokens: 0,
-                current_seq_len: 0,
-                last_token,
-                generated_tokens: Vec::with_capacity(req.target_output_len),
-                generated_top2: Vec::new(),
-                target_output_len: req.target_output_len,
-                reserved_pages: demand_pages,
-                permit_time: req.permit_time,
-                submit_time: req.submit_time,
-                first_token_time: None,
-                last_token_time: None,
-            };
+                demand_pages,
+                max_pages_per_seq,
+                self.prefix_tree.as_mut(),
+                self.recurrent_pool.is_some(),
+                &mut self.prefix_cache_queries_tokens,
+                &mut self.prefix_cache_hits_tokens,
+                &mut self.shadow_page_table,
+                &mut self.dirty_pt_slots,
+            )?;
             let sample_row_index = (chunk_end == prompt_len).then(|| {
                 let row = num_sample_rows;
                 num_sample_rows += 1;
@@ -1673,9 +2046,10 @@ impl ServingEngine {
             .iter()
             .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
             .count();
-        let continued_chunk = active
-            .iter()
-            .any(|seq| seq.prefilled_tokens > 0 && seq.prefilled_tokens < seq.prompt_tokens.len());
+        let continued_chunk = active.iter().any(|seq| {
+            seq.prefilled_tokens > seq.cached_prefix_tokens
+                && seq.prefilled_tokens < seq.prompt_tokens.len()
+        });
 
         let step_budget = if decode_active_count > 0 {
             mixed_cap.max(decode_active_count + 1).min(max_step_tokens)
@@ -1690,11 +2064,13 @@ impl ServingEngine {
             .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
         {
             let next_seq_len = seq.current_seq_len + 1;
-            seq.ensure_kv_pages(
+            seq.ensure_kv_pages_with_cache(
                 next_seq_len,
                 page_block_tokens,
                 max_pages_per_seq,
                 &self.kv_pool,
+                self.prefix_tree.as_mut(),
+                &mut self.prefix_cache_evictions_pages,
                 &mut self.shadow_page_table,
                 &mut self.dirty_pt_slots,
             )?;
@@ -1703,6 +2079,7 @@ impl ServingEngine {
         let mut token_cursor = 0usize;
         let mut num_seqs = 0usize;
         let mut num_sample_rows = 0usize;
+        let has_recurrent_pool = self.recurrent_pool.is_some();
 
         if decode_active_count > 0 {
             let mut staged_tokens = Vec::with_capacity(decode_active_count);
@@ -1734,6 +2111,10 @@ impl ServingEngine {
             plan.req_slot_ids_mut()?[..num_seqs].copy_from_slice(&staged_slots);
             plan.engram_prev_window_mut()?[..num_seqs * 3].copy_from_slice(&staged_lookbacks);
             plan.seq_lens_mut()?[..num_seqs].copy_from_slice(&staged_seq_lens);
+            if has_recurrent_pool {
+                plan.compressor_slot_ids_mut()?[..num_seqs].fill(-1);
+                plan.replay_mask_mut()?[..token_cursor].fill(0xFF);
+            }
             {
                 let sample_rows = plan.sample_row_indices_mut()?;
                 for (row, dst) in sample_rows[..num_sample_rows].iter_mut().enumerate() {
@@ -1770,7 +2151,7 @@ impl ServingEngine {
             };
             let needed_pages = chunk_end.div_ceil(page_block_tokens);
             let extra_pages = needed_pages.saturating_sub(seq.page_ids.len());
-            if extra_pages > self.kv_pool.available() {
+            if extra_pages > self.reclaimable_kv_pages() {
                 continue;
             }
             let sample_row_index = (chunk_end == prompt_len).then(|| {
@@ -1794,7 +2175,7 @@ impl ServingEngine {
             prefill_seqs_staged += 1;
         }
 
-        // Pass 3 (Region 3 / 1): Admit new waiting requests (`first_pos == 0`).
+        // Pass 3 (Region 3 / 1): Admit new waiting requests.
         while active.len() < max_seqs && token_cursor < step_budget {
             let Some(front) = waiting_permitted.front() else {
                 break;
@@ -1805,22 +2186,32 @@ impl ServingEngine {
                     "prompt length must be positive".to_owned(),
                 ));
             }
+            let (demand_pages, cached_tokens, extra_demand, reclaimable_after_pin) =
+                peek_request_admission(
+                    &front.prompt_tokens,
+                    front.target_output_len,
+                    page_block_tokens,
+                    &self.kv_pool,
+                    self.prefix_tree.as_ref(),
+                );
+            let uncached_prompt_len = prompt_len - cached_tokens;
             let remaining_budget = step_budget - token_cursor;
-            if num_seqs > 0 && remaining_budget < 16 && prompt_len > remaining_budget {
+            if num_seqs > 0 && remaining_budget < 16 && uncached_prompt_len > remaining_budget {
                 break;
             }
-            let Some((chunk_start, chunk_end)) =
-                prefill_chunk_range(prompt_len, 0, remaining_budget, max_prefill_chunk)
-            else {
+            let Some((chunk_start, chunk_end)) = prefill_chunk_range(
+                prompt_len,
+                cached_tokens,
+                remaining_budget,
+                max_prefill_chunk,
+            ) else {
                 break;
             };
-            let demand_pages =
-                request_kv_page_demand(prompt_len, front.target_output_len, page_block_tokens);
             if self.slot_pool.available() == 0
                 || !kv_demand_fits(
-                    self.kv_pool.available(),
+                    reclaimable_after_pin,
                     outstanding_reserved_pages(active),
-                    demand_pages,
+                    extra_demand,
                 )
             {
                 break;
@@ -1832,25 +2223,18 @@ impl ServingEngine {
                 EngineError::Protocol("SlotPool unexpectedly exhausted".to_owned())
             })?;
             let slot_id = slot_lease.id() as usize;
-            let last_token = *req.prompt_tokens.last().unwrap_or(&0);
-            let mut seq = ActiveSequence {
-                request_id: req.request_id,
+            let mut seq = admit_request_into_sequence(
+                req,
                 slot_lease,
-                kv_leases: Vec::new(),
-                page_ids: Vec::new(),
-                prompt_tokens: req.prompt_tokens,
-                prefilled_tokens: 0,
-                current_seq_len: 0,
-                last_token,
-                generated_tokens: Vec::with_capacity(req.target_output_len),
-                generated_top2: Vec::new(),
-                target_output_len: req.target_output_len,
-                reserved_pages: demand_pages,
-                permit_time: req.permit_time,
-                submit_time: req.submit_time,
-                first_token_time: None,
-                last_token_time: None,
-            };
+                demand_pages,
+                max_pages_per_seq,
+                self.prefix_tree.as_mut(),
+                self.recurrent_pool.is_some(),
+                &mut self.prefix_cache_queries_tokens,
+                &mut self.prefix_cache_hits_tokens,
+                &mut self.shadow_page_table,
+                &mut self.dirty_pt_slots,
+            )?;
             let sample_row_index = (chunk_end == prompt_len).then(|| {
                 let row = num_sample_rows;
                 num_sample_rows += 1;
@@ -1943,17 +2327,69 @@ impl ServingEngine {
         page_block_tokens: usize,
         max_pages_per_seq: usize,
     ) -> Result<()> {
-        seq.ensure_kv_pages(
+        seq.ensure_kv_pages_with_cache(
             chunk_end,
             page_block_tokens,
             max_pages_per_seq,
             &self.kv_pool,
+            self.prefix_tree.as_mut(),
+            &mut self.prefix_cache_evictions_pages,
             &mut self.shadow_page_table,
             &mut self.dirty_pt_slots,
         )?;
         let chunk_len = chunk_end - chunk_start;
         let slot_i32 = seq.slot_lease.id() as i32;
         let lookback = seq.lookback_window(chunk_start);
+
+        let has_recurrent_pool = self.recurrent_pool.is_some();
+        let restore_id = if has_recurrent_pool
+            && chunk_start == seq.cached_prefix_tokens
+            && seq.restore_checkpoint_id >= 0
+        {
+            let id = seq.restore_checkpoint_id;
+            seq.restore_checkpoint_id = -1;
+            id
+        } else {
+            -1
+        };
+
+        let mut checkpoint_rows: Vec<(usize, u8)> = Vec::new();
+        if let (Some(recurrent_pool), Some(node_tokens)) = (
+            self.recurrent_pool.as_ref(),
+            self.prefix_tree.as_ref().map(|t| t.block_tokens() as usize),
+        ) && !seq.checkpoint_alloc_stopped
+        {
+            let mut end_tokens = (chunk_start / node_tokens + 1) * node_tokens;
+            while end_tokens <= chunk_end {
+                if recurrent_pool.available() == 0
+                    && let Some(tree) = self.prefix_tree.as_mut()
+                {
+                    while recurrent_pool.available() == 0 {
+                        let evicted = tree.evict_lru(1);
+                        if evicted == 0 {
+                            break;
+                        }
+                        self.prefix_cache_evictions_pages +=
+                            (evicted * tree.pages_per_node()) as u64;
+                    }
+                }
+                let Some(ckpt_lease) = recurrent_pool.allocate(1) else {
+                    seq.checkpoint_alloc_stopped = true;
+                    break;
+                };
+                let ckpt_id = ckpt_lease.ids()[0];
+                if !(0..255).contains(&ckpt_id) {
+                    return Err(EngineError::Protocol(format!(
+                        "recurrent checkpoint slot {ckpt_id} outside valid uint8 range 0..255"
+                    )));
+                }
+                let rel_row = (end_tokens - 1) - chunk_start;
+                checkpoint_rows.push((rel_row, ckpt_id as u8));
+                seq.pending_checkpoints.push((end_tokens, ckpt_lease));
+                end_tokens += node_tokens;
+            }
+        }
+
         let mut plan = self.coordinator.plan_slot_mut(step_id)?;
         plan.token_ids_mut()?[token_cursor..token_cursor + chunk_len]
             .copy_from_slice(&seq.prompt_tokens[chunk_start..chunk_end]);
@@ -1968,6 +2404,14 @@ impl ServingEngine {
             .copy_from_slice(&lookback);
         plan.query_start_loc_mut()?[seq_batch_pos] = token_cursor as i32;
         plan.seq_lens_mut()?[seq_batch_pos] = chunk_end as i32;
+        if has_recurrent_pool {
+            plan.compressor_slot_ids_mut()?[seq_batch_pos] = restore_id;
+            let replay_slice = &mut plan.replay_mask_mut()?[token_cursor..token_cursor + chunk_len];
+            replay_slice.fill(0xFF);
+            for (rel_row, ckpt_u8) in checkpoint_rows {
+                replay_slice[rel_row] = ckpt_u8;
+            }
+        }
         if let Some(sample_row) = sample_row_index {
             plan.sample_row_indices_mut()?[sample_row] = (token_cursor + chunk_len - 1) as i32;
         }
@@ -2006,11 +2450,13 @@ impl ServingEngine {
             .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
         {
             let next_seq_len = seq.current_seq_len + 1;
-            seq.ensure_kv_pages(
+            seq.ensure_kv_pages_with_cache(
                 next_seq_len,
                 page_block_tokens,
                 max_pages_per_seq,
                 &self.kv_pool,
+                self.prefix_tree.as_mut(),
+                &mut self.prefix_cache_evictions_pages,
                 &mut self.shadow_page_table,
                 &mut self.dirty_pt_slots,
             )?;
@@ -2276,10 +2722,16 @@ mod tests {
             let mut seq = ActiveSequence {
                 request_id: 0,
                 slot_lease: slot_pool.allocate().expect("slot"),
+                prefix_lease: None,
                 kv_leases: Vec::new(),
                 page_ids: Vec::new(),
                 prompt_tokens: vec![42],
                 prefilled_tokens: 1,
+                computed_prompt_tokens: 1,
+                cached_prefix_tokens: 0,
+                restore_checkpoint_id: -1,
+                pending_checkpoints: Vec::new(),
+                checkpoint_alloc_stopped: false,
                 current_seq_len: 0,
                 last_token: 42,
                 generated_tokens: Vec::new(),
@@ -2344,10 +2796,16 @@ mod tests {
         let mut seq = ActiveSequence {
             request_id: 0,
             slot_lease: slot_pool.allocate().expect("slot"),
+            prefix_lease: None,
             kv_leases: Vec::new(),
             page_ids: Vec::new(),
             prompt_tokens: vec![10, 11, 12, 13],
             prefilled_tokens: 4,
+            computed_prompt_tokens: 4,
+            cached_prefix_tokens: 0,
+            restore_checkpoint_id: -1,
+            pending_checkpoints: Vec::new(),
+            checkpoint_alloc_stopped: false,
             current_seq_len: 4,
             last_token: 13,
             generated_tokens: Vec::new(),
@@ -2544,10 +3002,16 @@ mod tests {
         let mut seq = ActiveSequence {
             request_id: 0,
             slot_lease: slot_pool.allocate().expect("slot"),
+            prefix_lease: None,
             kv_leases: Vec::new(),
             page_ids: Vec::new(),
             prompt_tokens: vec![101, 102],
             prefilled_tokens: 2,
+            computed_prompt_tokens: 2,
+            cached_prefix_tokens: 0,
+            restore_checkpoint_id: -1,
+            pending_checkpoints: Vec::new(),
+            checkpoint_alloc_stopped: false,
             current_seq_len: 2,
             last_token: 201,
             generated_tokens: vec![201, 202],
@@ -2581,10 +3045,16 @@ mod tests {
             ActiveSequence {
                 request_id: 0,
                 slot_lease: slot_pool.allocate().expect("slot"),
+                prefix_lease: None,
                 kv_leases: Vec::new(),
                 page_ids: Vec::new(),
                 prompt_tokens: vec![10, 20, 30, 40],
                 prefilled_tokens: prefilled,
+                computed_prompt_tokens: prefilled,
+                cached_prefix_tokens: 0,
+                restore_checkpoint_id: -1,
+                pending_checkpoints: Vec::new(),
+                checkpoint_alloc_stopped: false,
                 current_seq_len: prefilled + generated.saturating_sub(1),
                 last_token: 99,
                 generated_tokens: vec![99; generated],
@@ -2598,22 +3068,30 @@ mod tests {
             }
         };
 
-        assert!(!decode_continues_for_all(&[], false, 0));
+        assert!(!decode_continues_for_all(&[], false, 0, false));
 
         // 1 generated out of 4: in_flight=0 -> 1+0+1=2 < 4 (true); in_flight=1 -> 1+1+1=3 < 4 (true);
         // in_flight=2 -> 1+2+1=4 < 4 (false, retires right after planned step).
-        let active = vec![make_seq(&slot_pool, 4, 1, 4)];
-        assert!(decode_continues_for_all(&active, false, 0));
-        assert!(decode_continues_for_all(&active, false, 1));
-        assert!(!decode_continues_for_all(&active, false, 2));
+        let mut active = vec![make_seq(&slot_pool, 4, 1, 4)];
+        assert!(decode_continues_for_all(&active, false, 0, false));
+        assert!(decode_continues_for_all(&active, false, 1, false));
+        assert!(!decode_continues_for_all(&active, false, 2, false));
+
+        // While prefill step is still in flight (`computed_prompt_tokens < prompt_len`),
+        // APC blocks pre-promotion decode overlap, then re-enables steady-state overlap afterward.
+        active[0].computed_prompt_tokens = 2;
+        assert!(decode_continues_for_all(&active, false, 0, false));
+        assert!(!decode_continues_for_all(&active, false, 0, true));
+        active[0].computed_prompt_tokens = 4;
+        assert!(decode_continues_for_all(&active, false, 0, true));
 
         // An admissible waiting request blocks overlap so prefill interleaving is not starved.
-        assert!(!decode_continues_for_all(&active, true, 0));
+        assert!(!decode_continues_for_all(&active, true, 0, false));
         drop(active);
 
         // Partial prefill sequence in `active` blocks decode-only pre-publishing.
         let partial = vec![make_seq(&slot_pool, 2, 0, 4)];
-        assert!(!decode_continues_for_all(&partial, false, 0));
+        assert!(!decode_continues_for_all(&partial, false, 0, false));
     }
 
     #[test]
@@ -2641,10 +3119,16 @@ mod tests {
         let mut seq = ActiveSequence {
             request_id: 0,
             slot_lease: slot_pool.allocate().expect("slot"),
+            prefix_lease: None,
             kv_leases: Vec::new(),
             page_ids: Vec::new(),
             prompt_tokens: vec![1; 32],
             prefilled_tokens: 16,
+            computed_prompt_tokens: 16,
+            cached_prefix_tokens: 0,
+            restore_checkpoint_id: -1,
+            pending_checkpoints: Vec::new(),
+            checkpoint_alloc_stopped: false,
             current_seq_len: 16,
             last_token: 1,
             generated_tokens: Vec::new(),
@@ -2729,10 +3213,16 @@ mod tests {
             let mut seq = ActiveSequence {
                 request_id,
                 slot_lease: slot_pool.allocate().expect("slot"),
+                prefix_lease: None,
                 kv_leases: Vec::new(),
                 page_ids: Vec::new(),
                 prompt_tokens: vec![1; 16],
                 prefilled_tokens: 16,
+                computed_prompt_tokens: 16,
+                cached_prefix_tokens: 0,
+                restore_checkpoint_id: -1,
+                pending_checkpoints: Vec::new(),
+                checkpoint_alloc_stopped: false,
                 current_seq_len: 16,
                 last_token: 1,
                 generated_tokens: vec![99],
@@ -2762,12 +3252,13 @@ mod tests {
 
         // Waiting request cannot fit yet -> waiting_admissible is false -> decode overlap stays on.
         let admissible_under_pressure =
-            front_request_admissible_in_pools(&active, &waiting, &slot_pool, &kv_pool, 2, 16);
+            front_request_admissible_in_pools(&active, &waiting, &slot_pool, &kv_pool, None, 2, 16);
         assert!(!admissible_under_pressure);
         assert!(decode_continues_for_all(
             &active,
             admissible_under_pressure,
-            0
+            0,
+            false
         ));
 
         // Slot exhaustion also keeps waiting_admissible false even when KV pages fit.
@@ -2775,20 +3266,407 @@ mod tests {
         active.push(make_active(2)); // consumes the 2nd slot; 8 - 6 = 2 unreserved pages
         assert_eq!(slot_pool.available(), 0);
         assert!(!front_request_admissible_in_pools(
-            &active, &waiting, &slot_pool, &kv_pool, 2, 16
+            &active, &waiting, &slot_pool, &kv_pool, None, 2, 16
         ));
 
         // Retiring seq 2 frees both its slot and its 3-page reservation (5 unreserved >= 3 demand),
         // flipping waiting_admissible to true and halting decode overlap so prefill can interleave.
         active.pop();
         let admissible_after_retire =
-            front_request_admissible_in_pools(&active, &waiting, &slot_pool, &kv_pool, 2, 16);
+            front_request_admissible_in_pools(&active, &waiting, &slot_pool, &kv_pool, None, 2, 16);
         assert!(admissible_after_retire);
         assert!(!decode_continues_for_all(
             &active,
             admissible_after_retire,
-            0
+            0,
+            false
         ));
+    }
+
+    #[test]
+    fn apc_admission_reservation_protects_evictable_headroom_and_shares_pinned_prefixes() {
+        let slot_pool = SlotPool::new(4);
+        let kv_pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 6);
+        let mut tree = PrefixTree::with_pages_per_node(16, 1).expect("tree");
+        let mut shadow_pt = vec![-1i32; 4 * 8];
+        let mut dirty = [0u128; 2];
+        let now = Instant::now();
+
+        // Populate a 2-page cached prefix [7; 32] (unpinned, evictable_kv_pages = 2, free = 4).
+        let cached_prompt = vec![7i32; 32];
+        let p0 = kv_pool.allocate(1).expect("p0");
+        let p1 = kv_pool.allocate(1).expect("p1");
+        let warm_lease = tree
+            .extend_prefix(
+                tree.match_prefix_bounded(&[], 0),
+                &cached_prompt,
+                vec![p0, p1],
+            )
+            .expect("insert warm prefix");
+        drop(warm_lease);
+        assert_eq!(kv_pool.available(), 4);
+        assert_eq!(tree.evictable_kv_pages(), 2);
+
+        // Seq A (disjoint prompt, 16 tok + 65 out => demand 5 pages) allocates 1 page so far,
+        // leaving 4 outstanding reserved pages. Reclaimable = 4 free + 2 evictable = 6 >= 5!
+        let mut queries = 0u64;
+        let mut hits = 0u64;
+        let mut seq_a = admit_request_into_sequence(
+            PendingRequest {
+                request_id: 1,
+                prompt_tokens: vec![9; 16],
+                target_output_len: 65,
+                permit_time: now,
+                submit_time: now,
+            },
+            slot_pool.allocate().expect("slot a"),
+            5,
+            8,
+            Some(&mut tree),
+            false,
+            &mut queries,
+            &mut hits,
+            &mut shadow_pt,
+            &mut dirty,
+        )
+        .expect("admit seq a");
+        let mut evictions = 0u64;
+        seq_a
+            .ensure_kv_pages_with_cache(
+                16,
+                16,
+                8,
+                &kv_pool,
+                Some(&mut tree),
+                &mut evictions,
+                &mut shadow_pt,
+                &mut dirty,
+            )
+            .expect("seq a first page");
+        let mut active = vec![seq_a];
+        assert_eq!(kv_pool.available(), 3);
+        assert_eq!(tree.evictable_kv_pages(), 2);
+        assert_eq!(outstanding_reserved_pages(&active), 4);
+
+        // Candidate B hits the 2 unpinned cached pages (32 + 16 + 1 out => demand 3 pages,
+        // matched 2 pages, extra_demand 1 page). Pinning those 2 unpinned pages would drop
+        // reclaimable headroom from 5 to 3 < 4 outstanding reserved + 1 extra = 5 -> MUST WAIT!
+        let mut prompt_b = cached_prompt.clone();
+        prompt_b.extend_from_slice(&[8; 16]);
+        let mut waiting = VecDeque::new();
+        waiting.push_back(PendingRequest {
+            request_id: 2,
+            prompt_tokens: prompt_b.clone(),
+            target_output_len: 1,
+            permit_time: now,
+            submit_time: now,
+        });
+        assert!(!front_request_admissible_in_pools(
+            &active,
+            &waiting,
+            &slot_pool,
+            &kv_pool,
+            Some(&tree),
+            4,
+            16,
+        ));
+
+        // Seq A grows across its remaining 4 reserved pages (total 5 pages = 80 tokens), evicting
+        // 1 of the 2 unpinned cached nodes on demand while leaving the root node cached; then a
+        // 6th page (96 tokens) evicts the remaining cached root node!
+        active[0]
+            .ensure_kv_pages_with_cache(
+                80,
+                16,
+                8,
+                &kv_pool,
+                Some(&mut tree),
+                &mut evictions,
+                &mut shadow_pt,
+                &mut dirty,
+            )
+            .expect("seq a full decode growth");
+        assert_eq!(evictions, 1);
+        assert_eq!(kv_pool.available(), 0);
+        assert_eq!(tree.cached_kv_pages(), 1);
+        active[0]
+            .ensure_kv_pages_with_cache(
+                96,
+                16,
+                8,
+                &kv_pool,
+                Some(&mut tree),
+                &mut evictions,
+                &mut shadow_pt,
+                &mut dirty,
+            )
+            .expect("seq a sixth page evicts remaining root");
+        assert_eq!(evictions, 2);
+        assert_eq!(kv_pool.available(), 0);
+        assert_eq!(tree.cached_kv_pages(), 0);
+        active.clear();
+        assert_eq!(kv_pool.available(), 6);
+
+        // Now admit two concurrent requests sharing a pinned prefix: the 2nd sees newly_pinned = 0!
+        let p0 = kv_pool.allocate(1).expect("p0");
+        let p1 = kv_pool.allocate(1).expect("p1");
+        let warm2 = tree
+            .extend_prefix(
+                tree.match_prefix_bounded(&[], 0),
+                &cached_prompt,
+                vec![p0, p1],
+            )
+            .expect("reinsert prefix");
+        drop(warm2);
+        let req_b1 = waiting.pop_front().expect("b1");
+        let (demand_b1, cached_b1, extra_b1, reclaimable_b1) =
+            peek_request_admission(&req_b1.prompt_tokens, 1, 16, &kv_pool, Some(&tree));
+        assert_eq!(
+            (demand_b1, cached_b1, extra_b1, reclaimable_b1),
+            (3, 32, 1, 4)
+        );
+        let mut seq_b1 = admit_request_into_sequence(
+            req_b1,
+            slot_pool.allocate().expect("slot b1"),
+            demand_b1,
+            8,
+            Some(&mut tree),
+            false,
+            &mut queries,
+            &mut hits,
+            &mut shadow_pt,
+            &mut dirty,
+        )
+        .expect("admit b1");
+        seq_b1
+            .ensure_kv_pages_with_cache(
+                48,
+                16,
+                8,
+                &kv_pool,
+                Some(&mut tree),
+                &mut evictions,
+                &mut shadow_pt,
+                &mut dirty,
+            )
+            .expect("b1 suffix page");
+        active.push(seq_b1);
+        assert_eq!(outstanding_reserved_pages(&active), 0);
+        // Cached 2 pages are already pinned by b1 (`newly_pinned_pages == 0`), 3 pages remain free,
+        // and b2 only needs 1 extra suffix page -> admissible concurrently!
+        waiting.push_back(PendingRequest {
+            request_id: 3,
+            prompt_tokens: prompt_b,
+            target_output_len: 17, // demand = ceil((48 + 16)/16) = 4, matched = 2, extra = 2 <= 3
+            permit_time: now,
+            submit_time: now,
+        });
+        assert!(front_request_admissible_in_pools(
+            &active,
+            &waiting,
+            &slot_pool,
+            &kv_pool,
+            Some(&tree),
+            4,
+            16,
+        ));
+    }
+
+    #[test]
+    fn duplicate_cold_promotion_canonicalizes_pages_and_hybrid_checkpoints_roundtrip() {
+        // 1) Duplicate cold promotion (across two incremental chunks 0..16 then 16..40)
+        //    canonicalizes the 2nd sequence's page_ids + shadow_pt and returns duplicate pages.
+        let slot_pool = SlotPool::new(4);
+        let kv_pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 16);
+        let mut tree = PrefixTree::with_pages_per_node(16, 1).expect("tree");
+        let mut shadow_pt = vec![-1i32; 4 * 8];
+        let mut dirty = [0u128; 2];
+        let now = Instant::now();
+        let mut queries = 0u64;
+        let mut hits = 0u64;
+        let mut evictions = 0u64;
+
+        let shared_prompt = vec![42i32; 40]; // 2 full 16-token nodes + 8-token tail (3 pages)
+        let mut active = Vec::new();
+        for request_id in 0..2 {
+            let mut seq = admit_request_into_sequence(
+                PendingRequest {
+                    request_id,
+                    prompt_tokens: shared_prompt.clone(),
+                    target_output_len: 8,
+                    permit_time: now,
+                    submit_time: now,
+                },
+                slot_pool.allocate().expect("slot"),
+                3,
+                8,
+                Some(&mut tree),
+                false,
+                &mut queries,
+                &mut hits,
+                &mut shadow_pt,
+                &mut dirty,
+            )
+            .expect("admit cold");
+            seq.prefilled_tokens = 16;
+            seq.current_seq_len = 16;
+            seq.ensure_kv_pages_with_cache(
+                16,
+                16,
+                8,
+                &kv_pool,
+                Some(&mut tree),
+                &mut evictions,
+                &mut shadow_pt,
+                &mut dirty,
+            )
+            .expect("alloc chunk 1 page");
+            active.push(seq);
+        }
+        promote_completed_prefixes_in_batch(
+            &mut active,
+            Some(&mut tree),
+            false,
+            1,
+            8,
+            &mut shadow_pt,
+            &mut dirty,
+        )
+        .expect("promote chunk 1");
+        assert_eq!(kv_pool.available(), 15); // 1 canonical page shared across both sequences!
+
+        for seq in &mut active {
+            seq.prefilled_tokens = 40;
+            seq.current_seq_len = 40;
+            seq.ensure_kv_pages_with_cache(
+                40,
+                16,
+                8,
+                &kv_pool,
+                Some(&mut tree),
+                &mut evictions,
+                &mut shadow_pt,
+                &mut dirty,
+            )
+            .expect("alloc chunk 2 pages");
+        }
+        assert_eq!(kv_pool.available(), 11); // 15 - 4 = 11
+        dirty = [0, 0];
+        promote_completed_prefixes_in_batch(
+            &mut active,
+            Some(&mut tree),
+            false,
+            1,
+            8,
+            &mut shadow_pt,
+            &mut dirty,
+        )
+        .expect("promote duplicate batch chunk 2");
+        // Duplicate 2nd prefix page from active[1] was freed immediately back to kv_pool!
+        assert_eq!(kv_pool.available(), 12);
+        assert_eq!(active[0].page_ids[..2], active[1].page_ids[..2]);
+        let slot1 = active[1].slot_lease.id() as usize;
+        assert_eq!(
+            &shadow_pt[slot1 * 8..slot1 * 8 + 2],
+            &active[0].page_ids[..2]
+        );
+        assert_ne!(dirty[0] & (1u128 << slot1), 0);
+        active.clear();
+        assert_eq!(kv_pool.available(), 14); // 2 prefix pages stay cached in `tree`
+        assert_eq!(tree.evictable_kv_pages(), 2);
+
+        // 2) Hybrid recurrent checkpointing (`pages_per_node = 4`, `16` tok/page -> `64` tok/node):
+        let kv_hybrid = BlockPool::new(CacheGroupKind::GlobalAndIndex, 16);
+        let ckpt_pool = BlockPool::new(CacheGroupKind::RecurrentState, 4);
+        let mut hybrid_tree = PrefixTree::with_pages_per_node(64, 4).expect("hybrid tree");
+        let mut hybrid_pt = vec![-1i32; 4 * 16];
+        let mut hybrid_dirty = [0u128; 2];
+        let hybrid_prompt: Vec<i32> = (0..140).map(|i| 300 + i).collect(); // 2 full 64-tok nodes + 12 tail
+        let mut h_seq = admit_request_into_sequence(
+            PendingRequest {
+                request_id: 10,
+                prompt_tokens: hybrid_prompt.clone(),
+                target_output_len: 4,
+                permit_time: now,
+                submit_time: now,
+            },
+            slot_pool.allocate().expect("h slot"),
+            9,
+            16,
+            Some(&mut hybrid_tree),
+            true,
+            &mut queries,
+            &mut hits,
+            &mut hybrid_pt,
+            &mut hybrid_dirty,
+        )
+        .expect("admit hybrid cold");
+        assert_eq!(h_seq.restore_checkpoint_id, -1);
+        h_seq.prefilled_tokens = 140;
+        h_seq.current_seq_len = 140;
+        h_seq
+            .ensure_kv_pages_with_cache(
+                140,
+                16,
+                16,
+                &kv_hybrid,
+                Some(&mut hybrid_tree),
+                &mut evictions,
+                &mut hybrid_pt,
+                &mut hybrid_dirty,
+            )
+            .expect("alloc 9 hybrid pages");
+        let ckpt_64 = ckpt_pool.allocate(1).expect("ckpt 64");
+        let ckpt_128 = ckpt_pool.allocate(1).expect("ckpt 128");
+        let expected_ckpt_128_id = ckpt_128.ids()[0];
+        h_seq.pending_checkpoints.push((64, ckpt_64));
+        h_seq.pending_checkpoints.push((128, ckpt_128));
+        let mut h_active = vec![h_seq];
+        promote_completed_prefixes_in_batch(
+            &mut h_active,
+            Some(&mut hybrid_tree),
+            true,
+            4,
+            16,
+            &mut hybrid_pt,
+            &mut hybrid_dirty,
+        )
+        .expect("promote hybrid");
+        assert!(h_active[0].pending_checkpoints.is_empty());
+        assert_eq!(h_active[0].kv_leases.len(), 1); // 9 - 8 promoted = 1 tail page
+        h_active.clear();
+        assert_eq!(kv_hybrid.available(), 8); // 8 pages cached in 2 nodes
+        assert_eq!(ckpt_pool.available(), 2); // 2 recurrent checkpoints cached in 2 nodes
+
+        // Warm hit on the same 140-token prompt reuses 128 tokens (8 KV pages) and restores
+        // `expected_ckpt_128_id` for the remaining 12-token suffix chunk!
+        let h_warm = admit_request_into_sequence(
+            PendingRequest {
+                request_id: 11,
+                prompt_tokens: hybrid_prompt,
+                target_output_len: 4,
+                permit_time: now,
+                submit_time: now,
+            },
+            slot_pool.allocate().expect("h warm slot"),
+            9,
+            16,
+            Some(&mut hybrid_tree),
+            true,
+            &mut queries,
+            &mut hits,
+            &mut hybrid_pt,
+            &mut hybrid_dirty,
+        )
+        .expect("admit hybrid warm");
+        assert_eq!(h_warm.cached_prefix_tokens, 128);
+        assert_eq!(h_warm.prefilled_tokens, 128);
+        assert_eq!(h_warm.page_ids.len(), 8);
+        assert_eq!(h_warm.restore_checkpoint_id, expected_ckpt_128_id);
+        drop(h_warm);
+        assert_eq!(hybrid_tree.evict_lru(2), 2);
+        assert_eq!(kv_hybrid.available(), 16);
+        assert_eq!(ckpt_pool.available(), 4);
     }
 }
 

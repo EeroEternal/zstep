@@ -55,6 +55,7 @@ pub struct WorkerLaunchConfig {
     pub allreduce_threads: u32,
     pub model_dir: Option<PathBuf>,
     pub num_kv_pages: u32,
+    pub num_recurrent_checkpoints: u32,
     pub max_model_len: Option<usize>,
     pub cancel_flag: Option<Arc<AtomicBool>>,
 }
@@ -739,6 +740,12 @@ fn spawn_workers(
         if let Some(max_model_len) = config.launch.max_model_len {
             command.env("ZSTEP_MAX_MODEL_LEN", max_model_len.to_string());
         }
+        if config.launch.num_recurrent_checkpoints > 0 {
+            command.env(
+                "ZSTEP_NUM_RECURRENT_CHECKPOINTS",
+                config.launch.num_recurrent_checkpoints.to_string(),
+            );
+        }
         // SAFETY: the closure only calls async-signal-safe `prctl` and `dup2`; the targets are
         // disjoint from normal descriptors and `dup2` clears CLOEXEC on the inherited descriptors.
         unsafe {
@@ -799,6 +806,12 @@ fn validate_config(config: &EngineConfig) -> Result<()> {
         return Err(EngineError::Protocol(
             "timeouts must be positive".to_owned(),
         ));
+    }
+    if config.launch.num_recurrent_checkpoints > 255 {
+        return Err(EngineError::Protocol(format!(
+            "num_recurrent_checkpoints={} exceeds uint8 SHM replay_mask limit (255)",
+            config.launch.num_recurrent_checkpoints
+        )));
     }
     Ok(())
 }

@@ -20,7 +20,7 @@ zstep/
 ├── crates/
 │   ├── zs-wire/                      # #[repr(C)] SHM layout, geometry & result ring
 │   ├── zs-shm/                       # RAII shm_open + mmap + eventfd transport
-│   ├── zs-kv/                        # BlockPool and standalone pure-attention Radix KV
+│   ├── zs-kv/                        # BlockPool, PrefixTree & Automatic Prefix Caching (APC)
 │   ├── zs-tokenizer/                 # HF / DeepSeek-V4.1 / ChatML tokenizer & streaming detokenizer
 │   ├── zs-scheduler/                 # WorkerCoordinator, ServingEngine & persistent online ServeLoop
 │   └── zs-server/                    # zstep / zs-server CLI: online OpenAI HTTP/SSE, parity & benchmarks
@@ -57,7 +57,7 @@ zstep/
   * **6 / 6 Uncached Throughput Sweep vs No-APC `vLLM 0.33.0`**: With `--no-enable-prefix-caching` and per-`(round, tier)` isolated seeds, `zstep` leads on uncached output throughput across all 6 tiers (**`+11.00%..+54.08%`**), while explicitly reporting the `max_prefill_chunk=2048` tail-latency tradeoff at `c=32/128`.
   * **Greedy Audit**: Runtime emits **`TRITON_RECOMPILATIONS=0 WATCHED_KERNELS=17`**. `chunked` matches `vLLM` **448/448 tokens (100% across all 5 cases)**; remaining `single`/`batched` flips occur strictly at `<= 2` BF16 ULPs (`margin <= 0.25` at logit `~25`), preserved honestly as `all_matched=false` in [`phase2_greedy_parity_report.json`](docs/benchmarks/phase2_greedy_parity_report.json).
 * **Phase 1 / Shared-Memory Control Plane**: 200-step 8-GPU measurement records **`4.690 µs/step`** Rust preparation (`0.166%` of GPU step time, `overlap_speedup=1.000269×`).
-* **KV scope**: [`crates/zs-kv/src/radix.rs`](crates/zs-kv/src/radix.rs) (`PrefixTree` / `KvCacheManager`) is a standalone pure-attention component and is **not wired into `DeepSeek-V4.1-Flash` or `Qwen3.5-35B-A3B` serving**; both runners use `BlockPool` physical-page RAII only.
+* **KV & Automatic Prefix Caching (APC)**: [`crates/zs-kv/src/prefix_cache.rs`](crates/zs-kv/src/prefix_cache.rs) (`PrefixTree` / `PrefixLease`) is wired into online `zstep serve` (`--enable-prefix-caching`, default enabled; `--no-enable-prefix-caching` to disable): `DeepSeek-V4.1-Flash` reuses 128-token KV pages directly (`pages_per_node = 1`), while hybrid `Qwen3.5-35B-A3B` pairs 4 × 16-token KV pages (`64` tok/node) with 30-layer `GatedDeltaNet` `(conv_state, ssm_state_vk)` recurrent checkpoints (`ZSTEP_NUM_RECURRENT_CHECKPOINTS=255`). Offline `--bench-tiers` sweeps keep APC disabled for symmetric uncached throughput metrology.
 
 ## Phase 3.6 (`+ b12x`) & Phase 3.5 Warm `n=3` Uncached Serving (`DeepSeek-V4.1-Flash`, `8 × RTX 6000D`)
 

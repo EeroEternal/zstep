@@ -749,6 +749,7 @@ fn run_engine(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             allreduce_threads: args.allreduce_threads,
             model_dir: args.model_dir.clone(),
             num_kv_pages,
+            num_recurrent_checkpoints: 0,
             max_model_len: None,
             cancel_flag: None,
         },
