@@ -206,6 +206,34 @@ Phase 2 双端 Top-2 贪心审计（[`phase2_greedy_parity_report.json`](phase2_
 
 Phase 1 8-GPU 200 步控制面实测：Rust 下一拍准备 **`4.690 µs/step`**（累计 `938 µs`，199 步重叠），占 GPU 平均步 `2,832.10 µs` 的 **`0.166%`**，`overlap_speedup = 1.000269×`。
 
+## 5b. GPU P2P（可选；需先关闭 PCIe ACS 重定向）
+
+`8 × RTX 6000D` 的 Mellanox CX-8 集成 PCIe 桥默认把 `ACSCtl` 置为 `0x001d`（`ReqRedir+`
+`CmpltRedir+`），此时任何 P2P 尝试都会让 NCCL 初始化挂死，所以 zstep/vLLM 基线统一使用
+`NCCL_P2P_DISABLE=1` + `NCCL_P2P_LEVEL=LOC`（host-SHM 路径）。若要启用真实 P2P：
+
+1. **清零桥寄存器并做功能自检**（开机服务，见 `6000d-acs-off.sh` / `6000d-p2p-selftest`）：
+   `ReqRedir+ == 0` 只是必要条件；自检还要跑一次 `cudaMemcpyPeer`（同桥 ≥ 25 GB/s、
+   跨桥 ≥ 10 GB/s）与 `cudaDeviceEnablePeerAccess`。
+2. **容器必须 `--ipc=host`**（或 `--shm-size ≥ 16g`）：默认 64 MB `/dev/shm` 会让 NCCL 的
+   IPC/CE 缓冲报 `No space left on device`，表现和“P2P 死锁”一样。
+3. **打开 zstep 的 P2P 开关**：`export ZSTEP_NCCL_P2P=1`（默认 off；worker 不再注入
+   `NCCL_P2P_DISABLE=1`，改为 `=0` + `NCCL_P2P_LEVEL=SYS`，可用 `ZSTEP_NCCL_P2P_LEVEL=PXB`
+   限制在同桥组）。vLLM 侧对应去掉 `NCCL_P2P_DISABLE=1` / `NCCL_P2P_LEVEL=LOC`。
+
+单次 AllReduce 实测（`8 × RTX 6000D`，`H=5120` BF16，`shm_v5 b=8/t=256/one-shot 64 KiB`
+vs NCCL P2P）：
+
+| M | 128 | 192 | 256 | 320 | 384 | 512 | 4096 |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `shm_v5` (µs) | **157.3** | 230.3 | 302.8 | 376.1 | 448.4 | 594.4 | 4,661.0 |
+| `NCCL` P2P (µs) | 237.8 | **188.8** | **243.3** | **353.0** | **334.0** | **437.1** | **3,228.4** |
+
+结论：P2P 下 crossover 从 `M≈512` 前移到 `M≈160`，因此 `DeepSeek-V4.1` 在
+`ZSTEP_NCCL_P2P=1` 且未显式设置 `ZSTEP_SHM_MAX_AR_NUMEL` 时默认取 `128*5120`
+（所有 CUDAGraph 解码桶仍走 `shm_v5`，eager prefill 走 NCCL P2P）；Qwen 侧尚未重测，
+保持 `320*5120`。**ACS 未清零时不要设置 `ZSTEP_NCCL_P2P=1`**（NCCL 初始化会挂死）。
+
 ## 6. 复现命令（支持含 `.git` 或无 `.git` 的 `git archive` 源码树）
 
 ```bash

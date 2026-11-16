@@ -737,6 +737,24 @@ fn spawn_workers(
 ) -> Result<WorkerProcesses> {
     let mut workers = WorkerProcesses::default();
     let allreduce_name = format!("{}_ar", config.shm_name);
+    // GPU P2P is opt-in: the default keeps the conservative host-SHM path (`LOC` +
+    // P2P disabled), which is the only path that is safe on nodes whose PCIe ACS
+    // redirection is still enabled. On nodes with the CX-8 ACS bits cleared
+    // (`6000d-acs-off.sh`) set `ZSTEP_NCCL_P2P=1` to let NCCL use peer access, and
+    // optionally `ZSTEP_NCCL_P2P_LEVEL=PXB` to restrict it to same-bridge groups.
+    let nccl_p2p = std::env::var("ZSTEP_NCCL_P2P")
+        .map(|value| value != "0")
+        .unwrap_or(false);
+    let nccl_p2p_level = std::env::var("ZSTEP_NCCL_P2P_LEVEL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            if nccl_p2p {
+                "SYS".to_owned()
+            } else {
+                "LOC".to_owned()
+            }
+        });
     for rank in 0..config.geometry.world_size as usize {
         let inherited_plan_fd = INHERITED_PLAN_FD_BASE + rank as i32;
         let inherited_done_fd = INHERITED_DONE_FD_BASE + rank as i32;
@@ -794,8 +812,8 @@ fn spawn_workers(
             .env("OMP_NUM_THREADS", "1")
             .env("MKL_NUM_THREADS", "1")
             .env("OPENBLAS_NUM_THREADS", "1")
-            .env("NCCL_P2P_DISABLE", "1")
-            .env("NCCL_P2P_LEVEL", "LOC")
+            .env("NCCL_P2P_DISABLE", if nccl_p2p { "0" } else { "1" })
+            .env("NCCL_P2P_LEVEL", &nccl_p2p_level)
             .env("NCCL_IB_DISABLE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())

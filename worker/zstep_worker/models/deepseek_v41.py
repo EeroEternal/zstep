@@ -725,8 +725,15 @@ class DeepSeekV41StepRunner:
         # at H_in=640, covering M=1..4096 where 1-shot native-`dim` `shm_ag` avoids
         # NCCL's `dim=0` + `permute().contiguous()` copy) plus 100% of CUDAGraph
         # captures through `shm_v5`; route larger eager AR payloads to `NCCL_LOC`.
+        # With GPU P2P enabled (`ZSTEP_NCCL_P2P=1` on ACS-cleared CX-8 nodes) the
+        # AR crossover moves from M~512 to between M=128 and M=192 (8x RTX 6000D,
+        # H=5120: M=128 shm 157 us vs NCCL/P2P 238 us; M=192 shm 230 us vs 189 us;
+        # M=4096 shm 4661 us vs 3228 us), so eager prefill drops to NCCL earlier
+        # while every CUDAGraph bucket (<=128 rows) still stays on `shm_v5`.
+        p2p_enabled = os.environ.get("ZSTEP_NCCL_P2P", "0") != "0"
+        default_shm_max_ar_numel = (128 if p2p_enabled else 320) * 5120
         shm_max_ar_numel = int(
-            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(320 * 5120))
+            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(default_shm_max_ar_numel))
         )
         shm_max_ag_numel = int(
             os.environ.get("ZSTEP_SHM_MAX_AG_NUMEL", str(1024 * 4096))
