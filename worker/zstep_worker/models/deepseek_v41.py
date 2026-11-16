@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import dataclasses
+import gc
 import logging
 import math
 import os
@@ -60,6 +61,7 @@ from zstep_worker.spec_decode import seq_results, verify_batch
 from zstep_worker.shm_bridge import (
     DECODE_GRAPH_BUCKETS,
     STEP_FLAG_DECODE_ONLY,
+    STEP_FLAG_DEVICE_TOKENS,
     SeqResult,
     ShmBridge,
     StepHeader,
@@ -68,6 +70,26 @@ from zstep_worker.shm_bridge import (
 )
 
 _LOG = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _SpecVerifyContext:
+    num_sample: int
+    sample_rows_np: np.ndarray
+    slot_np: np.ndarray
+    tok_np: np.ndarray
+    pos_np: np.ndarray
+    q_start_np: np.ndarray
+    pt_np: np.ndarray
+    aux_hidden_states: list[torch.Tensor] | None
+
+
+@dataclass(frozen=True)
+class _LaunchedStep:
+    parity: int
+    num_out: int
+    sample_slots_out: list[int]
+    spec_ctx: _SpecVerifyContext | None = None
 
 
 def apply_vllm_sm120_dsv41_patches() -> None:
@@ -298,6 +320,11 @@ class DeepSeekV41StepRunner:
     ) -> None:
         os.environ.setdefault("NCCL_P2P_DISABLE", "1")
         os.environ.setdefault("NCCL_P2P_LEVEL", "LOC")
+        os.environ.setdefault("NCCL_SHM_USE_CUDA_MEMCPY", "1")
+        os.environ.setdefault("NCCL_SHM_MEMCPY_MODE", "3")
+        os.environ.setdefault("NCCL_MIN_NCHANNELS", "6")
+        os.environ.setdefault("NCCL_MAX_NCHANNELS", "6")
+        os.environ.setdefault("NCCL_BUFFSIZE", "4194304")
         os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
         torch.set_num_threads(2)
 
@@ -310,6 +337,7 @@ class DeepSeekV41StepRunner:
         self.verify_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.verify_graph_aux: dict[int, list[torch.Tensor] | None] = {}
         self.dspark_drafter: Any | None = None
+        self._builder_groups: list[_AttnBuilderGroup] = []
 
         try:
             self._init_impl(
@@ -533,14 +561,24 @@ class DeepSeekV41StepRunner:
 
             self.dspark_model = load_dspark_model(self.model, self.vllm_config)
             self.dspark_model.eval()
+            max_draft_rows = min(256, self.max_step_tokens)
+            dspark_buckets = tuple(
+                b
+                for b in DECODE_GRAPH_BUCKETS
+                if b * max(1, self.num_spec_tokens) <= max_draft_rows
+            ) or (1,)
             prepare_b12x_dsv41_model(
                 self.dspark_model,
                 rank=rank,
                 device=self.device,
                 max_tokens=max(self.max_step_tokens, 8192),
-                decode_buckets=DECODE_GRAPH_BUCKETS,
+                decode_buckets=dspark_buckets,
                 exchange_group=self.exchange_group,
             )
+
+        # Reclaim transient b12x / weight-conversion blocks before large KV allocation
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Allocate & bind 512B-aligned KV / SWA / Indexer / Compressor caches
         self._kv_raw_buffers: list[torch.Tensor] = []
@@ -655,14 +693,45 @@ class DeepSeekV41StepRunner:
             (sc, 2), dtype=torch.int32, device=self.device
         )
         self.out_tokens_cpu: torch.Tensor = torch.zeros(
-            (sc, 2), dtype=torch.int32, pin_memory=True
+            (2, sc, 2), dtype=torch.int32, pin_memory=True
         )
         self.out_logprobs_cpu: torch.Tensor = torch.zeros(
-            (sc, 2), dtype=torch.int32, pin_memory=True
+            (2, sc, 2), dtype=torch.int32, pin_memory=True
+        )
+        self._out_tokens_np: list[np.ndarray] = [
+            self.out_tokens_cpu[0].numpy(),
+            self.out_tokens_cpu[1].numpy(),
+        ]
+        self._out_logprobs_np: list[np.ndarray] = [
+            self.out_logprobs_cpu[0].numpy(),
+            self.out_logprobs_cpu[1].numpy(),
+        ]
+        self.slots_cpu: torch.Tensor = torch.zeros(
+            ms, dtype=torch.int64, pin_memory=True
+        )
+        self.slots_gpu: torch.Tensor = torch.zeros(
+            ms, dtype=torch.int64, device=self.device
+        )
+        self.slot_last_tok_gpu: torch.Tensor = torch.zeros(
+            self.max_seqs, dtype=torch.int32, device=self.device
+        )
+        self.slot_lb_gpu: torch.Tensor = torch.full(
+            (self.max_seqs, self.engram_depth),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.next_lb_gpu: torch.Tensor = torch.full(
+            (ms, self.engram_depth), -1, dtype=torch.int32, device=self.device
         )
 
-        self.start_event: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
-        self.end_event: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
+        self.start_events: list[torch.cuda.Event] = [
+            torch.cuda.Event(enable_timing=True) for _ in range(2)
+        ]
+        self.end_events: list[torch.cuda.Event] = [
+            torch.cuda.Event(enable_timing=True) for _ in range(2)
+        ]
+        self._h2d_done_event: torch.cuda.Event = torch.cuda.Event()
         self.max_graph_bucket: int = min(self.geometry.max_seqs, 128)
         self.decode_graph_max_seq_len: int = (
             min(self.max_model_len, SM120_DSA_CANDIDATE_COVER_TOKENS)
@@ -721,12 +790,12 @@ class DeepSeekV41StepRunner:
         shm_ar = self.shm_ar
         shm_ag = self.shm_ag
         runner = self
-        # Route M <= 320 (<= 3.125 MiB AR at H=5120) and M <= 6553 (<= 8 MiB AG input
+        # Route M <= 384 (<= 3.75 MiB AR at H=5120) and M <= 6553 (<= 8 MiB AG input
         # at H_in=640, covering M=1..4096 where 1-shot native-`dim` `shm_ag` avoids
         # NCCL's `dim=0` + `permute().contiguous()` copy) plus 100% of CUDAGraph
         # captures through `shm_v5`; route larger eager AR payloads to `NCCL_LOC`.
         shm_max_ar_numel = int(
-            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(320 * 5120))
+            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(384 * 5120))
         )
         shm_max_ag_numel = int(
             os.environ.get("ZSTEP_SHM_MAX_AG_NUMEL", str(1024 * 4096))
@@ -908,6 +977,9 @@ class DeepSeekV41StepRunner:
                 and hcache.numel() > 0
             ):
                 hcache.zero_()
+        if hasattr(self, "slot_last_tok_gpu"):
+            self.slot_last_tok_gpu.zero_()
+            self.slot_lb_gpu.fill_(-1)
         torch.cuda.synchronize(self.device)
 
     def _build_step_attn_metadata(
@@ -1169,7 +1241,10 @@ class DeepSeekV41StepRunner:
                         lookback_token_ids=self.lookback_gpu,
                     )
                     self._sample_rows_into_argmax(hidden, self.sample_rows_gpu[:1], 1)
+                    del hidden
                 torch.cuda.synchronize(self.device)
+                if n_toks >= 2048:
+                    torch.cuda.empty_cache()
                 dist.barrier(group=self.exchange_group)
 
             # Also warm up + autotune eager decode (`seq_len = 64..2563`) so all
@@ -1232,6 +1307,7 @@ class DeepSeekV41StepRunner:
                         lookback_token_ids=self.lookback_gpu,
                     )
                     self._sample_rows_into_argmax(hidden, None, warm_b)
+                    del hidden
                 torch.cuda.synchronize(self.device)
                 dist.barrier(group=self.exchange_group)
         finally:
@@ -1262,6 +1338,8 @@ class DeepSeekV41StepRunner:
         self._zero_all_caches()
         dist.barrier(group=self.exchange_group)
 
+        gc.collect()
+        torch.cuda.empty_cache()
         buckets = [b for b in DECODE_GRAPH_BUCKETS if b <= self.max_graph_bucket]
         if not buckets or buckets[-1] != self.max_graph_bucket:
             buckets.append(self.max_graph_bucket)
@@ -1311,7 +1389,9 @@ class DeepSeekV41StepRunner:
                             positions=self.positions_gpu[:b],
                             lookback_token_ids=self.lookback_gpu,
                         )
-                        self._sample_rows_into_argmax(hidden, None, b)
+                        self._sample_rows_into_argmax(
+                            hidden, None, b, all_ranks=True
+                        )
             capture_stream.synchronize()
             dist.barrier(group=self.exchange_group)
 
@@ -1344,7 +1424,9 @@ class DeepSeekV41StepRunner:
                         positions=self.positions_gpu[:b],
                         lookback_token_ids=self.lookback_gpu,
                     )
-                    self._sample_rows_into_argmax(hidden, None, b)
+                    self._sample_rows_into_argmax(
+                        hidden, None, b, all_ranks=True
+                    )
             capture_stream.synchronize()
             dist.barrier(group=self.exchange_group)
             self.decode_graphs[b] = g
@@ -1357,6 +1439,8 @@ class DeepSeekV41StepRunner:
         if self.dspark_drafter is not None:
             self.dspark_drafter.capture_graphs(graph_pool, capture_stream)
         lock_workspace()
+        gc.collect()
+        torch.cuda.empty_cache()
         self._zero_all_caches()
         dist.barrier(group=self.exchange_group)
         if self.rank == 0:
@@ -1515,6 +1599,7 @@ class DeepSeekV41StepRunner:
     def _speculative_outputs(
         self,
         *,
+        parity: int,
         num_sample: int,
         sample_rows_np: np.ndarray,
         slot_np: np.ndarray,
@@ -1524,8 +1609,8 @@ class DeepSeekV41StepRunner:
         pt_np: np.ndarray,
         aux_hidden_states: list[torch.Tensor] | None,
     ) -> list[SeqResult]:
-        tokens = self.out_tokens_cpu[:num_sample, 0].numpy()
-        logprobs = self.out_logprobs_cpu[:num_sample, 0].numpy()
+        tokens = self._out_tokens_np[parity][:num_sample, 0]
+        logprobs = self._out_logprobs_np[parity][:num_sample, 0]
         verified = verify_batch(
             predictions=tokens,
             logprob_bits=logprobs,
@@ -1548,10 +1633,21 @@ class DeepSeekV41StepRunner:
             )
         return seq_results(verified, drafts) if self.rank == 0 else []
 
+    def _commit_decode_slot_state(self, n: int) -> None:
+        s_idx = self.slots_gpu[:n]
+        self.next_lb_gpu[:n, 0].copy_(self.token_ids_gpu[:n])
+        self.next_lb_gpu[:n, 1:3].copy_(self.lookback_gpu[:n, 0:2])
+        self.slot_lb_gpu.index_copy_(0, s_idx, self.next_lb_gpu[:n])
+        self.slot_last_tok_gpu.index_copy_(0, s_idx, self.out_tokens_gpu[:n, 0])
+
     @torch.inference_mode()
     def execute(
         self, plan: StepPlanView, header: StepHeader
     ) -> tuple[list[SeqResult], int]:
+        return self.finish(self.launch(plan, header))
+
+    @torch.inference_mode()
+    def launch(self, plan: StepPlanView, header: StepHeader) -> _LaunchedStep | None:
         from vllm.config import CUDAGraphMode
         from vllm.forward_context import set_forward_context
 
@@ -1559,7 +1655,8 @@ class DeepSeekV41StepRunner:
         total_tokens = header.num_encoder_tokens
         num_sample = header.num_sample_rows
         if total_tokens == 0 or num_seqs == 0:
-            return [], 1
+            return None
+        parity = header.step_id & 1
 
         tok_np = plan.token_ids(total_tokens)
         pos_np = plan.positions(total_tokens)
@@ -1575,9 +1672,12 @@ class DeepSeekV41StepRunner:
         unified_prefill = os.environ.get("ZSTEP_DS_UNIFIED_PREFILL", "0") == "1"
         eager_decode = os.environ.get("ZSTEP_DS_EAGER_DECODE", "0") == "1"
         is_spec_step = header.is_dspark_verify != 0
+        header_is_decode = (
+            (header.flags & STEP_FLAG_DECODE_ONLY) != 0 and not is_spec_step
+        )
+        use_dev_tok = header_is_decode and (header.flags & STEP_FLAG_DEVICE_TOKENS) != 0
         is_decode = (
-            (header.flags & STEP_FLAG_DECODE_ONLY) != 0
-            and not is_spec_step
+            header_is_decode
             and not unified_prefill
             and not eager_decode
         )
@@ -1599,11 +1699,16 @@ class DeepSeekV41StepRunner:
             and bool(np.all(q_lens == width))
         )
         aux_hidden_states: list[torch.Tensor] | None = None
+        self._h2d_done_event.synchronize()
 
-        self.start_event.record()
+        self.start_events[parity].record()
         if is_decode and int(seq_lens_np.max()) <= self.decode_graph_max_seq_len:
             bucket = select_decode_bucket(num_seqs, self.max_graph_bucket)
             active_pt = pt_np[slot_np, :] + 1
+            self.slots_cpu[:num_seqs].numpy()[:] = slot_np
+            self.slots_gpu[:num_seqs].copy_(
+                self.slots_cpu[:num_seqs], non_blocking=True
+            )
 
             mla_bt_np = self.mla_bt_cpu[:bucket].numpy()
             mla_bt_np[:num_seqs] = active_pt
@@ -1621,17 +1726,18 @@ class DeepSeekV41StepRunner:
             if bucket > num_seqs:
                 comp_bt_np[num_seqs:bucket] = self.dummy_comp_block
 
-            lb_np = self.lookback_cpu[:bucket].numpy()
-            lb_np[:num_seqs, 0] = prev_win_np[:, 2]
-            lb_np[:num_seqs, 1] = prev_win_np[:, 1]
-            lb_np[:num_seqs, 2] = prev_win_np[:, 0]
-            if bucket > num_seqs:
-                lb_np[num_seqs:bucket] = -1
+            if not use_dev_tok:
+                lb_np = self.lookback_cpu[:bucket].numpy()
+                lb_np[:num_seqs, 0] = prev_win_np[:, 2]
+                lb_np[:num_seqs, 1] = prev_win_np[:, 1]
+                lb_np[:num_seqs, 2] = prev_win_np[:, 0]
+                if bucket > num_seqs:
+                    lb_np[num_seqs:bucket] = -1
 
-            tok_cpu_np = self.token_ids_cpu[:bucket].numpy()
-            tok_cpu_np[:num_seqs] = tok_np
-            if bucket > num_seqs:
-                tok_cpu_np[num_seqs:bucket] = 0
+                tok_cpu_np = self.token_ids_cpu[:bucket].numpy()
+                tok_cpu_np[:num_seqs] = tok_np
+                if bucket > num_seqs:
+                    tok_cpu_np[num_seqs:bucket] = 0
 
             pos_cpu_np = self.positions_cpu[:bucket].numpy()
             pos_i64 = pos_np.astype(np.int64)
@@ -1655,12 +1761,24 @@ class DeepSeekV41StepRunner:
             self.comp_bt_gpu[:bucket].copy_(
                 self.comp_bt_cpu[:bucket], non_blocking=True
             )
-            self.lookback_gpu[:bucket].copy_(
-                self.lookback_cpu[:bucket], non_blocking=True
-            )
-            self.token_ids_gpu[:bucket].copy_(
-                self.token_ids_cpu[:bucket], non_blocking=True
-            )
+            if use_dev_tok:
+                s_idx = self.slots_gpu[:num_seqs]
+                torch.index_select(
+                    self.slot_last_tok_gpu, 0, s_idx, out=self.token_ids_gpu[:num_seqs]
+                )
+                torch.index_select(
+                    self.slot_lb_gpu, 0, s_idx, out=self.lookback_gpu[:num_seqs]
+                )
+                if bucket > num_seqs:
+                    self.token_ids_gpu[num_seqs:bucket].zero_()
+                    self.lookback_gpu[num_seqs:bucket].fill_(-1)
+            else:
+                self.lookback_gpu[:bucket].copy_(
+                    self.lookback_cpu[:bucket], non_blocking=True
+                )
+                self.token_ids_gpu[:bucket].copy_(
+                    self.token_ids_cpu[:bucket], non_blocking=True
+                )
             self.positions_gpu[:bucket].copy_(
                 self.positions_cpu[:bucket], non_blocking=True
             )
@@ -1685,16 +1803,19 @@ class DeepSeekV41StepRunner:
                 is_prefilling_cpu=self.decode_is_prefilling_cpu[:bucket],
                 for_capture=False,
             )
+            self._h2d_done_event.record()
             self.decode_graphs[bucket].replay()
+            self._commit_decode_slot_state(num_seqs)
 
             if self.rank == 0:
-                self.out_tokens_cpu[:num_seqs].copy_(
+                self.out_tokens_cpu[parity, :num_seqs].copy_(
                     self.out_tokens_gpu[:num_seqs], non_blocking=True
                 )
-                self.out_logprobs_cpu[:num_seqs].copy_(
+                self.out_logprobs_cpu[parity, :num_seqs].copy_(
                     self.out_logprobs_gpu[:num_seqs], non_blocking=True
                 )
             sample_slots_out = [int(slot_np[i]) for i in range(num_seqs)]
+            num_out = num_seqs
         elif use_verify_graph:
             rows = v_bucket * width
             seq_slots_np = slot_np[0:total_tokens:width]
@@ -1786,18 +1907,20 @@ class DeepSeekV41StepRunner:
                 is_prefilling_cpu=self.decode_is_prefilling_cpu[:v_bucket],
                 for_capture=False,
             )
+            self._h2d_done_event.record()
             self.verify_graphs[v_bucket].replay()
             raw_aux = self.verify_graph_aux[v_bucket]
             aux_hidden_states = (
                 [a[:total_tokens] for a in raw_aux] if raw_aux is not None else None
             )
-            self.out_tokens_cpu[:num_sample].copy_(
+            self.out_tokens_cpu[parity, :num_sample].copy_(
                 self.out_tokens_gpu[:num_sample], non_blocking=True
             )
-            self.out_logprobs_cpu[:num_sample].copy_(
+            self.out_logprobs_cpu[parity, :num_sample].copy_(
                 self.out_logprobs_gpu[:num_sample], non_blocking=True
             )
             sample_slots_out = []
+            num_out = num_sample
         else:
             first_pos = pos_np[q_start_np[:num_seqs]]
             # Enforce vLLM's strict 4-region mixed-batch ordering:
@@ -1854,12 +1977,13 @@ class DeepSeekV41StepRunner:
             swa_bt_np[:, 1::2] = active_pt * 2 + 1
             self.comp_bt_cpu[:num_seqs, 0].numpy()[:] = seq_slots_np + 1
 
-            lb_np = self.lookback_cpu[:num_seqs].numpy()
-            lb_np[:, 0] = prev_win_np[:, 2]
-            lb_np[:, 1] = prev_win_np[:, 1]
-            lb_np[:, 2] = prev_win_np[:, 0]
+            if not use_dev_tok:
+                lb_np = self.lookback_cpu[:num_seqs].numpy()
+                lb_np[:, 0] = prev_win_np[:, 2]
+                lb_np[:, 1] = prev_win_np[:, 1]
+                lb_np[:, 2] = prev_win_np[:, 0]
+                np.copyto(self.token_ids_cpu[:total_tokens].numpy(), tok_np)
 
-            np.copyto(self.token_ids_cpu[:total_tokens].numpy(), tok_np)
             pos_i64 = pos_np.astype(np.int64)
             np.copyto(self.positions_cpu[:total_tokens].numpy(), pos_i64)
             np.copyto(self.seq_lens_cpu[:num_seqs].numpy(), seq_lens_np)
@@ -1887,12 +2011,13 @@ class DeepSeekV41StepRunner:
             self.comp_bt_gpu[:num_seqs].copy_(
                 self.comp_bt_cpu[:num_seqs], non_blocking=True
             )
-            self.lookback_gpu[:num_seqs].copy_(
-                self.lookback_cpu[:num_seqs], non_blocking=True
-            )
-            self.token_ids_gpu[:total_tokens].copy_(
-                self.token_ids_cpu[:total_tokens], non_blocking=True
-            )
+            if not use_dev_tok:
+                self.lookback_gpu[:num_seqs].copy_(
+                    self.lookback_cpu[:num_seqs], non_blocking=True
+                )
+                self.token_ids_gpu[:total_tokens].copy_(
+                    self.token_ids_cpu[:total_tokens], non_blocking=True
+                )
             self.positions_gpu[:total_tokens].copy_(
                 self.positions_cpu[:total_tokens], non_blocking=True
             )
@@ -1922,6 +2047,26 @@ class DeepSeekV41StepRunner:
                 is_prefilling_cpu=self.mixed_is_prefilling_cpu[:num_seqs],
                 for_capture=False,
             )
+            if header_is_decode:
+                self.slots_cpu[:num_seqs].numpy()[:] = seq_slots_np
+                self.slots_gpu[:num_seqs].copy_(
+                    self.slots_cpu[:num_seqs], non_blocking=True
+                )
+                if use_dev_tok:
+                    s_idx = self.slots_gpu[:num_seqs]
+                    torch.index_select(
+                        self.slot_last_tok_gpu,
+                        0,
+                        s_idx,
+                        out=self.token_ids_gpu[:num_seqs],
+                    )
+                    torch.index_select(
+                        self.slot_lb_gpu,
+                        0,
+                        s_idx,
+                        out=self.lookback_gpu[:num_seqs],
+                    )
+            self._h2d_done_event.record()
             with set_forward_context(
                 attn_meta,
                 self.vllm_config,
@@ -1942,47 +2087,80 @@ class DeepSeekV41StepRunner:
                         hidden,
                         self.sample_rows_gpu[:num_sample],
                         num_sample,
-                        all_ranks=is_spec_step,
+                        all_ranks=(is_spec_step or header_is_decode),
                     )
+            if header_is_decode:
+                self._commit_decode_slot_state(num_seqs)
 
             if (self.rank == 0 or is_spec_step) and num_sample > 0:
-                self.out_tokens_cpu[:num_sample].copy_(
+                self.out_tokens_cpu[parity, :num_sample].copy_(
                     self.out_tokens_gpu[:num_sample], non_blocking=True
                 )
-                self.out_logprobs_cpu[:num_sample].copy_(
+                self.out_logprobs_cpu[parity, :num_sample].copy_(
                     self.out_logprobs_gpu[:num_sample], non_blocking=True
                 )
+            num_out = num_sample
 
-        self.end_event.record()
-        self.end_event.synchronize()
-        outputs: list[SeqResult] = []
-        if header.is_dspark_verify:
-            outputs = self._speculative_outputs(
+        self.end_events[parity].record()
+        spec_ctx = (
+            _SpecVerifyContext(
                 num_sample=num_sample,
-                sample_rows_np=sample_rows_np,
-                slot_np=slot_np,
-                tok_np=tok_np,
-                pos_np=pos_np,
-                q_start_np=q_start_np,
-                pt_np=pt_np,
+                sample_rows_np=sample_rows_np.copy(),
+                slot_np=slot_np.copy(),
+                tok_np=tok_np.copy(),
+                pos_np=pos_np.copy(),
+                q_start_np=q_start_np.copy(),
+                pt_np=pt_np.copy(),
                 aux_hidden_states=aux_hidden_states,
             )
-            self.end_event.record()
-            self.end_event.synchronize()
-        elif self.rank == 0 and num_sample > 0:
-            toks_out = self.out_tokens_cpu[:num_sample].tolist()
-            lps_out = self.out_logprobs_cpu[:num_sample].tolist()
-            for i in range(num_sample):
+            if is_spec_step
+            else None
+        )
+        return _LaunchedStep(
+            parity=parity,
+            num_out=num_out,
+            sample_slots_out=sample_slots_out,
+            spec_ctx=spec_ctx,
+        )
+
+    @torch.inference_mode()
+    def finish(self, step: _LaunchedStep | None) -> tuple[list[SeqResult], int]:
+        if step is None:
+            return [], 1
+        p = step.parity
+        self.end_events[p].synchronize()
+        outputs: list[SeqResult] = []
+        if step.spec_ctx is not None:
+            ctx = step.spec_ctx
+            outputs = self._speculative_outputs(
+                parity=p,
+                num_sample=ctx.num_sample,
+                sample_rows_np=ctx.sample_rows_np,
+                slot_np=ctx.slot_np,
+                tok_np=ctx.tok_np,
+                pos_np=ctx.pos_np,
+                q_start_np=ctx.q_start_np,
+                pt_np=ctx.pt_np,
+                aux_hidden_states=ctx.aux_hidden_states,
+            )
+            self.end_events[p].record()
+            self.end_events[p].synchronize()
+        elif self.rank == 0 and step.num_out > 0:
+            toks_np = self._out_tokens_np[p]
+            lps_np = self._out_logprobs_np[p]
+            for i in range(step.num_out):
                 outputs.append(
                     SeqResult(
-                        req_slot=sample_slots_out[i],
-                        accepted_token=int(toks_out[i][0]),
-                        accepted_logprob_bits=int(lps_out[i][0]) & 0xFFFF_FFFF,
-                        runner_up_token=int(toks_out[i][1]),
-                        runner_up_logprob_bits=int(lps_out[i][1]) & 0xFFFF_FFFF,
+                        req_slot=step.sample_slots_out[i],
+                        accepted_token=int(toks_np[i, 0]),
+                        accepted_logprob_bits=int(lps_np[i, 0]) & 0xFFFF_FFFF,
+                        runner_up_token=int(toks_np[i, 1]),
+                        runner_up_logprob_bits=int(lps_np[i, 1]) & 0xFFFF_FFFF,
                     )
                 )
-        gpu_exec_us = max(1, int(self.start_event.elapsed_time(self.end_event) * 1000.0))
+        gpu_exec_us = max(
+            1, int(self.start_events[p].elapsed_time(self.end_events[p]) * 1000.0)
+        )
         return outputs, gpu_exec_us
 
     def signal_abort(self) -> None:
@@ -2005,6 +2183,11 @@ class DeepSeekV41StepRunner:
             self.dspark_drafter.close()
         close_b12x_dsv41_model(getattr(self, "dspark_model", None))
         close_b12x_dsv41_model(getattr(self, "model", None))
+        self.dspark_model = None
+        self.model = None
+        builder_groups = getattr(self, "_builder_groups", None)
+        if builder_groups is not None:
+            builder_groups.clear()
         if self.argmax_channel is not None:
             self.argmax_channel.close(abort=True)
         if self.shm_ag is not None:
@@ -2027,6 +2210,7 @@ class DeepSeekV41StepRunner:
             destroy_model_parallel,
         )
 
+        torch.cuda.synchronize(self.device)
         self.decode_graphs.clear()
         self.verify_graphs.clear()
         self.verify_graph_aux.clear()
@@ -2034,6 +2218,13 @@ class DeepSeekV41StepRunner:
             self.dspark_drafter.close()
         close_b12x_dsv41_model(getattr(self, "dspark_model", None))
         close_b12x_dsv41_model(getattr(self, "model", None))
+        self.dspark_model = None
+        self.model = None
+        builder_groups = getattr(self, "_builder_groups", None)
+        if builder_groups is not None:
+            builder_groups.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
         if dist.is_initialized() and hasattr(self, "exchange_group"):
             dist.barrier(group=self.exchange_group)
         if self.argmax_channel is not None:

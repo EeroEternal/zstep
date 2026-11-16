@@ -1329,8 +1329,8 @@ impl ServingEngine {
     /// Publish decode steps before the previous step's result is read.
     ///
     /// Workers must implement `launch`/`finish`, `STEP_FLAG_DEVICE_TOKENS`, and
-    /// `STEP_FLAG_NEXT_PREPUBLISHED`, and must not rely on host-updated `engram_prev_window`
-    /// during overlapped decode bursts (enable only for models without host Engram lookback).
+    /// `STEP_FLAG_NEXT_PREPUBLISHED`, maintaining device-resident sampled tokens (and any
+    /// per-slot Engram lookback window) across overlapped decode bursts.
     pub fn set_device_token_overlap(&mut self, enabled: bool) {
         self.device_token_overlap = enabled;
     }
@@ -1808,6 +1808,7 @@ impl ServingEngine {
                 Some(promise) => promise,
                 None => {
                     let promise = self.device_token_overlap
+                        && !self.speculative.enabled()
                         && self.plan_flags(step_id)? & STEP_FLAG_DECODE_ONLY != 0
                         && decode_continues_for_all(
                             &active,
@@ -1838,8 +1839,8 @@ impl ServingEngine {
                     max_pages_per_seq,
                     true,
                 )?;
-                let promise =
-                    decode_continues_for_all(&active, waiting_admissible, 1, has_prefix_cache);
+                let promise = !self.speculative.enabled()
+                    && decode_continues_for_all(&active, waiting_admissible, 1, has_prefix_cache);
                 let mut flags = STEP_FLAG_DEVICE_TOKENS;
                 if promise {
                     flags |= STEP_FLAG_NEXT_PREPUBLISHED;

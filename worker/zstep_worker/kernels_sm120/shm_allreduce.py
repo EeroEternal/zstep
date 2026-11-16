@@ -811,6 +811,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         for (int j = 0; j < 4; ++j) {
             out.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
         }
+        output_vec[idx] = out.u4;
         st_wt_uint4(my_red + idx, out.u4);
     }
     __syncthreads();
@@ -836,12 +837,15 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         const int64_t sub_len = c_len / world_size;
         for (int64_t off = threadIdx.x; off < c_len; off += blockDim.x) {
             const int owner = static_cast<int>(off / sub_len);
-            const uint4* o_red = reinterpret_cast<const uint4*>(
-                s_peer_shm[owner] + 131072 + slot * slot_stride_bytes + half_slot);
-            output_vec[c_begin + off] = ld_cv_uint4(o_red + c_begin + off);
+            if (owner != rank) {
+                const uint4* o_red = reinterpret_cast<const uint4*>(
+                    s_peer_shm[owner] + 131072 + slot * slot_stride_bytes + half_slot);
+                output_vec[c_begin + off] = ld_cv_uint4(o_red + c_begin + off);
+            }
         }
     } else {
         for (int owner = 0; owner < world_size; ++owner) {
+            if (owner == rank) continue;
             const int64_t o_begin = c_begin + (c_len * owner) / world_size;
             const int64_t o_end = c_begin + (c_len * (owner + 1)) / world_size;
             const uint4* o_red = reinterpret_cast<const uint4*>(
@@ -2000,7 +2004,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v11_ext",
+            name="zstep_shm_allreduce_sm120_v12_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[

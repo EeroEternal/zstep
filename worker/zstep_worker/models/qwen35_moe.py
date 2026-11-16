@@ -418,6 +418,11 @@ class Qwen35MoeStepRunner:
         os.environ.setdefault("NCCL_P2P_DISABLE", "1")
         os.environ.setdefault("NCCL_P2P_LEVEL", "LOC")
         os.environ.setdefault("NCCL_IB_DISABLE", "1")
+        os.environ.setdefault("NCCL_SHM_USE_CUDA_MEMCPY", "1")
+        os.environ.setdefault("NCCL_SHM_MEMCPY_MODE", "3")
+        os.environ.setdefault("NCCL_MIN_NCHANNELS", "6")
+        os.environ.setdefault("NCCL_MAX_NCHANNELS", "6")
+        os.environ.setdefault("NCCL_BUFFSIZE", "4194304")
         dist.init_process_group(
             backend="gloo",
             init_method=f"file://{dist_init_file}",
@@ -432,10 +437,10 @@ class Qwen35MoeStepRunner:
             if (enable_nccl_prefill and dist.is_nccl_available())
             else None
         )
-        # Route M <= 800 (<= 3.125 MiB at H=2048) and 100% of CUDAGraph captures
+        # Route M <= 960 (<= 3.75 MiB at H=2048) and 100% of CUDAGraph captures
         # through `shm_v5`; route larger eager prefill chunks (M >= 1024) to `NCCL_LOC`.
         self.shm_max_ar_numel: int = int(
-            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(320 * 5120))
+            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(384 * 5120))
         )
         self.enable_fused_ar_norm: bool = (
             os.environ.get("ZSTEP_QWEN_ENABLE_FUSED_AR_NORM", "1") != "0"
