@@ -1,8 +1,8 @@
-# `zstep` 综合性能基准测试报告（SM120 非 P2P PCIe 8 卡）
+# `zstep` 综合性能基准测试报告（SM120 PCIe 8 卡：无 P2P 与自适应 PCIe P2P 双模）
 
-本文档汇总 `zstep` 在 **Blackwell Workstation / Consumer SM120（`sm_120a`）无 GPU P2P（`can_device_access_peer == 0`）8 卡 PCIe 平台**上的完整性能验证结果，涵盖：
+本文档汇总 `zstep` 在 **Blackwell Workstation / Consumer SM120（`sm_120a`）8 卡 PCIe 平台**上的完整性能验证结果，同时覆盖 **无 GPU P2P（`can_device_access_peer == 0`）** 与 **PCIe Switch P2P（`PXB` + CX8 混合归约）自适应双模**两类生产环境，涵盖：
 
-1. **底层通信与控制面微基准**（`shm_v5` Host-Pinned AllReduce、纯 Rust 控制面、SM120 专属算子）；
+1. **底层通信与控制面微基准**（无 P2P `shm_v5` Host-Pinned AllReduce、自适应 `shm_v5_pxb` CX8 混合 CUDA-IPC + Host-SHM 归约、纯 Rust 控制面、SM120 专属算子）；
 2. **基础引擎吞吐与延迟对标**（`zstep` 对称无缓存模式 vs `vLLM` HTTP / 纯引擎）；
 3. **在线自动前缀缓存（APC）**（`Qwen3.5` 混合 GQA + GatedDeltaNet 状态快照与 `DeepSeek-V4.1` 128-token 页缓存）；
 4. **在线投机解码（Speculative Decoding）**（`dspark`、`mtp`、`ngram` 三种方法的加速比、接受率与贪心一致性）；
@@ -17,9 +17,9 @@
 
 | 评测维度 | 模型与硬件平台 | 基线参考 | `zstep` 实测结果 | 相对收益 |
 | --- | --- | --- | --- | --- |
-| **PCIe AllReduce（小 batch 解码）** | `8 × RTX 6000D`（`H=5120`, `M=1`） | `NCCL_LOC`：`48.95 µs` | `shm_v5`：**`12.46–14.48 µs`** | **`3.38×–3.93×`** |
-| **基础引擎对称对标（`Qwen3.5`）** | `Qwen3.5-35B-A3B` TP=8 @ `8 × RTX 5090` / `6000D` | `vLLM 0.33.0`：`192.2–3,259.0 tok/s` | **`261.5–5,039.1 tok/s`**（`6000D` 在线 `serve` 单流达 **`380.0 tok/s`**） | **`+11.0%` ~ `+54.1%`**（在线单流重叠再增 **`+20.8%`**） |
-| **基础引擎对称对标（`DeepSeek-V4.1`）** | `DeepSeek-V4.1-Flash` TP=8 @ `8 × RTX 6000D` | `vLLM 0.31.0` 纯引擎：`83.6–1,126.3 tok/s` | **`124.0–1,795.8 tok/s`**（在线 `serve` 单流 **`133.5 tok/s`**，`in4096_c16` 总吞吐 **`6,518.9 tok/s`**） | **`+42.5%` ~ `+59.4%`**（全档位领先） |
+| **PCIe AllReduce（小/中 batch）** | `8 × RTX 6000D`（`H=5120`, `M=1..512`） | `NCCL_LOC`：`48.95 µs`（`M=1`）；`shm_v5`：`571.54 µs`（`M=512`） | `shm_v5`：**`12.46–14.48 µs`**（`M=1`）；`shm_v5_pxb`：**`323.95 µs`**（`M=512`） | **`3.38×–3.93×`**（`M=1`）；CX8 P2P 再快 **`1.40×–1.76×`** |
+| **基础引擎对称对标（`Qwen3.5`）** | `Qwen3.5-35B-A3B` TP=8 @ `8 × RTX 5090` / `6000D` | `vLLM 0.33.0`：`192.2–3,259.0 tok/s` | 无 P2P **`261.5–5,115.9 tok/s`**；自适应 P2P 达 **`5,877.1 tok/s`**（总吞吐 **`17,631.4 tok/s`**），在线 `serve` 单流 **`380.0 tok/s`** | 较 `vLLM` **`+11.0%` ~ `+80.3%`**；自适应 P2P 再增 **`+10.30%`**（中位 TTFT 降 **`12.2%–16.9%`**） |
+| **基础引擎对称对标（`DeepSeek-V4.1`）** | `DeepSeek-V4.1-Flash` TP=8 @ `8 × RTX 6000D` | `vLLM 0.31.0` 纯引擎：`83.6–1,126.3 tok/s` | 无 P2P **`124.0–1,807.2 tok/s`**；自适应 P2P 达 **`2,043.0 tok/s`**（`in4096_c16` 总吞吐 **`7,636.9 tok/s`**），在线单流 **`133.5 tok/s`** | 较 `vLLM` **`+42.5%` ~ `+81.4%`**；自适应 P2P 再增 **`+7.97%`**（中位 TTFT 降 **`13.7%–14.0%`**） |
 | **在线自动前缀缓存（APC）** | `Qwen3.5` / `DeepSeek-V4.1` TP=8 @ `8 × RTX 6000D` | Cold TTFT：`599.2 ms` / `1,049.6 ms` | Warm TTFT：**`36.9–44.4 ms`** / **`202.7–204.3 ms`** | **`13.49×–16.22×`** / **`5.14×–5.18×`** |
 | **在线投机解码（`Qwen3.5` `mtp K=3`）** | `Qwen3.5-35B-A3B` TP=8 @ `8 × RTX 6000D` | `zstep` 无投机：`309.3–314.3 tok/s` | **`583.6–762.5 tok/s`**（TPOT **`1.31–1.71 ms`**，$\tau=2.88\text{–}3.90$） | **`1.87×–2.45×`** |
 | **在线投机解码（`DeepSeek-V4.1` `dspark K=5`）** | `DeepSeek-V4.1-Flash` TP=8 @ `8 × RTX 6000D` | `zstep` 无投机：`117.9–118.6 tok/s` | **`168.9–395.1 tok/s`**（TPOT **`2.53–5.92 ms`**，$\tau=2.85\text{–}6.00$） | **`1.42×–3.35×`** |
@@ -30,17 +30,17 @@
 
 ## 2. 测试硬件拓扑与测量口径
 
-### 2.1 两套 SM120 非 P2P 测试平台
+### 2.1 两套 SM120 测试平台（无 P2P 与自适应 PCIe Switch P2P）
 
-所有实验均在 `can_device_access_peer(i, j) == 0`（任意两卡间无 NVLink 且无 PCIe P2P BAR 直通）的 8 卡 SM120 主机上完成。报告严格区分以下两套物理拓扑，不做跨机器混算：
+第 3.1 节与第 4.1–4.3 节的所有基线实验均在 `can_device_access_peer(i, j) == 0`（无 NVLink、无 PCIe P2P BAR 直通）条件下完成；第 3.3 节与第 4.4 节进一步验证了平台 B 在开启 `iommu=pt`、Open Kernel 驱动（`595.99+`）并清除 PCIe 桥接器 ACS 重定向位（`ReqRedir-`）后的**自适应 PCIe Switch P2P（`PXB`）加速能力**。报告严格区分物理拓扑与运行模式，不做跨机器混算：
 
 | 属性 | 平台 A：`8 × NVIDIA GeForce RTX 5090` | 平台 B：`8 × NVIDIA RTX 6000D` |
 | --- | --- | --- |
 | **GPU 架构 / SM 数** | Blackwell `sm_120a` | Blackwell `sm_120a`（`156 SMs` / GPU） |
 | **单卡显存 / 8 卡总显存** | `32 GB` GDDR7（共 `256 GB`） | `85,651 MiB` GDDR7（共 `669.15 GiB`） |
-| **PCIe 与 P2P 拓扑** | 8 卡分属 4 个 NUMA：`[0, 0, 0, 1, 2, 2, 2, 3]`，`P2P = 0` | 8 卡对称分属 2 个 NUMA：`[0, 0, 0, 0, 1, 1, 1, 1]`，PCIe Gen5 x16，`P2P = 0` |
-| **主机内存 / 驱动与 CUDA** | 4-NUMA Host Pinned SHM，CUDA `13.1` | `1.97 TiB` DDR5，Driver `590.48.01`，CUDA `13.1` |
-| **承载测试项** | Phase 2 `Qwen3.5-35B-A3B` vs `vLLM 0.33.0` 对称基线 | Phase 3 `Qwen3.5` 与 `DeepSeek-V4.1-Flash` 引擎极限、APC、投机解码、Nebula 全栈联调 |
+| **PCIe 与 P2P 拓扑** | 8 卡分属 4 个 NUMA：`[0, 0, 0, 1, 2, 2, 2, 3]`，`P2P = 0` | 2-NUMA `[0, 0, 0, 0, 1, 1, 1, 1]`，4 颗 CX8 PCIe Gen5 Switch 各挂 1 对 `(2k, 2k+1)` GPU：支持 **无 P2P（`LOC`）** 与 **同 Switch P2P（`PXB`，双向 `103.20 GB/s`）** 双模自动切换 |
+| **主机内存 / 驱动与 CUDA** | 4-NUMA Host Pinned SHM，CUDA `13.1` | `1.97 TiB` DDR5，Driver `590.48.01`（非 P2P）/ Open `595.99.02`（双模），CUDA `13.1` |
+| **承载测试项** | Phase 2 `Qwen3.5-35B-A3B` vs `vLLM 0.33.0` 对称基线 | Phase 3 `Qwen3.5` 与 `DeepSeek-V4.1-Flash` 非 P2P 基线、自适应 P2P 双模 A/B、APC、投机解码、Nebula 全栈联调 |
 
 ### 2.2 评测模型规格
 
@@ -81,6 +81,32 @@
   - **`b12x` 原生 MMA MXFP4 MoE**（[`b12x_dsv41.py`](../worker/zstep_worker/kernels_sm120/b12x_dsv41.py)）：在 `DeepSeek-V4.1` 解码微批量（`M=1..128`）上替代 Marlin FP4，消除权重解包瓶颈，使整网端到端吞吐额外提升 **`+36%` ~ `+54%`**。
   - **`sm12x_mega_gate` + `sm120_dsa_indexer`**：融合 `DeepSeek-V4.1` 稀疏路由 sigmoid top-8 分组门控与 FP8 Indexer 打分，单层门控 + 索引开销压缩至微秒级。
   - **Route A 零同步 GatedDeltaNet + FlashInfer CUDA Graph**（[`qwen35_ops.py`](../worker/zstep_worker/kernels_sm120/qwen35_ops.py)）：消除 `Qwen3.5` 线性注意力与全注意力混合步中的全部 Python `.item()` D2H 同步，在 `8 × RTX 6000D` 上将 `c=1` 解码速度从 `269 tok/s` 推升至 **`354.0 tok/s`**。
+
+### 3.3 自适应 PCIe P2P/ACS 探测与 CX8 混合归约微基准（`p2p_probe.py` + `shm_v5_pxb`）
+
+在具备 PCIe Switch 的多卡工作站/服务器（如 `8 × RTX 6000D`，4 颗 CX8 Switch 各连接 1 对 `(2k, 2k+1)` GPU）上，硬件拓扑存在三项关键特征：
+
+1. **桥接深度为 `PXB` 而非 `PIX`**：同颗 CX8 Switch 内的两张卡跨越两级内部下游桥（`nvidia-smi topo -m` 标记为 `PXB`），若配置 `NCCL_P2P_LEVEL=PIX` 会导致 P2P 完全失效；而跨 Root Port / 跨 NUMA UPI 的 SM BAR1 MMIO 写带宽仅约 `1.5 GB/s`，盲目开启 `SYS` 则会劣化甚至死锁。
+2. **ACS 重定向隐患**：若宿主机未清除 PCIe 桥接器的 `ACS ReqRedir+` 位，即使 `cudaDeviceCanAccessPeer == 1`，实测同 Switch 双向带宽也会跌至 `8.09 GB/s` 并触发 `NCCL PXB` 环形通信超时；清除 `ReqRedir-` 后，同 Switch 双向 D2D Copy Engine 达 **`103.20 GB/s`**，8-CTA SM 直写/直读达 **`80.58 GB/s` / `73.64 GB/s`**。
+3. **共享 CPU 上行链路瓶颈**：同颗 CX8 下的两张卡共享同一条 PCIe Gen5 x16 上行链路至 Xeon Root Complex（双卡并发时单卡上/下行有效带宽约 `27 GB/s`）。
+
+为此，[`p2p_probe.py`](../worker/zstep_worker/p2p_probe.py) 在 `ncclCommInitRank` 前自动解析全卡 `sysfs` PCIe 桥接树与 `world_size × world_size` P2P 矩阵，并对全部 `(2k, 2k+1)` Switch 对执行并发 CUDA-IPC 双向带宽实测（默认健康门限 `>= 25.0 GB/s`）：
+
+- **无 P2P 主机 / `ZSTEP_P2P_MODE=off` / ACS 异常（`< 25 GB/s`）**：零开销回退至经验证的非 P2P 参数（`NCCL_P2P_DISABLE=1`、`NCCL_P2P_LEVEL=LOC`、双 Copy Engine `MODE=3`、`6ch × 4MiB`、`shm_v5` 门限 `M <= 384`，不分配任何 CUDA-IPC 显存）；
+- **健康 P2P 主机（`>= 25 GB/s`）**：自动选定最优 `NCCL_P2P_LEVEL`（多 NUMA Switch 对选 `PXB`，单 NUMA 全直通选 `PHB`），开启 [`shm_allreduce.py`](../worker/zstep_worker/kernels_sm120/shm_allreduce.py) 中的 **`shm_v5_pxb` 混合单内核（同 CX8 伙伴 CUDA-IPC P2P 预归约 + 4 对代表跨 Host-SHM 交换，兼容 `all_reduce` 与融合 `all_reduce_add_rmsnorm` 及 CUDA Graph）**，并将 `shm_v5_pxb` 接管门限扩展至 `M <= 512`，将共享 CPU 上行链路流量削减 **`1.8×–2.67×`**。
+
+| 集合通信范围（`8 × RTX 6000D`, BF16） | 非 P2P 基线（`shm_v5` / `NCCL_LOC`） | 开启 P2P 后 `NCCL_PXB` | **`zstep` 自适应双模（`shm_v5_pxb` / `NCCL_PXB`）** | 相对非 P2P 加速比 |
+| --- | ---: | ---: | ---: | ---: |
+| `M=4, H=5120`（`40 KiB`，`pxb_1shot`） | `22.14 µs`（`shm_v5`） | `35.8 µs` | **`17.83 µs`** | **`1.24×`** |
+| `M=32, H=5120`（`320 KiB`，`pxb_2shot`） | `50.44 µs`（`shm_v5`） | `61.4 µs` | **`35.92 µs`** | **`1.40×`** |
+| `M=128, H=5120`（`1.25 MiB`，满载解码步） | `152.69 µs`（`shm_v5`） | `141.2 µs` | **`93.84 µs`** | **`1.63×`** |
+| `M=384, H=5120`（`3.75 MiB`，混合步） | `431.46 µs`（`shm_v5`） | `286.6 µs` | **`247.62 µs`** | **`1.74×`** |
+| `M=512, H=5120`（`5.00 MiB`，切换边界） | `571.54 µs`（`shm_v5`） | `352.5 µs` | **`323.95 µs`** | **`1.76×`** |
+| `M=1024, H=5120`（`10.0 MiB`，Prefill） | `957.20 µs`（`NCCL_LOC`） | `711.7 µs` | **`711.70 µs`**（`NCCL_PXB`） | **`1.34×`** |
+| `M=2048, H=5120`（`20.0 MiB`，长 Prefill） | `1,887.30 µs`（`NCCL_LOC`） | `1,450.1 µs` | **`1,450.10 µs`**（`NCCL_PXB`） | **`1.30×`** |
+| `M=128, H=2048`（`512 KiB`，`Qwen3.5` 解码） | `70.19 µs`（`shm_v5`） | `79.5 µs` | **`47.25 µs`** | **`1.49×`** |
+| `M=512, H=2048`（`2.00 MiB`，`Qwen3.5` 混合步） | `236.63 µs`（`shm_v5`） | `178.4 µs` | **`139.89 µs`** | **`1.69×`** |
+| `M=1024, H=2048`（`4.00 MiB`，`Qwen3.5` Prefill） | `423.50 µs`（`NCCL_LOC`） | `297.6 µs` | **`297.60 µs`**（`NCCL_PXB`） | **`1.42×`** |
 
 ---
 
@@ -178,6 +204,35 @@
 
 ---
 
+### 4.4 自适应双模 PCIe P2P + CX8 混合集合通信实测（平台 B：`8 × RTX 6000D` 同机有/无 P2P 对称 A/B）
+
+在同一台 `8 × RTX 6000D` 主机（Open Kernel `595.99.02`，`iommu=pt`，`6000d-acs-off.service` 已清除全部桥接器 `ReqRedir+`，实测同 CX8 Switch 双向带宽 `103.2–110.2 GB/s`）上，通过唯一环境变量开关对比 **`ZSTEP_P2P_MODE=off`（强制走无 P2P `LOC + shm_v5` 路径）** 与 **`ZSTEP_P2P_MODE=auto`（自适应启用 `NCCL_PXB + shm_v5_pxb` 混合路径）**，两侧均关闭前缀缓存与投机解码（Warm `n=2`）：
+
+#### （a）`Qwen/Qwen3.5-35B-A3B` 六档同机有/无 P2P 对照（几何平均输出吞吐 **`+10.30%`**，36/36 项指标全面改善）
+
+| 档位 | 无 P2P (`off`) Output (`tok/s`) | 自适应 P2P (`auto`) Output (`tok/s`) | 自适应 P2P Total (`tok/s`) | 吞吐增益 | `off` / `auto` Mean TPOT (`ms`) | `off` / `auto` Med TTFT (`ms`) | `off` / `auto` P99 ITL (`ms`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `in512_c1` | `347.80` | **`355.56`** | **`1,066.67`** | **`+2.23%`** | `2.71` / **`2.67`**（`-1.38%`） | `44.32` / **`37.73`**（`-14.86%`） | `2.83` / **`2.74`**（`-3.11%`） |
+| `in512_c16` | `2,265.15` | **`2,582.71`** | **`7,748.13`** | **`+14.02%`** | `6.28` / **`5.54`**（`-11.75%`） | `176.23` / **`146.90`**（`-16.64%`） | `6.25` / **`5.53`**（`-11.53%`） |
+| `in512_c64` | `4,351.07` | **`4,840.42`** | **`14,521.27`** | **`+11.25%`** | `12.77` / **`11.60`**（`-9.19%`） | `176.84` / **`146.99`**（`-16.88%`） | `186.12` / **`156.49`**（`-15.92%`） |
+| `in512_c128` | `5,115.92` | **`5,877.12`** | **`17,631.37`** | **`+14.88%`** | `21.59` / **`18.88`**（`-12.53%`） | `176.23` / **`147.07`**（`-16.55%`） | `191.34` / **`161.19`**（`-15.76%`） |
+| `in1024_c32` | `2,479.64` | **`2,651.38`** | **`13,256.90`** | **`+6.93%`** | `11.52` / **`10.89`**（`-5.46%`） | `190.39` / **`161.73`**（`-15.06%`） | `197.91` / **`169.59`**（`-14.31%`） |
+| `in4096_c16` | `464.13` | **`524.81`** | **`17,318.84`** | **`+13.08%`** | `24.84` / **`22.01`**（`-11.38%`） | `450.94` / **`395.77`**（`-12.23%`） | `230.66` / **`202.76`**（`-12.10%`） |
+
+#### （b）`DeepSeek-V4.1-Flash-1017` 五档同机有/无 P2P 对照（几何平均输出吞吐 **`+7.97%`**，高并发突破 `2,043 tok/s`）
+
+| 档位 | 无 P2P (`off`) Output (`tok/s`) | 自适应 P2P (`auto`) Output (`tok/s`) | 自适应 P2P Total (`tok/s`) | 吞吐增益 | `off` / `auto` Mean TPOT (`ms`) | `off` / `auto` Med TTFT (`ms`) | `off` / `auto` P99 ITL (`ms`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `in512_c1` | `123.65` | **`123.82`** | **`371.45`** | **`+0.14%`** | `7.46` / **`7.45`**（`-0.02%`） | `168.59` / **`166.37`**（`-1.32%`） | `7.57` / **`7.57`**（`-0.08%`） |
+| `in512_c24` | `986.56` | **`1,039.43`** | **`3,118.30`** | **`+5.36%`** | `22.01` / **`21.09`**（`-4.19%`） | `367.77` / **`316.21`**（`-14.02%`） | `188.12` / `188.64`（`+0.28%`） |
+| `in512_c128` | `1,807.24` | **`2,043.04`** | **`6,129.11`** | **`+13.05%`** | `61.20` / **`54.32`**（`-11.24%`） | `740.07` / **`637.47`**（`-13.86%`） | `369.88` / **`318.50`**（`-13.89%`） |
+| `in1024_c32` | `891.02` | **`972.86`** | **`4,864.30`** | **`+9.19%`** | `32.37` / **`29.83`**（`-7.85%`） | `372.88` / **`321.07`**（`-13.89%`） | `372.36` / **`320.68`**（`-13.88%`） |
+| `in4096_c16` | `205.42` | **`231.42`** | **`7,636.85`** | **`+12.66%`** | `55.60` / **`49.78`**（`-10.46%`） | `1,133.98` / **`979.05`**（`-13.66%`） | `379.10` / **`327.58`**（`-13.59%`） |
+
+> **双模等价性与安全性审计**：在 `--max-prefill-chunk 24` 分块调度下，`p2p=PXB(pxb_shm=on)` 的确定性数学审计（`prime_squares_table` `128` tokens）在 `single`、`batched`、`chunked` 三种模式下精确匹配率均为 **`100%`**（`1.0`），`TRITON_RECOMPILATIONS = 0`；在无 P2P 主机或显式设置 `ZSTEP_P2P_MODE=off` 时，非 P2P 吞吐与第 4.3 节基线完全持平（零回退损耗）。
+
+---
+
 ## 5. 在线自动前缀缓存（APC）性能验证
 
 `zs-server serve` 默认启用基数树（Radix Tree）自动前缀缓存（[`zs-kv`](../crates/zs-kv)），并与 Nebula Router 的 `NEBULA_KV_HASH_SEED` 前缀亲和路由协同工作。
@@ -263,7 +318,7 @@ $$\text{Client} \longrightarrow \text{nebula-gateway} \longrightarrow \text{nebu
 | --- | --- | --- | --- | --- |
 | **交互式 Agent / IDE 代码补全 / JSON 提取** | 低至中并发（`c = 1..8`），追求极致单流 TPOT 与多轮低 TTFT | `--enable-prefix-caching --speculative-method mtp --num-speculative-tokens 3` | `--enable-prefix-caching --speculative-method dspark --num-speculative-tokens 5` | 单流解码 **`584–762 tok/s`**（`Qwen3.5`）/ **`263–395 tok/s`**（`DS-V4.1`），多轮 TTFT 加速 **`5×–16×`** |
 | **RAG 原文引用 / 代码 Diff 重写（显存受限）** | 低并发、输入输出高度重叠、希望将全部剩余显存留给主模型 KV 池 | `--enable-prefix-caching --speculative-method ngram --num-speculative-tokens 3 --prompt-lookup-max 5 --prompt-lookup-min 2` | `--enable-prefix-caching --speculative-method ngram --num-speculative-tokens 5 --prompt-lookup-max 5 --prompt-lookup-min 2` | **零草稿权重/草稿 KV 显存开销**，重复片段最高 **`2.16×–2.92×`** 提速，不匹配负载零退化 |
-| **高并发离线批处理 / 高吞吐在线池** | 高并发（`c = 16..128`），GPU 算力已由 batch 填满 | `--enable-prefix-caching --speculative-method none`（若追求更低 `P99 ITL` 可加 `--max-prefill-chunk 512`） | `--enable-prefix-caching --speculative-method none` | 峰值输出吞吐 **`5,039 tok/s`**（`Qwen3.5`）/ **`1,796 tok/s`**（`DS-V4.1`），比 `vLLM` 高 **`+36%` ~ `+59%`** |
+| **高并发离线批处理 / 高吞吐在线池** | 高并发（`c = 16..128`），GPU 算力已由 batch 填满 | `--enable-prefix-caching --speculative-method none`（若追求更低 `P99 ITL` 可加 `--max-prefill-chunk 512`） | `--enable-prefix-caching --speculative-method none` | 无 P2P 峰值 **`5,039–5,116 tok/s`**（`Qwen3.5`）/ **`1,796–1,807 tok/s`**（`DS-V4.1`）；开启 PCIe Switch P2P 后达 **`5,877 tok/s`** / **`2,043 tok/s`**（比 `vLLM` 高 **`+54%` ~ `+81%`**） |
 
 ### Nebula 声明式部署配置示例（`ModelConfig.speculative_config`）
 

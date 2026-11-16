@@ -794,12 +794,12 @@ fn spawn_workers(
             .env("OMP_NUM_THREADS", "1")
             .env("MKL_NUM_THREADS", "1")
             .env("OPENBLAS_NUM_THREADS", "1")
-            .env("NCCL_P2P_DISABLE", "1")
-            .env("NCCL_P2P_LEVEL", "LOC")
-            .env("NCCL_IB_DISABLE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        if std::env::var_os("NCCL_IB_DISABLE").is_none() {
+            command.env("NCCL_IB_DISABLE", "1");
+        }
         if let Some(max_model_len) = config.launch.max_model_len {
             command.env("ZSTEP_MAX_MODEL_LEN", max_model_len.to_string());
         }

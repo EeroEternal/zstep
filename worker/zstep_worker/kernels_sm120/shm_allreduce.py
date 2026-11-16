@@ -48,6 +48,7 @@ SHM_V5_HEADER_BYTES = 131072
 SHM_V5_ABORT_OFFSET = 98304
 ARGMAX_SHM_ABORT_OFFSET = 128
 DEFAULT_ONE_SHOT_MAX_VECS = 4096  # Up to 64 KiB (e.g. M <= 16 at H=2048 or M <= 6 at H=5120 BF16)
+DEFAULT_PXB_MAX_ELEMENTS = 512 * 5120  # Up to 5.0 MiB (~40.1 MiB 4-slot CUDA-IPC HBM ring)
 
 _CPP_SOURCE = r"""
 #include <torch/extension.h>
@@ -56,6 +57,10 @@ _CPP_SOURCE = r"""
 
 std::uintptr_t register_mapped_host_cuda(std::uintptr_t host_address, int64_t bytes);
 void unregister_mapped_host_cuda(std::uintptr_t host_address);
+torch::Tensor alloc_ipc_buffer_cuda(int64_t bytes, torch::Tensor out_ptr_u64);
+std::uintptr_t open_ipc_handle_cuda(torch::Tensor handle_u8);
+void close_ipc_handle_cuda(std::uintptr_t ptr);
+void free_ipc_buffer_cuda(std::uintptr_t ptr);
 
 void launch_host_mapped_two_shot_cuda(
     const void* input_ptr,
@@ -77,13 +82,17 @@ void launch_shm_v5_allreduce_cuda(
     void* output_ptr,
     uint64_t* control_ptr,
     const std::uintptr_t* rank_shm_dev_ptrs,
+    std::uintptr_t my_hbm_ptr,
+    std::uintptr_t pt_hbm_ptr,
     int64_t slot_stride_bytes,
+    int64_t pxb_slot_stride_bytes,
     int64_t num_vecs,
     int rank,
     int world_size,
     int blocks,
     int threads,
     int one_shot_max_vecs,
+    int64_t pxb_max_vecs,
     std::uintptr_t stream_handle);
 
 void launch_shm_v5_allreduce_add_rmsnorm_cuda(
@@ -93,7 +102,10 @@ void launch_shm_v5_allreduce_add_rmsnorm_cuda(
     void* normed_out_ptr,
     uint64_t* control_ptr,
     const std::uintptr_t* rank_shm_dev_ptrs,
+    std::uintptr_t my_hbm_ptr,
+    std::uintptr_t pt_hbm_ptr,
     int64_t slot_stride_bytes,
+    int64_t pxb_slot_stride_bytes,
     int64_t rows,
     int64_t vecs_per_row,
     float inv_hidden,
@@ -104,6 +116,7 @@ void launch_shm_v5_allreduce_add_rmsnorm_cuda(
     int blocks,
     int threads,
     int one_shot_max_vecs,
+    int64_t pxb_max_vecs,
     int use_cluster,
     std::uintptr_t stream_handle);
 
@@ -153,6 +166,22 @@ void unregister_mapped_host(std::uintptr_t host_address) {
     unregister_mapped_host_cuda(host_address);
 }
 
+torch::Tensor alloc_ipc_buffer(int64_t bytes, torch::Tensor out_ptr_u64) {
+    return alloc_ipc_buffer_cuda(bytes, out_ptr_u64);
+}
+
+std::uintptr_t open_ipc_handle(torch::Tensor handle_u8) {
+    return open_ipc_handle_cuda(handle_u8);
+}
+
+void close_ipc_handle(std::uintptr_t ptr) {
+    close_ipc_handle_cuda(ptr);
+}
+
+void free_ipc_buffer(std::uintptr_t ptr) {
+    free_ipc_buffer_cuda(ptr);
+}
+
 void launch_host_mapped_two_shot(
     torch::Tensor input,
     torch::Tensor output,
@@ -198,17 +227,21 @@ void launch_host_mapped_two_shot(
         stream_handle);
 }
 
-void launch_shm_v5_allreduce(
+void launch_shm_v5_pxb_allreduce(
     torch::Tensor input,
     torch::Tensor output,
     torch::Tensor control,
     torch::Tensor rank_shm_ptrs_u64,
+    std::uintptr_t my_hbm_ptr,
+    std::uintptr_t pt_hbm_ptr,
     int64_t slot_stride_bytes,
+    int64_t pxb_slot_stride_bytes,
     int64_t rank,
     int64_t world_size,
     int64_t blocks,
     int64_t threads,
     int64_t one_shot_max_vecs,
+    int64_t pxb_max_vecs,
     std::uintptr_t stream_handle) {
     TORCH_CHECK(input.is_cuda() && output.is_cuda(), "input/output must be CUDA tensors");
     TORCH_CHECK(input.scalar_type() == at::kBFloat16 && output.scalar_type() == at::kBFloat16, "BF16 required");
@@ -226,24 +259,61 @@ void launch_shm_v5_allreduce(
         output.data_ptr(),
         reinterpret_cast<uint64_t*>(control.data_ptr<int64_t>()),
         reinterpret_cast<const std::uintptr_t*>(rank_shm_ptrs_u64.data_ptr<int64_t>()),
+        my_hbm_ptr,
+        pt_hbm_ptr,
         slot_stride_bytes,
+        pxb_slot_stride_bytes,
         input.numel() / 8,
         static_cast<int>(rank),
         static_cast<int>(world_size),
         static_cast<int>(blocks),
         static_cast<int>(threads),
         static_cast<int>(one_shot_max_vecs),
+        pxb_max_vecs,
         stream_handle);
 }
 
-void launch_shm_v5_allreduce_add_rmsnorm(
+void launch_shm_v5_allreduce(
+    torch::Tensor input,
+    torch::Tensor output,
+    torch::Tensor control,
+    torch::Tensor rank_shm_ptrs_u64,
+    int64_t slot_stride_bytes,
+    int64_t rank,
+    int64_t world_size,
+    int64_t blocks,
+    int64_t threads,
+    int64_t one_shot_max_vecs,
+    std::uintptr_t stream_handle) {
+    launch_shm_v5_pxb_allreduce(
+        input,
+        output,
+        control,
+        rank_shm_ptrs_u64,
+        0,
+        0,
+        slot_stride_bytes,
+        0,
+        rank,
+        world_size,
+        blocks,
+        threads,
+        one_shot_max_vecs,
+        0,
+        stream_handle);
+}
+
+void launch_shm_v5_pxb_allreduce_add_rmsnorm(
     torch::Tensor input,
     torch::Tensor residual,
     torch::Tensor weight,
     torch::Tensor normed_out,
     torch::Tensor control,
     torch::Tensor rank_shm_ptrs_u64,
+    std::uintptr_t my_hbm_ptr,
+    std::uintptr_t pt_hbm_ptr,
     int64_t slot_stride_bytes,
+    int64_t pxb_slot_stride_bytes,
     double eps,
     double weight_offset,
     int64_t rank,
@@ -251,6 +321,7 @@ void launch_shm_v5_allreduce_add_rmsnorm(
     int64_t blocks,
     int64_t threads,
     int64_t one_shot_max_vecs,
+    int64_t pxb_max_vecs,
     int64_t use_cluster,
     std::uintptr_t stream_handle) {
     TORCH_CHECK(
@@ -297,7 +368,10 @@ void launch_shm_v5_allreduce_add_rmsnorm(
         normed_out.data_ptr(),
         reinterpret_cast<uint64_t*>(control.data_ptr<int64_t>()),
         reinterpret_cast<const std::uintptr_t*>(rank_shm_ptrs_u64.data_ptr<int64_t>()),
+        my_hbm_ptr,
+        pt_hbm_ptr,
         slot_stride_bytes,
+        pxb_slot_stride_bytes,
         rows,
         vecs_per_row,
         1.0f / static_cast<float>(hidden),
@@ -308,7 +382,48 @@ void launch_shm_v5_allreduce_add_rmsnorm(
         static_cast<int>(blocks),
         static_cast<int>(threads),
         static_cast<int>(one_shot_max_vecs),
+        pxb_max_vecs,
         static_cast<int>(use_cluster),
+        stream_handle);
+}
+
+void launch_shm_v5_allreduce_add_rmsnorm(
+    torch::Tensor input,
+    torch::Tensor residual,
+    torch::Tensor weight,
+    torch::Tensor normed_out,
+    torch::Tensor control,
+    torch::Tensor rank_shm_ptrs_u64,
+    int64_t slot_stride_bytes,
+    double eps,
+    double weight_offset,
+    int64_t rank,
+    int64_t world_size,
+    int64_t blocks,
+    int64_t threads,
+    int64_t one_shot_max_vecs,
+    int64_t use_cluster,
+    std::uintptr_t stream_handle) {
+    launch_shm_v5_pxb_allreduce_add_rmsnorm(
+        input,
+        residual,
+        weight,
+        normed_out,
+        control,
+        rank_shm_ptrs_u64,
+        0,
+        0,
+        slot_stride_bytes,
+        0,
+        eps,
+        weight_offset,
+        rank,
+        world_size,
+        blocks,
+        threads,
+        one_shot_max_vecs,
+        0,
+        use_cluster,
         stream_handle);
 }
 
@@ -423,6 +538,7 @@ _CUDA_SOURCE = r"""
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -442,6 +558,8 @@ namespace {
 constexpr int kNumRingSlots = 4;
 constexpr int kMaxRanks = 8;
 constexpr int kOneShotMaxVecsLegacy = 1024;
+constexpr int kPxbOneShotMinVecs = 1024;
+constexpr int kPxbTwoShotMinVecs = 8192;
 constexpr int64_t kShmV5AbortOffset = 98304;
 constexpr int64_t kArgmaxAbortOffset = 128;
 // ~90 seconds at 2.5 GHz boost clock; checked only every 4096 spin iterations.
@@ -706,11 +824,15 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
     uint4* __restrict__ output_vec,
     uint64_t* __restrict__ control,
     char* const* __restrict__ rank_shm,
+    char* __restrict__ my_hbm,
+    char* __restrict__ pt_hbm,
     int64_t slot_stride_bytes,
+    int64_t pxb_slot_stride_bytes,
     int64_t num_vecs,
     int rank,
     int world_size,
-    int one_shot_max_vecs) {
+    int one_shot_max_vecs,
+    int64_t pxb_max_vecs) {
     const int b = blockIdx.x;
     __shared__ uint64_t s_step;
     __shared__ int s_aborted;
@@ -751,6 +873,284 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
 
     const int64_t half_slot = slot_stride_bytes / 2;
     uint4* my_in = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes);
+    const bool can_pxb =
+        (my_hbm != nullptr && pt_hbm != nullptr && world_size == 8 && num_vecs <= pxb_max_vecs && c_len >= 8);
+
+    // Hybrid CX8-partner P2P + 4-pair Host-SHM 1-Shot (`16..64 KiB`)
+    if (can_pxb && num_vecs > kPxbOneShotMinVecs && num_vecs <= one_shot_max_vecs) {
+        const int parity = rank & 1;
+        const int64_t c_mid = c_begin + c_len / 2;
+        const int64_t my_hb = (parity == 0) ? c_begin : c_mid;
+        const int64_t my_he = (parity == 0) ? c_mid : c_end;
+        const int64_t pt_hb = (parity == 0) ? c_mid : c_begin;
+        const int64_t pt_he = (parity == 0) ? c_end : c_mid;
+        const int64_t half_pxb = pxb_slot_stride_bytes / 2;
+
+        uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + 131072 + slot * pxb_slot_stride_bytes);
+        for (int64_t idx = pt_hb + threadIdx.x; idx < pt_he; idx += blockDim.x) {
+            st_wt_uint4(pt_in + idx, input_vec[idx]);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + b * 64), step);
+            if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + b * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+
+        const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + 131072 + slot * pxb_slot_stride_bytes);
+        uint4* my_hbm_sum = reinterpret_cast<uint4*>(
+            my_hbm + 131072 + slot * pxb_slot_stride_bytes + half_pxb);
+        for (int64_t idx = my_hb + threadIdx.x; idx < my_he; idx += blockDim.x) {
+            Pack128Bf16 a, bp, psum;
+            a.u4 = input_vec[idx];
+            bp.u4 = ld_cv_uint4(from_pt + idx);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 fa = __bfloat1622float2(a.pairs[j]);
+                const float2 fb = __bfloat1622float2(bp.pairs[j]);
+                psum.pairs[j] = __floats2bfloat162_rn(fa.x + fb.x, fa.y + fb.y);
+            }
+            my_hbm_sum[idx] = psum.u4;
+            st_wt_uint4(my_in + idx, psum.u4);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+        }
+        __syncthreads();
+        if (threadIdx.x < 8) {
+            sys_store_release_u64(
+                reinterpret_cast<uint64_t*>(s_peer_shm[threadIdx.x] + (b * 8 + rank) * 64), step);
+            if (!spin_wait_ge_u64(
+                    reinterpret_cast<const uint64_t*>(my_shm + (b * 8 + threadIdx.x) * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+
+        for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
+            const int h_par = (idx < c_mid) ? 0 : 1;
+            float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int src_r = q * 2 + h_par;
+                Pack128Bf16 pv;
+                if (src_r == rank) {
+                    pv.u4 = my_hbm_sum[idx];
+                } else {
+                    const uint4* p_in = reinterpret_cast<const uint4*>(
+                        s_peer_shm[src_r] + 131072 + slot * slot_stride_bytes);
+                    pv.u4 = ld_cv_uint4(p_in + idx);
+                }
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __bfloat1622float2(pv.pairs[j]);
+                    acc[2 * j] += f.x;
+                    acc[2 * j + 1] += f.y;
+                }
+            }
+            Pack128Bf16 out;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                out.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+            }
+            output_vec[idx] = out.u4;
+        }
+        __syncthreads();
+        if (threadIdx.x < 8) {
+            sys_store_release_u64(
+                reinterpret_cast<uint64_t*>(s_peer_shm[threadIdx.x] + 65536 + (b * 8 + rank) * 64), step);
+        }
+        return;
+    }
+
+    // Hybrid CX8-partner P2P + 4-pair Host-SHM 2-Shot (`>= 128 KiB`, up to `pxb_max_vecs`)
+    if (can_pxb && num_vecs >= kPxbTwoShotMinVecs) {
+        const int parity = rank & 1;
+        const int pair_id = rank >> 1;
+        const int64_t c_mid = c_begin + c_len / 2;
+        const int64_t my_hb = (parity == 0) ? c_begin : c_mid;
+        const int64_t my_he = (parity == 0) ? c_mid : c_end;
+        const int64_t pt_hb = (parity == 0) ? c_mid : c_begin;
+        const int64_t pt_he = (parity == 0) ? c_end : c_mid;
+        const int64_t my_hlen = my_he - my_hb;
+        const int64_t pt_hlen = pt_he - pt_hb;
+        const int64_t half_pxb = pxb_slot_stride_bytes / 2;
+
+        uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + 131072 + slot * pxb_slot_stride_bytes);
+        for (int64_t idx = pt_hb + threadIdx.x; idx < pt_he; idx += blockDim.x) {
+            st_wt_uint4(pt_in + idx, input_vec[idx]);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + b * 64), step);
+            if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + b * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+
+        const int64_t own_b = my_hb + (my_hlen * pair_id) / 4;
+        const int64_t own_e = my_hb + (my_hlen * (pair_id + 1)) / 4;
+        const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + 131072 + slot * pxb_slot_stride_bytes);
+        uint4* my_hbm_red = reinterpret_cast<uint4*>(
+            my_hbm + 131072 + slot * pxb_slot_stride_bytes + half_pxb);
+
+        for (int64_t idx = my_hb + threadIdx.x; idx < my_he; idx += blockDim.x) {
+            Pack128Bf16 a, bp, psum;
+            a.u4 = input_vec[idx];
+            bp.u4 = ld_cv_uint4(from_pt + idx);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 fa = __bfloat1622float2(a.pairs[j]);
+                const float2 fb = __bfloat1622float2(bp.pairs[j]);
+                psum.pairs[j] = __floats2bfloat162_rn(fa.x + fb.x, fa.y + fb.y);
+            }
+            if (idx >= own_b && idx < own_e) {
+                my_hbm_red[idx] = psum.u4;
+            } else {
+                st_wt_uint4(my_in + idx, psum.u4);
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+        }
+        __syncthreads();
+        if (threadIdx.x < 4 && threadIdx.x != pair_id) {
+            const int dst_r = threadIdx.x * 2 + parity;
+            sys_store_release_u64(
+                reinterpret_cast<uint64_t*>(s_peer_shm[dst_r] + (b * 8 + rank) * 64), step);
+            if (!spin_wait_ge_u64(
+                    reinterpret_cast<const uint64_t*>(my_shm + (b * 8 + dst_r) * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+
+        uint4* my_shm_red = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes + half_slot);
+        uint4* pt_hbm_red = reinterpret_cast<uint4*>(
+            pt_hbm + 131072 + slot * pxb_slot_stride_bytes + half_pxb);
+        for (int64_t idx = own_b + threadIdx.x; idx < own_e; idx += blockDim.x) {
+            float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int src_r = q * 2 + parity;
+                Pack128Bf16 pv;
+                if (q == pair_id) {
+                    pv.u4 = my_hbm_red[idx];
+                } else {
+                    const uint4* p_in = reinterpret_cast<const uint4*>(
+                        s_peer_shm[src_r] + 131072 + slot * slot_stride_bytes);
+                    pv.u4 = ld_cv_uint4(p_in + idx);
+                }
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __bfloat1622float2(pv.pairs[j]);
+                    acc[2 * j] += f.x;
+                    acc[2 * j + 1] += f.y;
+                }
+            }
+            Pack128Bf16 out;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                out.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+            }
+            output_vec[idx] = out.u4;
+            st_wt_uint4(pt_hbm_red + idx, out.u4);
+            st_wt_uint4(my_shm_red + idx, out.u4);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+        }
+        __syncthreads();
+        if (threadIdx.x < 4) {
+            if (threadIdx.x == pair_id) {
+                sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 32768 + b * 64), step);
+                if (!spin_wait_ge_u64(
+                        reinterpret_cast<const uint64_t*>(my_hbm + 32768 + b * 64), step, abort_flag)) {
+                    s_aborted = 1;
+                }
+            } else {
+                const int dst_r = threadIdx.x * 2 + parity;
+                sys_store_release_u64(
+                    reinterpret_cast<uint64_t*>(s_peer_shm[dst_r] + 32768 + (b * 8 + rank) * 64), step);
+                if (!spin_wait_ge_u64(
+                        reinterpret_cast<const uint64_t*>(my_shm + 32768 + (b * 8 + dst_r) * 64), step, abort_flag)) {
+                    s_aborted = 1;
+                }
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+
+        for (int q = 0; q < 4; ++q) {
+            if (q == pair_id) continue;
+            const int src_r = q * 2 + parity;
+            const int64_t qb = my_hb + (my_hlen * q) / 4;
+            const int64_t qe = my_hb + (my_hlen * (q + 1)) / 4;
+            const uint4* o_red = reinterpret_cast<const uint4*>(
+                s_peer_shm[src_r] + 131072 + slot * slot_stride_bytes + half_slot);
+            for (int64_t idx = qb + threadIdx.x; idx < qe; idx += blockDim.x) {
+                const uint4 v = ld_cv_uint4(o_red + idx);
+                output_vec[idx] = v;
+                st_wt_uint4(pt_hbm_red + idx, v);
+            }
+        }
+        const int64_t pt_own_b = pt_hb + (pt_hlen * pair_id) / 4;
+        const int64_t pt_own_e = pt_hb + (pt_hlen * (pair_id + 1)) / 4;
+        for (int64_t idx = pt_own_b + threadIdx.x; idx < pt_own_e; idx += blockDim.x) {
+            output_vec[idx] = ld_cv_uint4(my_hbm_red + idx);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 65536 + b * 64), step);
+            if (!spin_wait_ge_u64(
+                    reinterpret_cast<const uint64_t*>(my_hbm + 65536 + b * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+
+        for (int q = 0; q < 4; ++q) {
+            if (q == pair_id) continue;
+            const int64_t qb = pt_hb + (pt_hlen * q) / 4;
+            const int64_t qe = pt_hb + (pt_hlen * (q + 1)) / 4;
+            for (int64_t idx = qb + threadIdx.x; idx < qe; idx += blockDim.x) {
+                output_vec[idx] = ld_cv_uint4(my_hbm_red + idx);
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < 8) {
+            sys_store_release_u64(
+                reinterpret_cast<uint64_t*>(s_peer_shm[threadIdx.x] + 65536 + (b * 8 + rank) * 64), step);
+        }
+        return;
+    }
+
     for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
         st_wt_uint4(my_in + idx, input_vec[idx]);
     }
@@ -951,7 +1351,10 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
     uint4* __restrict__ normed_out_vec,
     uint64_t* __restrict__ control,
     char* const* __restrict__ rank_shm,
+    char* __restrict__ my_hbm,
+    char* __restrict__ pt_hbm,
     int64_t slot_stride_bytes,
+    int64_t pxb_slot_stride_bytes,
     int64_t rows,
     int64_t vecs_per_row,
     float inv_hidden,
@@ -959,7 +1362,8 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
     float weight_offset,
     int rank,
     int world_size,
-    int one_shot_max_vecs) {
+    int one_shot_max_vecs,
+    int64_t pxb_max_vecs) {
     const int b = blockIdx.x;
     const int blocks = gridDim.x;
     __shared__ uint64_t s_step;
@@ -1088,6 +1492,379 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
     const int64_t r_end = (rows * (b + 1)) / blocks;
     const int64_t c_begin = r_begin * vecs_per_row;
     const int64_t c_end = r_end * vecs_per_row;
+    const int num_iters = static_cast<int>((vecs_per_row + blockDim.x - 1) / blockDim.x);
+    const bool can_pxb =
+        (my_hbm != nullptr && pt_hbm != nullptr && world_size == 8 && num_vecs <= pxb_max_vecs && r_end > r_begin);
+
+    // Hybrid CX8-partner P2P + 4-pair Host-SHM 1-Shot fused epilogue (`16..64 KiB`, e.g. Qwen3.5 M=8, 16)
+    if (can_pxb && num_vecs > kPxbOneShotMinVecs && num_vecs <= one_shot_max_vecs && (vecs_per_row % 2) == 0) {
+        const int parity = rank & 1;
+        const int64_t col_half = vecs_per_row / 2;
+        const int64_t my_col_b = (parity == 0) ? 0 : col_half;
+        const int64_t pt_col_b = (parity == 0) ? col_half : 0;
+        const int64_t r_cnt = r_end - r_begin;
+        const int64_t total_half = r_cnt * col_half;
+        const int64_t half_pxb = pxb_slot_stride_bytes / 2;
+
+        uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + 131072 + slot * pxb_slot_stride_bytes);
+        for (int64_t t = threadIdx.x; t < total_half; t += blockDim.x) {
+            const int64_t r = r_begin + (t / col_half);
+            const int64_t col = pt_col_b + (t % col_half);
+            const int64_t idx = r * vecs_per_row + col;
+            st_wt_uint4(pt_in + idx, input_vec[idx]);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + b * 64), step);
+            if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + b * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+
+        const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + 131072 + slot * pxb_slot_stride_bytes);
+        uint4* my_hbm_sum = reinterpret_cast<uint4*>(
+            my_hbm + 131072 + slot * pxb_slot_stride_bytes + half_pxb);
+        for (int64_t t = threadIdx.x; t < total_half; t += blockDim.x) {
+            const int64_t r = r_begin + (t / col_half);
+            const int64_t col = my_col_b + (t % col_half);
+            const int64_t idx = r * vecs_per_row + col;
+            Pack128Bf16 a, bp, psum;
+            a.u4 = input_vec[idx];
+            bp.u4 = ld_cv_uint4(from_pt + idx);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 fa = __bfloat1622float2(a.pairs[j]);
+                const float2 fb = __bfloat1622float2(bp.pairs[j]);
+                psum.pairs[j] = __floats2bfloat162_rn(fa.x + fb.x, fa.y + fb.y);
+            }
+            my_hbm_sum[idx] = psum.u4;
+            st_wt_uint4(my_in + idx, psum.u4);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+        }
+        __syncthreads();
+        if (threadIdx.x < 8) {
+            sys_store_release_u64(
+                reinterpret_cast<uint64_t*>(s_peer_shm[threadIdx.x] + (b * 8 + rank) * 64), step);
+            if (!spin_wait_ge_u64(
+                    reinterpret_cast<const uint64_t*>(my_shm + (b * 8 + threadIdx.x) * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+
+        for (int64_t r = r_begin; r < r_end; ++r) {
+            const int64_t row_base = r * vecs_per_row;
+            Pack128Bf16 red_packs[3];
+            #pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                if (k < num_iters) {
+                    const int64_t col = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+                    if (col < vecs_per_row) {
+                        const int64_t idx = row_base + col;
+                        const int h_par = (col < col_half) ? 0 : 1;
+                        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                        #pragma unroll
+                        for (int q = 0; q < 4; ++q) {
+                            const int src_r = q * 2 + h_par;
+                            Pack128Bf16 pv;
+                            if (src_r == rank) {
+                                pv.u4 = my_hbm_sum[idx];
+                            } else {
+                                const uint4* p_in = reinterpret_cast<const uint4*>(
+                                    s_peer_shm[src_r] + 131072 + slot * slot_stride_bytes);
+                                pv.u4 = ld_cv_uint4(p_in + idx);
+                            }
+                            #pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                const float2 f = __bfloat1622float2(pv.pairs[j]);
+                                acc[2 * j] += f.x;
+                                acc[2 * j + 1] += f.y;
+                            }
+                        }
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            red_packs[k].pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+                        }
+                    }
+                }
+            }
+            apply_add_rmsnorm_epilogue_single_row(
+                row_base, vecs_per_row, residual_vec, weight_vec, normed_out_vec,
+                red_packs, num_iters, inv_hidden, eps, weight_offset, s_warp_sq, s_inv_rms_arr[0]);
+            __syncthreads();
+        }
+        if (threadIdx.x < 8) {
+            sys_store_release_u64(
+                reinterpret_cast<uint64_t*>(s_peer_shm[threadIdx.x] + 65536 + (b * 8 + rank) * 64), step);
+        }
+        return;
+    }
+
+    // Hybrid CX8-partner P2P + 4-pair Host-SHM 2-Shot fused epilogue (`>= 128 KiB`, e.g. Qwen3.5 M=32..1024)
+    if (can_pxb && num_vecs >= kPxbTwoShotMinVecs && (vecs_per_row % 8) == 0) {
+        const int parity = rank & 1;
+        const int pair_id = rank >> 1;
+        const int64_t col_half = vecs_per_row / 2;
+        const int64_t cols_per_rank = vecs_per_row / 8;
+        const int64_t my_col_b = (parity == 0) ? 0 : col_half;
+        const int64_t pt_col_b = (parity == 0) ? col_half : 0;
+        const int64_t own_col_b = my_col_b + pair_id * cols_per_rank;
+        const int64_t own_col_e = own_col_b + cols_per_rank;
+        const int64_t r_cnt = r_end - r_begin;
+        const int64_t total_half = r_cnt * col_half;
+        const int64_t total_own = r_cnt * cols_per_rank;
+        const int64_t half_pxb = pxb_slot_stride_bytes / 2;
+
+        uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + 131072 + slot * pxb_slot_stride_bytes);
+        for (int64_t t = threadIdx.x; t < total_half; t += blockDim.x) {
+            const int64_t r = r_begin + (t / col_half);
+            const int64_t col = pt_col_b + (t % col_half);
+            const int64_t idx = r * vecs_per_row + col;
+            st_wt_uint4(pt_in + idx, input_vec[idx]);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + b * 64), step);
+            if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + b * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+
+        const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + 131072 + slot * pxb_slot_stride_bytes);
+        uint4* my_hbm_red = reinterpret_cast<uint4*>(
+            my_hbm + 131072 + slot * pxb_slot_stride_bytes + half_pxb);
+        for (int64_t t = threadIdx.x; t < total_half; t += blockDim.x) {
+            const int64_t r = r_begin + (t / col_half);
+            const int64_t col = my_col_b + (t % col_half);
+            const int64_t idx = r * vecs_per_row + col;
+            Pack128Bf16 a, bp, psum;
+            a.u4 = input_vec[idx];
+            bp.u4 = ld_cv_uint4(from_pt + idx);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 fa = __bfloat1622float2(a.pairs[j]);
+                const float2 fb = __bfloat1622float2(bp.pairs[j]);
+                psum.pairs[j] = __floats2bfloat162_rn(fa.x + fb.x, fa.y + fb.y);
+            }
+            if (col >= own_col_b && col < own_col_e) {
+                my_hbm_red[idx] = psum.u4;
+            } else {
+                st_wt_uint4(my_in + idx, psum.u4);
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+        }
+        __syncthreads();
+        if (threadIdx.x < 4 && threadIdx.x != pair_id) {
+            const int dst_r = threadIdx.x * 2 + parity;
+            sys_store_release_u64(
+                reinterpret_cast<uint64_t*>(s_peer_shm[dst_r] + (b * 8 + rank) * 64), step);
+            if (!spin_wait_ge_u64(
+                    reinterpret_cast<const uint64_t*>(my_shm + (b * 8 + dst_r) * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+
+        uint4* my_shm_red = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes + half_slot);
+        uint4* pt_hbm_red = reinterpret_cast<uint4*>(
+            pt_hbm + 131072 + slot * pxb_slot_stride_bytes + half_pxb);
+        for (int64_t t = threadIdx.x; t < total_own; t += blockDim.x) {
+            const int64_t r = r_begin + (t / cols_per_rank);
+            const int64_t col = own_col_b + (t % cols_per_rank);
+            const int64_t idx = r * vecs_per_row + col;
+            float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int src_r = q * 2 + parity;
+                Pack128Bf16 pv;
+                if (q == pair_id) {
+                    pv.u4 = my_hbm_red[idx];
+                } else {
+                    const uint4* p_in = reinterpret_cast<const uint4*>(
+                        s_peer_shm[src_r] + 131072 + slot * slot_stride_bytes);
+                    pv.u4 = ld_cv_uint4(p_in + idx);
+                }
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __bfloat1622float2(pv.pairs[j]);
+                    acc[2 * j] += f.x;
+                    acc[2 * j + 1] += f.y;
+                }
+            }
+            Pack128Bf16 out;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                out.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+            }
+            my_hbm_red[idx] = out.u4;
+            st_wt_uint4(pt_hbm_red + idx, out.u4);
+            st_wt_uint4(my_shm_red + idx, out.u4);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+        }
+        __syncthreads();
+        if (threadIdx.x < 4) {
+            if (threadIdx.x == pair_id) {
+                sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 32768 + b * 64), step);
+                if (!spin_wait_ge_u64(
+                        reinterpret_cast<const uint64_t*>(my_hbm + 32768 + b * 64), step, abort_flag)) {
+                    s_aborted = 1;
+                }
+            } else {
+                const int dst_r = threadIdx.x * 2 + parity;
+                sys_store_release_u64(
+                    reinterpret_cast<uint64_t*>(s_peer_shm[dst_r] + 32768 + (b * 8 + rank) * 64), step);
+                if (!spin_wait_ge_u64(
+                        reinterpret_cast<const uint64_t*>(my_shm + 32768 + (b * 8 + dst_r) * 64), step, abort_flag)) {
+                    s_aborted = 1;
+                }
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+
+        for (int q = 0; q < 4; ++q) {
+            if (q == pair_id) continue;
+            const int src_r = q * 2 + parity;
+            const int64_t qb = my_col_b + q * cols_per_rank;
+            const uint4* o_red = reinterpret_cast<const uint4*>(
+                s_peer_shm[src_r] + 131072 + slot * slot_stride_bytes + half_slot);
+            for (int64_t t = threadIdx.x; t < total_own; t += blockDim.x) {
+                const int64_t r = r_begin + (t / cols_per_rank);
+                const int64_t col = qb + (t % cols_per_rank);
+                const int64_t idx = r * vecs_per_row + col;
+                const uint4 v = ld_cv_uint4(o_red + idx);
+                my_hbm_red[idx] = v;
+                st_wt_uint4(pt_hbm_red + idx, v);
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 65536 + b * 64), step);
+            if (!spin_wait_ge_u64(
+                    reinterpret_cast<const uint64_t*>(my_hbm + 65536 + b * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) {
+            return;
+        }
+
+        // All 8/8 columns of `[r_begin, r_end)` now reside in local `my_hbm_red`!
+        if (vecs_per_row == 256 && blockDim.x == 512) {
+            const int row_slot = threadIdx.x >> 8;
+            const int sub_tid = threadIdx.x & 255;
+            const int sub_warp = sub_tid >> 5;
+            const int lane_id = sub_tid & 31;
+            Pack128Bf16 w_pack;
+            w_pack.u4 = weight_vec[sub_tid];
+            float2 wf[4];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                wf[j] = __bfloat1622float2(w_pack.pairs[j]);
+            }
+            for (int64_t r0 = r_begin; r0 < r_end; r0 += 2) {
+                const int64_t r = r0 + row_slot;
+                float s_f32[8];
+                float thread_sq = 0.0f;
+                if (r < r_end) {
+                    const int64_t idx = r * 256 + sub_tid;
+                    Pack128Bf16 red_pack;
+                    red_pack.u4 = ld_cv_uint4(my_hbm_red + idx);
+                    Pack128Bf16 res_pack;
+                    res_pack.u4 = residual_vec[idx];
+                    Pack128Bf16 sum_pack;
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float2 rf = __bfloat1622float2(red_pack.pairs[j]);
+                        const float2 sf = __bfloat1622float2(res_pack.pairs[j]);
+                        sum_pack.pairs[j] = __floats2bfloat162_rn(rf.x + sf.x, rf.y + sf.y);
+                        const float2 sum_rt = __bfloat1622float2(sum_pack.pairs[j]);
+                        s_f32[2 * j] = sum_rt.x;
+                        s_f32[2 * j + 1] = sum_rt.y;
+                        thread_sq += sum_rt.x * sum_rt.x + sum_rt.y * sum_rt.y;
+                    }
+                    residual_vec[idx] = sum_pack.u4;
+                }
+                const float warp_sq = warp_reduce_sum(thread_sq);
+                if (lane_id == 0) {
+                    s_warp_sq[row_slot * 8 + sub_warp] = warp_sq;
+                }
+                __syncthreads();
+                if (sub_warp == 0) {
+                    float acc_sq = (lane_id < 8) ? s_warp_sq[row_slot * 8 + lane_id] : 0.0f;
+                    acc_sq = warp_reduce_sum(acc_sq);
+                    if (lane_id == 0) {
+                        s_inv_rms_arr[row_slot] = rsqrtf(acc_sq * inv_hidden + eps);
+                    }
+                }
+                __syncthreads();
+                if (r < r_end) {
+                    const float inv_rms = s_inv_rms_arr[row_slot];
+                    Pack128Bf16 out_pack;
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float y0 = (s_f32[2 * j] * inv_rms) * (weight_offset + wf[j].x);
+                        const float y1 = (s_f32[2 * j + 1] * inv_rms) * (weight_offset + wf[j].y);
+                        out_pack.pairs[j] = __floats2bfloat162_rn(y0, y1);
+                    }
+                    normed_out_vec[r * 256 + sub_tid] = out_pack.u4;
+                }
+                __syncthreads();
+            }
+        } else {
+            for (int64_t r = r_begin; r < r_end; ++r) {
+                const int64_t row_base = r * vecs_per_row;
+                Pack128Bf16 red_packs[3];
+                #pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    if (k < num_iters) {
+                        const int64_t col = threadIdx.x + static_cast<int64_t>(k) * blockDim.x;
+                        if (col < vecs_per_row) {
+                            red_packs[k].u4 = ld_cv_uint4(my_hbm_red + row_base + col);
+                        }
+                    }
+                }
+                apply_add_rmsnorm_epilogue_single_row(
+                    row_base, vecs_per_row, residual_vec, weight_vec, normed_out_vec,
+                    red_packs, num_iters, inv_hidden, eps, weight_offset, s_warp_sq, s_inv_rms_arr[0]);
+                __syncthreads();
+            }
+        }
+        if (threadIdx.x < 8) {
+            sys_store_release_u64(
+                reinterpret_cast<uint64_t*>(s_peer_shm[threadIdx.x] + 65536 + (b * 8 + rank) * 64), step);
+        }
+        return;
+    }
 
     for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
         st_wt_uint4(my_in + idx, input_vec[idx]);
@@ -1111,8 +1888,6 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
     if (s_aborted) {
         return;
     }
-
-    const int num_iters = static_cast<int>((vecs_per_row + blockDim.x - 1) / blockDim.x);
 
     if (num_vecs <= one_shot_max_vecs) {
         for (int64_t r = r_begin; r < r_end; ++r) {
@@ -1602,6 +2377,61 @@ void unregister_mapped_host_cuda(std::uintptr_t host_address) {
     ZSTEP_CUDA_CHECK(cudaHostUnregister(reinterpret_cast<void*>(host_address)));
 }
 
+torch::Tensor alloc_ipc_buffer_cuda(int64_t bytes, torch::Tensor out_ptr_u64) {
+    TORCH_CHECK(bytes > 0, "IPC buffer size must be positive");
+    TORCH_CHECK(
+        !out_ptr_u64.is_cuda() && out_ptr_u64.is_contiguous() &&
+            out_ptr_u64.scalar_type() == at::kLong && out_ptr_u64.numel() >= 1,
+        "out_ptr_u64 must be a contiguous CPU int64 tensor with numel >= 1");
+    void* ptr = nullptr;
+    ZSTEP_CUDA_CHECK(cudaMalloc(&ptr, static_cast<size_t>(bytes)));
+    cudaError_t z_err = cudaMemset(ptr, 0, static_cast<size_t>(bytes));
+    if (z_err != cudaSuccess) {
+        cudaFree(ptr);
+        ZSTEP_CUDA_CHECK(z_err);
+    }
+    ZSTEP_CUDA_CHECK(cudaDeviceSynchronize());
+    out_ptr_u64.data_ptr<int64_t>()[0] =
+        static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(ptr));
+    cudaIpcMemHandle_t handle;
+    cudaError_t h_err = cudaIpcGetMemHandle(&handle, ptr);
+    if (h_err != cudaSuccess) {
+        cudaFree(ptr);
+        out_ptr_u64.data_ptr<int64_t>()[0] = 0;
+        ZSTEP_CUDA_CHECK(h_err);
+    }
+    auto t = torch::empty(
+        {static_cast<int64_t>(sizeof(cudaIpcMemHandle_t))},
+        torch::dtype(torch::kUInt8));
+    std::memcpy(t.data_ptr<uint8_t>(), &handle, sizeof(cudaIpcMemHandle_t));
+    return t;
+}
+
+std::uintptr_t open_ipc_handle_cuda(torch::Tensor handle_u8) {
+    TORCH_CHECK(
+        !handle_u8.is_cuda() && handle_u8.is_contiguous() &&
+            handle_u8.scalar_type() == at::kByte &&
+            handle_u8.numel() == static_cast<int64_t>(sizeof(cudaIpcMemHandle_t)),
+        "handle_u8 must be a contiguous CPU uint8 tensor of cudaIpcMemHandle_t size");
+    cudaIpcMemHandle_t handle;
+    std::memcpy(&handle, handle_u8.data_ptr<uint8_t>(), sizeof(cudaIpcMemHandle_t));
+    void* ptr = nullptr;
+    ZSTEP_CUDA_CHECK(cudaIpcOpenMemHandle(&ptr, handle, cudaIpcMemLazyEnablePeerAccess));
+    return reinterpret_cast<std::uintptr_t>(ptr);
+}
+
+void close_ipc_handle_cuda(std::uintptr_t ptr) {
+    if (ptr != 0) {
+        ZSTEP_CUDA_CHECK(cudaIpcCloseMemHandle(reinterpret_cast<void*>(ptr)));
+    }
+}
+
+void free_ipc_buffer_cuda(std::uintptr_t ptr) {
+    if (ptr != 0) {
+        ZSTEP_CUDA_CHECK(cudaFree(reinterpret_cast<void*>(ptr)));
+    }
+}
+
 void launch_host_mapped_two_shot_cuda(
     const void* input_ptr,
     void* output_ptr,
@@ -1636,13 +2466,17 @@ void launch_shm_v5_allreduce_cuda(
     void* output_ptr,
     uint64_t* control_ptr,
     const std::uintptr_t* rank_shm_dev_ptrs,
+    std::uintptr_t my_hbm_ptr,
+    std::uintptr_t pt_hbm_ptr,
     int64_t slot_stride_bytes,
+    int64_t pxb_slot_stride_bytes,
     int64_t num_vecs,
     int rank,
     int world_size,
     int blocks,
     int threads,
     int one_shot_max_vecs,
+    int64_t pxb_max_vecs,
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     const int64_t vecs_per_cta = (num_vecs + blocks - 1) / blocks;
@@ -1654,11 +2488,15 @@ void launch_shm_v5_allreduce_cuda(
         reinterpret_cast<uint4*>(output_ptr),
         control_ptr,
         reinterpret_cast<char* const*>(rank_shm_dev_ptrs),
+        reinterpret_cast<char*>(my_hbm_ptr),
+        reinterpret_cast<char*>(pt_hbm_ptr),
         slot_stride_bytes,
+        pxb_slot_stride_bytes,
         num_vecs,
         rank,
         world_size,
-        one_shot_max_vecs);
+        one_shot_max_vecs,
+        pxb_max_vecs);
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1669,7 +2507,10 @@ void launch_shm_v5_allreduce_add_rmsnorm_cuda(
     void* normed_out_ptr,
     uint64_t* control_ptr,
     const std::uintptr_t* rank_shm_dev_ptrs,
+    std::uintptr_t my_hbm_ptr,
+    std::uintptr_t pt_hbm_ptr,
     int64_t slot_stride_bytes,
+    int64_t pxb_slot_stride_bytes,
     int64_t rows,
     int64_t vecs_per_row,
     float inv_hidden,
@@ -1680,6 +2521,7 @@ void launch_shm_v5_allreduce_add_rmsnorm_cuda(
     int blocks,
     int threads,
     int one_shot_max_vecs,
+    int64_t pxb_max_vecs,
     int use_cluster,
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
@@ -1731,7 +2573,10 @@ void launch_shm_v5_allreduce_add_rmsnorm_cuda(
         reinterpret_cast<uint4*>(normed_out_ptr),
         control_ptr,
         reinterpret_cast<char* const*>(rank_shm_dev_ptrs),
+        reinterpret_cast<char*>(my_hbm_ptr),
+        reinterpret_cast<char*>(pt_hbm_ptr),
         slot_stride_bytes,
+        pxb_slot_stride_bytes,
         rows,
         vecs_per_row,
         inv_hidden,
@@ -1739,7 +2584,8 @@ void launch_shm_v5_allreduce_add_rmsnorm_cuda(
         weight_offset,
         rank,
         world_size,
-        one_shot_max_vecs);
+        one_shot_max_vecs,
+        pxb_max_vecs);
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2004,15 +2850,21 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v12_ext",
+            name="zstep_shm_allreduce_sm120_v14_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
                 "register_mapped_host",
                 "unregister_mapped_host",
+                "alloc_ipc_buffer",
+                "open_ipc_handle",
+                "close_ipc_handle",
+                "free_ipc_buffer",
                 "launch_host_mapped_two_shot",
                 "launch_shm_v5_allreduce",
+                "launch_shm_v5_pxb_allreduce",
                 "launch_shm_v5_allreduce_add_rmsnorm",
+                "launch_shm_v5_pxb_allreduce_add_rmsnorm",
                 "launch_shm_v5_allgather",
                 "launch_local_top2_bf16",
                 "launch_tp8_argmax_gather_shm",
@@ -2048,6 +2900,7 @@ class _PerRankShmRingBase:
         self._per_rank_mappings: list[mmap.mmap] = []
         self._per_rank_host_addrs: list[int] = []
         self._own_shm_path: str = self._per_rank_paths[rank]
+        self._own_mm: mmap.mmap | None = None
 
         own_fd = os.open(
             self._own_shm_path, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o600
@@ -2060,6 +2913,7 @@ class _PerRankShmRingBase:
                 flags=mmap.MAP_SHARED,
                 prot=mmap.PROT_READ | mmap.PROT_WRITE,
             )
+            self._own_mm = own_mm
         finally:
             os.close(own_fd)
         # First-touch every 4 KiB page from this rank's NUMA-pinned thread.
@@ -2089,8 +2943,13 @@ class _PerRankShmRingBase:
                     )
                 finally:
                     os.close(pfd)
-            host_addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
-            dev_ptr = extension.register_mapped_host(host_addr, total_bytes)
+            try:
+                host_addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+                dev_ptr = extension.register_mapped_host(host_addr, total_bytes)
+            except BaseException:
+                if peer != rank and not mm.closed:
+                    mm.close()
+                raise
             self._per_rank_mappings.append(mm)
             self._per_rank_host_addrs.append(host_addr)
             dev_ptrs.append(dev_ptr)
@@ -2114,20 +2973,29 @@ class _PerRankShmRingBase:
                 struct.pack_into("<Q", mm, SHM_V5_ABORT_OFFSET, 1)
 
     def _close_per_rank_shm(self, extension) -> None:
-        for host_addr in self._per_rank_host_addrs:
+        host_addrs: list[int] = getattr(self, "_per_rank_host_addrs", [])
+        for host_addr in host_addrs:
             extension.unregister_mapped_host(host_addr)
-        self._per_rank_host_addrs.clear()
-        for mm in self._per_rank_mappings:
-            mm.close()
-        self._per_rank_mappings.clear()
-        try:
-            os.unlink(self._own_shm_path)
-        except FileNotFoundError:
-            pass
+        host_addrs.clear()
+        mappings: list[mmap.mmap] = getattr(self, "_per_rank_mappings", [])
+        for mm in mappings:
+            if not mm.closed:
+                mm.close()
+        mappings.clear()
+        own_mm: mmap.mmap | None = getattr(self, "_own_mm", None)
+        if own_mm is not None and not own_mm.closed:
+            own_mm.close()
+        self._own_mm = None
+        own_shm_path: str | None = getattr(self, "_own_shm_path", None)
+        if own_shm_path is not None:
+            try:
+                os.unlink(own_shm_path)
+            except FileNotFoundError:
+                pass
 
 
 class HostMappedShmAllReduce(_PerRankShmRingBase):
-    """Ordered host-mapped 4-slot ring BF16 AllReduce (`shm_v5` when `exchange_group` is set)."""
+    """Ordered host-mapped 4-slot ring BF16 AllReduce (`shm_v5` + optional CX8 `pxb` IPC)."""
 
     def __init__(
         self,
@@ -2141,6 +3009,8 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
         exchange_group: dist.ProcessGroup | None,
         create_shm: bool = False,
         one_shot_max_vecs: int = DEFAULT_ONE_SHOT_MAX_VECS,
+        enable_pxb_p2p: bool = False,
+        pxb_max_elements: int = DEFAULT_PXB_MAX_ELEMENTS,
     ) -> None:
         if world_size < 2 or world_size > MAX_RANKS or not 0 <= rank < world_size:
             raise ValueError(f"rank={rank} / world_size={world_size} invalid (max {MAX_RANKS})")
@@ -2162,68 +3032,165 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
         self.one_shot_max_vecs: int = one_shot_max_vecs
         self.device: torch.device = device
         self._use_shm_v5: bool = exchange_group is not None
+        self._exchange_group: dist.ProcessGroup | None = exchange_group
         self._closed: bool = False
         self._registered: bool = False
         self._owns_unlink: bool = False
+        self._mapping: mmap.mmap | None = None
+        self._shm_path: str | None = None
+        self._pxb_enabled: bool = False
+        self._my_hbm_ptr: int = 0
+        self._pt_hbm_ptr: int = 0
+        self.pxb_slot_stride_bytes: int = 0
+        self.pxb_max_vecs: int = 0
         self._extension = get_host_mapped_allreduce_extension()
 
-        if self._use_shm_v5:
-            assert exchange_group is not None
-            self.rank_stride_bytes = _align_up(capacity_elements * 2, 4096)
-            self.data_base_offset = SHM_V5_HEADER_BYTES
-            self.slot_stride_bytes = 2 * self.rank_stride_bytes
-            self.total_bytes = _align_up(
-                self.data_base_offset + NUM_RING_SLOTS * self.slot_stride_bytes, 4096
-            )
-            self._init_per_rank_shm(
-                name=name,
-                rank=rank,
-                world_size=world_size,
-                total_bytes=self.total_bytes,
-                exchange_group=exchange_group,
-                device=device,
-                extension=self._extension,
-            )
-            self._registered = True
-        else:
-            self.rank_stride_bytes = _align_up(capacity_elements * 2, 4096)
-            self.data_base_offset = 16384
-            self.slot_stride_bytes = _align_up(
-                2 * world_size * self.rank_stride_bytes, 4096
-            )
-            self.total_bytes = _align_up(
-                self.data_base_offset + NUM_RING_SLOTS * self.slot_stride_bytes, 4096
-            )
-            shm_path = f"/dev/shm/{name}"
-            flags = (os.O_CREAT | os.O_RDWR | os.O_TRUNC) if create_shm else os.O_RDWR
-            fd = os.open(shm_path, flags, 0o600)
-            try:
+        try:
+            if self._use_shm_v5:
+                assert exchange_group is not None
+                self.rank_stride_bytes = _align_up(capacity_elements * 2, 4096)
+                self.data_base_offset = SHM_V5_HEADER_BYTES
+                self.slot_stride_bytes = 2 * self.rank_stride_bytes
+                self.total_bytes = _align_up(
+                    self.data_base_offset + NUM_RING_SLOTS * self.slot_stride_bytes, 4096
+                )
+                self._init_per_rank_shm(
+                    name=name,
+                    rank=rank,
+                    world_size=world_size,
+                    total_bytes=self.total_bytes,
+                    exchange_group=exchange_group,
+                    device=device,
+                    extension=self._extension,
+                )
+                self._registered = True
+                if world_size == 8:
+                    self._init_pxb_ipc(
+                        exchange_group=exchange_group,
+                        want_pxb=enable_pxb_p2p,
+                        pxb_max_elements=min(capacity_elements, max(8, pxb_max_elements)),
+                    )
+            else:
+                self.rank_stride_bytes = _align_up(capacity_elements * 2, 4096)
+                self.data_base_offset = 16384
+                self.slot_stride_bytes = _align_up(
+                    2 * world_size * self.rank_stride_bytes, 4096
+                )
+                self.total_bytes = _align_up(
+                    self.data_base_offset + NUM_RING_SLOTS * self.slot_stride_bytes, 4096
+                )
+                shm_path = f"/dev/shm/{name}"
+                flags = (os.O_CREAT | os.O_RDWR | os.O_TRUNC) if create_shm else os.O_RDWR
+                fd = os.open(shm_path, flags, 0o600)
+                try:
+                    if create_shm:
+                        os.ftruncate(fd, self.total_bytes)
+                    self._mapping = mmap.mmap(
+                        fd,
+                        self.total_bytes,
+                        flags=mmap.MAP_SHARED,
+                        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                    )
+                finally:
+                    os.close(fd)
+                self._owns_unlink = create_shm
+                self._shm_path = shm_path
                 if create_shm:
-                    os.ftruncate(fd, self.total_bytes)
-                self._mapping = mmap.mmap(
-                    fd,
-                    self.total_bytes,
-                    flags=mmap.MAP_SHARED,
-                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                    ctypes.memset(
+                        ctypes.addressof(ctypes.c_char.from_buffer(self._mapping)),
+                        0,
+                        self.data_base_offset,
+                    )
+                self._host_address = ctypes.addressof(ctypes.c_char.from_buffer(self._mapping))
+                self._first_touch_legacy_pages()
+                self._device_address = self._extension.register_mapped_host(
+                    self._host_address, self.total_bytes
                 )
-            finally:
-                os.close(fd)
-            self._owns_unlink = create_shm
-            if create_shm:
-                ctypes.memset(
-                    ctypes.addressof(ctypes.c_char.from_buffer(self._mapping)),
-                    0,
-                    self.data_base_offset,
-                )
-            self._shm_path = shm_path
-            self._host_address = ctypes.addressof(ctypes.c_char.from_buffer(self._mapping))
-            self._first_touch_legacy_pages()
-            self._device_address = self._extension.register_mapped_host(
-                self._host_address, self.total_bytes
-            )
-            self._registered = True
+                self._registered = True
 
-        self.control: torch.Tensor = torch.zeros(MAX_BLOCKS, dtype=torch.int64, device=device)
+            self.control: torch.Tensor = torch.zeros(
+                MAX_BLOCKS, dtype=torch.int64, device=device
+            )
+        except BaseException:
+            self.close(abort=True)
+            raise
+
+    @property
+    def pxb_enabled(self) -> bool:
+        return self._pxb_enabled
+
+    def _init_pxb_ipc(
+        self,
+        *,
+        exchange_group: dist.ProcessGroup,
+        want_pxb: bool,
+        pxb_max_elements: int,
+    ) -> None:
+        aligned_elems = (pxb_max_elements // 8) * 8
+        pxb_rank_stride = _align_up(aligned_elems * 2, 4096)
+        pxb_slot_stride = 2 * pxb_rank_stride
+        pxb_total_bytes = _align_up(
+            SHM_V5_HEADER_BYTES + NUM_RING_SLOTS * pxb_slot_stride, 4096
+        )
+        own_ptr_t = torch.zeros(1, dtype=torch.int64)
+        handle_u8 = torch.zeros(64, dtype=torch.uint8)
+        alloc_ok = 0
+        if want_pxb:
+            try:
+                h = self._extension.alloc_ipc_buffer(pxb_total_bytes, own_ptr_t)
+                if h.numel() == 64:
+                    handle_u8.copy_(h)
+                    self._my_hbm_ptr = int(own_ptr_t.item())
+                    alloc_ok = 1
+            except RuntimeError:
+                alloc_ok = 0
+
+        status_t = torch.tensor([alloc_ok], dtype=torch.int32)
+        status_list = [torch.zeros(1, dtype=torch.int32) for _ in range(self.world_size)]
+        dist.all_gather(status_list, status_t, group=exchange_group)
+        if not all(int(s.item()) == 1 for s in status_list):
+            self._close_pxb_ipc(sync_peers=True)
+            return
+
+        gathered = [torch.empty_like(handle_u8) for _ in range(self.world_size)]
+        dist.all_gather(gathered, handle_u8, group=exchange_group)
+
+        open_ok = 0
+        try:
+            partner = self.rank ^ 1
+            self._pt_hbm_ptr = int(self._extension.open_ipc_handle(gathered[partner]))
+            open_ok = 1 if self._pt_hbm_ptr != 0 else 0
+        except RuntimeError:
+            open_ok = 0
+
+        open_t = torch.tensor([open_ok], dtype=torch.int32)
+        open_list = [torch.zeros(1, dtype=torch.int32) for _ in range(self.world_size)]
+        dist.all_gather(open_list, open_t, group=exchange_group)
+        if not all(int(s.item()) == 1 for s in open_list):
+            self._close_pxb_ipc(sync_peers=True)
+            return
+
+        dist.barrier(group=exchange_group)
+        self.pxb_slot_stride_bytes = pxb_slot_stride
+        self.pxb_max_vecs = aligned_elems // 8
+        self._pxb_enabled = True
+
+    def _close_pxb_ipc(self, *, sync_peers: bool = False) -> None:
+        if self._pt_hbm_ptr != 0:
+            self._extension.close_ipc_handle(self._pt_hbm_ptr)
+            self._pt_hbm_ptr = 0
+        if (
+            sync_peers
+            and self._exchange_group is not None
+            and dist.is_initialized()
+        ):
+            dist.barrier(group=self._exchange_group)
+        if self._my_hbm_ptr != 0:
+            self._extension.free_ipc_buffer(self._my_hbm_ptr)
+            self._my_hbm_ptr = 0
+        self._pxb_enabled = False
+        self.pxb_slot_stride_bytes = 0
+        self.pxb_max_vecs = 0
 
     def _first_touch_legacy_pages(self) -> None:
         mv = memoryview(self._mapping)
@@ -2250,17 +3217,21 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
         if self._use_shm_v5:
             # Keep `gridDim.x == self.blocks` invariant across every payload size so all
             # per-block ring step counters `control[0..blocks)` stay strictly in lockstep.
-            self._extension.launch_shm_v5_allreduce(
+            self._extension.launch_shm_v5_pxb_allreduce(
                 input,
                 output,
                 self.control,
                 self._rank_shm_ptrs,
+                self._my_hbm_ptr if self._pxb_enabled else 0,
+                self._pt_hbm_ptr if self._pxb_enabled else 0,
                 self.slot_stride_bytes,
+                self.pxb_slot_stride_bytes if self._pxb_enabled else 0,
                 self.rank,
                 self.world_size,
                 self.blocks,
                 self.threads,
                 self.one_shot_max_vecs,
+                self.pxb_max_vecs if self._pxb_enabled else 0,
                 stream_handle,
             )
         else:
@@ -2348,14 +3319,17 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
                 else 0
             )
             stream_handle = torch.cuda.current_stream(self.device).cuda_stream
-            self._extension.launch_shm_v5_allreduce_add_rmsnorm(
+            self._extension.launch_shm_v5_pxb_allreduce_add_rmsnorm(
                 input,
                 residual,
                 weight,
                 normed_out,
                 self.control,
                 self._rank_shm_ptrs,
+                self._my_hbm_ptr if self._pxb_enabled else 0,
+                self._pt_hbm_ptr if self._pxb_enabled else 0,
                 self.slot_stride_bytes,
+                self.pxb_slot_stride_bytes if self._pxb_enabled else 0,
                 float(eps),
                 1.0 if zero_centered else 0.0,
                 self.rank,
@@ -2363,6 +3337,7 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
                 self.blocks,
                 self.threads,
                 self.one_shot_max_vecs,
+                self.pxb_max_vecs if self._pxb_enabled else 0,
                 use_cluster,
                 stream_handle,
             )
@@ -2378,33 +3353,38 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
         return normed_out
 
     def close(self, *, abort: bool = False) -> None:
-        """Release CUDA host mapping and POSIX shared memory handle(s)."""
+        """Release CUDA host/IPC mapping(s) and POSIX shared memory handle(s)."""
         if self._closed:
             return
         if abort:
             self.signal_abort()
         torch.cuda.synchronize(self.device)
+        self._close_pxb_ipc(sync_peers=not abort)
         if self._use_shm_v5:
-            if self._registered:
+            if self._registered or hasattr(self, "_own_shm_path"):
                 self._close_per_rank_shm(self._extension)
                 self._registered = False
         else:
             if self._registered:
                 self._extension.unregister_mapped_host(self._host_address)
                 self._registered = False
-            self._mapping.close()
-            if self._owns_unlink:
+            if self._mapping is not None:
+                if not self._mapping.closed:
+                    self._mapping.close()
+                self._mapping = None
+            if self._owns_unlink and self._shm_path is not None:
                 try:
                     os.unlink(self._shm_path)
                 except FileNotFoundError:
                     pass
+                self._owns_unlink = False
         self._closed = True
 
     def __enter__(self) -> HostMappedShmAllReduce:
         return self
 
-    def __exit__(self, *_args: object) -> None:
-        self.close()
+    def __exit__(self, exc_type: object, *_args: object) -> None:
+        self.close(abort=exc_type is not None)
 
 
 class HostMappedShmAllGather(_PerRankShmRingBase):
@@ -2444,18 +3424,23 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
             SHM_V5_HEADER_BYTES + NUM_RING_SLOTS * self.slot_stride_bytes, 4096
         )
         self._closed: bool = False
+        self._registered: bool = False
         self._extension = get_host_mapped_allreduce_extension()
-        self._init_per_rank_shm(
-            name=name,
-            rank=rank,
-            world_size=world_size,
-            total_bytes=self.total_bytes,
-            exchange_group=exchange_group,
-            device=device,
-            extension=self._extension,
-        )
-        self._registered: bool = True
-        self.control: torch.Tensor = torch.zeros(MAX_BLOCKS, dtype=torch.int64, device=device)
+        try:
+            self._init_per_rank_shm(
+                name=name,
+                rank=rank,
+                world_size=world_size,
+                total_bytes=self.total_bytes,
+                exchange_group=exchange_group,
+                device=device,
+                extension=self._extension,
+            )
+            self._registered = True
+            self.control: torch.Tensor = torch.zeros(MAX_BLOCKS, dtype=torch.int64, device=device)
+        except BaseException:
+            self.close(abort=True)
+            raise
 
     def all_gather(
         self,
@@ -2512,7 +3497,7 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
         if abort:
             self.signal_abort()
         torch.cuda.synchronize(self.device)
-        if self._registered:
+        if self._registered or hasattr(self, "_own_shm_path"):
             self._close_per_rank_shm(self._extension)
             self._registered = False
         self._closed = True
@@ -2520,8 +3505,8 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
     def __enter__(self) -> HostMappedShmAllGather:
         return self
 
-    def __exit__(self, *_args: object) -> None:
-        self.close()
+    def __exit__(self, exc_type: object, *_args: object) -> None:
+        self.close(abort=exc_type is not None)
 
 
 class HostMappedShmArgmax:
