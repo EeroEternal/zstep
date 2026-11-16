@@ -59,7 +59,7 @@ pub const STEP_FLAG_DEVICE_TOKENS: u32 = 1 << 1;
 /// waits for this step's result, so a worker may launch that next step before completing this one.
 pub const STEP_FLAG_NEXT_PREPUBLISHED: u32 = 1 << 2;
 /// Canonical CUDA Graph batch buckets for decode-only steps.
-pub const DECODE_GRAPH_BUCKETS: [u32; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+pub const DECODE_GRAPH_BUCKETS: [u32; 11] = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128];
 /// Maximum active decode sequences supported by pre-captured decode CUDA Graphs.
 pub const MAX_DECODE_GRAPH_SEQS: u32 = 128;
 

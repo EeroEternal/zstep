@@ -18,8 +18,8 @@
 | 评测维度 | 模型与硬件平台 | 基线参考 | `zstep` 实测结果 | 相对收益 |
 | --- | --- | --- | --- | --- |
 | **PCIe AllReduce（小 batch 解码）** | `8 × RTX 6000D`（`H=5120`, `M=1`） | `NCCL_LOC`：`48.95 µs` | `shm_v5`：**`12.46–14.48 µs`** | **`3.38×–3.93×`** |
-| **基础引擎对称对标（`Qwen3.5`）** | `Qwen3.5-35B-A3B` TP=8 @ `8 × RTX 5090` | `vLLM 0.33.0`：`192.2–3,259.0 tok/s` | **`261.5–5,021.7 tok/s`**（`OVERLAP=1` @ `6000D` 单流达 **`354.0 tok/s`**） | **`+11.0%` ~ `+54.1%`**（全 6 档领先） |
-| **基础引擎对称对标（`DeepSeek-V4.1`）** | `DeepSeek-V4.1-Flash` TP=8 @ `8 × RTX 6000D` | `vLLM 0.31.0` 纯引擎：`83.6–1,126.3 tok/s` | **`100.4–1,733.3 tok/s`**（`in4096_c16` 总吞吐 **`6,518.9 tok/s`**） | **`+20.2%` ~ `+53.9%`**（全 10 档领先） |
+| **基础引擎对称对标（`Qwen3.5`）** | `Qwen3.5-35B-A3B` TP=8 @ `8 × RTX 5090` / `6000D` | `vLLM 0.33.0`：`192.2–3,259.0 tok/s` | **`261.5–5,039.1 tok/s`**（`6000D` 在线 `serve` 单流达 **`380.0 tok/s`**） | **`+11.0%` ~ `+54.1%`**（在线单流重叠再增 **`+20.8%`**） |
+| **基础引擎对称对标（`DeepSeek-V4.1`）** | `DeepSeek-V4.1-Flash` TP=8 @ `8 × RTX 6000D` | `vLLM 0.31.0` 纯引擎：`83.6–1,126.3 tok/s` | **`124.0–1,795.8 tok/s`**（在线 `serve` 单流 **`133.5 tok/s`**，`in4096_c16` 总吞吐 **`6,518.9 tok/s`**） | **`+42.5%` ~ `+59.4%`**（全档位领先） |
 | **在线自动前缀缓存（APC）** | `Qwen3.5` / `DeepSeek-V4.1` TP=8 @ `8 × RTX 6000D` | Cold TTFT：`599.2 ms` / `1,049.6 ms` | Warm TTFT：**`36.9–44.4 ms`** / **`202.7–204.3 ms`** | **`13.49×–16.22×`** / **`5.14×–5.18×`** |
 | **在线投机解码（`Qwen3.5` `mtp K=3`）** | `Qwen3.5-35B-A3B` TP=8 @ `8 × RTX 6000D` | `zstep` 无投机：`309.3–314.3 tok/s` | **`583.6–762.5 tok/s`**（TPOT **`1.31–1.71 ms`**，$\tau=2.88\text{–}3.90$） | **`1.87×–2.45×`** |
 | **在线投机解码（`DeepSeek-V4.1` `dspark K=5`）** | `DeepSeek-V4.1-Flash` TP=8 @ `8 × RTX 6000D` | `zstep` 无投机：`117.9–118.6 tok/s` | **`168.9–395.1 tok/s`**（TPOT **`2.53–5.92 ms`**，$\tau=2.85\text{–}6.00$） | **`1.42×–3.35×`** |
@@ -146,6 +146,38 @@
 
 ---
 
+### 4.3 SM120 重叠执行与集合通信优化消融（平台 B：`8 × RTX 6000D` 同机 A/B 实测）
+
+在上述 Phase 3 基线之上，`zstep` 进一步整合了五项针对非 P2P SM120 PCIe 8 卡拓扑的协同优化：
+
+1. **统一 11 档解码 CUDA Graph 阶梯 `(1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128)`**（[`zs-wire`](../crates/zs-wire/src/lib.rs)、[`shm_bridge.py`](../worker/zstep_worker/shm_bridge.py)）：消除 `c=24/48/96` 中间并发档位向上对齐至 `32/64/128` 时的无效 padding 计算。
+2. **`shm_v5` 本地分片直写 HBM + 门限提升至 `M <= 384`**（[`shm_allreduce.py`](../worker/zstep_worker/kernels_sm120/shm_allreduce.py)）：Stage-1 归约结果直接写入所属 rank 本地 HBM 并在 Stage-2 跳过自身分片，削减 **`12.5%`** PCIe 回读流量，同时覆盖 `M=321..384` 中批量混合步。
+3. **NCCL 双硬件 Copy Engine（Mode 3）+ Xeon DDIO `6ch × 4MiB`**：在大块 Prefill 的 NCCL 路径上打满 PCIe Gen5 双向 DMA 引擎并降低 L3 LLC 抖动。
+4. **`DeepSeekV41StepRunner` 双缓冲 `launch`/`finish` 流水线 + `STEP_FLAG_DEVICE_TOKENS`**（[`deepseek_v41.py`](../worker/zstep_worker/models/deepseek_v41.py)）：令解码输入 token 与 3-token Engram 回溯窗口全程常驻 GPU，使 Rust 下一拍 `StepPlan` 发布与当前 GPU 步完全重叠。
+5. **在线 `zstep serve` 默认开启 `device_token_overlap` 安全排空机制**（[`serve_loop.rs`](../crates/zs-scheduler/src/serve_loop.rs)、[`serve.rs`](../crates/zs-server/src/serve.rs)）：通过 `published_ahead` 承诺排空与超发后缀 KV 页回卷状态机，在保证 EOS、Stop-String、流式客户端断连 **零幽灵 token、零死锁、零 KV 页泄漏** 的前提下彻底消除在线 HTTP 服务的步间气泡，并将 `dspark` 默认 KV 容量校准为 `1,536` 页（`196,608` tokens）以实现免调参开箱即用。
+
+#### （a）`DeepSeek-V4.1-Flash` 离线引擎 5 档同机对称 A/B（Warm `n=2`，几何平均吞吐 **`+9.06%`**，20/20 指标全面改善）
+
+| 档位 | 优化前 Output (`tok/s`) | 优化后 Output (`tok/s`) | 吞吐增益 | 优化前 / 优化后 Mean TPOT (`ms`) | 优化前 / 优化后 Med TTFT (`ms`) | 优化前 / 优化后 P99 ITL (`ms`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `in512_c1` | `106.85` | **`124.02`** | **`+16.06%`** | `8.73` / **`7.44`**（`-14.83%`） | `166.9` / **`166.1`**（`-0.50%`） | `9.0` / **`7.6`**（`-15.87%`） |
+| `in512_c16` | `775.05` | **`837.18`** | **`+8.02%`** | `18.68` / **`17.22`**（`-7.79%`） | `380.2` / **`367.3`**（`-3.39%`） | `18.0` / **`16.2`**（`-9.65%`） |
+| `in512_c24` | `878.24` | **`989.88`** | **`+12.71%`** | `24.93` / **`21.94`**（`-12.01%`） | `380.8` / **`368.0`**（`-3.36%`） | `184.6` / **`184.3`**（`-0.19%`） |
+| `in1024_c32` | `848.50` | **`889.14`** | **`+4.79%`** | `34.03` / **`32.45`**（`-4.67%`） | `385.9` / **`373.2`**（`-3.29%`） | `385.3` / **`372.3`**（`-3.36%`） |
+| `in512_c128` | `1,723.43` | **`1,795.84`** | **`+4.20%`** | `64.27` / **`61.64`**（`-4.10%`） | `766.1` / **`740.7`**（`-3.32%`） | `383.0` / **`370.2`**（`-3.34%`） |
+
+> **分块贪心等价性审计**：在 `--max-prefill-chunk 24` 高压切分下，`single`、`batched`、`chunked` 三种执行模式的 `prime_squares_table` 贪心精确匹配率为 **`100%`**（`1.0`），且运行期 `TRITON_RECOMPILATIONS = 0`。
+
+#### （b）在线 HTTP `zstep serve`（开启 APC，单流 `c=1`）`device_token_overlap` 实测增益
+
+| 模型与在线模式 | `overlap=0`（原在线行为） | `overlap=1`（现默认行为） | 在线吞吐增益 | 等效 TPOT 变化 (`ms`) | EOS / Stop / TCP 强断审计 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| **`Qwen3.5-35B-A3B`**（`none`，APC on） | `314.60 tok/s` | **`380.02 tok/s`** | **`+20.79%`** | `3.18` -> **`2.63`**（`-17.21%`） | 贪心输出 100% 一致；空闲 `kv_cache_usage_perc == 0.0`，`triton_recompilations == 0` |
+| **`DeepSeek-V4.1-Flash`**（`none`，APC on） | `111.88 tok/s` | **`133.47 tok/s`** | **`+19.30%`** | `8.94` -> **`7.49`**（`-16.18%`） | 短回复 EOS（3 tokens）精确截断；TCP 中途强断后 `kv_cache_usage_perc == 0.0` |
+| **投机协同（`mtp K=3` / `dspark K=5`）** | — | **`501.7 tok/s`** / **`214.5–239.8 tok/s`** | 兼容无冲突 | **`1.99`** / **`4.17–4.66`** | 开启投机时自动切换至步内多 token 验证，默认参数免调参启动，空闲泄漏 `0.0` |
+
+---
+
 ## 5. 在线自动前缀缓存（APC）性能验证
 
 `zs-server serve` 默认启用基数树（Radix Tree）自动前缀缓存（[`zs-kv`](../crates/zs-kv)），并与 Nebula Router 的 `NEBULA_KV_HASH_SEED` 前缀亲和路由协同工作。
@@ -231,7 +263,7 @@ $$\text{Client} \longrightarrow \text{nebula-gateway} \longrightarrow \text{nebu
 | --- | --- | --- | --- | --- |
 | **交互式 Agent / IDE 代码补全 / JSON 提取** | 低至中并发（`c = 1..8`），追求极致单流 TPOT 与多轮低 TTFT | `--enable-prefix-caching --speculative-method mtp --num-speculative-tokens 3` | `--enable-prefix-caching --speculative-method dspark --num-speculative-tokens 5` | 单流解码 **`584–762 tok/s`**（`Qwen3.5`）/ **`263–395 tok/s`**（`DS-V4.1`），多轮 TTFT 加速 **`5×–16×`** |
 | **RAG 原文引用 / 代码 Diff 重写（显存受限）** | 低并发、输入输出高度重叠、希望将全部剩余显存留给主模型 KV 池 | `--enable-prefix-caching --speculative-method ngram --num-speculative-tokens 3 --prompt-lookup-max 5 --prompt-lookup-min 2` | `--enable-prefix-caching --speculative-method ngram --num-speculative-tokens 5 --prompt-lookup-max 5 --prompt-lookup-min 2` | **零草稿权重/草稿 KV 显存开销**，重复片段最高 **`2.16×–2.92×`** 提速，不匹配负载零退化 |
-| **高并发离线批处理 / 高吞吐在线池** | 高并发（`c = 16..128`），GPU 算力已由 batch 填满 | `--enable-prefix-caching --speculative-method none`（若追求更低 `P99 ITL` 可加 `--max-prefill-chunk 512`） | `--enable-prefix-caching --speculative-method none` | 峰值输出吞吐 **`5,039 tok/s`**（`Qwen3.5`）/ **`1,733 tok/s`**（`DS-V4.1`），比 `vLLM` 高 **`+36%` ~ `+54%`** |
+| **高并发离线批处理 / 高吞吐在线池** | 高并发（`c = 16..128`），GPU 算力已由 batch 填满 | `--enable-prefix-caching --speculative-method none`（若追求更低 `P99 ITL` 可加 `--max-prefill-chunk 512`） | `--enable-prefix-caching --speculative-method none` | 峰值输出吞吐 **`5,039 tok/s`**（`Qwen3.5`）/ **`1,796 tok/s`**（`DS-V4.1`），比 `vLLM` 高 **`+36%` ~ `+59%`** |
 
 ### Nebula 声明式部署配置示例（`ModelConfig.speculative_config`）
 

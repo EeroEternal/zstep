@@ -445,7 +445,11 @@ impl ServeArgs {
     pub fn resolved_num_kv_pages(&self) -> u32 {
         self.num_kv_pages.unwrap_or_else(|| {
             let base = if is_deepseek_v41_dir(&self.model_dir) {
-                2_560.0
+                if self.speculative.method == SpeculativeMethod::Dspark {
+                    1_536.0
+                } else {
+                    2_560.0
+                }
             } else {
                 49_152.0
             };
@@ -2012,6 +2016,9 @@ fn launch_engine(
                 return;
             }
             engine.set_max_mixed_step_tokens(mixed);
+            engine.set_device_token_overlap(
+                std::env::var("ZSTEP_DECODE_DEVICE_TOKENS").map_or(true, |v| v != "0"),
+            );
             let online = OnlineConfig {
                 eos_token_ids,
                 max_waiting_requests: args.max_waiting_requests,
@@ -2276,6 +2283,16 @@ mod tests {
         assert_eq!(dsv41_ok.page_block_tokens, 128);
         assert_eq!(dsv41_ok.resolved_apc_geometry().expect("dsv41 apc"), (1, 0));
         assert_eq!(dsv41_ok.resolved_num_kv_pages(), 2_560);
+        let dsv41_dspark = parse(&[
+            "--model-dir",
+            dsv41_path,
+            "--speculative-method",
+            "dspark",
+            "--num-speculative-tokens",
+            "5",
+        ])
+        .expect("dsv41 dspark ok");
+        assert_eq!(dsv41_dspark.resolved_num_kv_pages(), 1_536);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

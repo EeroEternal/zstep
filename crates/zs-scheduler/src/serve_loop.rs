@@ -180,10 +180,12 @@ struct OnlineState {
     meta: HashMap<u64, OnlineSequenceMeta>,
     cancelled: HashSet<u64>,
     completed_stops: HashSet<u64>,
+    draining_finished: HashMap<u64, LoopFinishReason>,
     eos_tokens: Vec<u32>,
     next_request_id: u64,
     max_waiting: usize,
     pre_staged: Option<u64>,
+    published_ahead: Option<(u64, bool)>,
     consecutive_prefills: usize,
     steps: u64,
     pending: Arc<AtomicU64>,
@@ -367,13 +369,10 @@ pub fn spawn(engine: ServingEngine, config: OnlineConfig) -> ServeLoopHandle {
 
 /// Spawn the persistent online loop sharing `state` directly with the HTTP probe state.
 pub fn spawn_with_state(
-    mut engine: ServingEngine,
+    engine: ServingEngine,
     config: OnlineConfig,
     state: Arc<AtomicU8>,
 ) -> ServeLoopHandle {
-    // Online serving keeps `device_token_overlap = false` so EOS / stop-string sequences
-    // never pre-publish speculative post-EOS GPU steps.
-    engine.set_device_token_overlap(false);
     let geometry = engine.coordinator.config().geometry;
     let max_seqs = geometry.max_seqs as usize;
     let max_waiting = config.max_waiting_requests.max(1);
@@ -425,10 +424,12 @@ fn run_loop(
         meta: HashMap::new(),
         cancelled: HashSet::new(),
         completed_stops: HashSet::new(),
+        draining_finished: HashMap::new(),
         eos_tokens: config.eos_token_ids,
         next_request_id: 1,
         max_waiting: config.max_waiting_requests.max(1),
         pre_staged: None,
+        published_ahead: None,
         consecutive_prefills: 0,
         steps: 0,
         pending,
@@ -503,11 +504,14 @@ fn run_loop(
             }
         }
 
-        let max_pages_per_seq = engine.coordinator.config().geometry.max_pages_per_seq as usize;
+        let geometry = engine.coordinator.config().geometry;
+        let page_block_tokens = geometry.page_block_tokens as usize;
+        let max_pages_per_seq = geometry.max_pages_per_seq as usize;
         let dummy_page = dummy_page_value(&engine);
         if reclaim_stopped_and_cancelled(
             &mut engine.shadow_page_table,
             &mut engine.dirty_pt_slots,
+            page_block_tokens,
             max_pages_per_seq,
             dummy_page,
             &mut online,
@@ -516,11 +520,16 @@ fn run_loop(
             update_gauges(&engine, &online, &metrics);
         }
 
-        if shutting_down && online.active.is_empty() && online.waiting.is_empty() {
+        if shutting_down
+            && online.published_ahead.is_none()
+            && online.active.is_empty()
+            && online.waiting.is_empty()
+        {
             break;
         }
 
-        if online.active.is_empty() && online.waiting.is_empty() {
+        if online.published_ahead.is_none() && online.active.is_empty() && online.waiting.is_empty()
+        {
             if let Err(err) = engine.coordinator.check_workers_healthy() {
                 fault = Some(err.to_string());
                 break;
@@ -635,9 +644,37 @@ fn fail_all(online: &mut OnlineState, metrics: &OnlineMetrics, message: &str) {
         metrics.failed.fetch_add(1, Ordering::Relaxed);
     }
     online.pre_staged = None;
+    online.published_ahead = None;
+    online.draining_finished.clear();
     online.meta.clear();
     online.active.clear();
     online.waiting.clear();
+}
+
+fn rewind_post_eos_pages(
+    seq: &mut ActiveSequence,
+    page_block_tokens: usize,
+    max_pages_per_seq: usize,
+    dummy_page: i32,
+    shadow_page_table: &mut [i32],
+    dirty_pt_slots: &mut [u128; 2],
+) {
+    if seq.prefilled_tokens < seq.prompt_tokens.len() {
+        return;
+    }
+    let committed_len = seq.prefilled_tokens + seq.generated_tokens.len().saturating_sub(1);
+    if seq.current_seq_len > committed_len {
+        seq.current_seq_len = committed_len;
+        rewind_rejected_suffix_pages(
+            seq,
+            committed_len,
+            page_block_tokens,
+            max_pages_per_seq,
+            dummy_page,
+            shadow_page_table,
+            dirty_pt_slots,
+        );
+    }
 }
 
 fn retire_active_at(
@@ -665,16 +702,21 @@ fn retire_active_at(
 }
 
 /// Reclaim cancelled or stop-string-completed sequences at a step boundary.
-/// Clears `online.pre_staged` whenever active batch membership changes.
+/// When `online.published_ahead` is in flight on the GPUs, active-sequence reclamation is
+/// deferred into `online.draining_finished` until the in-flight step(s) drain.
 fn reclaim_stopped_and_cancelled(
     shadow_page_table: &mut [i32],
     dirty_pt_slots: &mut [u128; 2],
+    page_block_tokens: usize,
     max_pages_per_seq: usize,
     dummy_page: i32,
     online: &mut OnlineState,
     metrics: &OnlineMetrics,
 ) -> bool {
-    if online.cancelled.is_empty() && online.completed_stops.is_empty() {
+    if online.cancelled.is_empty()
+        && online.completed_stops.is_empty()
+        && (online.published_ahead.is_some() || online.draining_finished.is_empty())
+    {
         return false;
     }
     let mut changed = false;
@@ -708,12 +750,42 @@ fn reclaim_stopped_and_cancelled(
         }
     }
 
+    if online.published_ahead.is_some() {
+        for seq in &online.active {
+            let id = seq.request_id as u64;
+            if online.completed_stops.contains(&id) {
+                online
+                    .draining_finished
+                    .entry(id)
+                    .or_insert(LoopFinishReason::StopToken);
+            } else if online.cancelled.contains(&id) {
+                online
+                    .draining_finished
+                    .entry(id)
+                    .or_insert(LoopFinishReason::Cancelled);
+            }
+        }
+        online.pre_staged = None;
+        online.cancelled.clear();
+        online.completed_stops.clear();
+        return changed;
+    }
+
     let mut index = 0;
     while index < online.active.len() {
         let id = online.active[index].request_id as u64;
         let is_stop = online.completed_stops.contains(&id);
         let is_cancel = online.cancelled.contains(&id);
-        if is_stop || is_cancel {
+        let drained = online.draining_finished.remove(&id);
+        if is_stop || is_cancel || drained.is_some() {
+            rewind_post_eos_pages(
+                &mut online.active[index],
+                page_block_tokens,
+                max_pages_per_seq,
+                dummy_page,
+                shadow_page_table,
+                dirty_pt_slots,
+            );
             retire_active_at(
                 index,
                 &mut online.active,
@@ -723,7 +795,14 @@ fn reclaim_stopped_and_cancelled(
                 max_pages_per_seq,
                 dummy_page,
             );
-            let reason = if is_stop {
+            let reason = if let Some(prev) = drained {
+                if prev == LoopFinishReason::Cancelled {
+                    metrics.cancelled.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    metrics.finished.fetch_add(1, Ordering::Relaxed);
+                }
+                prev
+            } else if is_stop {
                 metrics.finished.fetch_add(1, Ordering::Relaxed);
                 LoopFinishReason::StopToken
             } else {
@@ -753,16 +832,38 @@ fn reclaim_stopped_and_cancelled(
     changed
 }
 
-/// Retire active sequences that reached `target_output_len` or emitted an EOS token.
+/// Retire active sequences that reached `target_output_len`, emitted an EOS token, or finished
+/// draining an overlapped decode burst.
 /// Returns `true` if any active sequence retired (invalidating any `pre_staged` step).
 fn retire_completed_sequences(
     shadow_page_table: &mut [i32],
     dirty_pt_slots: &mut [u128; 2],
+    page_block_tokens: usize,
     max_pages_per_seq: usize,
     dummy_page: i32,
     online: &mut OnlineState,
     metrics: &OnlineMetrics,
 ) -> bool {
+    if online.published_ahead.is_some() {
+        for seq in &online.active {
+            let request_id = seq.request_id as u64;
+            let prefill_done = seq.prefilled_tokens == seq.prompt_tokens.len();
+            let generated = seq.generated_tokens.len();
+            let eos = prefill_done
+                && generated > 0
+                && online.eos_tokens.contains(&(seq.last_token as u32));
+            if generated >= seq.target_output_len || eos {
+                let reason = if eos {
+                    LoopFinishReason::StopToken
+                } else {
+                    LoopFinishReason::Length
+                };
+                online.draining_finished.entry(request_id).or_insert(reason);
+            }
+        }
+        return false;
+    }
+
     let mut any_retired = false;
     let mut index = 0;
     while index < online.active.len() {
@@ -776,8 +877,17 @@ fn retire_completed_sequences(
                 seq.last_token,
             )
         };
+        let drained = online.draining_finished.remove(&request_id);
         let eos = prefill_done && generated > 0 && online.eos_tokens.contains(&(last_token as u32));
-        if generated >= target || eos {
+        if drained.is_some() || generated >= target || eos {
+            rewind_post_eos_pages(
+                &mut online.active[index],
+                page_block_tokens,
+                max_pages_per_seq,
+                dummy_page,
+                shadow_page_table,
+                dirty_pt_slots,
+            );
             retire_active_at(
                 index,
                 &mut online.active,
@@ -787,14 +897,18 @@ fn retire_completed_sequences(
                 max_pages_per_seq,
                 dummy_page,
             );
-            let reason = if eos {
+            let reason = drained.unwrap_or(if eos {
                 LoopFinishReason::StopToken
             } else {
                 LoopFinishReason::Length
-            };
+            });
             emit(online, LoopEvent::Finished { request_id, reason });
             online.meta.remove(&request_id);
-            metrics.finished.fetch_add(1, Ordering::Relaxed);
+            if reason == LoopFinishReason::Cancelled {
+                metrics.cancelled.fetch_add(1, Ordering::Relaxed);
+            } else {
+                metrics.finished.fetch_add(1, Ordering::Relaxed);
+            }
             any_retired = true;
         } else {
             index += 1;
@@ -826,7 +940,7 @@ fn online_step(
         page_block_tokens,
     );
 
-    if online.active.is_empty() && !waiting_admissible {
+    if online.published_ahead.is_none() && online.active.is_empty() && !waiting_admissible {
         online.pre_staged = None;
         return Ok(false);
     }
@@ -836,7 +950,12 @@ fn online_step(
         online.pre_staged = None;
     }
 
-    let step_id = if let Some(next_sid) = online.pre_staged.take() {
+    let mut ahead_promise = None;
+    let step_id = if let Some((ahead_sid, promise)) = online.published_ahead.take() {
+        ahead_promise = Some(promise);
+        online.consecutive_prefills = 0;
+        ahead_sid
+    } else if let Some(next_sid) = online.pre_staged.take() {
         engine.step_cursor = next_sid;
         {
             let mut plan = engine.coordinator.plan_slot_mut(next_sid)?;
@@ -927,23 +1046,75 @@ fn online_step(
         sid
     };
 
-    engine.coordinator.publish_step(step_id)?;
-    online.steps += 1;
-
     let post_admit_waiting_admissible = engine.front_request_admissible(
         &online.active,
         &online.waiting,
         max_seqs,
         page_block_tokens,
     );
-    let can_overlap_next = !engine.speculative.enabled()
+    let has_prefix_cache = engine.has_prefix_cache();
+    let stop_overlap = !online.draining_finished.is_empty()
+        || !online.cancelled.is_empty()
+        || !online.completed_stops.is_empty();
+
+    let publish_next = match ahead_promise {
+        Some(promise) => promise,
+        None => {
+            let promise = engine.device_token_overlap
+                && !engine.speculative.enabled()
+                && !stop_overlap
+                && engine.plan_flags(step_id)? & STEP_FLAG_DECODE_ONLY != 0
+                && decode_continues_for_all(
+                    &online.active,
+                    post_admit_waiting_admissible,
+                    0,
+                    has_prefix_cache,
+                );
+            if promise {
+                engine.or_plan_flags(step_id, STEP_FLAG_NEXT_PREPUBLISHED)?;
+            }
+            engine.coordinator.publish_step(step_id)?;
+            online.steps += 1;
+            promise
+        }
+    };
+
+    if publish_next {
+        let next_sid = engine.step_cursor + 1;
+        engine.step_cursor = next_sid;
+        engine.stage_decode_step(
+            next_sid,
+            &mut online.active,
+            page_block_tokens,
+            max_pages_per_seq,
+            true,
+        )?;
+        let next_promise = !stop_overlap
+            && decode_continues_for_all(
+                &online.active,
+                post_admit_waiting_admissible,
+                1,
+                has_prefix_cache,
+            );
+        let mut flags = STEP_FLAG_DEVICE_TOKENS;
+        if next_promise {
+            flags |= STEP_FLAG_NEXT_PREPUBLISHED;
+        }
+        engine.or_plan_flags(next_sid, flags)?;
+        engine.coordinator.publish_step(next_sid)?;
+        online.steps += 1;
+        online.published_ahead = Some((next_sid, next_promise));
+    } else if ahead_promise.is_none()
+        && !engine.device_token_overlap
+        && !engine.speculative.enabled()
+        && !stop_overlap
         && decode_continues_for_all(
             &online.active,
             post_admit_waiting_admissible,
             0,
-            engine.has_prefix_cache(),
-        );
-    if can_overlap_next {
+            has_prefix_cache,
+        )
+    {
         let next_sid = engine.step_cursor + 1;
         engine.stage_decode_step(
             next_sid,
@@ -969,6 +1140,14 @@ fn online_step(
             .get(output.req_slot as usize)
             .unwrap_or(&usize::MAX);
         if idx >= online.active.len() {
+            continue;
+        }
+        let seq_req_id = online.active[idx].request_id as u64;
+        if online.draining_finished.contains_key(&seq_req_id)
+            || online.cancelled.contains(&seq_req_id)
+            || online.completed_stops.contains(&seq_req_id)
+        {
+            online.active[idx].staged_verify = None;
             continue;
         }
         let seq = &mut online.active[idx];
@@ -1043,6 +1222,7 @@ fn online_step(
     let _ = retire_completed_sequences(
         &mut engine.shadow_page_table,
         &mut engine.dirty_pt_slots,
+        page_block_tokens,
         max_pages_per_seq,
         dummy_page,
         online,
@@ -1362,10 +1542,12 @@ mod tests {
             meta: HashMap::new(),
             cancelled: HashSet::new(),
             completed_stops: HashSet::new(),
+            draining_finished: HashMap::new(),
             eos_tokens: vec![2],
             next_request_id: 1,
             max_waiting: 64,
             pre_staged: Some(7),
+            published_ahead: None,
             consecutive_prefills: 0,
             steps: 0,
             pending: Arc::clone(&pending),
@@ -1503,6 +1685,7 @@ mod tests {
             reclaim_stopped_and_cancelled(
                 &mut shadow_pt,
                 &mut dirty_pt_slots,
+                page_block_tokens,
                 max_pages_per_seq,
                 dummy_page,
                 &mut online,
@@ -1518,6 +1701,7 @@ mod tests {
             retire_completed_sequences(
                 &mut shadow_pt,
                 &mut dirty_pt_slots,
+                page_block_tokens,
                 max_pages_per_seq,
                 dummy_page,
                 &mut online,
@@ -1535,6 +1719,7 @@ mod tests {
         reclaim_stopped_and_cancelled(
             &mut shadow_pt,
             &mut dirty_pt_slots,
+            page_block_tokens,
             max_pages_per_seq,
             dummy_page,
             &mut online,
@@ -1568,10 +1753,12 @@ mod tests {
             meta: HashMap::new(),
             cancelled: HashSet::new(),
             completed_stops: HashSet::new(),
+            draining_finished: HashMap::new(),
             eos_tokens: vec![151645],
             next_request_id: 2,
             max_waiting: 8,
             pre_staged: Some(42),
+            published_ahead: None,
             consecutive_prefills: 0,
             steps: 1,
             pending: Arc::clone(&pending),
@@ -1613,8 +1800,15 @@ mod tests {
             last_token_time: Some(Instant::now()),
         });
 
-        let retired =
-            retire_completed_sequences(&mut shadow_pt, &mut dirty, 4, 16, &mut online, &metrics);
+        let retired = retire_completed_sequences(
+            &mut shadow_pt,
+            &mut dirty,
+            16,
+            4,
+            16,
+            &mut online,
+            &metrics,
+        );
         assert!(retired);
         assert!(online.pre_staged.is_none());
         assert!(online.active.is_empty());
@@ -1702,10 +1896,12 @@ mod tests {
             meta: HashMap::new(),
             cancelled: HashSet::new(),
             completed_stops: HashSet::new(),
+            draining_finished: HashMap::new(),
             eos_tokens: vec![2],
             next_request_id: 1,
             max_waiting: 64,
             pre_staged: None,
+            published_ahead: None,
             consecutive_prefills: 0,
             steps: 0,
             pending: Arc::clone(&pending),
@@ -1850,6 +2046,7 @@ mod tests {
             reclaim_stopped_and_cancelled(
                 &mut shadow_pt,
                 &mut dirty_pt_slots,
+                page_block_tokens,
                 max_pages_per_seq,
                 dummy_page,
                 &mut online,
@@ -1858,6 +2055,7 @@ mod tests {
             retire_completed_sequences(
                 &mut shadow_pt,
                 &mut dirty_pt_slots,
+                page_block_tokens,
                 max_pages_per_seq,
                 dummy_page,
                 &mut online,
@@ -1874,6 +2072,7 @@ mod tests {
         reclaim_stopped_and_cancelled(
             &mut shadow_pt,
             &mut dirty_pt_slots,
+            page_block_tokens,
             max_pages_per_seq,
             dummy_page,
             &mut online,
@@ -1889,5 +2088,170 @@ mod tests {
         assert_eq!(kv_pool.available(), kv_capacity);
         assert_eq!(ckpt_pool.available(), ckpt_capacity);
         assert!(hits > 0, "expected warm APC prefix hits across 120 steps");
+    }
+
+    #[test]
+    fn published_ahead_defers_eos_and_cancel_reclamation_until_drained_with_zero_leaks() {
+        let slot_pool = SlotPool::new(4);
+        let kv_pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 16);
+        let mut shadow_pt = vec![16i32; 4 * 4];
+        let mut dirty = [0u128; 2];
+        let pending = Arc::new(AtomicU64::new(2));
+        let metrics = OnlineMetrics::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink_eos = Arc::clone(&events);
+        let sink_cancel = Arc::clone(&events);
+
+        let mut online = OnlineState {
+            waiting: VecDeque::new(),
+            active: Vec::new(),
+            slot_to_active: vec![usize::MAX; 4],
+            meta: HashMap::new(),
+            cancelled: HashSet::new(),
+            completed_stops: HashSet::new(),
+            draining_finished: HashMap::new(),
+            eos_tokens: vec![151645],
+            next_request_id: 3,
+            max_waiting: 8,
+            pre_staged: None,
+            published_ahead: Some((9, false)),
+            consecutive_prefills: 0,
+            steps: 2,
+            pending: Arc::clone(&pending),
+        };
+        online.meta.insert(
+            1,
+            OnlineSequenceMeta {
+                sink: Arc::new(move |ev| sink_eos.lock().expect("lock").push(ev)),
+            },
+        );
+        online.meta.insert(
+            2,
+            OnlineSequenceMeta {
+                sink: Arc::new(move |ev| sink_cancel.lock().expect("lock").push(ev)),
+            },
+        );
+
+        // Seq 1 hit EOS at len=16, while pre-published step 9 already allocated a 2nd KV page (len=17).
+        let slot1 = slot_pool.allocate().expect("slot1");
+        let slot1_id = slot1.id() as usize;
+        online.slot_to_active[slot1_id] = 0;
+        let mut seq1 = ActiveSequence {
+            request_id: 1,
+            slot_lease: slot1,
+            prefix_lease: None,
+            kv_leases: Vec::new(),
+            page_ids: Vec::new(),
+            prompt_tokens: vec![10; 15],
+            prefilled_tokens: 15,
+            computed_prompt_tokens: 15,
+            cached_prefix_tokens: 0,
+            restore_checkpoint_id: -1,
+            pending_checkpoints: Vec::new(),
+            checkpoint_alloc_stopped: false,
+            current_seq_len: 17,
+            last_token: 151645,
+            generated_tokens: vec![42, 151645],
+            generated_top2: Vec::new(),
+            pending_draft_tokens: Vec::new(),
+            staged_verify: None,
+            target_output_len: 64,
+            reserved_pages: 5,
+            permit_time: Instant::now(),
+            submit_time: Instant::now(),
+            first_token_time: Some(Instant::now()),
+            last_token_time: Some(Instant::now()),
+        };
+        seq1.ensure_kv_pages(17, 16, 4, &kv_pool, &mut shadow_pt, &mut dirty)
+            .expect("pages seq1");
+        assert_eq!(seq1.page_ids.len(), 2);
+        online.active.push(seq1);
+
+        // Seq 2 receives Cancel while step 9 is still in flight on the GPUs.
+        let slot2 = slot_pool.allocate().expect("slot2");
+        let slot2_id = slot2.id() as usize;
+        online.slot_to_active[slot2_id] = 1;
+        let mut seq2 = ActiveSequence {
+            request_id: 2,
+            slot_lease: slot2,
+            prefix_lease: None,
+            kv_leases: Vec::new(),
+            page_ids: Vec::new(),
+            prompt_tokens: vec![20; 8],
+            prefilled_tokens: 8,
+            computed_prompt_tokens: 8,
+            cached_prefix_tokens: 0,
+            restore_checkpoint_id: -1,
+            pending_checkpoints: Vec::new(),
+            checkpoint_alloc_stopped: false,
+            current_seq_len: 10,
+            last_token: 77,
+            generated_tokens: vec![76, 77],
+            generated_top2: Vec::new(),
+            pending_draft_tokens: Vec::new(),
+            staged_verify: None,
+            target_output_len: 64,
+            reserved_pages: 5,
+            permit_time: Instant::now(),
+            submit_time: Instant::now(),
+            first_token_time: Some(Instant::now()),
+            last_token_time: Some(Instant::now()),
+        };
+        seq2.ensure_kv_pages(10, 16, 4, &kv_pool, &mut shadow_pt, &mut dirty)
+            .expect("pages seq2");
+        online.active.push(seq2);
+        online.cancelled.insert(2);
+
+        // While `published_ahead` is Some, neither EOS nor Cancel may drop leases prematurely.
+        assert!(!reclaim_stopped_and_cancelled(
+            &mut shadow_pt,
+            &mut dirty,
+            16,
+            4,
+            16,
+            &mut online,
+            &metrics,
+        ));
+        assert!(!retire_completed_sequences(
+            &mut shadow_pt,
+            &mut dirty,
+            16,
+            4,
+            16,
+            &mut online,
+            &metrics,
+        ));
+        assert_eq!(online.active.len(), 2);
+        assert_eq!(slot_pool.available(), 2);
+        assert_eq!(kv_pool.available(), 13);
+        assert_eq!(
+            online.draining_finished.get(&1),
+            Some(&LoopFinishReason::StopToken)
+        );
+        assert_eq!(
+            online.draining_finished.get(&2),
+            Some(&LoopFinishReason::Cancelled)
+        );
+        assert!(events.lock().expect("lock").is_empty());
+
+        // Once step 9 finishes (`published_ahead` becomes None), both sequences rewind & retire cleanly.
+        online.published_ahead = None;
+        assert!(retire_completed_sequences(
+            &mut shadow_pt,
+            &mut dirty,
+            16,
+            4,
+            16,
+            &mut online,
+            &metrics,
+        ));
+        assert!(online.active.is_empty());
+        assert!(online.draining_finished.is_empty());
+        assert_eq!(slot_pool.available(), 4);
+        assert_eq!(kv_pool.available(), 16);
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.finished.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.cancelled.load(Ordering::Relaxed), 1);
+        assert!(shadow_pt.iter().all(|&cell| cell == 16));
     }
 }

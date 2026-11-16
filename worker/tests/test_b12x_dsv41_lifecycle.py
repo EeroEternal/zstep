@@ -203,3 +203,42 @@ def test_b12x_source_fingerprint_changes_with_source(
             sys.modules.pop("b12x", None)
         else:
             sys.modules["b12x"] = prev
+
+
+def test_dsv41_runner_abort_close_survives_early_init_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pathlib import Path
+    from zstep_worker.models.deepseek_v41 import DeepSeekV41StepRunner
+
+    closed_channels: list[str] = []
+
+    class _FakeChan:
+        def __init__(self, tag: str) -> None:
+            self.tag = tag
+
+        def signal_abort(self) -> None:
+            closed_channels.append(f"abort:{self.tag}")
+
+        def close(self, *, abort: bool = False) -> None:
+            closed_channels.append(f"close:{self.tag}:{abort}")
+
+    def _fail_early(self: DeepSeekV41StepRunner, **kwargs: object) -> None:
+        self.shm_ar = _FakeChan("ar")  # type: ignore[assignment]
+        self.argmax_channel = _FakeChan("argmax")  # type: ignore[assignment]
+        raise ValueError("synthetic early _init_impl validation error")
+
+    monkeypatch.setattr(DeepSeekV41StepRunner, "_init_impl", _fail_early)
+    with pytest.raises(ValueError, match="synthetic early _init_impl validation error"):
+        DeepSeekV41StepRunner(
+            model_dir=Path("/nonexistent"),
+            rank=0,
+            bridge=None,  # type: ignore[arg-type]
+            dist_init_file="/tmp/fake",
+            allreduce_name="fake",
+            allreduce_blocks=8,
+            allreduce_threads=256,
+            num_kv_pages=16,
+        )
+    assert "close:argmax:True" in closed_channels
+    assert "close:ar:True" in closed_channels
