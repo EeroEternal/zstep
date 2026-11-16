@@ -57,6 +57,7 @@ from zstep_worker.kernels_sm120.shm_allreduce import (
     HostMappedShmArgmax,
     get_host_mapped_allreduce_extension,
 )
+from zstep_worker.p2p_probe import P2pTopologyReport, configure_adaptive_p2p_env
 from zstep_worker.spec_decode import seq_results, verify_batch
 from zstep_worker.shm_bridge import (
     DECODE_GRAPH_BUCKETS,
@@ -318,13 +319,6 @@ class DeepSeekV41StepRunner:
         allreduce_threads: int,
         num_kv_pages: int,
     ) -> None:
-        os.environ.setdefault("NCCL_P2P_DISABLE", "1")
-        os.environ.setdefault("NCCL_P2P_LEVEL", "LOC")
-        os.environ.setdefault("NCCL_SHM_USE_CUDA_MEMCPY", "1")
-        os.environ.setdefault("NCCL_SHM_MEMCPY_MODE", "3")
-        os.environ.setdefault("NCCL_MIN_NCHANNELS", "6")
-        os.environ.setdefault("NCCL_MAX_NCHANNELS", "6")
-        os.environ.setdefault("NCCL_BUFFSIZE", "4194304")
         os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
         torch.set_num_threads(2)
 
@@ -390,6 +384,12 @@ class DeepSeekV41StepRunner:
 
         torch.cuda.set_device(rank)
         self.device: torch.device = torch.device("cuda", rank)
+        self.p2p_report: P2pTopologyReport = configure_adaptive_p2p_env(
+            rank=rank,
+            world_size=self.world_size,
+            device_index=rank,
+            dist_init_file=dist_init_file,
+        )
 
         apply_vllm_sm120_dsv41_patches()
 
@@ -533,6 +533,7 @@ class DeepSeekV41StepRunner:
             blocks=allreduce_blocks,
             threads=allreduce_threads,
             exchange_group=self.exchange_group,
+            enable_pxb_p2p=self.p2p_report.pxb_shm_enabled,
         )
         self.shm_ag: HostMappedShmAllGather = HostMappedShmAllGather(
             name=f"{allreduce_name}_ag",
@@ -790,12 +791,12 @@ class DeepSeekV41StepRunner:
         shm_ar = self.shm_ar
         shm_ag = self.shm_ag
         runner = self
-        # Route M <= 384 (<= 3.75 MiB AR at H=5120) and M <= 6553 (<= 8 MiB AG input
-        # at H_in=640, covering M=1..4096 where 1-shot native-`dim` `shm_ag` avoids
-        # NCCL's `dim=0` + `permute().contiguous()` copy) plus 100% of CUDAGraph
-        # captures through `shm_v5`; route larger eager AR payloads to `NCCL_LOC`.
+        # Route M <= 512 when CX8 PXB-SHM hybrid is active (or M <= 384 on non-P2P)
+        # plus 100% of CUDAGraph captures through `shm_ar`; route larger eager AR
+        # payloads to topology-aware NCCL (`PXB` on P2P switches, `LOC` on non-P2P).
+        default_ar_rows = 512 if shm_ar.pxb_enabled else 384
         shm_max_ar_numel = int(
-            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(384 * 5120))
+            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(default_ar_rows * 5120))
         )
         shm_max_ag_numel = int(
             os.environ.get("ZSTEP_SHM_MAX_AG_NUMEL", str(1024 * 4096))
@@ -1463,10 +1464,14 @@ class DeepSeekV41StepRunner:
                 if self.b12x_summary.dsa_decode_enabled
                 else "dsa_decode=off"
             )
+            p2p_info = (
+                f"p2p={self.p2p_report.nccl_p2p_level}"
+                f"(pxb_shm={'on' if self.shm_ar.pxb_enabled else 'off'})"
+            )
             print(
                 f"[DeepSeekV41StepRunner] ready: max_model_len={self.max_model_len} "
                 f"kv_pages={self.num_kv_pages} buckets={buckets} "
-                f"{b12x_info} {mg_info} {dsa_info} "
+                f"{b12x_info} {mg_info} {dsa_info} {p2p_info} "
                 f"shm_ar_warm={self.shm_ar_calls} shm_ag_warm={self.shm_ag_calls} "
                 f"nccl_large_warm={self.nccl_eager_large_calls} "
                 f"nccl_fallback_warm={self.nccl_fallback_calls}",

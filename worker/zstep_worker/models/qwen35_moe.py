@@ -61,6 +61,7 @@ from zstep_worker.kernels_sm120.shm_allreduce import (
     HostMappedShmAllReduce,
     get_host_mapped_allreduce_extension,
 )
+from zstep_worker.p2p_probe import P2pTopologyReport, configure_adaptive_p2p_env
 from zstep_worker.spec_decode import VerifiedSequence, seq_results, verify_batch
 from zstep_worker.shm_bridge import (
     DECODE_GRAPH_BUCKETS,
@@ -415,14 +416,12 @@ class Qwen35MoeStepRunner:
             raise ValueError("ZSTEP_NUM_SPEC_TOKENS must be in 1..=7")
         self.mtp_drafter: Any = None
 
-        os.environ.setdefault("NCCL_P2P_DISABLE", "1")
-        os.environ.setdefault("NCCL_P2P_LEVEL", "LOC")
-        os.environ.setdefault("NCCL_IB_DISABLE", "1")
-        os.environ.setdefault("NCCL_SHM_USE_CUDA_MEMCPY", "1")
-        os.environ.setdefault("NCCL_SHM_MEMCPY_MODE", "3")
-        os.environ.setdefault("NCCL_MIN_NCHANNELS", "6")
-        os.environ.setdefault("NCCL_MAX_NCHANNELS", "6")
-        os.environ.setdefault("NCCL_BUFFSIZE", "4194304")
+        self.p2p_report: P2pTopologyReport = configure_adaptive_p2p_env(
+            rank=rank,
+            world_size=self.world_size,
+            device_index=rank,
+            dist_init_file=dist_init_file,
+        )
         dist.init_process_group(
             backend="gloo",
             init_method=f"file://{dist_init_file}",
@@ -437,11 +436,6 @@ class Qwen35MoeStepRunner:
             if (enable_nccl_prefill and dist.is_nccl_available())
             else None
         )
-        # Route M <= 960 (<= 3.75 MiB at H=2048) and 100% of CUDAGraph captures
-        # through `shm_v5`; route larger eager prefill chunks (M >= 1024) to `NCCL_LOC`.
-        self.shm_max_ar_numel: int = int(
-            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(384 * 5120))
-        )
         self.enable_fused_ar_norm: bool = (
             os.environ.get("ZSTEP_QWEN_ENABLE_FUSED_AR_NORM", "1") != "0"
         )
@@ -455,6 +449,14 @@ class Qwen35MoeStepRunner:
             blocks=allreduce_blocks,
             threads=allreduce_threads,
             exchange_group=self.exchange_group,
+            enable_pxb_p2p=self.p2p_report.pxb_shm_enabled,
+        )
+        # Route M <= 1280 at H=2048 when CX8 PXB-SHM hybrid is active (or M <= 960
+        # on non-P2P) plus 100% of CUDAGraph captures through `communicator`; route
+        # larger eager prefill chunks (e.g. M=2048/4096) to topology-aware NCCL.
+        default_ar_rows = 512 if self.communicator.pxb_enabled else 384
+        self.shm_max_ar_numel: int = int(
+            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(default_ar_rows * 5120))
         )
         self.argmax_channel: _Tp8ArgmaxShmChannel = _Tp8ArgmaxShmChannel(
             name=f"{allreduce_name}_argmax",
