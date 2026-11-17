@@ -110,7 +110,7 @@ def test_close_b12x_dsv41_model_is_idempotent() -> None:
 
 def test_sm120_summary_defaults_and_env_gating(monkeypatch: pytest.MonkeyPatch) -> None:
     assert SM120_DSA_CANDIDATE_COVER_TOKENS == 16384
-    assert DEFAULT_MEGA_GATE_MIN_TOKENS == 32
+    assert DEFAULT_MEGA_GATE_MIN_TOKENS == 1
 
     summary = B12xPrepareSummary(
         enabled=True,

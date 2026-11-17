@@ -42,13 +42,14 @@ from torch.utils.cpp_extension import load_inline
 from zstep_worker.numa_pin import DeviceNumaTopology, pin_process_to_device_numa
 
 NUM_RING_SLOTS = 4
+NUM_PXB_RING_SLOTS = 2
 MAX_RANKS = 8
 MAX_BLOCKS = 64
 SHM_V5_HEADER_BYTES = 131072
 SHM_V5_ABORT_OFFSET = 98304
 ARGMAX_SHM_ABORT_OFFSET = 128
 DEFAULT_ONE_SHOT_MAX_VECS = 4096  # Up to 64 KiB (e.g. M <= 16 at H=2048 or M <= 6 at H=5120 BF16)
-DEFAULT_PXB_MAX_ELEMENTS = 512 * 5120  # Up to 5.0 MiB (~40.1 MiB 4-slot CUDA-IPC HBM ring)
+DEFAULT_PXB_MAX_ELEMENTS = 3072 * 5120  # Up to 30.0 MiB (~122.6 MiB 2-slot dual-regime CUDA-IPC HBM ring)
 
 _CPP_SOURCE = r"""
 #include <torch/extension.h>
@@ -832,8 +833,10 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
     int rank,
     int world_size,
     int one_shot_max_vecs,
-    int64_t pxb_max_vecs) {
-    const int b = blockIdx.x;
+    int64_t pxb_max_vecs,
+    int flag_base) {
+    const int b_local = blockIdx.x;
+    const int b = flag_base + b_local;
     __shared__ uint64_t s_step;
     __shared__ int s_aborted;
     __shared__ char* s_peer_shm[kMaxRanks];
@@ -848,16 +851,21 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
     }
     __syncthreads();
     const uint64_t step = s_step;
-    const int slot = static_cast<int>((step - 1ULL) & 3);
+    const bool split_regime = (flag_base > 0 || (my_hbm != nullptr && gridDim.x == 32));
+    const int slot = split_regime
+        ? ((flag_base > 0 ? 2 : 0) + static_cast<int>((step - 1ULL) & 1))
+        : static_cast<int>((step - 1ULL) & 3);
+    const int pxb_slot = static_cast<int>((step - 1ULL) & 1);
+    const uint64_t ring_depth = (split_regime || my_hbm != nullptr) ? 2ULL : 4ULL;
     char* my_shm = s_peer_shm[rank];
     const uint64_t* abort_flag = reinterpret_cast<const uint64_t*>(my_shm + kShmV5AbortOffset);
 
-    const int64_t c_begin = (num_vecs * b) / gridDim.x;
-    const int64_t c_end = (num_vecs * (b + 1)) / gridDim.x;
+    const int64_t c_begin = (num_vecs * b_local) / gridDim.x;
+    const int64_t c_end = (num_vecs * (b_local + 1)) / gridDim.x;
     const int64_t c_len = c_end - c_begin;
 
-    if (step > 4ULL) {
-        const uint64_t min_done = step - 4ULL;
+    if (step > ring_depth) {
+        const uint64_t min_done = step - ring_depth;
         if (threadIdx.x < world_size) {
             const uint64_t* my_done = reinterpret_cast<const uint64_t*>(
                 my_shm + 65536 + (b * 8 + threadIdx.x) * 64);
@@ -875,6 +883,12 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
     uint4* my_in = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes);
     const bool can_pxb =
         (my_hbm != nullptr && pt_hbm != nullptr && world_size == 8 && num_vecs <= pxb_max_vecs && c_len >= 8);
+    const int64_t cur_pxb_stride = (flag_base > 0) ? 1310720LL : pxb_slot_stride_bytes;
+    const int64_t pxb_base_off = 131072LL + (
+        (flag_base > 0)
+            ? (2LL * pxb_slot_stride_bytes + pxb_slot * cur_pxb_stride)
+            : (pxb_slot * pxb_slot_stride_bytes)
+    );
 
     // Hybrid CX8-partner P2P + 4-pair Host-SHM 1-Shot (`16..64 KiB`)
     if (can_pxb && num_vecs > kPxbOneShotMinVecs && num_vecs <= one_shot_max_vecs) {
@@ -884,9 +898,9 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         const int64_t my_he = (parity == 0) ? c_mid : c_end;
         const int64_t pt_hb = (parity == 0) ? c_mid : c_begin;
         const int64_t pt_he = (parity == 0) ? c_end : c_mid;
-        const int64_t half_pxb = pxb_slot_stride_bytes / 2;
+        const int64_t half_pxb = cur_pxb_stride / 2;
 
-        uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + 131072 + slot * pxb_slot_stride_bytes);
+        uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + pxb_base_off);
         for (int64_t idx = pt_hb + threadIdx.x; idx < pt_he; idx += blockDim.x) {
             st_wt_uint4(pt_in + idx, input_vec[idx]);
         }
@@ -903,9 +917,8 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             return;
         }
 
-        const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + 131072 + slot * pxb_slot_stride_bytes);
-        uint4* my_hbm_sum = reinterpret_cast<uint4*>(
-            my_hbm + 131072 + slot * pxb_slot_stride_bytes + half_pxb);
+        const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + pxb_base_off);
+        uint4* my_hbm_sum = reinterpret_cast<uint4*>(my_hbm + pxb_base_off + half_pxb);
         for (int64_t idx = my_hb + threadIdx.x; idx < my_he; idx += blockDim.x) {
             Pack128Bf16 a, bp, psum;
             a.u4 = input_vec[idx];
@@ -984,9 +997,9 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         const int64_t pt_he = (parity == 0) ? c_end : c_mid;
         const int64_t my_hlen = my_he - my_hb;
         const int64_t pt_hlen = pt_he - pt_hb;
-        const int64_t half_pxb = pxb_slot_stride_bytes / 2;
+        const int64_t half_pxb = cur_pxb_stride / 2;
 
-        uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + 131072 + slot * pxb_slot_stride_bytes);
+        uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + pxb_base_off);
         for (int64_t idx = pt_hb + threadIdx.x; idx < pt_he; idx += blockDim.x) {
             st_wt_uint4(pt_in + idx, input_vec[idx]);
         }
@@ -1005,9 +1018,8 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
 
         const int64_t own_b = my_hb + (my_hlen * pair_id) / 4;
         const int64_t own_e = my_hb + (my_hlen * (pair_id + 1)) / 4;
-        const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + 131072 + slot * pxb_slot_stride_bytes);
-        uint4* my_hbm_red = reinterpret_cast<uint4*>(
-            my_hbm + 131072 + slot * pxb_slot_stride_bytes + half_pxb);
+        const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + pxb_base_off);
+        uint4* my_hbm_red = reinterpret_cast<uint4*>(my_hbm + pxb_base_off + half_pxb);
 
         for (int64_t idx = my_hb + threadIdx.x; idx < my_he; idx += blockDim.x) {
             Pack128Bf16 a, bp, psum;
@@ -1045,8 +1057,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         }
 
         uint4* my_shm_red = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes + half_slot);
-        uint4* pt_hbm_red = reinterpret_cast<uint4*>(
-            pt_hbm + 131072 + slot * pxb_slot_stride_bytes + half_pxb);
+        uint4* pt_hbm_red = reinterpret_cast<uint4*>(pt_hbm + pxb_base_off + half_pxb);
         for (int64_t idx = own_b + threadIdx.x; idx < own_e; idx += blockDim.x) {
             float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
             #pragma unroll
@@ -1363,8 +1374,10 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
     int rank,
     int world_size,
     int one_shot_max_vecs,
-    int64_t pxb_max_vecs) {
-    const int b = blockIdx.x;
+    int64_t pxb_max_vecs,
+    int flag_base) {
+    const int b_local = blockIdx.x;
+    const int b = flag_base + b_local;
     const int blocks = gridDim.x;
     __shared__ uint64_t s_step;
     __shared__ int s_aborted;
@@ -1383,12 +1396,17 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
     }
     __syncthreads();
     const uint64_t step = s_step;
-    const int slot = static_cast<int>((step - 1ULL) & 3);
+    const bool split_regime = (flag_base > 0 || (my_hbm != nullptr && blocks == 32));
+    const int slot = split_regime
+        ? ((flag_base > 0 ? 2 : 0) + static_cast<int>((step - 1ULL) & 1))
+        : static_cast<int>((step - 1ULL) & 3);
+    const int pxb_slot = static_cast<int>((step - 1ULL) & 1);
+    const uint64_t ring_depth = (split_regime || my_hbm != nullptr) ? 2ULL : 4ULL;
     char* my_shm = s_peer_shm[rank];
     const uint64_t* abort_flag = reinterpret_cast<const uint64_t*>(my_shm + kShmV5AbortOffset);
 
-    if (step > 4ULL) {
-        const uint64_t min_done = step - 4ULL;
+    if (step > ring_depth) {
+        const uint64_t min_done = step - ring_depth;
         if (threadIdx.x < world_size) {
             const uint64_t* my_done = reinterpret_cast<const uint64_t*>(
                 my_shm + 65536 + (b * 8 + threadIdx.x) * 64);
@@ -1407,8 +1425,8 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
     uint4* my_in = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes);
 
     if (rows < blocks) {
-        const int64_t c_begin = (num_vecs * b) / blocks;
-        const int64_t c_end = (num_vecs * (b + 1)) / blocks;
+        const int64_t c_begin = (num_vecs * b_local) / blocks;
+        const int64_t c_end = (num_vecs * (b_local + 1)) / blocks;
         for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
             st_wt_uint4(my_in + idx, input_vec[idx]);
         }
@@ -1433,7 +1451,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
         }
 
         const int k_grp = static_cast<int>(blocks / rows);
-        if ((b % k_grp) != 0) {
+        if ((b_local % k_grp) != 0) {
             return;
         }
         const int extra_flags = (k_grp - 1) * world_size;
@@ -1451,7 +1469,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
             return;
         }
 
-        const int64_t r = b / k_grp;
+        const int64_t r = b_local / k_grp;
         const int64_t row_base = r * vecs_per_row;
         const int num_iters = static_cast<int>((vecs_per_row + blockDim.x - 1) / blockDim.x);
         Pack128Bf16 red_packs[3];
@@ -1488,13 +1506,19 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
         return;
     }
 
-    const int64_t r_begin = (rows * b) / blocks;
-    const int64_t r_end = (rows * (b + 1)) / blocks;
+    const int64_t r_begin = (rows * b_local) / blocks;
+    const int64_t r_end = (rows * (b_local + 1)) / blocks;
     const int64_t c_begin = r_begin * vecs_per_row;
     const int64_t c_end = r_end * vecs_per_row;
     const int num_iters = static_cast<int>((vecs_per_row + blockDim.x - 1) / blockDim.x);
     const bool can_pxb =
         (my_hbm != nullptr && pt_hbm != nullptr && world_size == 8 && num_vecs <= pxb_max_vecs && r_end > r_begin);
+    const int64_t cur_pxb_stride = (flag_base > 0) ? 1310720LL : pxb_slot_stride_bytes;
+    const int64_t pxb_base_off = 131072LL + (
+        (flag_base > 0)
+            ? (2LL * pxb_slot_stride_bytes + pxb_slot * cur_pxb_stride)
+            : (pxb_slot * pxb_slot_stride_bytes)
+    );
 
     // Hybrid CX8-partner P2P + 4-pair Host-SHM 1-Shot fused epilogue (`16..64 KiB`, e.g. Qwen3.5 M=8, 16)
     if (can_pxb && num_vecs > kPxbOneShotMinVecs && num_vecs <= one_shot_max_vecs && (vecs_per_row % 2) == 0) {
@@ -1504,9 +1528,9 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
         const int64_t pt_col_b = (parity == 0) ? col_half : 0;
         const int64_t r_cnt = r_end - r_begin;
         const int64_t total_half = r_cnt * col_half;
-        const int64_t half_pxb = pxb_slot_stride_bytes / 2;
+        const int64_t half_pxb = cur_pxb_stride / 2;
 
-        uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + 131072 + slot * pxb_slot_stride_bytes);
+        uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + pxb_base_off);
         for (int64_t t = threadIdx.x; t < total_half; t += blockDim.x) {
             const int64_t r = r_begin + (t / col_half);
             const int64_t col = pt_col_b + (t % col_half);
@@ -1526,9 +1550,8 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
             return;
         }
 
-        const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + 131072 + slot * pxb_slot_stride_bytes);
-        uint4* my_hbm_sum = reinterpret_cast<uint4*>(
-            my_hbm + 131072 + slot * pxb_slot_stride_bytes + half_pxb);
+        const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + pxb_base_off);
+        uint4* my_hbm_sum = reinterpret_cast<uint4*>(my_hbm + pxb_base_off + half_pxb);
         for (int64_t t = threadIdx.x; t < total_half; t += blockDim.x) {
             const int64_t r = r_begin + (t / col_half);
             const int64_t col = my_col_b + (t % col_half);
@@ -1624,9 +1647,9 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
         const int64_t r_cnt = r_end - r_begin;
         const int64_t total_half = r_cnt * col_half;
         const int64_t total_own = r_cnt * cols_per_rank;
-        const int64_t half_pxb = pxb_slot_stride_bytes / 2;
+        const int64_t half_pxb = cur_pxb_stride / 2;
 
-        uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + 131072 + slot * pxb_slot_stride_bytes);
+        uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + pxb_base_off);
         for (int64_t t = threadIdx.x; t < total_half; t += blockDim.x) {
             const int64_t r = r_begin + (t / col_half);
             const int64_t col = pt_col_b + (t % col_half);
@@ -1646,9 +1669,8 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
             return;
         }
 
-        const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + 131072 + slot * pxb_slot_stride_bytes);
-        uint4* my_hbm_red = reinterpret_cast<uint4*>(
-            my_hbm + 131072 + slot * pxb_slot_stride_bytes + half_pxb);
+        const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + pxb_base_off);
+        uint4* my_hbm_red = reinterpret_cast<uint4*>(my_hbm + pxb_base_off + half_pxb);
         for (int64_t t = threadIdx.x; t < total_half; t += blockDim.x) {
             const int64_t r = r_begin + (t / col_half);
             const int64_t col = my_col_b + (t % col_half);
@@ -1688,8 +1710,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
         }
 
         uint4* my_shm_red = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes + half_slot);
-        uint4* pt_hbm_red = reinterpret_cast<uint4*>(
-            pt_hbm + 131072 + slot * pxb_slot_stride_bytes + half_pxb);
+        uint4* pt_hbm_red = reinterpret_cast<uint4*>(pt_hbm + pxb_base_off + half_pxb);
         for (int64_t t = threadIdx.x; t < total_own; t += blockDim.x) {
             const int64_t r = r_begin + (t / cols_per_rank);
             const int64_t col = own_col_b + (t % cols_per_rank);
@@ -2077,9 +2098,12 @@ __global__ __cluster_dims__(8, 1, 1) __launch_bounds__(256, 1) void shm_v5_ar_ad
     float eps,
     float weight_offset,
     int rank,
-    int world_size) {
+    int world_size,
+    int flag_base,
+    int pxb_active) {
     cg::cluster_group cluster = cg::this_cluster();
-    const int b = cluster.block_rank();
+    const int b_local = cluster.block_rank();
+    const int b = flag_base + b_local;
     constexpr int blocks = 8;
 
     __shared__ uint64_t s_step;
@@ -2102,12 +2126,15 @@ __global__ __cluster_dims__(8, 1, 1) __launch_bounds__(256, 1) void shm_v5_ar_ad
     }
     __syncthreads();
     const uint64_t step = s_step;
-    const int slot = static_cast<int>((step - 1ULL) & 3);
+    const int slot = (flag_base > 0)
+        ? (2 + static_cast<int>((step - 1ULL) & 1))
+        : static_cast<int>((step - 1ULL) & 3);
+    const uint64_t ring_depth = (flag_base > 0 || pxb_active != 0) ? 2ULL : 4ULL;
     char* my_shm = s_peer_shm[rank];
     const uint64_t* abort_flag = reinterpret_cast<const uint64_t*>(my_shm + kShmV5AbortOffset);
 
-    if (step > 4ULL) {
-        const uint64_t min_done = step - 4ULL;
+    if (step > ring_depth) {
+        const uint64_t min_done = step - ring_depth;
         if (threadIdx.x < world_size) {
             const uint64_t* my_done = reinterpret_cast<const uint64_t*>(
                 my_shm + 65536 + (b * 8 + threadIdx.x) * 64);
@@ -2119,8 +2146,8 @@ __global__ __cluster_dims__(8, 1, 1) __launch_bounds__(256, 1) void shm_v5_ar_ad
     }
 
     const int64_t num_vecs = rows * vecs_per_row;
-    const int64_t c_begin = (num_vecs * b) / blocks;
-    const int64_t c_end = (num_vecs * (b + 1)) / blocks;
+    const int64_t c_begin = (num_vecs * b_local) / blocks;
+    const int64_t c_end = (num_vecs * (b_local + 1)) / blocks;
     const int64_t slice_len = c_end - c_begin;
     uint4* my_in = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes);
 
@@ -2147,7 +2174,7 @@ __global__ __cluster_dims__(8, 1, 1) __launch_bounds__(256, 1) void shm_v5_ar_ad
     }
 
     const int k_grp = static_cast<int>(blocks / rows);
-    const int64_t r = b / k_grp;
+    const int64_t r = b_local / k_grp;
     const int64_t row_base = r * vecs_per_row;
     const int num_iters = static_cast<int>((slice_len + blockDim.x - 1) / blockDim.x);
 
@@ -2479,11 +2506,15 @@ void launch_shm_v5_allreduce_cuda(
     int64_t pxb_max_vecs,
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    const int64_t vecs_per_cta = (num_vecs + blocks - 1) / blocks;
+    const bool small_pxb = (my_hbm_ptr != 0 && blocks == 32 && num_vecs <= 40960);
+    const int launch_blocks = small_pxb ? 8 : blocks;
+    const int flag_base = small_pxb ? 32 : 0;
+    const int64_t vecs_per_cta = (num_vecs + launch_blocks - 1) / launch_blocks;
     const int capped_threads = threads > 512 ? 512 : threads;
-    const int launch_threads =
-        (capped_threads == 256 && vecs_per_cta > 256) ? 512 : capped_threads;
-    shm_v5_allreduce_kernel<<<blocks, launch_threads, 0, stream>>>(
+    const int launch_threads = small_pxb
+        ? 256
+        : ((capped_threads == 256 && vecs_per_cta > 256) ? 512 : capped_threads);
+    shm_v5_allreduce_kernel<<<launch_blocks, launch_threads, 0, stream>>>(
         reinterpret_cast<const uint4*>(input_ptr),
         reinterpret_cast<uint4*>(output_ptr),
         control_ptr,
@@ -2496,7 +2527,8 @@ void launch_shm_v5_allreduce_cuda(
         rank,
         world_size,
         one_shot_max_vecs,
-        pxb_max_vecs);
+        pxb_max_vecs,
+        flag_base);
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2526,9 +2558,12 @@ void launch_shm_v5_allreduce_add_rmsnorm_cuda(
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     const int64_t num_vecs = rows * vecs_per_row;
-    const int64_t vecs_per_cta = (num_vecs + blocks - 1) / blocks;
+    const bool small_pxb = (my_hbm_ptr != 0 && blocks == 32 && num_vecs <= 40960);
+    const int launch_blocks = small_pxb ? 8 : blocks;
+    const int flag_base = small_pxb ? 32 : 0;
+    const int64_t vecs_per_cta = (num_vecs + launch_blocks - 1) / launch_blocks;
 
-    if (use_cluster != 0 && rows < blocks && blocks == 8 && (blocks % rows) == 0) {
+    if (use_cluster != 0 && rows < launch_blocks && launch_blocks == 8 && (launch_blocks % rows) == 0) {
         int dev = 0;
         ZSTEP_CUDA_CHECK(cudaGetDevice(&dev));
         static std::atomic<uint64_t> attr_init_mask{0ULL};
@@ -2556,17 +2591,20 @@ void launch_shm_v5_allreduce_add_rmsnorm_cuda(
             eps,
             weight_offset,
             rank,
-            world_size);
+            world_size,
+            flag_base,
+            my_hbm_ptr != 0 ? 1 : 0);
         ZSTEP_CUDA_CHECK(cudaGetLastError());
         return;
     }
 
     const int capped_threads = threads > 512 ? 512 : threads;
+    const int eff_threads = small_pxb ? 256 : capped_threads;
     const int launch_threads =
-        (capped_threads == 256 && (vecs_per_cta > 256 || vecs_per_row > 256))
+        (eff_threads == 256 && (vecs_per_cta > 256 || vecs_per_row > 256))
             ? 512
-            : capped_threads;
-    shm_v5_ar_add_rmsnorm_kernel<<<blocks, launch_threads, 0, stream>>>(
+            : eff_threads;
+    shm_v5_ar_add_rmsnorm_kernel<<<launch_blocks, launch_threads, 0, stream>>>(
         reinterpret_cast<const uint4*>(input_ptr),
         reinterpret_cast<uint4*>(residual_ptr),
         reinterpret_cast<const uint4*>(weight_ptr),
@@ -2585,7 +2623,8 @@ void launch_shm_v5_allreduce_add_rmsnorm_cuda(
         rank,
         world_size,
         one_shot_max_vecs,
-        pxb_max_vecs);
+        pxb_max_vecs,
+        flag_base);
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2850,7 +2889,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v14_ext",
+            name="zstep_shm_allreduce_sm120_v16_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -3129,8 +3168,11 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
         aligned_elems = (pxb_max_elements // 8) * 8
         pxb_rank_stride = _align_up(aligned_elems * 2, 4096)
         pxb_slot_stride = 2 * pxb_rank_stride
+        small_pxb_stride = 2 * _align_up(40960 * 16, 4096)
         pxb_total_bytes = _align_up(
-            SHM_V5_HEADER_BYTES + NUM_RING_SLOTS * pxb_slot_stride, 4096
+            SHM_V5_HEADER_BYTES
+            + NUM_PXB_RING_SLOTS * (pxb_slot_stride + small_pxb_stride),
+            4096,
         )
         own_ptr_t = torch.zeros(1, dtype=torch.int64)
         handle_u8 = torch.zeros(64, dtype=torch.uint8)
@@ -3259,18 +3301,22 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
         if rows <= 0 or hidden <= 0 or hidden % 8 != 0:
             return False
         vecs_per_row = hidden // 8
+        num_vecs = rows * vecs_per_row
+        small_pxb = self._pxb_enabled and self.blocks == 32 and num_vecs <= 40960
+        eff_blocks = 8 if small_pxb else self.blocks
         capped_threads = 512 if self.threads > 512 else self.threads
-        vecs_per_cta = (rows * vecs_per_row + self.blocks - 1) // self.blocks
+        eff_threads = 256 if small_pxb else capped_threads
+        vecs_per_cta = (num_vecs + eff_blocks - 1) // eff_blocks
         launch_threads = (
             512
-            if (capped_threads == 256 and (vecs_per_cta > 256 or vecs_per_row > 256))
-            else capped_threads
+            if (eff_threads == 256 and (vecs_per_cta > 256 or vecs_per_row > 256))
+            else eff_threads
         )
         if vecs_per_row > 3 * launch_threads or vecs_per_row > 1536:
             return False
-        if rows < self.blocks and (self.blocks % rows) != 0:
+        if rows < eff_blocks and (eff_blocks % rows) != 0:
             return False
-        if rows * vecs_per_row > self.one_shot_max_vecs and (vecs_per_row % self.world_size) != 0:
+        if num_vecs > self.one_shot_max_vecs and (vecs_per_row % self.world_size) != 0:
             return False
         return True
 
@@ -3308,13 +3354,19 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
         ):
             rows, hidden = int(input.shape[0]), int(input.shape[1])
             vecs_per_row = hidden // 8
+            num_vecs = rows * vecs_per_row
+            eff_blocks = (
+                8
+                if (self._pxb_enabled and self.blocks == 32 and num_vecs <= 40960)
+                else self.blocks
+            )
             use_cluster = (
                 1
                 if (
-                    rows < self.blocks
-                    and self.blocks == 8
-                    and (self.blocks % rows) == 0
-                    and (vecs_per_row // (self.blocks // rows)) <= 3 * 256
+                    rows < eff_blocks
+                    and eff_blocks == 8
+                    and (eff_blocks % rows) == 0
+                    and (vecs_per_row // (eff_blocks // rows)) <= 3 * 256
                 )
                 else 0
             )

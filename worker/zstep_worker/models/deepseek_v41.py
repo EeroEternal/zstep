@@ -390,6 +390,9 @@ class DeepSeekV41StepRunner:
             device_index=rank,
             dist_init_file=dist_init_file,
         )
+        if self.p2p_report.pxb_shm_enabled:
+            os.environ.setdefault("NCCL_SHM_USE_CUDA_MEMCPY", "1")
+            os.environ.setdefault("NCCL_SHM_MEMCPY_MODE", "3")
 
         apply_vllm_sm120_dsv41_patches()
 
@@ -525,15 +528,19 @@ class DeepSeekV41StepRunner:
 
         # Initialize NUMA-local shm_v5 AllReduce, AllGather, and lock-free TP=8 Argmax
         ar_max_tokens = max(self.max_step_tokens, 2048)
+        use_pxb_ar = self.p2p_report.pxb_shm_enabled
+        pxb_ar_blocks = max(allreduce_blocks, 32) if use_pxb_ar else allreduce_blocks
+        pxb_ar_threads = max(allreduce_threads, 512) if use_pxb_ar else allreduce_threads
         self.shm_ar: HostMappedShmAllReduce = HostMappedShmAllReduce(
             name=allreduce_name,
             rank=rank,
             world_size=self.world_size,
             capacity_elements=ar_max_tokens * 8192,
-            blocks=allreduce_blocks,
-            threads=allreduce_threads,
+            blocks=pxb_ar_blocks,
+            threads=pxb_ar_threads,
             exchange_group=self.exchange_group,
             enable_pxb_p2p=self.p2p_report.pxb_shm_enabled,
+            pxb_max_elements=min(ar_max_tokens, 3072) * 5120,
         )
         self.shm_ag: HostMappedShmAllGather = HostMappedShmAllGather(
             name=f"{allreduce_name}_ag",
@@ -791,15 +798,16 @@ class DeepSeekV41StepRunner:
         shm_ar = self.shm_ar
         shm_ag = self.shm_ag
         runner = self
-        # Route M <= 512 when CX8 PXB-SHM hybrid is active (or M <= 384 on non-P2P)
+        # Route M <= 3072 when CX8 PXB-SHM hybrid is active (or M <= 384 on non-P2P)
         # plus 100% of CUDAGraph captures through `shm_ar`; route larger eager AR
         # payloads to topology-aware NCCL (`PXB` on P2P switches, `LOC` on non-P2P).
-        default_ar_rows = 512 if shm_ar.pxb_enabled else 384
+        default_ar_rows = 3072 if shm_ar.pxb_enabled else 384
         shm_max_ar_numel = int(
             os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(default_ar_rows * 5120))
         )
+        default_ag_elems = 64 * 3200 if shm_ar.pxb_enabled else 1024 * 4096
         shm_max_ag_numel = int(
-            os.environ.get("ZSTEP_SHM_MAX_AG_NUMEL", str(1024 * 4096))
+            os.environ.get("ZSTEP_SHM_MAX_AG_NUMEL", str(default_ag_elems))
         )
 
         tp_group.use_custom_op_call = False
@@ -1116,6 +1124,7 @@ class DeepSeekV41StepRunner:
             _LOG.warning(
                 "Optional CuTeDSL warmup skipped on rank %d: %s", self.rank, exc
             )
+        torch.cuda.empty_cache()
 
         # Warm up eager prefill/chunked-extend shapes across all Triton specialization
         # classes (`==1`, `%16 != 0`, `%16 == 0`), multi-seq batches, short contexts,

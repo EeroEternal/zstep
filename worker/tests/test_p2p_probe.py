@@ -266,44 +266,63 @@ def _pxb_8gpu_worker(rank: int, init_file: str, shm_name: str) -> None:
         backend="gloo", init_method=f"file://{init_file}", rank=rank, world_size=8
     )
     try:
-        for use_pxb in (False, True):
+        configs = [
+            (False, 8, 256),
+            (True, 8, 256),
+            (True, 32, 512),
+        ]
+        for cfg_idx, (use_pxb, blk, thr) in enumerate(configs):
             with HostMappedShmAllReduce(
-                name=f"{shm_name}_{int(use_pxb)}",
+                name=f"{shm_name}_{cfg_idx}",
                 rank=rank,
                 world_size=8,
                 capacity_elements=1024 * 5120,
-                blocks=8,
-                threads=256,
+                blocks=blk,
+                threads=thr,
                 exchange_group=dist.group.WORLD,
                 enable_pxb_p2p=use_pxb,
                 pxb_max_elements=512 * 5120,
             ) as comm:
                 assert comm.pxb_enabled is use_pxb
-                # Rapidly alternate across all 4 internal branches:
-                # M=1 (shm_v5 1s) -> M=4 (pxb_1s) -> M=8 (shm_v5 2s) -> M=64 (pxb_2s) -> M=768 (shm_v5 > pxb_max)
+                # Rapidly alternate across all internal branches + dual-grid regimes:
+                # M=1 (cluster8 / 1s) -> M=4 (pxb_1s / cluster8) -> M=8/24/64 (small_pxb 8x256)
+                # -> M=96/256 (large_pxb 32x512) -> M=768 (shm_v5 > pxb_max)
                 shapes = [
                     (1, 5120),
                     (4, 5120),
                     (8, 5120),
+                    (24, 5120),
                     (64, 5120),
+                    (96, 5120),
                     (256, 5120),
                     (768, 5120),
                     (16, 2048),
                     (128, 2048),
+                    (256, 2048),
                 ]
-                expected_steps = 0
-                for step_i in range(2):
+                large_steps = 0
+                small_steps = 0
+                for step_i in range(3):
                     for m, h in shapes:
+                        num_vecs = (m * h) // 8
+                        is_small_split = use_pxb and blk == 32 and num_vecs <= 40960
+                        eff_blocks = 8 if is_small_split else blk
+
                         torch.manual_seed(500 + step_i * 97 + m * 13 + rank)
                         x = torch.randn((m, h), dtype=torch.bfloat16, device=device) * 0.125
                         ref_cpu = x.float().cpu()
                         dist.all_reduce(ref_cpu, group=dist.group.WORLD)
                         out = torch.empty_like(x)
                         comm.all_reduce(x, output=out)
-                        expected_steps += 1
+                        if is_small_split:
+                            small_steps += 1
+                        else:
+                            large_steps += 1
                         out_cpu = out.float().cpu()
                         diff = float((out_cpu - ref_cpu).abs().max().item())
-                        assert diff < 0.03, f"all_reduce mismatch (pxb={use_pxb}) at {(m, h)}: {diff}"
+                        assert diff < 0.03, (
+                            f"all_reduce mismatch (pxb={use_pxb}, blk={blk}) at {(m, h)}: {diff}"
+                        )
 
                         res_in = torch.randn((m, h), dtype=torch.bfloat16, device=device) * 0.1
                         res = res_in.clone()
@@ -314,7 +333,10 @@ def _pxb_8gpu_worker(rank: int, init_file: str, shm_name: str) -> None:
                         comm.all_reduce_add_rmsnorm(
                             x, res, w, normed_out=norm_out, eps=1e-6, zero_centered=True
                         )
-                        expected_steps += 1
+                        if is_small_split:
+                            small_steps += 1
+                        else:
+                            large_steps += 1
                         exact_rf = exact_res_ref.float()
                         exact_inv = torch.rsqrt(exact_rf.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
                         exact_norm = (exact_rf * exact_inv * (1.0 + w.float().cpu())).to(torch.bfloat16)
@@ -326,21 +348,26 @@ def _pxb_8gpu_worker(rank: int, init_file: str, shm_name: str) -> None:
                         exact_norm_diff = float((norm_out.float().cpu() - exact_norm.float()).abs().max().item())
                         res_diff = float((res.float().cpu() - res_ref.float()).abs().max().item())
                         norm_diff = float((norm_out.float().cpu() - exp_norm.float()).abs().max().item())
-                        # When `m >= blocks`, `all_reduce` and `all_reduce_add_rmsnorm` take the
-                        # identical reduction tree (`pxb_1s`, `pxb_2s`, or `shm_v5`), so residual is bit-exact.
-                        if m >= comm.blocks:
+                        if m >= eff_blocks:
                             assert exact_res_diff == 0.0, (
-                                f"exact residual mismatch (pxb={use_pxb}) at {(m, h)}: {exact_res_diff}"
+                                f"exact residual mismatch (pxb={use_pxb}, blk={blk}) at {(m, h)}: {exact_res_diff}"
                             )
                             assert exact_norm_diff <= 0.035, (
-                                f"exact rmsnorm mismatch (pxb={use_pxb}) at {(m, h)}: {exact_norm_diff}"
+                                f"exact rmsnorm mismatch (pxb={use_pxb}, blk={blk}) at {(m, h)}: {exact_norm_diff}"
                             )
-                        assert res_diff < 0.03, f"residual mismatch (pxb={use_pxb}) at {(m, h)}: {res_diff}"
-                        assert norm_diff < 0.08, f"rmsnorm mismatch (pxb={use_pxb}) at {(m, h)}: {norm_diff}"
+                        assert res_diff < 0.03, f"residual mismatch (pxb={use_pxb}, blk={blk}) at {(m, h)}: {res_diff}"
+                        assert norm_diff < 0.08, f"rmsnorm mismatch (pxb={use_pxb}, blk={blk}) at {(m, h)}: {norm_diff}"
 
                 torch.cuda.synchronize(device)
-                ctrl = comm.control[: comm.blocks].cpu().tolist()
-                assert ctrl == [expected_steps] * comm.blocks, f"lockstep broken: {ctrl} != {expected_steps}"
+                ctrl_main = comm.control[:blk].cpu().tolist()
+                assert ctrl_main == [large_steps] * blk, (
+                    f"main lockstep broken: {ctrl_main} != {large_steps}"
+                )
+                if use_pxb and blk == 32:
+                    ctrl_small = comm.control[32:40].cpu().tolist()
+                    assert ctrl_small == [small_steps] * 8, (
+                        f"small_pxb lockstep broken: {ctrl_small} != {small_steps}"
+                    )
     finally:
         dist.destroy_process_group()
 

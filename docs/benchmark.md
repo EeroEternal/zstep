@@ -19,7 +19,7 @@
 | --- | --- | --- | --- | --- |
 | **PCIe AllReduce（小/中 batch）** | `8 × RTX 6000D`（`H=5120`, `M=1..512`） | `NCCL_LOC`：`48.95 µs`（`M=1`）；`shm_v5`：`571.54 µs`（`M=512`） | `shm_v5`：**`12.46–14.48 µs`**（`M=1`）；`shm_v5_pxb`：**`323.95 µs`**（`M=512`） | **`3.38×–3.93×`**（`M=1`）；CX8 P2P 再快 **`1.40×–1.76×`** |
 | **基础引擎对称对标（`Qwen3.5`）** | `Qwen3.5-35B-A3B` TP=8 @ `8 × RTX 5090` / `6000D` | `vLLM 0.33.0`：`192.2–3,259.0 tok/s` | 无 P2P **`261.5–5,115.9 tok/s`**；自适应 P2P 达 **`5,877.1 tok/s`**（总吞吐 **`17,631.4 tok/s`**），在线 `serve` 单流 **`380.0 tok/s`** | 较 `vLLM` **`+11.0%` ~ `+80.3%`**；自适应 P2P 再增 **`+10.30%`**（中位 TTFT 降 **`12.2%–16.9%`**） |
-| **基础引擎对称对标（`DeepSeek-V4.1`）** | `DeepSeek-V4.1-Flash` TP=8 @ `8 × RTX 6000D` | `vLLM 0.31.0` 纯引擎：`83.6–1,126.3 tok/s` | 无 P2P **`124.0–1,807.2 tok/s`**；自适应 P2P 达 **`2,043.0 tok/s`**（`in4096_c16` 总吞吐 **`7,636.9 tok/s`**），在线单流 **`133.5 tok/s`** | 较 `vLLM` **`+42.5%` ~ `+81.4%`**；自适应 P2P 再增 **`+7.97%`**（中位 TTFT 降 **`13.7%–14.0%`**） |
+| **基础引擎对称对标（`DeepSeek-V4.1`）** | `DeepSeek-V4.1-Flash` TP=8 @ `8 × RTX 6000D` | `vLLM 0.31.0` 纯引擎：`83.6–1,126.3 tok/s` | 无 P2P **`124.0–1,807.2 tok/s`**；自适应 P2P 双态网格达 **`2,172.5 tok/s`**（`in1024_c128` 总吞吐 **`7,645.4 tok/s`**），在线单流 **`133.5 tok/s`** | 较 `vLLM` **`+42.5%` ~ `+92.9%`**；自适应 P2P 累计增 **`+12.0%`**（中位 TTFT 累计降 **`~24%`**） |
 | **在线自动前缀缓存（APC）** | `Qwen3.5` / `DeepSeek-V4.1` TP=8 @ `8 × RTX 6000D` | Cold TTFT：`599.2 ms` / `1,049.6 ms` | Warm TTFT：**`36.9–44.4 ms`** / **`202.7–204.3 ms`** | **`13.49×–16.22×`** / **`5.14×–5.18×`** |
 | **在线投机解码（`Qwen3.5` `mtp K=3`）** | `Qwen3.5-35B-A3B` TP=8 @ `8 × RTX 6000D` | `zstep` 无投机：`309.3–314.3 tok/s` | **`583.6–762.5 tok/s`**（TPOT **`1.31–1.71 ms`**，$\tau=2.88\text{–}3.90$） | **`1.87×–2.45×`** |
 | **在线投机解码（`DeepSeek-V4.1` `dspark K=5`）** | `DeepSeek-V4.1-Flash` TP=8 @ `8 × RTX 6000D` | `zstep` 无投机：`117.9–118.6 tok/s` | **`168.9–395.1 tok/s`**（TPOT **`2.53–5.92 ms`**，$\tau=2.85\text{–}6.00$） | **`1.42×–3.35×`** |
@@ -231,6 +231,17 @@
 
 > **双模等价性与安全性审计**：在 `--max-prefill-chunk 24` 分块调度下，`p2p=PXB(pxb_shm=on)` 的确定性数学审计（`prime_squares_table` `128` tokens）在 `single`、`batched`、`chunked` 三种模式下精确匹配率均为 **`100%`**（`1.0`），`TRITON_RECOMPILATIONS = 0`；在无 P2P 主机或显式设置 `ZSTEP_P2P_MODE=off` 时，非 P2P 吞吐与第 4.3 节基线完全持平（零回退损耗）。
 
+#### （c）`DeepSeek-V4.1-Flash` 2-Slot PXB 环 + 双态网格（`M <= 3072`）进一步演化（3 轮交错中位数，几何平均再增 **`+3.72%`**）
+
+在 `4.4(b)` 基线（4-slot、`M <= 512`、`8×256` 网格）之上，进一步将 PXB CUDA-IPC HBM 环收敛为无 WAR 冒险的 **2-Slot 环**（在扩展至 `M <= 3072` 的同时较 4-slot 省出 `117.5 MiB` 峰值显存），并引入物理隔离**双态 CTA 网格**（`M <= 64` 走 `b=32..39` `8×256` 低延迟槽 `{2,3}`，`64 < M <= 3072` 走 `b=0..31` `32×512` 高带宽槽 `{0,1}`，同步覆盖 `all_reduce` 与融合 `all_reduce_add_rmsnorm`）、`DEFAULT_MEGA_GATE_MIN_TOKENS = 1` 以及 `M > 64` Engram AllGather 路由优化：
+
+| 档位 | `4.4(b)` 基线 Output (`tok/s`) | 双态 2-Slot Output (`tok/s`) | 吞吐增益 | 轮间 CV（基线 / 优化后） | 基线 / 优化后 Med TTFT (`ms`) | 基线 / 优化后 Mean TPOT (`ms`) | 基线 / 优化后 P99 ITL (`ms`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `in512_c16` | `859.63` | **`860.88`** | **`+0.15%`** | `0.55%` / `0.91%` | `315.77` / **`310.83`**（`-1.56%`） | `16.98` / `17.03`（`+0.29%`） | `16.40` / `16.46`（`+0.37%`） |
+| `in1024_c32` | `944.86` | **`964.23`** | **`+2.05%`** | `0.23%` / `1.03%` | `320.38` / **`283.26`**（**`-11.59%`**） | `30.06` / **`29.63`**（`-1.43%`） | `320.25` / **`283.04`**（**`-11.62%`**） |
+| `in512_c128` | `2,045.62` | **`2,172.47`** | **`+6.20%`** | `0.35%` / `0.56%` | `636.21` / **`561.98`**（**`-11.67%`**） | `54.24` / **`51.41`**（`-5.22%`） | `317.93` / **`280.70`**（**`-11.71%`**） |
+| `in1024_c128` | `1,433.83` | **`1,529.08`** | **`+6.64%`** | `0.14%` / `0.30%` | `643.82` / **`569.73`**（**`-11.51%`**） | `75.05` / **`70.48`**（`-6.09%`） | `322.51` / **`285.82`**（**`-11.38%`**） |
+
 ---
 
 ## 5. 在线自动前缀缓存（APC）性能验证
@@ -318,7 +329,7 @@ $$\text{Client} \longrightarrow \text{nebula-gateway} \longrightarrow \text{nebu
 | --- | --- | --- | --- | --- |
 | **交互式 Agent / IDE 代码补全 / JSON 提取** | 低至中并发（`c = 1..8`），追求极致单流 TPOT 与多轮低 TTFT | `--enable-prefix-caching --speculative-method mtp --num-speculative-tokens 3` | `--enable-prefix-caching --speculative-method dspark --num-speculative-tokens 5` | 单流解码 **`584–762 tok/s`**（`Qwen3.5`）/ **`263–395 tok/s`**（`DS-V4.1`），多轮 TTFT 加速 **`5×–16×`** |
 | **RAG 原文引用 / 代码 Diff 重写（显存受限）** | 低并发、输入输出高度重叠、希望将全部剩余显存留给主模型 KV 池 | `--enable-prefix-caching --speculative-method ngram --num-speculative-tokens 3 --prompt-lookup-max 5 --prompt-lookup-min 2` | `--enable-prefix-caching --speculative-method ngram --num-speculative-tokens 5 --prompt-lookup-max 5 --prompt-lookup-min 2` | **零草稿权重/草稿 KV 显存开销**，重复片段最高 **`2.16×–2.92×`** 提速，不匹配负载零退化 |
-| **高并发离线批处理 / 高吞吐在线池** | 高并发（`c = 16..128`），GPU 算力已由 batch 填满 | `--enable-prefix-caching --speculative-method none`（若追求更低 `P99 ITL` 可加 `--max-prefill-chunk 512`） | `--enable-prefix-caching --speculative-method none` | 无 P2P 峰值 **`5,039–5,116 tok/s`**（`Qwen3.5`）/ **`1,796–1,807 tok/s`**（`DS-V4.1`）；开启 PCIe Switch P2P 后达 **`5,877 tok/s`** / **`2,043 tok/s`**（比 `vLLM` 高 **`+54%` ~ `+81%`**） |
+| **高并发离线批处理 / 高吞吐在线池** | 高并发（`c = 16..128`），GPU 算力已由 batch 填满 | `--enable-prefix-caching --speculative-method none`（若追求更低 `P99 ITL` 可加 `--max-prefill-chunk 512`） | `--enable-prefix-caching --speculative-method none` | 无 P2P 峰值 **`5,039–5,116 tok/s`**（`Qwen3.5`）/ **`1,796–1,807 tok/s`**（`DS-V4.1`）；开启 PCIe Switch P2P 后达 **`5,877 tok/s`** / **`2,172 tok/s`**（比 `vLLM` 高 **`+54%` ~ `+93%`**） |
 
 ### Nebula 声明式部署配置示例（`ModelConfig.speculative_config`）
 
