@@ -45,9 +45,8 @@ MLA+SWA untouched:
 3. **Fused BF16 Router GEMM + `sqrtsoftplus` Top-6 Gate (`sm12x_mega_gate`, `40 layers`)**:
    - Uses `flashinfer.experimental.sm12x_mega_gate` (`enable_pdl=False`, pre-compiled
      CuTe-DSL TVM-FFI schedules + shared static scratch/self-rearming barriers) for
-     `M >= ZSTEP_MEGA_GATE_MIN_TOKENS` (default `32`), keeping small `M < 32` decode
-     batches on `GateLinear` + `dsv4_topk` and accelerating `M >= 32` decode and
-     eager prefill (`1.44x-3.27x` faster across `M = 256..3072`).
+     `M >= ZSTEP_MEGA_GATE_MIN_TOKENS` (default `1`), accelerating both CUDAGraph
+     decode (`M >= 1`) and eager prefill (`1.44x-3.27x` faster across `M = 256..3072`).
 4. **Fused Paged DSA Indexer (`sm120_dsa_indexer`, `8 layers`)**:
    - Uses `flashinfer.experimental.sm120_dsa_indexer._api.dsa_indexer_det_topk_paged`
      for paged decode (`3.0x-4.3x` faster across all 8 indexer layers in CUDAGraph
@@ -81,7 +80,7 @@ _DEFAULT_COMPAT_CANDIDATES: tuple[str, ...] = (
 )
 
 SM120_DSA_CANDIDATE_COVER_TOKENS: int = 16384
-DEFAULT_MEGA_GATE_MIN_TOKENS: int = 32
+DEFAULT_MEGA_GATE_MIN_TOKENS: int = 1
 
 # Per-shape eager Cutlass crossover thresholds measured on RTX 6000D (`sm_120`,
 # 156 SMs) with retained `PreparationSession` + `autotune=True`:
