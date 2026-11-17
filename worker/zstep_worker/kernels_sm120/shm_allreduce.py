@@ -353,8 +353,10 @@ void launch_shm_v5_pxb_allreduce_add_rmsnorm(
     TORCH_CHECK(input.numel() * 2 <= slot_stride_bytes / 2, "input exceeds SHM slot capacity");
     const int64_t vecs_per_row = hidden / 8;
     TORCH_CHECK(vecs_per_row <= 1536, "hidden exceeds 3-iter epilogue limit (12288)");
-    if (rows < blocks) {
-        TORCH_CHECK(blocks % rows == 0, "rows < blocks requires blocks % rows == 0");
+    const int64_t eff_blocks =
+        (my_hbm_ptr != 0 && blocks == 32 && rows * vecs_per_row <= 40960) ? 8 : blocks;
+    if (rows < eff_blocks) {
+        TORCH_CHECK(eff_blocks % rows == 0, "rows < eff_blocks requires eff_blocks % rows == 0");
     }
     if (rows * vecs_per_row > one_shot_max_vecs) {
         TORCH_CHECK(

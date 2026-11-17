@@ -1322,6 +1322,24 @@ impl ServingEngine {
         self.max_mixed_step_tokens = max_mixed_step_tokens.filter(|&cap| cap > 0);
     }
 
+    /// Update branch-aware prefix cache references for an agent session (`EvolvingInfra` Alg. E.1).
+    pub fn record_agent_branch_tokens(
+        &self,
+        branch_id: &str,
+        tokens: &[i32],
+    ) -> Option<(bool, u64)> {
+        self.prefix_tree
+            .as_ref()
+            .map(|tree| tree.record_branch_tokens(branch_id, tokens))
+    }
+
+    /// Release all prefix cache `branch_ref_count` holds owned by `branch_id`.
+    pub fn release_agent_branch(&self, branch_id: &str) -> usize {
+        self.prefix_tree
+            .as_ref()
+            .map_or(0, |tree| tree.release_branch(branch_id))
+    }
+
     pub fn set_max_prefill_coalesce_wait_ms(&mut self, wait_ms: u64) {
         self.max_prefill_coalesce_wait_ms = wait_ms;
     }
@@ -2195,11 +2213,9 @@ impl ServingEngine {
                 && seq.prefilled_tokens < seq.prompt_tokens.len()
         });
 
-        let step_budget = if decode_active_count > 0 {
-            mixed_cap.max(decode_active_count + 1).min(max_step_tokens)
-        } else {
-            max_step_tokens
-        };
+        let step_budget = mixed_cap
+            .max(decode_active_count.saturating_add(1))
+            .min(max_step_tokens);
 
         // Pass 1 (Region 0): Reserve KV pages and stage all prompt-complete active decode
         // sequences first (`q_len == 1, pos > 0`) so in-flight decodes never starve.

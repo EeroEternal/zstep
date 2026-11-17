@@ -572,4 +572,65 @@ mod tests {
         assert_eq!(manager.prefix_tree().evict_lru(3), 3);
         assert_eq!(manager.global_pool().available(), 12);
     }
+
+    #[test]
+    fn branch_aware_eviction_preserves_paused_tool_branch_over_compacted_history() {
+        let pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 8);
+        let tree = PrefixTree::new(4).expect("tree");
+        let sys_and_tool_a: Vec<i32> = vec![1, 1, 1, 1, 10, 10, 10, 10];
+        let sys_and_pre_compact_b: Vec<i32> = vec![1, 1, 1, 1, 20, 20, 20, 20];
+        let sys_and_post_compact_b: Vec<i32> = vec![1, 1, 1, 1, 30, 30, 30, 30];
+
+        // Branch A finishes Turn 1 and pauses on a slow external tool (`pin_count == 0`, older tick).
+        let lease_a = tree
+            .extend_prefix(
+                tree.match_prefix(&[]),
+                &sys_and_tool_a,
+                vec![pool.allocate(1).unwrap(), pool.allocate(1).unwrap()],
+            )
+            .expect("extend A");
+        assert_eq!(
+            tree.record_branch_tokens("agent-a", &sys_and_tool_a),
+            (false, 1)
+        );
+        drop(lease_a);
+
+        // Branch B finishes Turn 1 AFTER A (newer tick), then runs `/compact` on Turn 2.
+        let match_b1 = tree.match_prefix(&sys_and_pre_compact_b);
+        let lease_b1 = tree
+            .extend_prefix(
+                match_b1,
+                &sys_and_pre_compact_b[4..],
+                vec![pool.allocate(1).unwrap()],
+            )
+            .expect("extend B1");
+        assert_eq!(
+            tree.record_branch_tokens("agent-b", &sys_and_pre_compact_b),
+            (false, 1)
+        );
+        drop(lease_b1);
+
+        let match_b2 = tree.match_prefix(&sys_and_post_compact_b);
+        let lease_b2 = tree
+            .extend_prefix(
+                match_b2,
+                &sys_and_post_compact_b[4..],
+                vec![pool.allocate(1).unwrap()],
+            )
+            .expect("extend B2");
+        assert_eq!(
+            tree.record_branch_tokens("agent-b", &sys_and_post_compact_b),
+            (true, 2)
+        );
+        drop(lease_b2);
+
+        // Under KV pressure, stock LRU would evict paused `agent-a`'s older leaf (`[10; 4]`);
+        // branch-aware eviction reclaims `agent-b`'s orphaned `/compact` leaf (`[20; 4]`) first!
+        assert_eq!(tree.evict_lru(1), 1);
+        assert_eq!(tree.peek_prefix_bounded(&sys_and_tool_a, 2).0, 2);
+        assert_eq!(tree.peek_prefix_bounded(&sys_and_pre_compact_b, 2).0, 1);
+        assert_eq!(tree.release_branch("agent-a"), 2);
+        assert_eq!(tree.release_branch("agent-b"), 2);
+        assert_eq!(tree.active_branches(), 0);
+    }
 }

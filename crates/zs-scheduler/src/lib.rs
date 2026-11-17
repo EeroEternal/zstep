@@ -24,12 +24,14 @@
 //! (Layers 20..39) plus CUDA Graph bucket targets for all 8 RTX 6000D workers.
 
 mod coordinator;
+mod perf_model;
 mod serving;
 
 pub use coordinator::{
     CoordinatorMetrics, DEFAULT_HEARTBEAT_TIMEOUT, EngineConfig, EngineError, SpeculativeConfig,
     SpeculativeMethod, WorkerCoordinator, WorkerLaunchConfig,
 };
+pub use perf_model::{StepObservation, StepTimePredictor, attention_pairs, expert_fraction};
 pub use serving::{
     AggregateMetric, BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierResult,
     BenchmarkTierSpec, DEFAULT_PREFILL_COALESCE_WAIT_MS, EngineState, EventSink,

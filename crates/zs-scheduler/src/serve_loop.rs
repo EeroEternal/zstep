@@ -194,8 +194,10 @@ struct OnlineState {
 enum LoopCommand {
     Submit(
         SubmitRequest,
+        Option<String>,
         SyncSender<std::result::Result<u64, SubmitError>>,
     ),
+    ReleaseBranch(String),
     Cancel(u64),
     CompleteStop(u64),
     Drain,
@@ -235,6 +237,15 @@ impl ServeLoopHandle {
 
     /// Submit a request. Returns the loop-assigned request id or a typed admission error.
     pub fn submit(&self, request: SubmitRequest) -> std::result::Result<u64, SubmitError> {
+        self.submit_with_branch(request, None)
+    }
+
+    /// Submit a request tagged with an optional agent `branch_id` for compaction-aware KV caching.
+    pub fn submit_with_branch(
+        &self,
+        request: SubmitRequest,
+        branch_id: Option<String>,
+    ) -> std::result::Result<u64, SubmitError> {
         let cur_state = self.state();
         if cur_state != EngineState::Ready {
             return Err(SubmitError::Unavailable(cur_state));
@@ -264,7 +275,7 @@ impl ServeLoopHandle {
                 .tx
                 .lock()
                 .map_err(|_| SubmitError::Unavailable(self.state()))?;
-            match guard.try_send(LoopCommand::Submit(request, reply_tx)) {
+            match guard.try_send(LoopCommand::Submit(request, branch_id, reply_tx)) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     self.pending.fetch_sub(1, Ordering::Relaxed);
@@ -286,6 +297,13 @@ impl ServeLoopHandle {
             self.pending.fetch_sub(1, Ordering::Relaxed);
         }
         result
+    }
+
+    /// Release an agent branch on session termination so its prefix blocks become tier-0 evictable.
+    pub fn release_branch(&self, branch_id: impl Into<String>) {
+        if let Ok(guard) = self.tx.lock() {
+            let _ = guard.try_send(LoopCommand::ReleaseBranch(branch_id.into()));
+        }
     }
 
     /// Cancel an in-flight or queued request due to client disconnect / timeout / backpressure.
@@ -438,11 +456,12 @@ fn run_loop(
     let mut draining = EngineState::from_u8(state.load(Ordering::Acquire)) == EngineState::Draining;
     let mut shutting_down = false;
     let mut fault: Option<String> = None;
+    let mut request_branches: HashMap<u64, (String, Vec<i32>)> = HashMap::new();
 
     loop {
         loop {
             match rx.try_recv() {
-                Ok(LoopCommand::Submit(request, reply)) => {
+                Ok(LoopCommand::Submit(request, branch_id, reply)) => {
                     let cur_state = EngineState::from_u8(state.load(Ordering::Acquire));
                     let result = if draining || shutting_down || cur_state != EngineState::Ready {
                         let unavailable = if cur_state == EngineState::Ready {
@@ -458,6 +477,11 @@ fn run_loop(
                         let request_id = online.next_request_id;
                         online.next_request_id += 1;
                         let now = Instant::now();
+                        if let Some(bid) = branch_id {
+                            let _ = engine.record_agent_branch_tokens(&bid, &request.prompt_tokens);
+                            request_branches
+                                .insert(request_id, (bid, request.prompt_tokens.clone()));
+                        }
                         online
                             .meta
                             .insert(request_id, OnlineSequenceMeta { sink: request.sink });
@@ -471,6 +495,9 @@ fn run_loop(
                         Ok(request_id)
                     };
                     let _ = reply.send(result);
+                }
+                Ok(LoopCommand::ReleaseBranch(branch_id)) => {
+                    let _ = engine.release_agent_branch(&branch_id);
                 }
                 Ok(LoopCommand::Cancel(request_id)) => {
                     online.cancelled.insert(request_id);
@@ -541,6 +568,10 @@ fn run_loop(
 
         match online_step(&mut engine, &mut online, &metrics) {
             Ok(true) => {
+                for (bid, tokens) in request_branches.values() {
+                    let _ = engine.record_agent_branch_tokens(bid, tokens);
+                }
+                request_branches.retain(|id, _| online.meta.contains_key(id));
                 update_gauges(&engine, &online, &metrics);
             }
             Ok(false) => {
@@ -1314,7 +1345,7 @@ pub fn spawn_mock(script: MockScript) -> ServeLoopHandle {
             loop {
                 loop {
                     match rx.try_recv() {
-                        Ok(LoopCommand::Submit(request, reply)) => {
+                        Ok(LoopCommand::Submit(request, _branch_id, reply)) => {
                             let cur_state =
                                 EngineState::from_u8(mock_state.load(Ordering::Acquire));
                             if draining || shutting_down || cur_state != EngineState::Ready {
@@ -1336,6 +1367,7 @@ pub fn spawn_mock(script: MockScript) -> ServeLoopHandle {
                             let _ = reply.send(Ok(id));
                             waiting.push_back((id, request.sink));
                         }
+                        Ok(LoopCommand::ReleaseBranch(_)) => {}
                         Ok(LoopCommand::Cancel(id)) => {
                             cancelled.insert(id);
                         }

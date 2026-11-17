@@ -66,13 +66,21 @@ impl std::error::Error for KvError {}
 
 struct PrefixNode {
     parent: usize,
+    generation: u64,
     token_key: Box<[i32]>,
     children: HashMap<Box<[i32]>, usize>,
     lease: Option<BlockLease>,
     aux_lease: Option<BlockLease>,
     pin_count: usize,
+    branch_ref_count: usize,
     last_access_tick: u64,
     evicted: bool,
+}
+
+struct BranchState {
+    version: u64,
+    aligned_tokens: Vec<i32>,
+    node_refs: Vec<(usize, u64)>,
 }
 
 struct PrefixTreeInner {
@@ -82,6 +90,8 @@ struct PrefixTreeInner {
     free_node_slots: Vec<usize>,
     cached_blocks: usize,
     access_clock: u64,
+    alloc_clock: u64,
+    branches: HashMap<String, BranchState>,
 }
 
 impl PrefixTreeInner {
@@ -90,7 +100,9 @@ impl PrefixTreeInner {
         self.access_clock
     }
 
-    fn alloc_node(&mut self, node: PrefixNode) -> usize {
+    fn alloc_node(&mut self, mut node: PrefixNode) -> usize {
+        self.alloc_clock = self.alloc_clock.wrapping_add(1);
+        node.generation = self.alloc_clock;
         if let Some(slot) = self.free_node_slots.pop() {
             self.nodes[slot] = node;
             slot
@@ -99,6 +111,20 @@ impl PrefixTreeInner {
             self.nodes.push(node);
             slot
         }
+    }
+
+    fn release_node_refs(&mut self, refs: &[(usize, u64)]) -> usize {
+        let mut released = 0usize;
+        for &(idx, generation) in refs {
+            if let Some(node) = self.nodes.get_mut(idx)
+                && !node.evicted
+                && node.generation == generation
+            {
+                node.branch_ref_count = node.branch_ref_count.saturating_sub(1);
+                released += 1;
+            }
+        }
+        released
     }
 
     fn evict_lru_leaves(&mut self, target_blocks: usize) -> usize {
@@ -112,7 +138,12 @@ impl PrefixTreeInner {
                 .filter(|(_, node)| {
                     !node.evicted && node.pin_count == 0 && node.children.is_empty()
                 })
-                .min_by_key(|(_, node)| node.last_access_tick)
+                .min_by_key(|(_, node)| {
+                    (
+                        usize::from(node.branch_ref_count > 0),
+                        node.last_access_tick,
+                    )
+                })
                 .map(|(idx, _)| idx);
 
             let Some(victim_idx) = candidate else {
@@ -167,11 +198,13 @@ impl PrefixTree {
         }
         let root = PrefixNode {
             parent: 0,
+            generation: 0,
             token_key: Box::new([]),
             children: HashMap::new(),
             lease: None,
             aux_lease: None,
             pin_count: 1,
+            branch_ref_count: 0,
             last_access_tick: 0,
             evicted: false,
         };
@@ -183,6 +216,8 @@ impl PrefixTree {
                 free_node_slots: Vec::new(),
                 cached_blocks: 0,
                 access_clock: 0,
+                alloc_clock: 0,
+                branches: HashMap::new(),
             })),
         })
     }
@@ -434,11 +469,13 @@ impl PrefixTree {
                 let key: Box<[i32]> = chunk.into();
                 let node = PrefixNode {
                     parent: current,
+                    generation: 0,
                     token_key: key.clone(),
                     children: HashMap::new(),
                     lease: Some(block_lease),
                     aux_lease,
                     pin_count: 1,
+                    branch_ref_count: 0,
                     last_access_tick: tick,
                     evicted: false,
                 };
@@ -461,7 +498,77 @@ impl PrefixTree {
         })
     }
 
-    /// Evict up to `target_blocks` unpinned leaf nodes in strict LRU order.
+    /// Update branch-aware reference counts for `branch_id` against `tokens`.
+    ///
+    /// When `tokens`'s block-aligned prefix does not start with the branch's prior snapshot
+    /// (e.g., after `/compact` context rewriting), increments the branch version and immediately
+    /// drops `branch_ref_count` on orphaned nodes so they evict ahead of paused tool branches.
+    pub fn record_branch_tokens(&self, branch_id: &str, tokens: &[i32]) -> (bool, u64) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let block_tokens = guard.block_tokens;
+        let aligned_len = (tokens.len() / block_tokens) * block_tokens;
+        let aligned = &tokens[..aligned_len];
+        let (compacted, version) = if let Some(prev) = guard.branches.remove(branch_id) {
+            guard.release_node_refs(&prev.node_refs);
+            let is_compacted =
+                !prev.aligned_tokens.is_empty() && !aligned.starts_with(&prev.aligned_tokens);
+            let next_ver = if is_compacted {
+                prev.version + 1
+            } else {
+                prev.version
+            };
+            (is_compacted, next_ver)
+        } else {
+            (false, 1)
+        };
+        let mut current = 0usize;
+        let mut node_refs = Vec::with_capacity(aligned_len / block_tokens);
+        for chunk in aligned.chunks_exact(block_tokens) {
+            let Some(&child_idx) = guard.nodes[current].children.get(chunk) else {
+                break;
+            };
+            let node = &mut guard.nodes[child_idx];
+            node.branch_ref_count += 1;
+            node_refs.push((child_idx, node.generation));
+            current = child_idx;
+        }
+        guard.branches.insert(
+            branch_id.to_owned(),
+            BranchState {
+                version,
+                aligned_tokens: aligned.to_vec(),
+                node_refs,
+            },
+        );
+        (compacted, version)
+    }
+
+    /// Release an agent branch on session completion, dropping its live `branch_ref_count` holds.
+    pub fn release_branch(&self, branch_id: &str) -> usize {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(prev) = guard.branches.remove(branch_id) else {
+            return 0;
+        };
+        guard.release_node_refs(&prev.node_refs)
+    }
+
+    /// Number of registered agent branches currently tracked by the cache.
+    pub fn active_branches(&self) -> usize {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.branches.len()
+    }
+
+    /// Evict up to `target_blocks` unpinned leaf nodes, prioritizing orphaned (`branch_ref_count == 0`)
+    /// blocks ahead of paused agent branches (`branch_ref_count > 0`) in LRU order.
     pub fn evict_lru(&self, target_blocks: usize) -> usize {
         let mut guard = self
             .inner
