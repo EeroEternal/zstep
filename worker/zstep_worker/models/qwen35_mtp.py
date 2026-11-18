@@ -22,13 +22,13 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
+from zstep_worker.env_config import WorkerRuntimeConfig
 from zstep_worker.kernels_sm120.qwen35_ops import (
     paged_gqa_decode_gated,
     paged_gqa_prefill_varlen_gated,
@@ -401,7 +401,7 @@ class Qwen35MtpDrafter:
         graph_pool: Any,
         capture_stream: torch.cuda.Stream,
     ) -> None:
-        if os.environ.get("ZSTEP_DISABLE_DRAFT_GRAPHS", "0") == "1":
+        if WorkerRuntimeConfig.from_env().disable_draft_graphs:
             return
         runner = self.runner
         k = self.num_draft_tokens

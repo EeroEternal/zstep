@@ -40,6 +40,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
+from zstep_worker.env_config import WorkerRuntimeConfig
 from zstep_worker.numa_pin import (
     DeviceNumaTopology,
     pin_process_to_device_numa,
@@ -335,6 +336,9 @@ def _probe_model_type(model_dir: str) -> str:
 class RuntimeLoop:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        self.runtime_config: WorkerRuntimeConfig = WorkerRuntimeConfig.from_env()
+        if args.rank == 0:
+            print(self.runtime_config.format_log_line(), flush=True)
         # Pin host CPU affinity to this rank's PCIe NUMA domain BEFORE touching SHM or CUDA.
         self.numa_topology: DeviceNumaTopology = pin_process_to_device_numa(args.rank)
         self.bridge = ShmBridge(name=args.shm_name, shm_fd=args.shm_fd)

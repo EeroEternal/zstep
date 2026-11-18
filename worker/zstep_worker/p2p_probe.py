@@ -37,11 +37,14 @@ import os
 from pathlib import Path
 import time
 
+from zstep_worker.env_config import (
+    DEFAULT_MIN_PXB_BI_GBPS as DEFAULT_MIN_PXB_BI_GBPS,
+    WorkerRuntimeConfig,
+)
 from zstep_worker.numa_pin import _load_cudart, _query_cuda_pci_bus_id
 
 _LOG = logging.getLogger(__name__)
 
-DEFAULT_MIN_PXB_BI_GBPS = 25.0
 _CUDA_MEMCPY_DEVICE_TO_DEVICE = 3
 _CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 1
 _CUDA_IPC_HANDLE_BYTES = 64
@@ -374,7 +377,8 @@ def configure_adaptive_p2p_env(
 ) -> P2pTopologyReport:
     """Auto-detect PCIe P2P + ACS health and populate optimal `NCCL_*` env vars before init."""
     os.environ.setdefault("NCCL_IB_DISABLE", "1")
-    mode = os.environ.get("ZSTEP_P2P_MODE", "auto").strip().lower()
+    cfg = WorkerRuntimeConfig.from_env()
+    mode = cfg.p2p_mode
     user_p2p_disable = os.environ.get("NCCL_P2P_DISABLE")
 
     def _apply_non_p2p_defaults(reason: str, bi_gbps: float | None = None) -> P2pTopologyReport:
@@ -462,9 +466,7 @@ def configure_adaptive_p2p_env(
     else:
         return _apply_non_p2p_defaults("partial_peer_access_unsupported")
 
-    min_bi_gbps = float(
-        os.environ.get("ZSTEP_P2P_MIN_PXB_BI_GBPS", str(DEFAULT_MIN_PXB_BI_GBPS))
-    )
+    min_bi_gbps = cfg.p2p_min_pxb_bi_gbps
     measured_bi_gbps: float | None = None
     if (
         dist_init_file is not None
@@ -493,9 +495,8 @@ def configure_adaptive_p2p_env(
 
     os.environ.setdefault("NCCL_P2P_DISABLE", "0")
     os.environ.setdefault("NCCL_P2P_LEVEL", recommended_level)
-    pxb_shm_env = os.environ.get("ZSTEP_SHM_ENABLE_PXB_P2P", "1").strip().lower()
     pxb_shm_enabled = (
-        pxb_shm_env not in {"0", "off", "false"}
+        cfg.shm_enable_pxb_p2p
         and world_size == 8
         and all_switch_pairs_peer_ok
     )

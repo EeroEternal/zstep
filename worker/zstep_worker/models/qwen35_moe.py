@@ -408,12 +408,13 @@ class Qwen35MoeStepRunner:
         self.max_pages_per_seq: int = self.geometry.max_pages_per_seq
         self.num_kv_pages: int = num_kv_pages
         self.dummy_page: int = num_kv_pages
-        self.spec_method: str = os.environ.get("ZSTEP_SPEC_METHOD", "none")
-        self.num_spec_tokens: int = int(os.environ.get("ZSTEP_NUM_SPEC_TOKENS", "0"))
+        from zstep_worker.env_config import WorkerRuntimeConfig
+
+        self.runtime_config: WorkerRuntimeConfig = WorkerRuntimeConfig.from_env()
+        self.spec_method: str = self.runtime_config.spec_method
+        self.num_spec_tokens: int = self.runtime_config.num_spec_tokens
         if self.spec_method not in {"none", "ngram", "mtp"}:
             raise ValueError(f"Qwen3.5 does not support speculative method {self.spec_method}")
-        if self.spec_method != "none" and not 1 <= self.num_spec_tokens <= 7:
-            raise ValueError("ZSTEP_NUM_SPEC_TOKENS must be in 1..=7")
         self.mtp_drafter: Any = None
 
         self.p2p_report: P2pTopologyReport = configure_adaptive_p2p_env(
@@ -430,14 +431,8 @@ class Qwen35MoeStepRunner:
             timeout=timedelta(seconds=300),
         )
         self.exchange_group = dist.group.WORLD
-        enable_nccl_prefill = os.environ.get("ZSTEP_QWEN_ENABLE_NCCL_PREFILL", "1") != "0"
         self.nccl_group: dist.ProcessGroup | None = (
-            dist.new_group(backend="nccl")
-            if (enable_nccl_prefill and dist.is_nccl_available())
-            else None
-        )
-        self.enable_fused_ar_norm: bool = (
-            os.environ.get("ZSTEP_QWEN_ENABLE_FUSED_AR_NORM", "1") != "0"
+            dist.new_group(backend="nccl") if dist.is_nccl_available() else None
         )
         self.shm_ar_calls: int = 0
         self.nccl_eager_large_calls: int = 0
@@ -455,8 +450,8 @@ class Qwen35MoeStepRunner:
         # on non-P2P) plus 100% of CUDAGraph captures through `communicator`; route
         # larger eager prefill chunks (e.g. M=2048/4096) to topology-aware NCCL.
         default_ar_rows = 512 if self.communicator.pxb_enabled else 384
-        self.shm_max_ar_numel: int = int(
-            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(default_ar_rows * 5120))
+        self.shm_max_ar_numel: int = self.runtime_config.effective_shm_max_ar_numel(
+            default_ar_rows * 5120
         )
         self.argmax_channel: _Tp8ArgmaxShmChannel = _Tp8ArgmaxShmChannel(
             name=f"{allreduce_name}_argmax",
@@ -493,14 +488,9 @@ class Qwen35MoeStepRunner:
         # Optional block-boundary recurrent state checkpoints for Automatic Prefix Caching (APC).
         # Slot IDs `0..255` are conveyed via `compressor_slot_ids` (int32, -1 = none) for restore
         # and `replay_mask` (uint8, 0xFF = none) for per-row snapshot.
-        self.num_recurrent_checkpoints: int = int(
-            os.environ.get("ZSTEP_NUM_RECURRENT_CHECKPOINTS", "0")
+        self.num_recurrent_checkpoints: int = (
+            self.runtime_config.num_recurrent_checkpoints
         )
-        if self.num_recurrent_checkpoints < 0 or self.num_recurrent_checkpoints > 255:
-            raise ValueError(
-                "ZSTEP_NUM_RECURRENT_CHECKPOINTS must be in 0..=255 "
-                f"(got {self.num_recurrent_checkpoints})"
-            )
         self.num_cached_recurrent_slots: int = self.num_recurrent_checkpoints + (
             self.max_seqs * 8 if self.spec_method != "none" else 0
         )
@@ -1103,20 +1093,14 @@ class Qwen35MoeStepRunner:
         reduced: torch.Tensor,
         eps: float,
     ) -> None:
-        if self.enable_fused_ar_norm:
-            self.communicator.all_reduce_add_rmsnorm(
-                input_,
-                hidden,
-                norm_w,
-                normed_out=normed,
-                eps=eps,
-                zero_centered=True,
-                scratch_out=reduced,
-            )
-            return
-        self.communicator.all_reduce(input_, output=reduced)
-        fused_add_zero_centered_rmsnorm(
-            reduced, hidden, norm_w, normed_out=normed, eps=eps
+        self.communicator.all_reduce_add_rmsnorm(
+            input_,
+            hidden,
+            norm_w,
+            normed_out=normed,
+            eps=eps,
+            zero_centered=True,
+            scratch_out=reduced,
         )
 
     def _all_reduce_prefill(self, input_: torch.Tensor, *, output: torch.Tensor) -> None:
@@ -1148,11 +1132,7 @@ class Qwen35MoeStepRunner:
             and not torch.cuda.is_current_stream_capturing()
             and input_.numel() > self.shm_max_ar_numel
         )
-        if (
-            self.enable_fused_ar_norm
-            and not use_nccl_large
-            and self.communicator.can_fuse_add_rmsnorm(input_)
-        ):
+        if not use_nccl_large and self.communicator.can_fuse_add_rmsnorm(input_):
             self.communicator.all_reduce_add_rmsnorm(
                 input_,
                 hidden,
@@ -1410,7 +1390,7 @@ class Qwen35MoeStepRunner:
             dist.barrier(group=self.exchange_group)
             self.decode_graphs[b] = g
 
-        if self.verify_buckets and os.environ.get("ZSTEP_DISABLE_VERIFY_GRAPHS", "0") != "1":
+        if self.verify_buckets and not self.runtime_config.disable_verify_graphs:
             width = self.num_spec_tokens + 1
             for b in self.verify_buckets:
                 rows = b * width

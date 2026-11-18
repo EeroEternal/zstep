@@ -29,6 +29,18 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
+
+def _has_sm120_gpu() -> bool:
+    if sys.platform != "linux":
+        return False
+    try:
+        import torch
+    except ImportError:
+        return False
+    return bool(torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0))
+
 
 def run_coordinator_e2e(*, zstep_bin: Path, world_size: int, steps: int) -> dict[str, object]:
     worker_root = Path(__file__).resolve().parents[1]
@@ -73,6 +85,16 @@ def run_coordinator_e2e(*, zstep_bin: Path, world_size: int, steps: int) -> dict
         assert not Path(f"/dev/shm/{shm_name}").exists()
         assert not Path(f"/dev/shm/{shm_name}_ar").exists()
         return metrics
+
+
+def test_coordinator_e2e_1gpu() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    binary = Path(os.environ.get("ZSTEP_BIN", str(repo_root / "target/release/zstep")))
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        pytest.skip(f"Compiled zstep binary not found at {binary}")
+    if not _has_sm120_gpu():
+        pytest.skip("Requires Linux host with an sm_120 CUDA GPU")
+    run_coordinator_e2e(zstep_bin=binary, world_size=1, steps=8)
 
 
 if __name__ == "__main__":

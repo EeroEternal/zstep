@@ -8,9 +8,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
+
+try:
+    import torch
+    import torch.distributed as dist
+    import torch.multiprocessing as mp
+except ImportError:  # pragma: no cover - exercised in torch-free CI
+    torch = None  # type: ignore[assignment]
+    dist = None  # type: ignore[assignment]
+    mp = None  # type: ignore[assignment]
 
 from zstep_worker.p2p_probe import (
     _CudaIpcMemHandle,
@@ -26,6 +32,7 @@ def test_cuda_ipc_mem_handle_preserves_embedded_null_bytes() -> None:
     assert bytes(h.reserved) == raw
 
 
+@pytest.mark.skipif(torch is None, reason="Requires PyTorch")
 def test_shm_allreduce_partial_init_cleanup_preserves_exception(tmp_path: Path) -> None:
     from zstep_worker.kernels_sm120 import shm_allreduce as sa
 
@@ -76,6 +83,7 @@ def test_shm_allreduce_partial_init_cleanup_preserves_exception(tmp_path: Path) 
         assert not leaked_file.exists()
 
 
+@pytest.mark.skipif(torch is None, reason="Requires PyTorch")
 def test_shm_allgather_attach_pxb_ipc_tracks_owner_liveness() -> None:
     from types import SimpleNamespace
     from zstep_worker.kernels_sm120.shm_allreduce import (
@@ -485,7 +493,9 @@ def _pxb_8gpu_worker(rank: int, init_file: str, shm_name: str) -> None:
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    torch is None
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (12, 0),
     reason="Requires an sm_120 CUDA device",
 )
 def test_sm120_mhc_fused_kernels_parity() -> None:
@@ -630,7 +640,8 @@ def test_sm120_mhc_fused_kernels_parity() -> None:
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
+    torch is None
+    or not torch.cuda.is_available()
     or torch.cuda.device_count() < 8
     or not torch.cuda.can_device_access_peer(0, 1),
     reason="Requires 8 P2P-capable GPUs",
