@@ -76,6 +76,55 @@ def test_shm_allreduce_partial_init_cleanup_preserves_exception(tmp_path: Path) 
         assert not leaked_file.exists()
 
 
+def test_shm_allgather_attach_pxb_ipc_tracks_owner_liveness() -> None:
+    from types import SimpleNamespace
+    from zstep_worker.kernels_sm120.shm_allreduce import (
+        HostMappedShmAllGather,
+        HostMappedShmAllReduce,
+    )
+
+    ag = object.__new__(HostMappedShmAllGather)
+    ag.rank = 0
+    ag.world_size = 8
+    ag.device = torch.device("cpu")
+    ag._closed = False
+    ag._registered = False
+    ag._pxb_ar_ref = None
+
+    ar = object.__new__(HostMappedShmAllReduce)
+    ar.rank = 0
+    ar.world_size = 8
+    ar.device = torch.device("cpu")
+    ar._closed = False
+    ar._pxb_enabled = True
+    ar._my_hbm_ptr = 0x1000_0000
+    ar._pt_hbm_ptr = 0x2000_0000
+    ar.pxb_slot_stride_bytes = 4096
+
+    ag.attach_pxb_ipc(ar)
+    assert ag._my_hbm_ptr == 0x1000_0000
+    assert ag._pt_hbm_ptr == 0x2000_0000
+    assert ag._pxb_cap_bytes == 8192
+
+    # Mismatched rank/world/device must fail loudly.
+    bad_ar = SimpleNamespace(
+        rank=1,
+        world_size=8,
+        device=torch.device("cpu"),
+        pxb_enabled=True,
+        _closed=False,
+    )
+    with pytest.raises(ValueError, match="attach_pxb_ipc rank/world/device mismatch"):
+        ag.attach_pxb_ipc(bad_ar)  # type: ignore[arg-type]
+
+    # Closing `ar` before `ag` immediately zeroes IPC pointers (no dangling UAF).
+    ar._closed = True
+    ar._pxb_enabled = False
+    assert ag._my_hbm_ptr == 0
+    assert ag._pt_hbm_ptr == 0
+    assert ag._pxb_cap_bytes == 0
+
+
 def test_classify_pci_pair_relation_matches_cx8_6000d_hierarchy() -> None:
     gpu0 = "/sys/devices/pci0000:16/0000:16:01.0/0000:17:00.0/0000:18:00.0/0000:19:00.0/0000:1a:00.0/0000:1b:00.0"
     gpu1 = "/sys/devices/pci0000:16/0000:16:01.0/0000:17:00.0/0000:18:00.0/0000:19:00.0/0000:1d:00.0/0000:1e:00.0"
@@ -372,19 +421,20 @@ def _pxb_8gpu_worker(rank: int, init_file: str, shm_name: str) -> None:
                         f"small_pxb lockstep broken: {ctrl_small} != {small_steps}"
                     )
                     # Verify PXB partner-relayed AllGather (`attach_pxb_ipc`) interleaved
-                    # back-to-back with `comm.all_reduce` on the shared 2-slot IPC ring.
+                    # back-to-back with `comm.all_reduce` on the shared 2-slot IPC ring,
+                    # including `use_pxb=True -> False (ag_m=1152) -> True (ag_m=24)` transitions.
                     with HostMappedShmAllGather(
                         name=f"{shm_name}_ag_{cfg_idx}",
                         rank=rank,
                         world_size=8,
-                        capacity_input_elements=512 * 3200,
+                        capacity_input_elements=1280 * 3200,
                         blocks=32,
                         threads=512,
                         exchange_group=dist.group.WORLD,
                     ) as ag:
                         ag.attach_pxb_ipc(comm)
                         assert ag._my_hbm_ptr == comm._my_hbm_ptr and ag._my_hbm_ptr != 0
-                        for ag_m in (1, 8, 16, 32, 128):
+                        for ag_m in (1, 8, 16, 32, 128, 1152, 24):
                             torch.manual_seed(900 + ag_m * 17 + rank)
                             ag_in = torch.randn(
                                 (ag_m, 3200), dtype=torch.bfloat16, device=device
@@ -421,8 +471,9 @@ def _pxb_8gpu_worker(rank: int, init_file: str, shm_name: str) -> None:
                             )
 
                             # Interleave AllReduce immediately after PXB AllGather on same ring
+                            ar_m = min(ag_m, 768)
                             ar_x = torch.randn(
-                                (ag_m, 5120), dtype=torch.bfloat16, device=device
+                                (ar_m, 5120), dtype=torch.bfloat16, device=device
                             ) * 0.125
                             ar_ref = ar_x.float().cpu()
                             dist.all_reduce(ar_ref, group=dist.group.WORLD)

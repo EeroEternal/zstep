@@ -34,6 +34,7 @@ import math
 import mmap
 import os
 import struct
+import weakref
 
 import torch
 import torch.distributed as dist
@@ -387,9 +388,10 @@ void launch_shm_v5_pxb_allreduce_add_rmsnorm(
     TORCH_CHECK(input.numel() * 2 <= slot_stride_bytes / 2, "input exceeds SHM slot capacity");
     const int64_t vecs_per_row = hidden / 8;
     TORCH_CHECK(vecs_per_row <= 1536, "hidden exceeds 3-iter epilogue limit (12288)");
-    const int64_t eff_blocks = (my_hbm_ptr != 0 && blocks == 32 && rows * vecs_per_row <= 40960) ? 8 : blocks;
+    const int64_t eff_blocks =
+        (my_hbm_ptr != 0 && blocks == 32 && rows * vecs_per_row <= 40960) ? 8 : blocks;
     if (rows < eff_blocks) {
-        TORCH_CHECK(eff_blocks % rows == 0, "rows < blocks requires blocks % rows == 0");
+        TORCH_CHECK(eff_blocks % rows == 0, "rows < eff_blocks requires eff_blocks % rows == 0");
     }
     if (rows * vecs_per_row > one_shot_max_vecs) {
         TORCH_CHECK(
@@ -515,16 +517,64 @@ void launch_mhc_post_collapse_rmsnorm(
     int64_t write_aux,
     int64_t post_only,
     std::uintptr_t stream_handle) {
+    TORCH_CHECK(x.is_cuda() && residual.is_cuda(), "x/residual must be CUDA tensors");
+    TORCH_CHECK(
+        x.scalar_type() == at::kBFloat16 && residual.scalar_type() == at::kBFloat16,
+        "x/residual must be BF16");
+    TORCH_CHECK(x.is_contiguous() && residual.is_contiguous(), "x/residual must be contiguous");
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == 5120, "x must have shape [num_tokens, 5120]");
+    const int64_t num_tokens = x.size(0);
+    TORCH_CHECK(
+        residual.dim() == 3 && residual.size(0) == num_tokens &&
+        residual.size(1) == 4 && residual.size(2) == 5120,
+        "residual must have shape [num_tokens, 4, 5120]");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(x.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<std::uintptr_t>(residual.data_ptr()) % 16 == 0,
+        "x/residual pointers must be 16-byte aligned");
+    TORCH_CHECK(
+        post_mix.is_cuda() && post_mix.scalar_type() == at::kFloat &&
+        post_mix.is_contiguous() && post_mix.numel() == num_tokens * 4,
+        "post_mix must be contiguous FP32 CUDA tensor of numel num_tokens * 4");
+    TORCH_CHECK(
+        comb_mix.is_cuda() && comb_mix.scalar_type() == at::kFloat &&
+        comb_mix.is_contiguous() && comb_mix.numel() == num_tokens * 16,
+        "comb_mix must be contiguous FP32 CUDA tensor of numel num_tokens * 16");
+    if (!post_only) {
+        TORCH_CHECK(
+            pre_mix.is_cuda() && pre_mix.scalar_type() == at::kFloat &&
+            pre_mix.is_contiguous() && pre_mix.numel() == num_tokens * 4,
+            "pre_mix must be contiguous FP32 CUDA tensor of numel num_tokens * 4");
+        TORCH_CHECK(
+            norm_weight.is_cuda() && norm_weight.scalar_type() == at::kBFloat16 &&
+            norm_weight.is_contiguous() && norm_weight.numel() == 5120 &&
+            reinterpret_cast<std::uintptr_t>(norm_weight.data_ptr()) % 16 == 0,
+            "norm_weight must be 16B-aligned contiguous BF16 CUDA tensor of numel 5120");
+        TORCH_CHECK(
+            layer_input.is_cuda() && layer_input.scalar_type() == at::kBFloat16 &&
+            layer_input.is_contiguous() && layer_input.dim() == 2 &&
+            layer_input.size(0) == num_tokens && layer_input.size(1) == 5120 &&
+            reinterpret_cast<std::uintptr_t>(layer_input.data_ptr()) % 16 == 0,
+            "layer_input must be 16B-aligned contiguous BF16 CUDA tensor [num_tokens, 5120]");
+        if (write_aux) {
+            TORCH_CHECK(
+                aux_out.is_cuda() && aux_out.scalar_type() == at::kBFloat16 &&
+                aux_out.is_contiguous() && aux_out.dim() == 2 &&
+                aux_out.size(0) == num_tokens && aux_out.size(1) == 5120 &&
+                reinterpret_cast<std::uintptr_t>(aux_out.data_ptr()) % 16 == 0,
+                "aux_out must be 16B-aligned contiguous BF16 CUDA tensor [num_tokens, 5120]");
+        }
+    }
     launch_mhc_post_collapse_rmsnorm_cuda(
         x.data_ptr(),
         residual.data_ptr(),
         post_mix.data_ptr<float>(),
         comb_mix.data_ptr<float>(),
-        pre_mix.data_ptr<float>(),
+        post_only ? nullptr : pre_mix.data_ptr<float>(),
         post_only ? nullptr : norm_weight.data_ptr(),
         post_only ? nullptr : layer_input.data_ptr(),
-        write_aux ? aux_out.data_ptr() : nullptr,
-        static_cast<int>(x.size(0)),
+        (!post_only && write_aux) ? aux_out.data_ptr() : nullptr,
+        static_cast<int>(num_tokens),
         static_cast<float>(norm_eps),
         static_cast<int>(write_aux),
         static_cast<int>(post_only),
@@ -547,6 +597,42 @@ void launch_mhc_sinkhorn_stats(
     int64_t sinkhorn_repeat,
     int64_t save_pre_mix,
     std::uintptr_t stream_handle) {
+    TORCH_CHECK(
+        gemm_mul.is_cuda() && gemm_mul.scalar_type() == at::kFloat &&
+        gemm_mul.is_contiguous() && gemm_mul.dim() == 3 && gemm_mul.size(2) == 24,
+        "gemm_mul must be contiguous FP32 CUDA tensor [n_splits, num_tokens, 24]");
+    const int64_t n_splits = gemm_mul.size(0);
+    const int64_t num_tokens = gemm_mul.size(1);
+    TORCH_CHECK(
+        n_splits > 0 && rms_numel > 0 && sinkhorn_repeat >= 1,
+        "n_splits, rms_numel, and sinkhorn_repeat must be >= 1");
+    TORCH_CHECK(
+        gemm_sqr.is_cuda() && gemm_sqr.scalar_type() == at::kFloat &&
+        gemm_sqr.is_contiguous() && gemm_sqr.dim() == 2 &&
+        gemm_sqr.size(0) == n_splits && gemm_sqr.size(1) == num_tokens,
+        "gemm_sqr must be contiguous FP32 CUDA tensor [n_splits, num_tokens]");
+    TORCH_CHECK(
+        hc_scale.is_cuda() && hc_scale.scalar_type() == at::kFloat &&
+        hc_scale.is_contiguous() && hc_scale.numel() >= 3,
+        "hc_scale must be contiguous FP32 CUDA tensor of numel >= 3");
+    TORCH_CHECK(
+        hc_base.is_cuda() && hc_base.scalar_type() == at::kFloat &&
+        hc_base.is_contiguous() && hc_base.numel() >= 24,
+        "hc_base must be contiguous FP32 CUDA tensor of numel >= 24");
+    TORCH_CHECK(
+        post_mix.is_cuda() && post_mix.scalar_type() == at::kFloat &&
+        post_mix.is_contiguous() && post_mix.numel() == num_tokens * 4,
+        "post_mix must be contiguous FP32 CUDA tensor of numel num_tokens * 4");
+    TORCH_CHECK(
+        comb_mix.is_cuda() && comb_mix.scalar_type() == at::kFloat &&
+        comb_mix.is_contiguous() && comb_mix.numel() == num_tokens * 16,
+        "comb_mix must be contiguous FP32 CUDA tensor of numel num_tokens * 16");
+    if (save_pre_mix) {
+        TORCH_CHECK(
+            pre_mix_out.is_cuda() && pre_mix_out.scalar_type() == at::kFloat &&
+            pre_mix_out.is_contiguous() && pre_mix_out.numel() == num_tokens * 4,
+            "pre_mix_out must be contiguous FP32 CUDA tensor of numel num_tokens * 4");
+    }
     launch_mhc_sinkhorn_stats_cuda(
         gemm_mul.data_ptr<float>(),
         gemm_sqr.data_ptr<float>(),
@@ -554,9 +640,9 @@ void launch_mhc_sinkhorn_stats(
         hc_base.data_ptr<float>(),
         post_mix.data_ptr<float>(),
         comb_mix.data_ptr<float>(),
-        pre_mix_out.data_ptr<float>(),
-        static_cast<int>(gemm_mul.size(1)),
-        static_cast<int>(gemm_mul.size(0)),
+        save_pre_mix ? pre_mix_out.data_ptr<float>() : nullptr,
+        static_cast<int>(num_tokens),
+        static_cast<int>(n_splits),
         1.0f / static_cast<float>(rms_numel),
         static_cast<float>(rms_eps),
         static_cast<float>(hc_pre_eps),
@@ -2445,7 +2531,7 @@ __global__ __launch_bounds__(512, 2) void shm_v5_allgather_kernel(
     }
 
     uint4* my_in = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes);
-    // CX8 PXB partner-relayed AllGather (`[98368..116800)` dedicated header flags):
+    // CX8 PXB partner-relayed AllGather (`[98368..118848)` dedicated header flags across <=64 CTAs):
     // Cuts per-GPU Host-SHM reads across shared PCIe Gen5 x16 switch uplink from 7*B to 3*B (-57.1%).
     if (my_hbm != nullptr && pt_hbm != nullptr && world_size == 8) {
         if (threadIdx.x == 0) {
@@ -3326,7 +3412,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v17_ext",
+            name="zstep_shm_allreduce_sm120_v18_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -3916,9 +4002,7 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
         )
         self._closed: bool = False
         self._registered: bool = False
-        self._my_hbm_ptr: int = 0
-        self._pt_hbm_ptr: int = 0
-        self._pxb_cap_bytes: int = 0
+        self._pxb_ar_ref: weakref.ReferenceType[HostMappedShmAllReduce] | None = None
         self._extension = get_host_mapped_allreduce_extension()
         try:
             self._init_per_rank_shm(
@@ -3936,12 +4020,45 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
             self.close(abort=True)
             raise
 
+    @property
+    def _my_hbm_ptr(self) -> int:
+        ar = self._pxb_ar_ref() if self._pxb_ar_ref is not None else None
+        if ar is not None and not self._closed and not ar._closed and ar.pxb_enabled:
+            return ar._my_hbm_ptr
+        return 0
+
+    @property
+    def _pt_hbm_ptr(self) -> int:
+        ar = self._pxb_ar_ref() if self._pxb_ar_ref is not None else None
+        if ar is not None and not self._closed and not ar._closed and ar.pxb_enabled:
+            return ar._pt_hbm_ptr
+        return 0
+
+    @property
+    def _pxb_cap_bytes(self) -> int:
+        ar = self._pxb_ar_ref() if self._pxb_ar_ref is not None else None
+        if ar is not None and not self._closed and not ar._closed and ar.pxb_enabled:
+            return NUM_PXB_RING_SLOTS * ar.pxb_slot_stride_bytes
+        return 0
+
     def attach_pxb_ipc(self, shm_ar: HostMappedShmAllReduce) -> None:
-        """Attach CX8 PXB CUDA-IPC partner ring pointers from `shm_ar` (zero extra HBM)."""
-        if shm_ar.pxb_enabled and self.world_size == 8:
-            self._my_hbm_ptr = shm_ar._my_hbm_ptr
-            self._pt_hbm_ptr = shm_ar._pt_hbm_ptr
-            self._pxb_cap_bytes = NUM_PXB_RING_SLOTS * shm_ar.pxb_slot_stride_bytes
+        """Attach CX8 PXB CUDA-IPC partner ring from `shm_ar` (zero extra HBM, owner-liveness tracked)."""
+        if self._closed:
+            raise RuntimeError("AllGather channel is closed")
+        if (
+            shm_ar.rank != self.rank
+            or shm_ar.world_size != self.world_size
+            or shm_ar.device != self.device
+        ):
+            raise ValueError(
+                f"attach_pxb_ipc rank/world/device mismatch: "
+                f"ag=({self.rank}, {self.world_size}, {self.device}) vs "
+                f"ar=({shm_ar.rank}, {shm_ar.world_size}, {shm_ar.device})"
+            )
+        if shm_ar.pxb_enabled and not shm_ar._closed and self.world_size == 8:
+            self._pxb_ar_ref = weakref.ref(shm_ar)
+        else:
+            self._pxb_ar_ref = None
 
     def all_gather(
         self,
@@ -3976,14 +4093,16 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
             raise ValueError(f"inner_elems={inner_elems} must be divisible by 8")
         vecs_per_row = inner_elems // 8
         stream_handle = torch.cuda.current_stream(self.device).cuda_stream
-        use_pxb = self._my_hbm_ptr != 0 and 3 * input.numel() * 2 <= self._pxb_cap_bytes
+        my_ptr = self._my_hbm_ptr
+        pt_ptr = self._pt_hbm_ptr
+        use_pxb = my_ptr != 0 and pt_ptr != 0 and 3 * input.numel() * 2 <= self._pxb_cap_bytes
         self._extension.launch_shm_v5_allgather(
             input,
             output,
             self.control,
             self._rank_shm_ptrs,
-            self._my_hbm_ptr if use_pxb else 0,
-            self._pt_hbm_ptr if use_pxb else 0,
+            my_ptr if use_pxb else 0,
+            pt_ptr if use_pxb else 0,
             self.slot_stride_bytes,
             outer_rows,
             vecs_per_row,
@@ -4001,6 +4120,7 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
         if abort:
             self.signal_abort()
         torch.cuda.synchronize(self.device)
+        self._pxb_ar_ref = None
         if self._registered or hasattr(self, "_own_shm_path"):
             self._close_per_rank_shm(self._extension)
             self._registered = False

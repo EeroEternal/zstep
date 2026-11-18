@@ -18,9 +18,11 @@ from zstep_worker.kernels_sm120.b12x_dsv41 import (  # noqa: E402
     _CUTLASS_LARGE_M_THRESHOLDS,
     _MHC_STATE_BY_DEV,
     _compute_b12x_source_fingerprint,
+    _compute_mhc_split_cap,
     _prepare_sm12x_mega_gate,
     _slice_arena_for_specs,
     _specs_nbytes,
+    _wrap_mhc_forward_join,
     close_b12x_dsv41_model,
     flush_sm120_mhc_before_ar,
     is_sm120_dsa_decode_available,
@@ -83,7 +85,18 @@ def test_close_b12x_dsv41_model_is_idempotent() -> None:
     plain._b12x_scratch_arenas = (torch.zeros(4), {})  # type: ignore[attr-defined]
     plain._sm120_mega_gate_state = object()  # type: ignore[attr-defined]
     plain._sm120_mhc_dev = 77  # type: ignore[attr-defined]
-    _MHC_STATE_BY_DEV[77] = types.SimpleNamespace(deferred=None)
+    flushed: list[object] = []
+
+    def _fake_flush(stream: object) -> None:
+        flushed.append(stream)
+        _MHC_STATE_BY_DEV[77].deferred = None
+
+    _MHC_STATE_BY_DEV[77] = types.SimpleNamespace(
+        dev=torch.device("cpu"),
+        deferred=("pending_sinkhorn",),
+        pending=False,
+        flush=_fake_flush,
+    )
 
     fake_dsa_api = types.ModuleType("flashinfer.experimental.sm120_dsa_indexer._api")
     fake_dsa_api._LOGITS = {0: torch.zeros(4)}  # type: ignore[attr-defined]
@@ -95,6 +108,12 @@ def test_close_b12x_dsv41_model_is_idempotent() -> None:
     try:
         flush_sm120_mhc_before_ar(None)
         flush_sm120_mhc_before_ar(77)
+        assert len(flushed) == 1
+        assert _MHC_STATE_BY_DEV[77].deferred is None
+        # Second flush with `deferred=None` is a no-op.
+        flush_sm120_mhc_before_ar(77)
+        assert len(flushed) == 1
+
         close_b12x_dsv41_model(plain)
         assert sess.close_calls == 1
         assert getattr(plain, "_b12x_session", None) is None
@@ -115,6 +134,69 @@ def test_close_b12x_dsv41_model_is_idempotent() -> None:
             sys.modules.pop(mod_key, None)
         else:
             sys.modules[mod_key] = prev_mod
+
+
+def test_mhc_multi_model_owner_refcount_and_forward_join_guard() -> None:
+    assert _compute_mhc_split_cap(lambda _k, n: 16 if n <= 2500 else 2, 4096) == 40000
+
+    target = torch.nn.Linear(4, 4, bias=False)
+    draft = torch.nn.Linear(4, 4, bias=False)
+    dev_idx = 78
+    join_flushes: list[int] = []
+
+    def _fake_flush(_stream: object) -> None:
+        join_flushes.append(1)
+        _MHC_STATE_BY_DEV[dev_idx].deferred = None
+        _MHC_STATE_BY_DEV[dev_idx].pending = True
+
+    _MHC_STATE_BY_DEV[dev_idx] = types.SimpleNamespace(
+        dev=torch.device("cpu"),
+        mhc_stream=None,
+        deferred=None,
+        pending=False,
+        flush=_fake_flush,
+        owners={id(target), id(draft)},
+    )
+    target._sm120_mhc_dev = dev_idx  # type: ignore[attr-defined]
+    draft._sm120_mhc_dev = dev_idx  # type: ignore[attr-defined]
+    _wrap_mhc_forward_join(target, dev_idx)
+    _wrap_mhc_forward_join(draft, dev_idx)
+    try:
+        # Normal forward exit flushes/joins any residual `deferred` / `pending` state.
+        _MHC_STATE_BY_DEV[dev_idx].deferred = ("unflushed_tail",)
+        _ = target(torch.zeros(2, 4))
+        assert join_flushes == [1]
+        assert _MHC_STATE_BY_DEV[dev_idx].deferred is None
+        assert _MHC_STATE_BY_DEV[dev_idx].pending is False
+
+        # Exception mid-forward clears `deferred` and `pending` without re-flushing stale args.
+        class _BoomMod(torch.nn.Module):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                _MHC_STATE_BY_DEV[dev_idx].deferred = ("stale_on_err",)
+                _MHC_STATE_BY_DEV[dev_idx].pending = True
+                raise RuntimeError("boom")
+
+        boom = _BoomMod()
+        _wrap_mhc_forward_join(boom, dev_idx)
+        with pytest.raises(RuntimeError, match="boom"):
+            boom(torch.zeros(2, 4))
+        assert _MHC_STATE_BY_DEV[dev_idx].deferred is None
+        assert _MHC_STATE_BY_DEV[dev_idx].pending is False
+        assert join_flushes == [1]
+
+        # Closing `draft` keeps `_MHC_STATE_BY_DEV[dev_idx]` alive for `target`.
+        close_b12x_dsv41_model(draft)
+        assert getattr(draft, "_sm120_mhc_dev", None) is None
+        assert not getattr(draft, "_zstep_sm120_mhc_fwd_wrapped", False)
+        assert dev_idx in _MHC_STATE_BY_DEV
+
+        # Closing last owner `target` evicts `_MHC_STATE_BY_DEV[dev_idx]`.
+        close_b12x_dsv41_model(target)
+        assert getattr(target, "_sm120_mhc_dev", None) is None
+        assert not getattr(target, "_zstep_sm120_mhc_fwd_wrapped", False)
+        assert dev_idx not in _MHC_STATE_BY_DEV
+    finally:
+        _MHC_STATE_BY_DEV.pop(dev_idx, None)
 
 
 def test_sm120_summary_defaults_and_env_gating(monkeypatch: pytest.MonkeyPatch) -> None:
