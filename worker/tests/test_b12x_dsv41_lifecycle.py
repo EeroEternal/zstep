@@ -16,11 +16,13 @@ from zstep_worker.kernels_sm120.b12x_dsv41 import (  # noqa: E402
     SM120_DSA_CANDIDATE_COVER_TOKENS,
     B12xPrepareSummary,
     _CUTLASS_LARGE_M_THRESHOLDS,
+    _MHC_STATE_BY_DEV,
     _compute_b12x_source_fingerprint,
     _prepare_sm12x_mega_gate,
     _slice_arena_for_specs,
     _specs_nbytes,
     close_b12x_dsv41_model,
+    flush_sm120_mhc_before_ar,
     is_sm120_dsa_decode_available,
     maybe_enable_b12x_for_dsv41,
 )
@@ -80,6 +82,8 @@ def test_close_b12x_dsv41_model_is_idempotent() -> None:
     plain._b12x_session = sess  # type: ignore[attr-defined]
     plain._b12x_scratch_arenas = (torch.zeros(4), {})  # type: ignore[attr-defined]
     plain._sm120_mega_gate_state = object()  # type: ignore[attr-defined]
+    plain._sm120_mhc_dev = 77  # type: ignore[attr-defined]
+    _MHC_STATE_BY_DEV[77] = types.SimpleNamespace(deferred=None)
 
     fake_dsa_api = types.ModuleType("flashinfer.experimental.sm120_dsa_indexer._api")
     fake_dsa_api._LOGITS = {0: torch.zeros(4)}  # type: ignore[attr-defined]
@@ -89,11 +93,15 @@ def test_close_b12x_dsv41_model_is_idempotent() -> None:
     prev_mod = sys.modules.get(mod_key)
     sys.modules[mod_key] = fake_dsa_api
     try:
+        flush_sm120_mhc_before_ar(None)
+        flush_sm120_mhc_before_ar(77)
         close_b12x_dsv41_model(plain)
         assert sess.close_calls == 1
         assert getattr(plain, "_b12x_session", None) is None
         assert getattr(plain, "_b12x_scratch_arenas", None) is None
         assert getattr(plain, "_sm120_mega_gate_state", None) is None
+        assert getattr(plain, "_sm120_mhc_dev", None) is None
+        assert 77 not in _MHC_STATE_BY_DEV
         assert fake_dsa_api._LOGITS == {}
         assert fake_dsa_api._LONG_WS == {}
         assert fake_dsa_api._RETIRED == []
@@ -102,6 +110,7 @@ def test_close_b12x_dsv41_model_is_idempotent() -> None:
         close_b12x_dsv41_model(plain)
         assert sess.close_calls == 1
     finally:
+        _MHC_STATE_BY_DEV.pop(77, None)
         if prev_mod is None:
             sys.modules.pop(mod_key, None)
         else:

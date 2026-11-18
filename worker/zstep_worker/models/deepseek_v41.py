@@ -46,6 +46,7 @@ from zstep_worker.kernels_sm120.b12x_dsv41 import (
     SM120_DSA_CANDIDATE_COVER_TOKENS,
     B12xPrepareSummary,
     close_b12x_dsv41_model,
+    flush_sm120_mhc_before_ar,
     install_b12x_dsv41_quant_patches,
     install_sm120_dsa_indexer_patches,
     is_sm120_dsa_decode_available,
@@ -547,10 +548,11 @@ class DeepSeekV41StepRunner:
             rank=rank,
             world_size=self.world_size,
             capacity_input_elements=ar_max_tokens * 4096,
-            blocks=allreduce_blocks,
-            threads=allreduce_threads,
+            blocks=pxb_ar_blocks,
+            threads=pxb_ar_threads,
             exchange_group=self.exchange_group,
         )
+        self.shm_ag.attach_pxb_ipc(self.shm_ar)
         self.argmax_channel: HostMappedShmArgmax = HostMappedShmArgmax(
             name=f"{allreduce_name}_argmax",
             rank=rank,
@@ -805,7 +807,9 @@ class DeepSeekV41StepRunner:
         shm_max_ar_numel = int(
             os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(default_ar_rows * 5120))
         )
-        default_ag_elems = 64 * 3200 if shm_ar.pxb_enabled else 1024 * 4096
+        default_ag_elems = (
+            min(self.max_step_tokens, 3072) * 3200 if shm_ar.pxb_enabled else 1024 * 4096
+        )
         shm_max_ag_numel = int(
             os.environ.get("ZSTEP_SHM_MAX_AG_NUMEL", str(default_ag_elems))
         )
@@ -813,6 +817,7 @@ class DeepSeekV41StepRunner:
         tp_group.use_custom_op_call = False
 
         def _fast_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+            flush_sm120_mhc_before_ar(runner.device.index)
             numel = input_.numel()
             capturing = torch.cuda.is_current_stream_capturing()
             if (

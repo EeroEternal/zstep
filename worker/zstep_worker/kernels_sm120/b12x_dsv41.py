@@ -1628,6 +1628,261 @@ def _prepare_sm12x_mega_gate(
     return len(eligible), len(specs_to_compile), min_tokens
 
 
+_MHC_STATE_BY_DEV: dict[int, Any] = {}
+
+
+def flush_sm120_mhc_before_ar(device_idx: int | None) -> None:
+    """Flush any deferred `n > 256` mHC Sinkhorn projection into the `shm_ar` window."""
+    s = _MHC_STATE_BY_DEV.get(0 if device_idx is None else device_idx)
+    if s is not None and s.deferred is not None:
+        s.flush(torch.cuda.current_stream(s.dev))
+
+
+def _prepare_sm120_mhc_overlap(
+    model: torch.nn.Module, *, device: torch.device, max_tokens: int
+) -> None:
+    """Install 1-pass in-place SM120 mHC post+collapse+RMSNorm and side-stream Sinkhorn overlap."""
+    if not (
+        _env_flag("ZSTEP_ENABLE_SM120_MHC_OVERLAP", default=True)
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability() == (12, 0)
+    ):
+        return
+    try:
+        from vllm.forward_context import in_piecewise_cudagraph
+        from vllm.model_executor.kernels.mhc.warmup import compute_mhc_pre_num_splits
+        from vllm.models.deepseek_v41.nvidia import model as dsv41_model
+        from vllm.models.deepseek_v41.nvidia.ops import mhc as dsv41_mhc
+        from vllm.utils.deep_gemm import is_deep_gemm_supported, tf32_hc_prenorm_gemm
+        from zstep_worker.kernels_sm120.shm_allreduce import (
+            get_host_mapped_allreduce_extension,
+        )
+    except ImportError:
+        return
+    if not is_deep_gemm_supported():
+        return
+
+    cap = max(int(max_tokens), 8192)
+    dev_idx = 0 if device.index is None else int(device.index)
+    mcap = max(32768, cap)
+    f32 = {"dtype": torch.float32, "device": device}
+    st = types.SimpleNamespace(
+        dev=device,
+        mhc_stream=torch.cuda.Stream(device=device),
+        mix_flat=torch.empty((mcap * 24,), **f32),
+        sqr_flat=torch.empty((mcap,), **f32),
+        empty_aux=torch.empty((0, 5120), dtype=torch.bfloat16, device=device),
+        post_buf=(torch.empty((cap, 4, 1), **f32), torch.empty((cap, 4, 1), **f32)),
+        comb_buf=(torch.empty((cap, 4, 4), **f32), torch.empty((cap, 4, 4), **f32)),
+        pre_buf=(torch.empty((cap, 4), **f32), torch.empty((cap, 4), **f32)),
+        cap=cap,
+        slot=0,
+        pending=False,
+        deferred=None,
+        ext=None,
+    )
+
+    def _flush(main_s: torch.cuda.Stream) -> None:
+        if st.deferred is not None:
+            (
+                n,
+                res,
+                fn,
+                hc_scale,
+                hc_base,
+                np_,
+                nc,
+                npr,
+                r_eps,
+                pre_eps,
+                sk_eps,
+                p_mult,
+                sk_rep,
+            ) = st.deferred
+            st.deferred = None
+            splits = compute_mhc_pre_num_splits(20480, n)
+            mix_v = st.mix_flat[: splits * n * 24].view(splits, n, 24)
+            sqr_v = st.sqr_flat[: splits * n].view(splits, n)
+            st.mhc_stream.wait_stream(main_s)
+            with torch.cuda.stream(st.mhc_stream):
+                tf32_hc_prenorm_gemm(res.view(n, 20480), fn, mix_v, sqr_v, splits)
+                st.ext.launch_mhc_sinkhorn_stats(
+                    mix_v,
+                    sqr_v,
+                    hc_scale,
+                    hc_base,
+                    np_.view(n, 4),
+                    nc.view(n, 16),
+                    npr,
+                    20480,
+                    r_eps,
+                    pre_eps,
+                    sk_eps,
+                    p_mult,
+                    sk_rep,
+                    1,
+                    st.mhc_stream.cuda_stream,
+                )
+            st.pending = True
+
+    st.flush = _flush
+    _MHC_STATE_BY_DEV[dev_idx] = st
+    model._sm120_mhc_dev = dev_idx  # type: ignore[attr-defined]
+    if getattr(dsv41_model, "_zstep_sm120_mhc_patched", False):
+        return
+    orig_post = dsv41_model.mhc_post_tilelang
+    orig_shifted = dsv41_model.mhc_shifted_post_pre
+
+    def _sync_in(s: Any, main_s: torch.cuda.Stream) -> None:
+        if s.deferred is not None:
+            s.flush(main_s)
+        if s.pending:
+            main_s.wait_stream(s.mhc_stream)
+            s.pending = False
+
+    def _patched_post(x, residual, post_layer_mix, comb_res_mix):
+        s = _MHC_STATE_BY_DEV.get(residual.device.index)
+        if s is not None:
+            main_s = torch.cuda.current_stream(residual.device)
+            _sync_in(s, main_s)
+            if (
+                residual.shape[1:] == (4, 5120)
+                and x.shape == (residual.shape[0], 5120)
+                and all(
+                    t.is_contiguous()
+                    for t in (x, residual, post_layer_mix, comb_res_mix)
+                )
+            ):
+                if residual.shape[0] > 0:
+                    s.ext = s.ext or get_host_mapped_allreduce_extension()
+                    s.ext.launch_mhc_post_collapse_rmsnorm(
+                        x,
+                        residual,
+                        post_layer_mix,
+                        comb_res_mix,
+                        post_layer_mix,
+                        s.empty_aux,
+                        s.empty_aux,
+                        s.empty_aux,
+                        1e-6,
+                        0,
+                        1,
+                        main_s.cuda_stream,
+                    )
+                return residual
+        return orig_post(x, residual, post_layer_mix, comb_res_mix)
+
+    def _patched_shifted(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        pre_mix=None,
+        norm_weight=None,
+        norm_eps=1e-6,
+        capture_aux=False,
+        *,
+        stream=None,
+        reduce_results=False,
+    ):
+        s = _MHC_STATE_BY_DEV.get(residual.device.index)
+        if s is not None:
+            _sync_in(s, torch.cuda.current_stream(residual.device))
+        if (
+            s is not None
+            and isinstance(x, torch.Tensor)
+            and not reduce_results
+            and stream is None
+            and pre_mix is not None
+            and norm_weight is not None
+            and fn.shape == (24, 20480)
+            and residual.shape[1:] == (4, 5120)
+            and x.shape == (residual.shape[0], 5120)
+            and 0 < residual.shape[0] <= s.cap
+            and not in_piecewise_cudagraph()
+            and all(
+                t.is_contiguous()
+                for t in (x, residual, post_layer_mix, comb_res_mix, pre_mix, norm_weight)
+            )
+        ):
+            s.ext = s.ext or get_host_mapped_allreduce_extension()
+            n = int(x.shape[0])
+            main_s = torch.cuda.current_stream(residual.device)
+            layer_in = torch.empty(
+                (n, 5120), dtype=torch.bfloat16, device=residual.device
+            )
+            aux = torch.empty_like(layer_in) if capture_aux else s.empty_aux
+            s.ext.launch_mhc_post_collapse_rmsnorm(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                pre_mix,
+                norm_weight,
+                layer_in,
+                aux,
+                float(norm_eps),
+                1 if capture_aux else 0,
+                0,
+                main_s.cuda_stream,
+            )
+            p, s.slot = s.slot, s.slot ^ 1
+            next_post = s.post_buf[p][:n]
+            next_comb = s.comb_buf[p][:n]
+            next_pre = s.pre_buf[p][:n]
+            s.deferred = (
+                n,
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                next_post,
+                next_comb,
+                next_pre,
+                float(rms_eps),
+                float(hc_pre_eps),
+                float(hc_sinkhorn_eps),
+                float(hc_post_mult_value),
+                int(sinkhorn_repeat),
+            )
+            if n <= 256:
+                s.flush(main_s)
+            return residual, next_post, next_comb, layer_in, next_pre, aux
+        return orig_shifted(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            pre_mix=pre_mix,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            capture_aux=capture_aux,
+            stream=stream,
+            reduce_results=reduce_results,
+        )
+
+    dsv41_model.mhc_post_tilelang = _patched_post
+    dsv41_model.mhc_shifted_post_pre = _patched_shifted
+    dsv41_mhc.mhc_shifted_post_pre = _patched_shifted
+    dsv41_model._zstep_sm120_mhc_patched = True
+
+
 def prepare_b12x_dsv41_model(
     model: torch.nn.Module,
     *,
@@ -1639,6 +1894,7 @@ def prepare_b12x_dsv41_model(
 ) -> B12xPrepareSummary:
     """Compile/autotune all SM120 `b12x`, `sm12x_mega_gate` & `sm120_dsa_indexer` plans (rank 0 first)."""
     t0 = time.perf_counter()
+    _prepare_sm120_mhc_overlap(model, device=device, max_tokens=max_tokens)
     dsa_enabled = _prepare_sm120_dsa_indexer(
         rank=rank,
         device=device,
@@ -2042,6 +2298,9 @@ def close_b12x_dsv41_model(model: torch.nn.Module | None) -> None:
             model._b12x_scratch_arenas = None  # type: ignore[attr-defined]
         if hasattr(model, "_sm120_mega_gate_state"):
             model._sm120_mega_gate_state = None  # type: ignore[attr-defined]
+        if getattr(model, "_sm120_mhc_dev", None) is not None:
+            _MHC_STATE_BY_DEV.pop(model._sm120_mhc_dev, None)  # type: ignore[attr-defined]
+            model._sm120_mhc_dev = None  # type: ignore[attr-defined]
 
     dsa_api = sys.modules.get("flashinfer.experimental.sm120_dsa_indexer._api")
     if dsa_api is not None:

@@ -126,6 +126,8 @@ void launch_shm_v5_allgather_cuda(
     void* output_ptr,
     uint64_t* control_ptr,
     const std::uintptr_t* rank_shm_dev_ptrs,
+    std::uintptr_t my_hbm_ptr,
+    std::uintptr_t pt_hbm_ptr,
     int64_t slot_stride_bytes,
     int64_t outer_rows,
     int64_t vecs_per_row,
@@ -133,6 +135,38 @@ void launch_shm_v5_allgather_cuda(
     int world_size,
     int blocks,
     int threads,
+    std::uintptr_t stream_handle);
+void launch_mhc_post_collapse_rmsnorm_cuda(
+    const void* x_ptr,
+    void* residual_ptr,
+    const float* post_mix_ptr,
+    const float* comb_mix_ptr,
+    const float* pre_mix_ptr,
+    const void* norm_weight_ptr,
+    void* layer_input_ptr,
+    void* aux_out_ptr,
+    int num_tokens,
+    float norm_eps,
+    int write_aux,
+    int post_only,
+    std::uintptr_t stream_handle);
+void launch_mhc_sinkhorn_stats_cuda(
+    const float* gemm_mul_ptr,
+    const float* gemm_sqr_ptr,
+    const float* hc_scale_ptr,
+    const float* hc_base_ptr,
+    float* post_mix_ptr,
+    float* comb_mix_ptr,
+    float* pre_mix_out_ptr,
+    int num_tokens,
+    int n_splits,
+    float inv_rms_numel,
+    float rms_eps,
+    float hc_pre_eps,
+    float hc_sinkhorn_eps,
+    float hc_post_mult,
+    int sinkhorn_repeat,
+    int save_pre_mix,
     std::uintptr_t stream_handle);
 
 void launch_local_top2_bf16_cuda(
@@ -353,8 +387,9 @@ void launch_shm_v5_pxb_allreduce_add_rmsnorm(
     TORCH_CHECK(input.numel() * 2 <= slot_stride_bytes / 2, "input exceeds SHM slot capacity");
     const int64_t vecs_per_row = hidden / 8;
     TORCH_CHECK(vecs_per_row <= 1536, "hidden exceeds 3-iter epilogue limit (12288)");
-    if (rows < blocks) {
-        TORCH_CHECK(blocks % rows == 0, "rows < blocks requires blocks % rows == 0");
+    const int64_t eff_blocks = (my_hbm_ptr != 0 && blocks == 32 && rows * vecs_per_row <= 40960) ? 8 : blocks;
+    if (rows < eff_blocks) {
+        TORCH_CHECK(eff_blocks % rows == 0, "rows < blocks requires blocks % rows == 0");
     }
     if (rows * vecs_per_row > one_shot_max_vecs) {
         TORCH_CHECK(
@@ -433,6 +468,8 @@ void launch_shm_v5_allgather(
     torch::Tensor output,
     torch::Tensor control,
     torch::Tensor rank_shm_ptrs_u64,
+    std::uintptr_t my_hbm_ptr,
+    std::uintptr_t pt_hbm_ptr,
     int64_t slot_stride_bytes,
     int64_t outer_rows,
     int64_t vecs_per_row,
@@ -454,6 +491,8 @@ void launch_shm_v5_allgather(
         output.data_ptr(),
         reinterpret_cast<uint64_t*>(control.data_ptr<int64_t>()),
         reinterpret_cast<const std::uintptr_t*>(rank_shm_ptrs_u64.data_ptr<int64_t>()),
+        my_hbm_ptr,
+        pt_hbm_ptr,
         slot_stride_bytes,
         outer_rows,
         vecs_per_row,
@@ -461,6 +500,70 @@ void launch_shm_v5_allgather(
         static_cast<int>(world_size),
         static_cast<int>(blocks),
         static_cast<int>(threads),
+        stream_handle);
+}
+void launch_mhc_post_collapse_rmsnorm(
+    torch::Tensor x,
+    torch::Tensor residual,
+    torch::Tensor post_mix,
+    torch::Tensor comb_mix,
+    torch::Tensor pre_mix,
+    torch::Tensor norm_weight,
+    torch::Tensor layer_input,
+    torch::Tensor aux_out,
+    double norm_eps,
+    int64_t write_aux,
+    int64_t post_only,
+    std::uintptr_t stream_handle) {
+    launch_mhc_post_collapse_rmsnorm_cuda(
+        x.data_ptr(),
+        residual.data_ptr(),
+        post_mix.data_ptr<float>(),
+        comb_mix.data_ptr<float>(),
+        pre_mix.data_ptr<float>(),
+        post_only ? nullptr : norm_weight.data_ptr(),
+        post_only ? nullptr : layer_input.data_ptr(),
+        write_aux ? aux_out.data_ptr() : nullptr,
+        static_cast<int>(x.size(0)),
+        static_cast<float>(norm_eps),
+        static_cast<int>(write_aux),
+        static_cast<int>(post_only),
+        stream_handle);
+}
+
+void launch_mhc_sinkhorn_stats(
+    torch::Tensor gemm_mul,
+    torch::Tensor gemm_sqr,
+    torch::Tensor hc_scale,
+    torch::Tensor hc_base,
+    torch::Tensor post_mix,
+    torch::Tensor comb_mix,
+    torch::Tensor pre_mix_out,
+    int64_t rms_numel,
+    double rms_eps,
+    double hc_pre_eps,
+    double hc_sinkhorn_eps,
+    double hc_post_mult,
+    int64_t sinkhorn_repeat,
+    int64_t save_pre_mix,
+    std::uintptr_t stream_handle) {
+    launch_mhc_sinkhorn_stats_cuda(
+        gemm_mul.data_ptr<float>(),
+        gemm_sqr.data_ptr<float>(),
+        hc_scale.data_ptr<float>(),
+        hc_base.data_ptr<float>(),
+        post_mix.data_ptr<float>(),
+        comb_mix.data_ptr<float>(),
+        pre_mix_out.data_ptr<float>(),
+        static_cast<int>(gemm_mul.size(1)),
+        static_cast<int>(gemm_mul.size(0)),
+        1.0f / static_cast<float>(rms_numel),
+        static_cast<float>(rms_eps),
+        static_cast<float>(hc_pre_eps),
+        static_cast<float>(hc_sinkhorn_eps),
+        static_cast<float>(hc_post_mult),
+        static_cast<int>(sinkhorn_repeat),
+        static_cast<int>(save_pre_mix),
         stream_handle);
 }
 
@@ -560,7 +663,7 @@ constexpr int kNumRingSlots = 4;
 constexpr int kMaxRanks = 8;
 constexpr int kOneShotMaxVecsLegacy = 1024;
 constexpr int kPxbOneShotMinVecs = 1024;
-constexpr int kPxbTwoShotMinVecs = 8192;
+constexpr int kPxbTwoShotMinVecs = 4097;
 constexpr int64_t kShmV5AbortOffset = 98304;
 constexpr int64_t kArgmaxAbortOffset = 128;
 // ~90 seconds at 2.5 GHz boost clock; checked only every 4096 spin iterations.
@@ -619,6 +722,7 @@ __device__ __forceinline__ void st_wt_uint4(uint4* addr, uint4 v) {
 union Pack128Bf16 {
     uint4 u4;
     __nv_bfloat162 pairs[4];
+    __nv_bfloat16 elems[8];
 };
 
 __device__ __forceinline__ void load_peer_vecs(
@@ -2284,11 +2388,19 @@ __global__ __cluster_dims__(8, 1, 1) __launch_bounds__(256, 1) void shm_v5_ar_ad
 
 // 1-shot NUMA-local SHM AllGather for `[outer_rows, vecs_per_row * 8]` ->
 // `[outer_rows, world_size * vecs_per_row * 8]` BF16 tensors (handles dim=0 and dim>=1).
-__global__ void shm_v5_allgather_kernel(
+__device__ __forceinline__ void write_ag_out(
+    uint4* out, int64_t outer_rows, int64_t vpr, int p, int64_t idx, uint4 v) {
+    const int64_t row = (outer_rows == 1) ? 0 : (idx / vpr);
+    out[(outer_rows == 1) ? (static_cast<int64_t>(p) * vpr + idx) : ((row * 8 + p) * vpr + (idx - row * vpr))] = v;
+}
+
+__global__ __launch_bounds__(512, 2) void shm_v5_allgather_kernel(
     const uint4* __restrict__ input_vec,
     uint4* __restrict__ output_vec,
     uint64_t* __restrict__ control,
     char* const* __restrict__ rank_shm,
+    char* __restrict__ my_hbm,
+    char* __restrict__ pt_hbm,
     int64_t slot_stride_bytes,
     int64_t outer_rows,
     int64_t vecs_per_row,
@@ -2333,6 +2445,107 @@ __global__ void shm_v5_allgather_kernel(
     }
 
     uint4* my_in = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes);
+    // CX8 PXB partner-relayed AllGather (`[98368..116800)` dedicated header flags):
+    // Cuts per-GPU Host-SHM reads across shared PCIe Gen5 x16 switch uplink from 7*B to 3*B (-57.1%).
+    if (my_hbm != nullptr && pt_hbm != nullptr && world_size == 8) {
+        if (threadIdx.x == 0) {
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 98368 + b * 64), step);
+            if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + 98368 + b * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) return;
+
+        const int parity = rank & 1, pair_id = rank >> 1, pt_r = rank ^ 1;
+        uint4* pt_buf = reinterpret_cast<uint4*>(pt_hbm + 131072);
+        const uint4* my_buf = reinterpret_cast<const uint4*>(my_hbm + 131072);
+        for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
+            const uint4 v = input_vec[idx];
+            st_wt_uint4(my_in + idx, v);
+            st_wt_uint4(pt_buf + idx, v);
+            write_ag_out(output_vec, outer_rows, vecs_per_row, rank, idx, v);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 102464 + b * 64), step);
+            if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + 102464 + b * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        } else if (threadIdx.x <= 3) {
+            const int dst_r = ((pair_id + threadIdx.x) & 3) * 2 + parity;
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(s_peer_shm[dst_r] + (b * 8 + rank) * 64), step);
+        }
+        __syncthreads();
+        if (s_aborted) return;
+
+        for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
+            write_ag_out(output_vec, outer_rows, vecs_per_row, pt_r, idx, ld_cv_uint4(my_buf + idx));
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 106560 + b * 64), step);
+            if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + 106560 + b * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        } else if (threadIdx.x <= 3) {
+            const int src_r = ((pair_id + threadIdx.x) & 3) * 2 + parity;
+            if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_shm + (b * 8 + src_r) * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) return;
+
+        const int r1 = ((pair_id + 1) & 3) * 2 + parity;
+        const int r2 = ((pair_id + 2) & 3) * 2 + parity;
+        const int r3 = ((pair_id + 3) & 3) * 2 + parity;
+        const uint4* s1 = reinterpret_cast<const uint4*>(s_peer_shm[r1] + 131072 + slot * slot_stride_bytes);
+        const uint4* s2 = reinterpret_cast<const uint4*>(s_peer_shm[r2] + 131072 + slot * slot_stride_bytes);
+        const uint4* s3 = reinterpret_cast<const uint4*>(s_peer_shm[r3] + 131072 + slot * slot_stride_bytes);
+        for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
+            const uint4 v1 = ld_cv_uint4(s1 + idx);
+            const uint4 v2 = ld_cv_uint4(s2 + idx);
+            const uint4 v3 = ld_cv_uint4(s3 + idx);
+            st_wt_uint4(pt_buf + idx, v1);
+            st_wt_uint4(pt_buf + num_in_vecs + idx, v2);
+            st_wt_uint4(pt_buf + 2 * num_in_vecs + idx, v3);
+            write_ag_out(output_vec, outer_rows, vecs_per_row, r1, idx, v1);
+            write_ag_out(output_vec, outer_rows, vecs_per_row, r2, idx, v2);
+            write_ag_out(output_vec, outer_rows, vecs_per_row, r3, idx, v3);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 110656 + b * 64), step);
+            if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + 110656 + b * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) return;
+
+        for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
+            write_ag_out(output_vec, outer_rows, vecs_per_row, r1 ^ 1, idx, ld_cv_uint4(my_buf + idx));
+            write_ag_out(output_vec, outer_rows, vecs_per_row, r2 ^ 1, idx, ld_cv_uint4(my_buf + num_in_vecs + idx));
+            write_ag_out(output_vec, outer_rows, vecs_per_row, r3 ^ 1, idx, ld_cv_uint4(my_buf + 2 * num_in_vecs + idx));
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 114752 + b * 64), step);
+            if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + 114752 + b * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        if (threadIdx.x < 8) {
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(s_peer_shm[threadIdx.x] + 65536 + (b * 8 + rank) * 64), step);
+        }
+        return;
+    }
     for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
         st_wt_uint4(my_in + idx, input_vec[idx]);
     }
@@ -2385,6 +2598,154 @@ __global__ void shm_v5_allgather_kernel(
     }
 }
 
+// 1-pass register-fused SM120 mHC post + stream collapse + RMSNorm (`640` threads = `5120` cols,
+// updating `residual` in-place to save a 2nd 4*5120 HBM pass and 160 MiB peak HBM at M=4096).
+__global__ __launch_bounds__(640, 2) void sm120_mhc_post_collapse_rmsnorm_kernel(
+    const uint4* __restrict__ x_vec,
+    uint4* __restrict__ res_vec,
+    const float* __restrict__ post_mix,
+    const float* __restrict__ comb_mix,
+    const float* __restrict__ pre_mix,
+    const uint4* __restrict__ norm_weight_vec,
+    uint4* __restrict__ layer_input_vec,
+    uint4* __restrict__ aux_out_vec,
+    float norm_eps,
+    int write_aux,
+    int post_only) {
+    const int tok = blockIdx.x, tid = threadIdx.x;
+    __shared__ float s_post[4], s_comb[16], s_pre[4], s_warp_sq[20], s_inv_rms;
+    if (tid < 4) {
+        s_post[tid] = post_mix[tok * 4 + tid];
+        if (!post_only) s_pre[tid] = pre_mix[tok * 4 + tid];
+    }
+    if (tid < 16) s_comb[tid] = comb_mix[tok * 16 + tid];
+    __syncthreads();
+
+    const int64_t base_x = static_cast<int64_t>(tok) * 640 + tid;
+    const int64_t base_r = static_cast<int64_t>(tok) * 2560 + tid;
+    Pack128Bf16 dx, b0, b1, b2, b3, nr0, nr1, nr2, nr3, aux_pack, w_pack, out_pack;
+    dx.u4 = x_vec[base_x];
+    b0.u4 = res_vec[base_r];
+    b1.u4 = res_vec[base_r + 640];
+    b2.u4 = res_vec[base_r + 1280];
+    b3.u4 = res_vec[base_r + 1920];
+    float collapsed[8], thread_sq = 0.0f;
+
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const float df = __bfloat162float(dx.elems[e]);
+        const float r0 = __bfloat162float(b0.elems[e]), r1 = __bfloat162float(b1.elems[e]);
+        const float r2 = __bfloat162float(b2.elems[e]), r3 = __bfloat162float(b3.elems[e]);
+        const __nv_bfloat16 o0 = __float2bfloat16_rn(s_post[0] * df + s_comb[0] * r0 + s_comb[4] * r1 + s_comb[8] * r2 + s_comb[12] * r3);
+        const __nv_bfloat16 o1 = __float2bfloat16_rn(s_post[1] * df + s_comb[1] * r0 + s_comb[5] * r1 + s_comb[9] * r2 + s_comb[13] * r3);
+        const __nv_bfloat16 o2 = __float2bfloat16_rn(s_post[2] * df + s_comb[2] * r0 + s_comb[6] * r1 + s_comb[10] * r2 + s_comb[14] * r3);
+        const __nv_bfloat16 o3 = __float2bfloat16_rn(s_post[3] * df + s_comb[3] * r0 + s_comb[7] * r1 + s_comb[11] * r2 + s_comb[15] * r3);
+        nr0.elems[e] = o0;
+        nr1.elems[e] = o1;
+        nr2.elems[e] = o2;
+        nr3.elems[e] = o3;
+        if (!post_only) {
+            const float x0 = __bfloat162float(o0), x1 = __bfloat162float(o1);
+            const float x2 = __bfloat162float(o2), x3 = __bfloat162float(o3);
+            if (write_aux) {
+                aux_pack.elems[e] = __float2bfloat16_rn((x0 + x1 + x2 + x3) * 0.25f);
+            }
+            const float val = __bfloat162float(
+                __float2bfloat16_rn(s_pre[0] * x0 + s_pre[1] * x1 + s_pre[2] * x2 + s_pre[3] * x3));
+            collapsed[e] = val;
+            thread_sq += val * val;
+        }
+    }
+    res_vec[base_r] = nr0.u4;
+    res_vec[base_r + 640] = nr1.u4;
+    res_vec[base_r + 1280] = nr2.u4;
+    res_vec[base_r + 1920] = nr3.u4;
+    if (post_only) return;
+    if (write_aux) aux_out_vec[base_x] = aux_pack.u4;
+
+    const float w_sq = warp_reduce_sum(thread_sq);
+    const int warp_id = tid >> 5, lane = tid & 31;
+    if (lane == 0) s_warp_sq[warp_id] = w_sq;
+    __syncthreads();
+    if (warp_id == 0) {
+        float acc = warp_reduce_sum((lane < 20) ? s_warp_sq[lane] : 0.0f);
+        if (lane == 0) s_inv_rms = rsqrtf(acc * (1.0f / 5120.0f) + norm_eps);
+    }
+    __syncthreads();
+
+    w_pack.u4 = norm_weight_vec[tid];
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        out_pack.elems[e] = __float2bfloat16_rn(collapsed[e] * s_inv_rms * __bfloat162float(w_pack.elems[e]));
+    }
+    layer_input_vec[base_x] = out_pack.u4;
+}
+
+// 4-token-per-CTA 16-lane warp-shuffle 4x4 Sinkhorn coefficient generator for SM120 mHC overlap.
+__global__ __launch_bounds__(128, 8) void sm120_mhc_sinkhorn_stats_kernel(
+    const float* __restrict__ gemm_mul,
+    const float* __restrict__ gemm_sqr,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    float* __restrict__ post_mix,
+    float* __restrict__ comb_mix,
+    float* __restrict__ pre_mix_out,
+    int num_tokens,
+    int n_splits,
+    float inv_rms_numel,
+    float rms_eps,
+    float hc_pre_eps,
+    float hc_sinkhorn_eps,
+    float hc_post_mult,
+    int sinkhorn_repeat,
+    int save_pre_mix) {
+    const int lane = threadIdx.x & 31, tok = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (tok >= num_tokens) return;
+    float sq = 0.0f, mix_val = 0.0f;
+    if (lane == 0) {
+        for (int s = 0; s < n_splits; ++s) {
+            sq += gemm_sqr[static_cast<int64_t>(s) * num_tokens + tok];
+        }
+        sq = rsqrtf(sq * inv_rms_numel + rms_eps);
+    }
+    const float rms = __shfl_sync(0xFFFFFFFFU, sq, 0);
+    if (lane < 24) {
+        for (int s = 0; s < n_splits; ++s) {
+            mix_val += gemm_mul[(static_cast<int64_t>(s) * num_tokens + tok) * 24 + lane];
+        }
+        mix_val *= rms;
+    }
+    const float m_post = __shfl_sync(0xFFFFFFFFU, mix_val, (lane < 4) ? (lane + 4) : 0);
+    if (lane < 4) {
+        if (save_pre_mix) {
+            pre_mix_out[tok * 4 + lane] = (1.0f / (1.0f + expf(-(mix_val * hc_scale[0] + hc_base[lane])))) + hc_pre_eps;
+        }
+        post_mix[tok * 4 + lane] = (1.0f / (1.0f + expf(-(m_post * hc_scale[1] + hc_base[lane + 4])))) * hc_post_mult;
+    }
+    const float m_cm = __shfl_sync(0xFFFFFFFFU, mix_val, (lane < 16) ? (lane + 8) : 0);
+    if (lane < 16) {
+        const unsigned m16 = 0x0000FFFFU;
+        float cm = m_cm * hc_scale[2] + hc_base[lane + 8];
+        float rmax = fmaxf(cm, __shfl_xor_sync(m16, cm, 1));
+        rmax = fmaxf(rmax, __shfl_xor_sync(m16, rmax, 2));
+        cm = expf(cm - rmax);
+        float rsum = cm + __shfl_xor_sync(m16, cm, 1);
+        rsum += __shfl_xor_sync(m16, rsum, 2);
+        cm = cm / rsum + hc_sinkhorn_eps;
+        float csum = cm + __shfl_xor_sync(m16, cm, 4);
+        csum += __shfl_xor_sync(m16, csum, 8);
+        cm = cm / (csum + hc_sinkhorn_eps);
+        for (int it = 0; it < sinkhorn_repeat - 1; ++it) {
+            rsum = cm + __shfl_xor_sync(m16, cm, 1);
+            rsum += __shfl_xor_sync(m16, rsum, 2);
+            cm = cm / (rsum + hc_sinkhorn_eps);
+            csum = cm + __shfl_xor_sync(m16, cm, 4);
+            csum += __shfl_xor_sync(m16, csum, 8);
+            cm = cm / (csum + hc_sinkhorn_eps);
+        }
+        comb_mix[tok * 16 + lane] = cm;
+    }
+}
 }  // namespace
 
 std::uintptr_t register_mapped_host_cuda(std::uintptr_t host_address, int64_t bytes) {
@@ -2633,6 +2994,8 @@ void launch_shm_v5_allgather_cuda(
     void* output_ptr,
     uint64_t* control_ptr,
     const std::uintptr_t* rank_shm_dev_ptrs,
+    std::uintptr_t my_hbm_ptr,
+    std::uintptr_t pt_hbm_ptr,
     int64_t slot_stride_bytes,
     int64_t outer_rows,
     int64_t vecs_per_row,
@@ -2644,17 +3007,91 @@ void launch_shm_v5_allgather_cuda(
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     const int64_t num_in_vecs = outer_rows * vecs_per_row;
     const int64_t vecs_per_cta = (num_in_vecs + blocks - 1) / blocks;
-    const int launch_threads = (threads == 256 && vecs_per_cta > 256) ? 512 : threads;
+    const int capped = threads > 512 ? 512 : threads;
+    const int launch_threads = (capped == 256 && vecs_per_cta > 256) ? 512 : capped;
     shm_v5_allgather_kernel<<<blocks, launch_threads, 0, stream>>>(
         reinterpret_cast<const uint4*>(input_ptr),
         reinterpret_cast<uint4*>(output_ptr),
         control_ptr,
         reinterpret_cast<char* const*>(rank_shm_dev_ptrs),
+        reinterpret_cast<char*>(my_hbm_ptr),
+        reinterpret_cast<char*>(pt_hbm_ptr),
         slot_stride_bytes,
         outer_rows,
         vecs_per_row,
         rank,
         world_size);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_mhc_post_collapse_rmsnorm_cuda(
+    const void* x_ptr,
+    void* residual_ptr,
+    const float* post_mix_ptr,
+    const float* comb_mix_ptr,
+    const float* pre_mix_ptr,
+    const void* norm_weight_ptr,
+    void* layer_input_ptr,
+    void* aux_out_ptr,
+    int num_tokens,
+    float norm_eps,
+    int write_aux,
+    int post_only,
+    std::uintptr_t stream_handle) {
+    if (num_tokens <= 0) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    sm120_mhc_post_collapse_rmsnorm_kernel<<<num_tokens, 640, 0, stream>>>(
+        reinterpret_cast<const uint4*>(x_ptr),
+        reinterpret_cast<uint4*>(residual_ptr),
+        post_mix_ptr,
+        comb_mix_ptr,
+        pre_mix_ptr,
+        reinterpret_cast<const uint4*>(norm_weight_ptr),
+        reinterpret_cast<uint4*>(layer_input_ptr),
+        reinterpret_cast<uint4*>(aux_out_ptr),
+        norm_eps,
+        write_aux,
+        post_only);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_mhc_sinkhorn_stats_cuda(
+    const float* gemm_mul_ptr,
+    const float* gemm_sqr_ptr,
+    const float* hc_scale_ptr,
+    const float* hc_base_ptr,
+    float* post_mix_ptr,
+    float* comb_mix_ptr,
+    float* pre_mix_out_ptr,
+    int num_tokens,
+    int n_splits,
+    float inv_rms_numel,
+    float rms_eps,
+    float hc_pre_eps,
+    float hc_sinkhorn_eps,
+    float hc_post_mult,
+    int sinkhorn_repeat,
+    int save_pre_mix,
+    std::uintptr_t stream_handle) {
+    if (num_tokens <= 0) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    sm120_mhc_sinkhorn_stats_kernel<<<(num_tokens + 3) / 4, 128, 0, stream>>>(
+        gemm_mul_ptr,
+        gemm_sqr_ptr,
+        hc_scale_ptr,
+        hc_base_ptr,
+        post_mix_ptr,
+        comb_mix_ptr,
+        pre_mix_out_ptr,
+        num_tokens,
+        n_splits,
+        inv_rms_numel,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult,
+        sinkhorn_repeat,
+        save_pre_mix);
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2889,7 +3326,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v16_ext",
+            name="zstep_shm_allreduce_sm120_v17_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -2905,6 +3342,8 @@ def get_host_mapped_allreduce_extension():
                 "launch_shm_v5_allreduce_add_rmsnorm",
                 "launch_shm_v5_pxb_allreduce_add_rmsnorm",
                 "launch_shm_v5_allgather",
+                "launch_mhc_post_collapse_rmsnorm",
+                "launch_mhc_sinkhorn_stats",
                 "launch_local_top2_bf16",
                 "launch_tp8_argmax_gather_shm",
             ],
@@ -3477,6 +3916,9 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
         )
         self._closed: bool = False
         self._registered: bool = False
+        self._my_hbm_ptr: int = 0
+        self._pt_hbm_ptr: int = 0
+        self._pxb_cap_bytes: int = 0
         self._extension = get_host_mapped_allreduce_extension()
         try:
             self._init_per_rank_shm(
@@ -3493,6 +3935,13 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
         except BaseException:
             self.close(abort=True)
             raise
+
+    def attach_pxb_ipc(self, shm_ar: HostMappedShmAllReduce) -> None:
+        """Attach CX8 PXB CUDA-IPC partner ring pointers from `shm_ar` (zero extra HBM)."""
+        if shm_ar.pxb_enabled and self.world_size == 8:
+            self._my_hbm_ptr = shm_ar._my_hbm_ptr
+            self._pt_hbm_ptr = shm_ar._pt_hbm_ptr
+            self._pxb_cap_bytes = NUM_PXB_RING_SLOTS * shm_ar.pxb_slot_stride_bytes
 
     def all_gather(
         self,
@@ -3527,11 +3976,14 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
             raise ValueError(f"inner_elems={inner_elems} must be divisible by 8")
         vecs_per_row = inner_elems // 8
         stream_handle = torch.cuda.current_stream(self.device).cuda_stream
+        use_pxb = self._my_hbm_ptr != 0 and 3 * input.numel() * 2 <= self._pxb_cap_bytes
         self._extension.launch_shm_v5_allgather(
             input,
             output,
             self.control,
             self._rank_shm_ptrs,
+            self._my_hbm_ptr if use_pxb else 0,
+            self._pt_hbm_ptr if use_pxb else 0,
             self.slot_stride_bytes,
             outer_rows,
             vecs_per_row,
