@@ -22,13 +22,13 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
+from zstep_worker.env_config import WorkerRuntimeConfig
 from zstep_worker.shm_bridge import DECODE_GRAPH_BUCKETS, select_decode_bucket
 from zstep_worker.spec_decode import VerifiedSequence
 
@@ -148,7 +148,7 @@ class DeepSeekV41DSparkDrafter:
         graph_pool: Any,
         capture_stream: torch.cuda.Stream,
     ) -> None:
-        if os.environ.get("ZSTEP_DISABLE_DRAFT_GRAPHS", "0") == "1":
+        if WorkerRuntimeConfig.from_env().disable_draft_graphs:
             return
         from vllm.config import CUDAGraphMode
         from vllm.forward_context import set_forward_context

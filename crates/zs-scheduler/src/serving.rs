@@ -24,7 +24,7 @@
 //! `zs_kv::BlockLease`) and overlaps next-step decode preparation (`in_flight_depth = 1`)
 //! while the 8 GPU workers execute the current step.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::process::Command;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
@@ -370,6 +370,48 @@ pub struct BenchmarkProvenance {
     pub warmup_prompts: usize,
     pub max_step_tokens: u32,
     pub max_prefill_chunk: usize,
+    pub env_overrides: BTreeMap<String, String>,
+}
+
+fn is_sensitive_env_key(key: &str) -> bool {
+    key.split('_').any(|seg| {
+        matches!(
+            seg.to_ascii_uppercase().as_str(),
+            "KEY"
+                | "KEYS"
+                | "SECRET"
+                | "SECRETS"
+                | "TOKEN"
+                | "PASSWORD"
+                | "PASSWD"
+                | "CREDENTIAL"
+                | "CREDENTIALS"
+                | "AUTH"
+                | "BEARER"
+        )
+    })
+}
+
+fn collect_zstep_env_overrides<I, K, V>(vars: I) -> BTreeMap<String, String>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let mut overrides = BTreeMap::new();
+    for (k, v) in vars {
+        let key = k.as_ref();
+        if !key.starts_with("ZSTEP_") {
+            continue;
+        }
+        let val = if is_sensitive_env_key(key) {
+            "[REDACTED]".to_owned()
+        } else {
+            v.as_ref().to_owned()
+        };
+        overrides.insert(key.to_owned(), val);
+    }
+    overrides
 }
 
 impl BenchmarkProvenance {
@@ -427,6 +469,7 @@ impl BenchmarkProvenance {
             warmup_prompts,
             max_step_tokens,
             max_prefill_chunk,
+            env_overrides: collect_zstep_env_overrides(std::env::vars()),
         })
     }
 
@@ -443,6 +486,17 @@ impl BenchmarkProvenance {
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(", ");
+        let env_json = if self.env_overrides.is_empty() {
+            "{}".to_owned()
+        } else {
+            let entries = self
+                .env_overrides
+                .iter()
+                .map(|(k, v)| format!("      {}: {}", json_string(k), json_string(v)))
+                .collect::<Vec<_>>()
+                .join(",\n");
+            format!("{{\n{entries}\n    }}")
+        };
         format!(
             concat!(
                 "  \"provenance\": {{\n",
@@ -454,7 +508,8 @@ impl BenchmarkProvenance {
                 "    \"repeats\": {},\n",
                 "    \"warmup_prompts\": {},\n",
                 "    \"max_step_tokens\": {},\n",
-                "    \"max_prefill_chunk\": {}\n",
+                "    \"max_prefill_chunk\": {},\n",
+                "    \"env_overrides\": {}\n",
                 "  }}"
             ),
             json_string(&self.git_commit),
@@ -466,6 +521,7 @@ impl BenchmarkProvenance {
             self.warmup_prompts,
             self.max_step_tokens,
             self.max_prefill_chunk,
+            env_json,
         )
     }
 }
@@ -4172,6 +4228,59 @@ mod tests {
         assert_eq!(active[0].prefix_lease.as_ref().unwrap().matched_nodes(), 2);
         assert!(active[0].kv_leases.is_empty());
         assert!(active[0].pending_checkpoints.is_empty());
+    }
+
+    #[test]
+    fn provenance_collects_zstep_env_overrides_and_redacts_secrets() {
+        let overrides = collect_zstep_env_overrides([
+            ("PATH", "/usr/bin"),
+            ("ZSTEP_P2P_MODE", "auto"),
+            ("ZSTEP_NUM_SPEC_TOKENS", "5"),
+            ("ZSTEP_REQUIRE_SM120_EXP", "1"),
+            ("ZSTEP_API_KEY", "sk-live-secret"),
+            ("ZSTEP_SECRET_KEY", "sk-secondary"),
+            ("ZSTEP_PASSWORD", "pw-123"),
+            ("ZSTEP_CUSTOM_TOKEN", "tok-123"),
+        ]);
+        assert_eq!(overrides.len(), 7);
+        assert_eq!(
+            overrides.get("ZSTEP_P2P_MODE").map(String::as_str),
+            Some("auto")
+        );
+        assert_eq!(
+            overrides.get("ZSTEP_NUM_SPEC_TOKENS").map(String::as_str),
+            Some("5")
+        );
+        for secret_key in [
+            "ZSTEP_API_KEY",
+            "ZSTEP_SECRET_KEY",
+            "ZSTEP_PASSWORD",
+            "ZSTEP_CUSTOM_TOKEN",
+        ] {
+            assert_eq!(
+                overrides.get(secret_key).map(String::as_str),
+                Some("[REDACTED]"),
+                "{secret_key} must be redacted"
+            );
+        }
+
+        let prov = BenchmarkProvenance {
+            git_commit: "deadbeef".to_owned(),
+            nvidia_driver_version: "595.99.02".to_owned(),
+            gpu_graphics_clocks_mhz: vec![2400],
+            gpu_mem_clocks_mhz: vec![14000],
+            seed: 42,
+            repeats: 3,
+            warmup_prompts: 16,
+            max_step_tokens: 4096,
+            max_prefill_chunk: 2048,
+            env_overrides: overrides,
+        };
+        let json = prov.to_json();
+        assert!(json.contains("\"env_overrides\": {"));
+        assert!(json.contains("\"ZSTEP_P2P_MODE\": \"auto\""));
+        assert!(json.contains("\"ZSTEP_API_KEY\": \"[REDACTED]\""));
+        assert!(!json.contains("sk-live-secret"));
     }
 }
 

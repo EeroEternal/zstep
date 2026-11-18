@@ -35,6 +35,11 @@ import triton
 import triton.language as tl
 from torch.utils.cpp_extension import load_inline
 
+from zstep_worker.env_config import (
+    parse_qwen_fused_gdn_enabled,
+    parse_qwen_gdn_decode_mode,
+)
+
 # ---------------------------------------------------------------------------
 # Inline CUDA C++ helper: GPU-only shared-memory MoE token-to-expert bucketing
 # ---------------------------------------------------------------------------
@@ -2955,15 +2960,10 @@ def linear_attn_decode_step(
     batch_rows = qkvzba.shape[0]
     if batch_rows == 0:
         return gated_out_buf
-    if os.environ.get("ZSTEP_QWEN_ENABLE_FUSED_GDN", "1") != "0":
+    if parse_qwen_fused_gdn_enabled():
         ext = get_qwen35_cuda_ext()
         stream_handle = torch.cuda.current_stream(qkvzba.device).cuda_stream
-        mode_cfg = os.environ.get("ZSTEP_QWEN_GDN_DECODE_MODE", "auto")
-        if mode_cfg not in ("auto", "cluster2", "split_2op", "split_3op"):
-            raise ValueError(
-                f"Unsupported ZSTEP_QWEN_GDN_DECODE_MODE={mode_cfg!r}; "
-                "expected one of ('auto', 'cluster2', 'split_2op', 'split_3op')"
-            )
+        mode_cfg = parse_qwen_gdn_decode_mode()
         if mode_cfg == "cluster2" or (mode_cfg == "auto" and batch_rows > 32):
             ext.launch_gdn_decode_cluster2_vk(
                 qkvzba,
@@ -3079,7 +3079,7 @@ def linear_attn_prefill_varlen(
     total_rows = qkvzba.shape[0]
     if total_rows == 0 or num_seqs == 0:
         return gated_out_buf
-    if os.environ.get("ZSTEP_QWEN_ENABLE_FUSED_GDN", "1") != "0":
+    if parse_qwen_fused_gdn_enabled():
         ext = get_qwen35_cuda_ext()
         stream_handle = torch.cuda.current_stream(qkvzba.device).cuda_stream
         qk_scratch = (

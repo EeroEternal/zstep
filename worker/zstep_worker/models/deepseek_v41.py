@@ -364,12 +364,13 @@ class DeepSeekV41StepRunner:
 
         self.model_dir: Path = model_dir
         self.rank: int = rank
-        self.spec_method: str = os.environ.get("ZSTEP_SPEC_METHOD", "none")
-        self.num_spec_tokens: int = int(os.environ.get("ZSTEP_NUM_SPEC_TOKENS", "0"))
+        from zstep_worker.env_config import WorkerRuntimeConfig
+
+        self.runtime_config: WorkerRuntimeConfig = WorkerRuntimeConfig.from_env()
+        self.spec_method: str = self.runtime_config.spec_method
+        self.num_spec_tokens: int = self.runtime_config.num_spec_tokens
         if self.spec_method not in {"none", "ngram", "dspark"}:
             raise ValueError(f"DeepSeek-V4.1 does not support speculative method {self.spec_method}")
-        if self.spec_method != "none" and not 1 <= self.num_spec_tokens <= 7:
-            raise ValueError("ZSTEP_NUM_SPEC_TOKENS must be in 1..=7")
         self.dspark_model: Any = None
         self.bridge: ShmBridge = bridge
         self.geometry = bridge.superblock.geometry
@@ -410,7 +411,7 @@ class DeepSeekV41StepRunner:
         from vllm.model_executor.model_loader import get_model
         from vllm.v1.worker.workspace import init_workspace_manager
 
-        self.max_model_len: int = int(os.environ.get("ZSTEP_MAX_MODEL_LEN", "32768"))
+        self.max_model_len: int = self.runtime_config.max_model_len
         self.max_seqs: int = max(self.geometry.max_seqs, 128)
         self.max_step_tokens: int = max(self.geometry.max_step_tokens, 4096)
         self.max_pages_per_seq: int = self.geometry.max_pages_per_seq
@@ -804,14 +805,14 @@ class DeepSeekV41StepRunner:
         # plus 100% of CUDAGraph captures through `shm_ar`; route larger eager AR
         # payloads to topology-aware NCCL (`PXB` on P2P switches, `LOC` on non-P2P).
         default_ar_rows = 3072 if shm_ar.pxb_enabled else 384
-        shm_max_ar_numel = int(
-            os.environ.get("ZSTEP_SHM_MAX_AR_NUMEL", str(default_ar_rows * 5120))
+        shm_max_ar_numel = self.runtime_config.effective_shm_max_ar_numel(
+            default_ar_rows * 5120
         )
         default_ag_elems = (
             min(self.max_step_tokens, 3072) * 3200 if shm_ar.pxb_enabled else 1024 * 4096
         )
-        shm_max_ag_numel = int(
-            os.environ.get("ZSTEP_SHM_MAX_AG_NUMEL", str(default_ag_elems))
+        shm_max_ag_numel = self.runtime_config.effective_shm_max_ag_numel(
+            default_ag_elems
         )
 
         tp_group.use_custom_op_call = False
@@ -1448,7 +1449,7 @@ class DeepSeekV41StepRunner:
 
         if (
             self.spec_method != "none"
-            and os.environ.get("ZSTEP_DISABLE_VERIFY_GRAPHS", "0") != "1"
+            and not self.runtime_config.disable_verify_graphs
         ):
             self._capture_spec_verify_graphs(graph_pool, capture_stream)
         if self.dspark_drafter is not None:
@@ -1688,18 +1689,11 @@ class DeepSeekV41StepRunner:
         max_slot_end = min(self.max_seqs, int(slot_np.max()) + 1)
         pt_np = plan.global_kv_page_table(max_slot_end)[:, : self.bt_width]
 
-        unified_prefill = os.environ.get("ZSTEP_DS_UNIFIED_PREFILL", "0") == "1"
-        eager_decode = os.environ.get("ZSTEP_DS_EAGER_DECODE", "0") == "1"
         is_spec_step = header.is_dspark_verify != 0
-        header_is_decode = (
+        is_decode = (
             (header.flags & STEP_FLAG_DECODE_ONLY) != 0 and not is_spec_step
         )
-        use_dev_tok = header_is_decode and (header.flags & STEP_FLAG_DEVICE_TOKENS) != 0
-        is_decode = (
-            header_is_decode
-            and not unified_prefill
-            and not eager_decode
-        )
+        use_dev_tok = is_decode and (header.flags & STEP_FLAG_DEVICE_TOKENS) != 0
         width = self.num_spec_tokens + 1
         q_lens = q_start_np[1:] - q_start_np[:-1]
         v_bucket = (
@@ -1709,8 +1703,6 @@ class DeepSeekV41StepRunner:
         )
         use_verify_graph = (
             is_spec_step
-            and not unified_prefill
-            and not eager_decode
             and v_bucket in self.verify_graphs
             and num_sample == total_tokens
             and total_tokens == num_seqs * width
@@ -1983,8 +1975,8 @@ class DeepSeekV41StepRunner:
             sample_slots_out = [
                 int(slot_np[int(sample_rows_np[i])]) for i in range(num_sample)
             ]
-            self.mixed_is_prefilling_cpu[:num_seqs].numpy()[:] = (
-                True if unified_prefill else ((q_lens > 1) | (first_pos == 0))
+            self.mixed_is_prefilling_cpu[:num_seqs].numpy()[:] = (q_lens > 1) | (
+                first_pos == 0
             )
 
             seq_slots_np = slot_np[q_start_np[:num_seqs]]
@@ -2066,7 +2058,7 @@ class DeepSeekV41StepRunner:
                 is_prefilling_cpu=self.mixed_is_prefilling_cpu[:num_seqs],
                 for_capture=False,
             )
-            if header_is_decode:
+            if is_decode:
                 self.slots_cpu[:num_seqs].numpy()[:] = seq_slots_np
                 self.slots_gpu[:num_seqs].copy_(
                     self.slots_cpu[:num_seqs], non_blocking=True
@@ -2106,9 +2098,9 @@ class DeepSeekV41StepRunner:
                         hidden,
                         self.sample_rows_gpu[:num_sample],
                         num_sample,
-                        all_ranks=(is_spec_step or header_is_decode),
+                        all_ranks=(is_spec_step or is_decode),
                     )
-            if header_is_decode:
+            if is_decode:
                 self._commit_decode_slot_state(num_seqs)
 
             if (self.rank == 0 or is_spec_step) and num_sample > 0:

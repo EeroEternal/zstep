@@ -8,22 +8,23 @@
 //! request-id propagation, `/metrics` field names & histograms, SSE `[DONE]` uniqueness).
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
-use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use zs_scheduler::{
     DEFAULT_HEARTBEAT_TIMEOUT, EngineConfig, EngineState, LoopEvent, LoopFinishReason,
     OnlineConfig, OnlineMetrics, ServeLoopHandle, ServingEngine, SpeculativeConfig,
@@ -47,8 +48,12 @@ pub const SERVE_USAGE: &str = "zstep serve — persistent OpenAI-compatible HTTP
 Usage: zstep serve --model-dir <PATH> [OPTIONS]\n\
   --model-dir PATH               Model weights & tokenizer.json directory (required)\n\
   --served-model-name ID         Model ID exposed on /v1/models (default: directory basename)\n\
-  --host IP                      Bind address (default: 0.0.0.0)\n\
+  --host IP                      Bind address (default: 127.0.0.1)\n\
   --port PORT                    Bind port (default: 43537)\n\
+  --api-key TOKEN                Optional Bearer token for /v1/*, /admin/* & /metrics (or ZSTEP_API_KEY)\n\
+  --admin-port PORT              Optional loopback-only port (127.0.0.1:PORT) for /admin/* & /metrics\n\
+  --allow-remote-metrics         Allow unauthenticated non-loopback GET /metrics (default: enabled)\n\
+  --no-allow-remote-metrics      Restrict unauthenticated GET /metrics to loopback (or ZSTEP_ALLOW_REMOTE_METRICS=0)\n\
   --world-size N                 GPU TP workers, 1..=8 (default: 8)\n\
   --gpu-memory-utilization F     KV page calibration factor in (0.0, 1.0] (default: 0.95)\n\
   --max-model-len N              Max total prompt + output tokens (default: 32768)\n\
@@ -79,6 +84,26 @@ Usage: zstep serve --model-dir <PATH> [OPTIONS]\n\
 // CLI
 // ---------------------------------------------------------------------------
 
+/// Redacted Bearer API token wrapper so `{args:?}` never leaks credentials into logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretToken(String);
+
+impl SecretToken {
+    pub fn new(raw: String) -> Self {
+        Self(raw)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Debug for SecretToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("\"[REDACTED]\"")
+    }
+}
+
 /// Parsed `zstep serve` arguments (contract: `nebula/docs/dev/zstep.md` §2.1/§2.2).
 #[derive(Debug, Clone)]
 pub struct ServeArgs {
@@ -86,6 +111,9 @@ pub struct ServeArgs {
     pub served_model_name: String,
     pub host: String,
     pub port: u16,
+    pub api_key: Option<SecretToken>,
+    pub admin_port: Option<u16>,
+    pub allow_remote_metrics: bool,
     pub world_size: u32,
     pub gpu_memory_utilization: f64,
     pub max_model_len: usize,
@@ -145,6 +173,8 @@ pub fn validate_known_flags(argv: &[String]) -> Result<BTreeMap<String, String>,
         "--served-model-name",
         "--host",
         "--port",
+        "--api-key",
+        "--admin-port",
         "--world-size",
         "--gpu-memory-utilization",
         "--max-model-len",
@@ -169,6 +199,12 @@ pub fn validate_known_flags(argv: &[String]) -> Result<BTreeMap<String, String>,
         "--prompt-lookup-max",
         "--prompt-lookup-min",
     ];
+    const BOOL_FLAGS: &[&str] = &[
+        "--enable-prefix-caching",
+        "--no-enable-prefix-caching",
+        "--allow-remote-metrics",
+        "--no-allow-remote-metrics",
+    ];
     let mut values = BTreeMap::new();
     let mut index = 0;
     while index < argv.len() {
@@ -183,6 +219,16 @@ pub fn validate_known_flags(argv: &[String]) -> Result<BTreeMap<String, String>,
             index += 1;
             continue;
         }
+        if flag == "--allow-remote-metrics" {
+            values.insert("--allow-remote-metrics".to_owned(), "true".to_owned());
+            index += 1;
+            continue;
+        }
+        if flag == "--no-allow-remote-metrics" {
+            values.insert("--allow-remote-metrics".to_owned(), "false".to_owned());
+            index += 1;
+            continue;
+        }
         if !flag.starts_with("--") {
             return Err(format!("unexpected positional argument `{flag}`"));
         }
@@ -192,7 +238,10 @@ pub fn validate_known_flags(argv: &[String]) -> Result<BTreeMap<String, String>,
         let Some(value) = argv.get(index + 1) else {
             return Err(format!("missing value for `{flag}`"));
         };
-        if value.starts_with("--") {
+        let is_known_flag = VALUE_FLAGS.contains(&value.as_str())
+            || BOOL_FLAGS.contains(&value.as_str())
+            || matches!(value.as_str(), "--help" | "-h");
+        if is_known_flag || (flag != "--api-key" && value.starts_with("--")) {
             return Err(format!("missing value for `{flag}` (got `{value}`)"));
         }
         values.insert(flag.to_owned(), value.clone());
@@ -216,6 +265,24 @@ fn parse_map_number<T: std::str::FromStr>(
 
 impl ServeArgs {
     pub fn parse(argv: &[String]) -> Result<Self, String> {
+        let env_api_key = std::env::var("ZSTEP_API_KEY").ok();
+        let env_remote_metrics = std::env::var("ZSTEP_ALLOW_REMOTE_METRICS")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| {
+                !matches!(
+                    v.trim(),
+                    "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
+                )
+            });
+        Self::parse_with_env(argv, env_api_key.as_deref(), env_remote_metrics)
+    }
+
+    pub fn parse_with_env(
+        argv: &[String],
+        env_api_key: Option<&str>,
+        env_remote_metrics: Option<bool>,
+    ) -> Result<Self, String> {
         let values = validate_known_flags(argv)?;
         let model_dir_raw = values
             .get("--model-dir")
@@ -374,14 +441,48 @@ impl ServeArgs {
                     .to_owned(),
             );
         }
+        let port = parse_map_number(&values, "--port", 43537u16)?;
+        let admin_port = values
+            .get("--admin-port")
+            .map(|raw| raw.parse::<u16>())
+            .transpose()
+            .map_err(|_| "--admin-port must be a valid TCP port (0..=65535)".to_owned())?;
+        if let Some(ap) = admin_port
+            && ap != 0
+            && ap == port
+        {
+            return Err(format!(
+                "--admin-port ({ap}) must differ from --port ({port})"
+            ));
+        }
+        let api_key = if let Some(cli_key) = values.get("--api-key") {
+            let trimmed = cli_key.trim();
+            if trimmed.is_empty() {
+                return Err("--api-key must not be empty".to_owned());
+            }
+            Some(SecretToken::new(trimmed.to_owned()))
+        } else {
+            env_api_key
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| SecretToken::new(v.to_owned()))
+        };
+        let allow_remote_metrics = match values.get("--allow-remote-metrics").map(String::as_str) {
+            Some("true") => true,
+            Some("false") => false,
+            _ => env_remote_metrics.unwrap_or(true),
+        };
         let args = Self {
             model_dir,
             served_model_name,
             host: values
                 .get("--host")
                 .cloned()
-                .unwrap_or_else(|| "0.0.0.0".to_owned()),
-            port: parse_map_number(&values, "--port", 43537u16)?,
+                .unwrap_or_else(|| "127.0.0.1".to_owned()),
+            port,
+            api_key,
+            admin_port,
+            allow_remote_metrics,
             world_size,
             gpu_memory_utilization,
             max_model_len,
@@ -544,6 +645,8 @@ struct AppState {
     phase: Arc<AtomicU8>,
     handle: Mutex<Option<ServeLoopHandle>>,
     shutdown_requested: Arc<AtomicBool>,
+    api_key: Option<SecretToken>,
+    allow_remote_metrics: bool,
     tokenizer: Tokenizer,
     served_model_name: String,
     tokenizer_mode: String,
@@ -568,7 +671,10 @@ impl AppState {
     }
 
     fn handle(&self) -> Option<ServeLoopHandle> {
-        self.handle.lock().ok().and_then(|guard| guard.clone())
+        self.handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn metrics(&self) -> Option<Arc<OnlineMetrics>> {
@@ -620,23 +726,123 @@ fn lifecycle_error(state: &AppState) -> Option<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// Router & operational probes
+// Authentication, access control & routers
 // ---------------------------------------------------------------------------
 
+fn constant_time_eq(provided: &[u8], expected: &[u8]) -> bool {
+    let provided = std::hint::black_box(provided);
+    let expected = std::hint::black_box(expected);
+    let mut diff = std::hint::black_box(provided.len() ^ expected.len());
+    for (idx, &exp_byte) in expected.iter().enumerate() {
+        let prov_byte = provided.get(idx).copied().unwrap_or(0);
+        diff = std::hint::black_box(diff | ((prov_byte ^ exp_byte) as usize));
+    }
+    std::hint::black_box(diff) == 0
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&[u8]> {
+    let raw = headers.get(header::AUTHORIZATION)?.as_bytes();
+    if raw.len() <= 7 || !raw[..7].eq_ignore_ascii_case(b"bearer ") {
+        return None;
+    }
+    let token = &raw[7..];
+    let start = token.iter().position(|b| !b.is_ascii_whitespace())?;
+    let end = token.iter().rposition(|b| !b.is_ascii_whitespace())?;
+    Some(&token[start..=end])
+}
+
+fn unauthorized_response() -> Response {
+    let mut resp = error_response(
+        StatusCode::UNAUTHORIZED,
+        "authentication_error",
+        "invalid_api_key",
+        "missing or invalid Authorization Bearer token",
+    );
+    resp.headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    resp
+}
+
+fn authorize_bearer(headers: &HeaderMap, state: &AppState) -> Option<Response> {
+    let expected = state.api_key.as_ref()?;
+    match extract_bearer_token(headers) {
+        Some(provided) if constant_time_eq(provided, expected.as_bytes()) => None,
+        _ => Some(unauthorized_response()),
+    }
+}
+
+fn is_loopback_peer(peer: Option<SocketAddr>) -> bool {
+    peer.is_some_and(|addr| match addr.ip() {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    })
+}
+
+fn authorize_ops_request(
+    req: &Request<Body>,
+    state: &AppState,
+    allow_remote_unauth: bool,
+) -> Option<Response> {
+    if state.api_key.is_some() {
+        return authorize_bearer(req.headers(), state);
+    }
+    if allow_remote_unauth {
+        return None;
+    }
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0);
+    if is_loopback_peer(peer) {
+        None
+    } else {
+        Some(error_response(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "loopback_only",
+            "admin and metrics endpoints require --api-key, --admin-port, or loopback access",
+        ))
+    }
+}
+
+#[cfg(test)]
 fn router(state: Arc<AppState>) -> Router {
+    router_with_ops(state, true)
+}
+
+fn router_with_ops(state: Arc<AppState>, include_ops: bool) -> Router {
+    let base = Router::new()
+        .route("/livez", get(livez))
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/v1/models", get(list_models))
+        .route("/v1/chat/completions", post(chat_completions));
+    if include_ops {
+        base.route("/metrics", get(metrics))
+            .route("/admin/drain", post(admin_drain))
+            .with_state(state)
+    } else {
+        base.with_state(state)
+    }
+}
+
+fn admin_loopback_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/livez", get(livez))
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics))
         .route("/admin/drain", post(admin_drain))
-        .route("/v1/models", get(list_models))
-        .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
 }
 
 fn publish_launched_handle(state: &AppState, handle: ServeLoopHandle) {
-    let mut guard = state.handle.lock().expect("handle mutex");
+    let mut guard = state
+        .handle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = Some(handle.clone());
     if let Err(cur) = state.phase.compare_exchange(
         EngineState::Starting as u8,
@@ -650,7 +856,10 @@ fn publish_launched_handle(state: &AppState, handle: ServeLoopHandle) {
 }
 
 fn request_drain(state: &AppState) {
-    let guard = state.handle.lock().expect("handle mutex");
+    let guard = state
+        .handle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if state.phase() != EngineState::Faulted {
         state.set_phase(EngineState::Draining);
     }
@@ -706,7 +915,10 @@ async fn ready(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-async fn list_models(State(state): State<Arc<AppState>>) -> Response {
+async fn list_models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(response) = authorize_bearer(&headers, &state) {
+        return response;
+    }
     if let Some(response) = lifecycle_error(&state) {
         return response;
     }
@@ -726,12 +938,18 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-async fn admin_drain(State(state): State<Arc<AppState>>) -> Response {
+async fn admin_drain(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    if let Some(response) = authorize_ops_request(&req, &state, false) {
+        return response;
+    }
     request_drain(&state);
     (StatusCode::OK, Json(json!({"status": "draining"}))).into_response()
 }
 
-async fn metrics(State(state): State<Arc<AppState>>) -> Response {
+async fn metrics(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    if let Some(response) = authorize_ops_request(&req, &state, state.allow_remote_metrics) {
+        return response;
+    }
     let text = render_metrics(&state);
     (
         StatusCode::OK,
@@ -1278,6 +1496,9 @@ async fn chat_completions(
     body: Body,
 ) -> Response {
     let request_id = extract_request_id(&headers, &state);
+    if let Some(response) = authorize_bearer(&headers, &state) {
+        return with_request_id(response, &request_id);
+    }
     let traceparent = extract_traceparent(&headers).map(str::to_owned);
 
     let raw_bytes = match axum::body::to_bytes(body, MAX_HTTP_BODY_BYTES).await {
@@ -1876,6 +2097,8 @@ pub fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         phase: Arc::new(AtomicU8::new(EngineState::Starting as u8)),
         handle: Mutex::new(None),
         shutdown_requested: Arc::new(AtomicBool::new(false)),
+        api_key: args.api_key.clone(),
+        allow_remote_metrics: args.allow_remote_metrics,
         tokenizer,
         served_model_name: args.served_model_name.clone(),
         tokenizer_mode: args.tokenizer_mode.clone(),
@@ -1897,8 +2120,19 @@ pub fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let address: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
         let listener = tokio::net::TcpListener::bind(address).await?;
         let bound = listener.local_addr()?;
+        let admin_listener = if let Some(admin_port) = args.admin_port {
+            let admin_addr = SocketAddr::from(([127, 0, 0, 1], admin_port));
+            Some(tokio::net::TcpListener::bind(admin_addr).await?)
+        } else {
+            None
+        };
+        let admin_bound = match &admin_listener {
+            Some(listener) => Some(listener.local_addr()?),
+            None => None,
+        };
         println!(
-            "zstep_serve git_sha={git_sha} listening={bound} model={} model_dir={} world_size={} page_block_tokens={} num_kv_pages={num_kv_pages} max_model_len={} max_seqs={} max_step_tokens={} kv_cache_dtype={} enable_prefix_caching={}",
+            "zstep_serve git_sha={git_sha} listening={bound} admin_listening={admin_bound:?} auth_enabled={} model={} model_dir={} world_size={} page_block_tokens={} num_kv_pages={num_kv_pages} max_model_len={} max_seqs={} max_step_tokens={} kv_cache_dtype={} enable_prefix_caching={}",
+            args.api_key.is_some(),
             args.served_model_name,
             args.model_dir.display(),
             args.world_size,
@@ -1921,13 +2155,30 @@ pub fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .name("zstep-engine-launch".to_owned())
             .spawn(move || {
                 launch_engine(launch_state, launch_args, launch_done_tx, launch_exit_pair)
-            })
-            .expect("spawn engine launch thread");
+            })?;
 
+        let (admin_stop_tx, mut admin_stop_rx) = watch::channel(false);
+        let admin_task = if let Some(admin_listener) = admin_listener {
+            let admin_app = admin_loopback_router(Arc::clone(&state))
+                .into_make_service_with_connect_info::<SocketAddr>();
+            Some(tokio::spawn(async move {
+                let _ = axum::serve(admin_listener, admin_app)
+                    .with_graceful_shutdown(async move {
+                        let _ = admin_stop_rx.changed().await;
+                    })
+                    .await;
+            }))
+        } else {
+            None
+        };
+
+        let launch_done_rx = Arc::new(tokio::sync::Mutex::new(Some(launch_done_rx)));
+        let shutdown_launch_rx = Arc::clone(&launch_done_rx);
         let shutdown_state = Arc::clone(&state);
         let drain_timeout = args.drain_timeout;
-        let app = router(state);
-        axum::serve(listener, app)
+        let app = router_with_ops(Arc::clone(&state), args.admin_port.is_none())
+            .into_make_service_with_connect_info::<SocketAddr>();
+        let serve_res = axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 wait_for_shutdown_signal().await;
                 println!(
@@ -1938,7 +2189,9 @@ pub fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .shutdown_requested
                     .store(true, Ordering::Release);
                 request_drain(&shutdown_state);
-                let _ = launch_done_rx.await;
+                if let Some(rx) = shutdown_launch_rx.lock().await.take() {
+                    let _ = rx.await;
+                }
                 if let Some(handle) = shutdown_state.handle() {
                     handle.drain();
                     let deadline = Instant::now() + drain_timeout;
@@ -1958,23 +2211,44 @@ pub fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
+                    // Shut down `ServeLoop` before `with_graceful_shutdown` returns so any
+                    // remaining SSE streams drop their event channels immediately when
+                    // `drain_timeout` expires instead of holding `axum::serve` open.
                     handle.shutdown();
                     let _ = tokio::task::spawn_blocking(move || {
                         handle.join(Duration::from_secs(30))
                     })
                     .await;
                 }
-                let (lock, cvar) = &*exit_thread_pair;
-                if let Ok(mut stop) = lock.lock() {
-                    *stop = true;
-                    cvar.notify_all();
-                }
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = launch_join_handle.join();
-                })
-                .await;
             })
-            .await?;
+            .await;
+
+        // Unconditional idempotent teardown on both graceful signal exit and `axum::serve` errors
+        // so `zstep-engine-launch`, `admin_task`, and SHM worker segments never leak.
+        state.shutdown_requested.store(true, Ordering::Release);
+        request_drain(&state);
+        let _ = admin_stop_tx.send(true);
+        if let Some(rx) = launch_done_rx.lock().await.take() {
+            let _ = rx.await;
+        }
+        if let Some(handle) = state.handle() {
+            handle.shutdown();
+            let _ = tokio::task::spawn_blocking(move || handle.join(Duration::from_secs(30))).await;
+        }
+        {
+            let (lock, cvar) = &*exit_thread_pair;
+            let mut stop = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *stop = true;
+            cvar.notify_all();
+        }
+        if let Some(admin_task) = admin_task {
+            let _ = admin_task.await;
+        }
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = launch_join_handle.join();
+        })
+        .await;
+        serve_res?;
         Ok(())
     })
 }
@@ -2034,9 +2308,11 @@ fn launch_engine(
             // completes (`PR_SET_PDEATHSIG` on Linux tracks the spawning thread's lifetime).
             drop(state);
             let (lock, cvar) = &*exit_thread_pair;
-            let mut stop = lock.lock().expect("exit mutex");
+            let mut stop = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             while !*stop {
-                stop = cvar.wait(stop).expect("exit cvar");
+                stop = cvar
+                    .wait(stop)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
         }
         Err(error) => {
@@ -2127,6 +2403,8 @@ mod tests {
             phase: phase_arc,
             handle: Mutex::new(handle),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            api_key: None,
+            allow_remote_metrics: true,
             tokenizer: test_tokenizer(),
             served_model_name: "zstep-test".to_owned(),
             tokenizer_mode: "auto".to_owned(),
@@ -2148,7 +2426,8 @@ mod tests {
             .expect("bind");
         let address = listener.local_addr().expect("addr");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, router(state)).await;
+            let svc = router(state).into_make_service_with_connect_info::<SocketAddr>();
+            let _ = axum::serve(listener, svc).await;
         });
         address
     }
@@ -2351,6 +2630,8 @@ mod tests {
             phase: fail0_handle.state_arc(),
             handle: Mutex::new(None),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            api_key: None,
+            allow_remote_metrics: true,
             tokenizer: test_tokenizer(),
             served_model_name: "zstep-test".to_owned(),
             tokenizer_mode: "auto".to_owned(),
@@ -2682,6 +2963,8 @@ mod tests {
             phase: handle.state_arc(),
             handle: Mutex::new(Some(handle.clone())),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            api_key: None,
+            allow_remote_metrics: true,
             tokenizer: test_tokenizer(),
             served_model_name: "zstep-test".to_owned(),
             tokenizer_mode: "auto".to_owned(),
@@ -2859,6 +3142,8 @@ mod tests {
             phase: handle.state_arc(),
             handle: Mutex::new(Some(handle.clone())),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            api_key: None,
+            allow_remote_metrics: true,
             tokenizer: test_tokenizer(),
             served_model_name: "zstep-test".to_owned(),
             tokenizer_mode: "auto".to_owned(),
@@ -2916,6 +3201,409 @@ mod tests {
             prom_active.contains("zstep:spec_decode_mean_acceptance_length 3.4\n"),
             "{prom_active}"
         );
+
+        handle.shutdown();
+        let _ = handle.join(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn default_host_is_loopback_and_security_flags_validate_and_redact() {
+        let raw = vec!["--model-dir".to_owned(), "/tmp/qwen35".to_owned()];
+        let defaults = ServeArgs::parse_with_env(&raw, None, None).expect("defaults");
+        assert_eq!(defaults.host, "127.0.0.1");
+        assert_eq!(defaults.port, 43537);
+        assert!(defaults.api_key.is_none());
+        assert!(defaults.admin_port.is_none());
+        assert!(defaults.allow_remote_metrics);
+
+        // `ZSTEP_API_KEY` env fallback + `ZSTEP_ALLOW_REMOTE_METRICS=0` opt-out + redacted Debug.
+        let from_env = ServeArgs::parse_with_env(&raw, Some("  sk-env-secret-123  "), Some(false))
+            .expect("env key");
+        assert_eq!(
+            from_env.api_key.as_ref().map(SecretToken::as_bytes),
+            Some(b"sk-env-secret-123".as_slice())
+        );
+        assert!(!from_env.allow_remote_metrics);
+        let dbg = format!("{from_env:?}");
+        assert!(
+            !dbg.contains("sk-env-secret-123"),
+            "secret leaked in Debug: {dbg}"
+        );
+        assert!(dbg.contains("[REDACTED]"), "{dbg}");
+
+        // CLI `--api-key` overrides `ZSTEP_API_KEY` (including non-flag tokens beginning with `--`),
+        // and `--no-allow-remote-metrics` overrides `env_remote_metrics = Some(true)`.
+        let cli_override: Vec<String> = [
+            "--model-dir",
+            "/tmp/qwen35",
+            "--api-key",
+            "--leading-dash-token",
+            "--admin-port",
+            "9100",
+            "--no-allow-remote-metrics",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let parsed = ServeArgs::parse_with_env(&cli_override, Some("sk-env"), Some(true))
+            .expect("cli override");
+        assert_eq!(
+            parsed.api_key.as_ref().map(SecretToken::as_bytes),
+            Some(b"--leading-dash-token".as_slice())
+        );
+        assert_eq!(parsed.admin_port, Some(9100));
+        assert!(!parsed.allow_remote_metrics);
+
+        // Empty `--api-key`, missing `--api-key` value swallowing a known flag, and colliding
+        // `--admin-port == --port` must all fail loudly.
+        let empty_key: Vec<String> = ["--model-dir", "/tmp/qwen35", "--api-key", "   "]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert!(ServeArgs::parse_with_env(&empty_key, None, None).is_err());
+
+        let swallowed_flag: Vec<String> = [
+            "--model-dir",
+            "/tmp/qwen35",
+            "--api-key",
+            "--enable-prefix-caching",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        assert!(ServeArgs::parse_with_env(&swallowed_flag, None, None).is_err());
+
+        let colliding_port: Vec<String> = [
+            "--model-dir",
+            "/tmp/qwen35",
+            "--port",
+            "43537",
+            "--admin-port",
+            "43537",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        assert!(ServeArgs::parse_with_env(&colliding_port, None, None).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bearer_auth_protects_v1_admin_and_metrics_while_keeping_probes_open() {
+        let handle = zs_scheduler::spawn_mock(zs_scheduler::MockScript {
+            tokens: vec![1],
+            ..Default::default()
+        });
+        handle.set_state(EngineState::Ready);
+        let state = Arc::new(AppState {
+            phase: handle.state_arc(),
+            handle: Mutex::new(Some(handle.clone())),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            api_key: Some(SecretToken::new("sk-top-secret".to_owned())),
+            allow_remote_metrics: false,
+            tokenizer: test_tokenizer(),
+            served_model_name: "zstep-test".to_owned(),
+            tokenizer_mode: "auto".to_owned(),
+            enable_prefix_caching: false,
+            speculative_enabled: false,
+            max_model_len: 4096,
+            page_block_tokens: 16,
+            max_pages_per_seq: 256,
+            num_kv_pages: 4096,
+            created_at: 0,
+            started: Instant::now(),
+            request_counter: AtomicU64::new(0),
+        });
+        let address = spawn_server(state).await;
+
+        // Operational health probes remain accessible without credentials.
+        for path in ["/livez", "/health", "/ready"] {
+            let (code, _, _) =
+                tokio::task::spawn_blocking(move || http(address, "GET", path, None, &[]))
+                    .await
+                    .expect("join");
+            assert_eq!(code, 200, "probe {path} must stay 200");
+        }
+
+        // Missing or wrong Bearer token returns 401 + WWW-Authenticate on /v1/*, /metrics, /admin/drain.
+        let body = chat_body("hi", false, "");
+        for (method, path, payload) in [
+            ("GET", "/v1/models", None),
+            ("POST", "/v1/chat/completions", Some(body.as_str())),
+            ("GET", "/metrics", None),
+            ("POST", "/admin/drain", None),
+        ] {
+            let p = payload.map(str::to_owned);
+            let (code_missing, hdrs_missing, err_missing) =
+                tokio::task::spawn_blocking(move || {
+                    http(
+                        address,
+                        method,
+                        path,
+                        p.as_deref(),
+                        &[("x-request-id", "req_auth_401")],
+                    )
+                })
+                .await
+                .expect("join");
+            assert_eq!(code_missing, 401, "{method} {path}: {err_missing}");
+            assert!(
+                hdrs_missing
+                    .to_lowercase()
+                    .contains("www-authenticate: bearer"),
+                "{hdrs_missing}"
+            );
+            assert!(err_missing.contains("invalid_api_key"), "{err_missing}");
+
+            let p_wrong = payload.map(str::to_owned);
+            let (code_wrong, _, _) = tokio::task::spawn_blocking(move || {
+                http(
+                    address,
+                    method,
+                    path,
+                    p_wrong.as_deref(),
+                    &[("Authorization", "Bearer wrong-token")],
+                )
+            })
+            .await
+            .expect("join");
+            assert_eq!(code_wrong, 401, "{method} {path} wrong token");
+        }
+
+        // Valid case-insensitive `bearer` scheme succeeds across /v1/*, /metrics, and /admin/drain.
+        let auth_hdr = [("Authorization", "bearer sk-top-secret")];
+        let (models_ok, _, _) = tokio::task::spawn_blocking(move || {
+            http(address, "GET", "/v1/models", None, &auth_hdr)
+        })
+        .await
+        .expect("join");
+        assert_eq!(models_ok, 200);
+
+        let chat_ok_body = chat_body("hi", false, r#","max_tokens":2"#);
+        let (chat_ok, _, _) = tokio::task::spawn_blocking(move || {
+            http(
+                address,
+                "POST",
+                "/v1/chat/completions",
+                Some(&chat_ok_body),
+                &auth_hdr,
+            )
+        })
+        .await
+        .expect("join");
+        assert_eq!(chat_ok, 200);
+
+        let (metrics_ok, _, _) =
+            tokio::task::spawn_blocking(move || http(address, "GET", "/metrics", None, &auth_hdr))
+                .await
+                .expect("join");
+        assert_eq!(metrics_ok, 200);
+
+        let (drain_ok, _, _) = tokio::task::spawn_blocking(move || {
+            http(address, "POST", "/admin/drain", None, &auth_hdr)
+        })
+        .await
+        .expect("join");
+        assert_eq!(drain_ok, 200);
+
+        handle.shutdown();
+        let _ = handle.join(Duration::from_secs(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn separate_admin_port_and_remote_peer_guard_block_unauthenticated_lan_drain() {
+        let handle = zs_scheduler::spawn_mock(zs_scheduler::MockScript::default());
+        let state = test_state(EngineState::Ready, Some(handle.clone()));
+
+        // 1) Non-loopback peer (`172.17.0.1:51000`, e.g. Docker bridge NAT / K8s Pod scraper)
+        //    without `api_key`: mutating `/admin/drain` is strictly 403, read-only `/metrics` is
+        //    200 by default (`allow_remote_metrics = true`) and 403 when `--no-allow-remote-metrics`.
+        let mut remote_drain_req = Request::builder()
+            .method("POST")
+            .uri("/admin/drain")
+            .body(Body::empty())
+            .expect("req");
+        remote_drain_req
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([172, 17, 0, 1], 51000))));
+        let drain_resp = admin_drain(State(state.clone()), remote_drain_req).await;
+        assert_eq!(drain_resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            state.phase(),
+            EngineState::Ready,
+            "remote 403 must not drain"
+        );
+
+        let mut remote_metrics_default = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .expect("req");
+        remote_metrics_default
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([172, 17, 0, 1], 51001))));
+        let metrics_default_resp = metrics(State(state.clone()), remote_metrics_default).await;
+        assert_eq!(metrics_default_resp.status(), StatusCode::OK);
+
+        let locked_metrics_state = Arc::new(AppState {
+            phase: handle.state_arc(),
+            handle: Mutex::new(Some(handle.clone())),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            api_key: None,
+            allow_remote_metrics: false,
+            tokenizer: test_tokenizer(),
+            served_model_name: "zstep-test".to_owned(),
+            tokenizer_mode: "auto".to_owned(),
+            enable_prefix_caching: false,
+            speculative_enabled: false,
+            max_model_len: 4096,
+            page_block_tokens: 16,
+            max_pages_per_seq: 256,
+            num_kv_pages: 4096,
+            created_at: 0,
+            started: Instant::now(),
+            request_counter: AtomicU64::new(0),
+        });
+        let mut remote_metrics_locked = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .expect("req");
+        remote_metrics_locked
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([172, 17, 0, 1], 51002))));
+        let metrics_locked_resp = metrics(State(locked_metrics_state), remote_metrics_locked).await;
+        assert_eq!(metrics_locked_resp.status(), StatusCode::FORBIDDEN);
+
+        // 2) Dedicated `--admin-port`: public router omits `/metrics` and `/admin/drain` (404),
+        //    while loopback admin router serves both cleanly AND enforces `--api-key` when set.
+        let pub_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind pub");
+        let pub_addr = pub_listener.local_addr().expect("pub addr");
+        let pub_state = state.clone();
+        tokio::spawn(async move {
+            let svc = router_with_ops(pub_state, false)
+                .into_make_service_with_connect_info::<SocketAddr>();
+            let _ = axum::serve(pub_listener, svc).await;
+        });
+
+        let adm_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind adm");
+        let adm_addr = adm_listener.local_addr().expect("adm addr");
+        let adm_state = state.clone();
+        tokio::spawn(async move {
+            let svc = admin_loopback_router(adm_state)
+                .into_make_service_with_connect_info::<SocketAddr>();
+            let _ = axum::serve(adm_listener, svc).await;
+        });
+
+        let (pub_metrics, _, _) =
+            tokio::task::spawn_blocking(move || http(pub_addr, "GET", "/metrics", None, &[]))
+                .await
+                .expect("join");
+        let (pub_drain, _, _) =
+            tokio::task::spawn_blocking(move || http(pub_addr, "POST", "/admin/drain", None, &[]))
+                .await
+                .expect("join");
+        assert_eq!((pub_metrics, pub_drain), (404, 404));
+
+        let (adm_metrics, _, _) =
+            tokio::task::spawn_blocking(move || http(adm_addr, "GET", "/metrics", None, &[]))
+                .await
+                .expect("join");
+        let (adm_drain, _, _) =
+            tokio::task::spawn_blocking(move || http(adm_addr, "POST", "/admin/drain", None, &[]))
+                .await
+                .expect("join");
+        assert_eq!((adm_metrics, adm_drain), (200, 200));
+        assert_eq!(state.phase(), EngineState::Draining);
+
+        // 3) `--admin-port` combined with `--api-key` still enforces Bearer auth on loopback.
+        handle.set_state(EngineState::Ready);
+        let keyed_adm_state = Arc::new(AppState {
+            phase: handle.state_arc(),
+            handle: Mutex::new(Some(handle.clone())),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            api_key: Some(SecretToken::new("sk-admin-key".to_owned())),
+            allow_remote_metrics: true,
+            tokenizer: test_tokenizer(),
+            served_model_name: "zstep-test".to_owned(),
+            tokenizer_mode: "auto".to_owned(),
+            enable_prefix_caching: false,
+            speculative_enabled: false,
+            max_model_len: 4096,
+            page_block_tokens: 16,
+            max_pages_per_seq: 256,
+            num_kv_pages: 4096,
+            created_at: 0,
+            started: Instant::now(),
+            request_counter: AtomicU64::new(0),
+        });
+        let keyed_adm_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind keyed adm");
+        let keyed_adm_addr = keyed_adm_listener.local_addr().expect("keyed adm addr");
+        tokio::spawn(async move {
+            let svc = admin_loopback_router(keyed_adm_state)
+                .into_make_service_with_connect_info::<SocketAddr>();
+            let _ = axum::serve(keyed_adm_listener, svc).await;
+        });
+
+        let (keyed_unauth_m, _, _) =
+            tokio::task::spawn_blocking(move || http(keyed_adm_addr, "GET", "/metrics", None, &[]))
+                .await
+                .expect("join");
+        let (keyed_unauth_d, _, _) = tokio::task::spawn_blocking(move || {
+            http(keyed_adm_addr, "POST", "/admin/drain", None, &[])
+        })
+        .await
+        .expect("join");
+        assert_eq!((keyed_unauth_m, keyed_unauth_d), (401, 401));
+
+        let auth = [("Authorization", "Bearer sk-admin-key")];
+        let (keyed_ok_m, _, _) = tokio::task::spawn_blocking(move || {
+            http(keyed_adm_addr, "GET", "/metrics", None, &auth)
+        })
+        .await
+        .expect("join");
+        let (keyed_ok_d, _, _) = tokio::task::spawn_blocking(move || {
+            http(keyed_adm_addr, "POST", "/admin/drain", None, &auth)
+        })
+        .await
+        .expect("join");
+        assert_eq!((keyed_ok_m, keyed_ok_d), (200, 200));
+
+        handle.shutdown();
+        let _ = handle.join(Duration::from_secs(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poisoned_handle_mutex_recovers_without_panicking_handlers() {
+        let handle = zs_scheduler::spawn_mock(zs_scheduler::MockScript::default());
+        let state = test_state(EngineState::Ready, Some(handle.clone()));
+        let poison_ref = Arc::clone(&state);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = poison_ref.handle.lock().unwrap();
+            panic!("simulate panic while holding handle mutex");
+        }));
+        assert!(state.handle.is_poisoned());
+
+        let address = spawn_server(state.clone()).await;
+        let (health_code, _, _) =
+            tokio::task::spawn_blocking(move || http(address, "GET", "/health", None, &[]))
+                .await
+                .expect("join");
+        let (metrics_code, _, _) =
+            tokio::task::spawn_blocking(move || http(address, "GET", "/metrics", None, &[]))
+                .await
+                .expect("join");
+        let (drain_code, _, _) =
+            tokio::task::spawn_blocking(move || http(address, "POST", "/admin/drain", None, &[]))
+                .await
+                .expect("join");
+        assert_eq!((health_code, metrics_code, drain_code), (200, 200, 200));
+        assert_eq!(state.phase(), EngineState::Draining);
 
         handle.shutdown();
         let _ = handle.join(Duration::from_secs(2));

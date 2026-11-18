@@ -73,6 +73,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from zstep_worker.env_config import WorkerRuntimeConfig
+
 _LOG = logging.getLogger(__name__)
 
 _DEFAULT_COMPAT_CANDIDATES: tuple[str, ...] = (
@@ -129,20 +131,6 @@ class _Sm120MegaGateState:
     patched_layers: int
 
 
-def _env_flag(name: str, default: bool = True) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() not in ("0", "false", "no", "off")
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    return int(raw.strip())
-
-
 def _compute_b12x_source_fingerprint() -> str:
     """Compute a short deterministic hash over loaded `b12x` sources to isolate disk caches."""
     b12x_mod = sys.modules.get("b12x")
@@ -171,8 +159,9 @@ def _compute_b12x_source_fingerprint() -> str:
 
 def is_sm120_dsa_decode_available() -> bool:
     """Return True when SM120 fused paged DSA indexer decode is enabled and importable."""
-    require_exp = _env_flag("ZSTEP_REQUIRE_SM120_EXP", default=False)
-    if not _env_flag("ZSTEP_ENABLE_SM120_DSA_DECODE", default=True):
+    cfg = WorkerRuntimeConfig.from_env()
+    require_exp = cfg.require_sm120_exp
+    if not cfg.enable_sm120_dsa_decode:
         if require_exp:
             raise RuntimeError(
                 "ZSTEP_REQUIRE_SM120_EXP=1 conflicts with ZSTEP_ENABLE_SM120_DSA_DECODE=0"
@@ -227,11 +216,10 @@ def _prepend_pythonpath(entry: str) -> None:
 
 def maybe_enable_b12x_for_dsv41() -> bool:
     """Configure environment & import paths for `b12x` on SM120 if available."""
-    require_b12x = _env_flag("ZSTEP_REQUIRE_B12X", default=False) or _env_flag(
-        "ZSTEP_REQUIRE_SM120_EXP", default=False
-    )
-    explicit_enable = os.environ.get("ZSTEP_ENABLE_B12X") is not None
-    if not _env_flag("ZSTEP_ENABLE_B12X", default=True):
+    cfg = WorkerRuntimeConfig.from_env()
+    require_b12x = cfg.require_b12x or cfg.require_sm120_exp
+    explicit_enable = cfg.explicit_enable_b12x
+    if not cfg.enable_b12x:
         if require_b12x:
             raise RuntimeError(
                 "ZSTEP_REQUIRE_B12X=1 conflicts with ZSTEP_ENABLE_B12X=0"
@@ -252,7 +240,7 @@ def maybe_enable_b12x_for_dsv41() -> bool:
     # Force `dynamic` tactic over `micro` for `M = 1, 2, 4` (`36.9 us` vs `117 us`).
     os.environ.setdefault("B12X_W4A8_TINY_DECODE", "0")
 
-    custom_compat = os.environ.get("ZSTEP_B12X_COMPAT_DIR", "").strip()
+    custom_compat = cfg.b12x_compat_dir
     candidates = (
         (custom_compat, *_DEFAULT_COMPAT_CANDIDATES)
         if custom_compat
@@ -1168,14 +1156,15 @@ def _prepare_sm12x_mega_gate(
     exchange_group: dist.ProcessGroup | None,
 ) -> tuple[int, int, int]:
     """Pre-compile SM120 CuTe-DSL MegaGate schedules (rank 0 first) and patch eligible MoERunners."""
-    require_exp = _env_flag("ZSTEP_REQUIRE_SM120_EXP", default=False)
-    if not _env_flag("ZSTEP_ENABLE_SM12X_MEGA_GATE", default=True):
+    cfg_env = WorkerRuntimeConfig.from_env()
+    require_exp = cfg_env.require_sm120_exp
+    if not cfg_env.enable_sm12x_mega_gate:
         if require_exp:
             raise RuntimeError(
                 "ZSTEP_REQUIRE_SM120_EXP=1 conflicts with ZSTEP_ENABLE_SM12X_MEGA_GATE=0"
             )
         return 0, 0, 0
-    min_tokens = _env_int("ZSTEP_MEGA_GATE_MIN_TOKENS", DEFAULT_MEGA_GATE_MIN_TOKENS)
+    min_tokens = cfg_env.mega_gate_min_tokens
     if min_tokens <= 0 or min_tokens > int(max_tokens):
         if require_exp:
             raise RuntimeError(
@@ -1344,7 +1333,7 @@ def _prepare_sm12x_mega_gate(
             _LOG.warning("SM12x MegaGate found 0 eligible MoERunner layers")
         return 0, 0, 0
 
-    enable_pdl = _env_flag("ZSTEP_MEGA_GATE_ENABLE_PDL", default=False)
+    enable_pdl = cfg_env.mega_gate_enable_pdl
     specs_to_compile: list[KernelSpec] = []
     geom_cfg_by_m: dict[
         tuple[int, int, int, bool, bool], list[MegaGateConfig | None]
@@ -1711,7 +1700,7 @@ def _prepare_sm120_mhc_overlap(
 ) -> None:
     """Install 1-pass in-place SM120 mHC post+collapse+RMSNorm and side-stream Sinkhorn overlap."""
     if not (
-        _env_flag("ZSTEP_ENABLE_SM120_MHC_OVERLAP", default=True)
+        WorkerRuntimeConfig.from_env().enable_sm120_mhc_overlap
         and torch.cuda.is_available()
         and torch.cuda.get_device_capability() == (12, 0)
     ):
@@ -2322,11 +2311,11 @@ def prepare_b12x_dsv41_model(
         if b12x_fp == "default"
         else f"b12x_zstep_dsv41_v2_{b12x_fp}"
     )
-    cache_dir = os.environ.get(
-        "ZSTEP_B12X_CACHE_DIR",
-        str(Path.home() / ".cache" / default_cache_name),
+    cfg_env = WorkerRuntimeConfig.from_env()
+    cache_dir = cfg_env.b12x_cache_dir or str(
+        Path.home() / ".cache" / default_cache_name
     )
-    autotune = _env_flag("ZSTEP_B12X_AUTOTUNE", default=True)
+    autotune = cfg_env.b12x_autotune
 
     def _run_session() -> Any:
         sess = PreparationSession(

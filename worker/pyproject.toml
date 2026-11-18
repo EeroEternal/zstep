@@ -5,11 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "zstep-worker"
 version = "0.1.0"
-description = "Explicit sm_120 step GPU worker for zstep (8x NVIDIA RTX 6000D)"
+description = "Explicit sm_120 step GPU worker for zstep (NVIDIA RTX 5090 / RTX 6000D)"
 requires-python = ">=3.11"
 license = { text = "MIT" }
+# Keep core dependencies CPU-light so SHM layout parity, P2P topology, speculative
+# verification, env config, and AST hot-path guards run in lightweight CI without CUDA.
 dependencies = [
-    "numpy>=1.26",
+    "numpy>=1.26,<3.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0,<10.0",
+    "ruff==0.9.10",
+]
+# Reference SM120 runtime stack: `vllm/vllm-openai:v0.31.0` (`torch==2.13.0+cu130`,
+# CUDA 13.0) overlaid with `./scripts/prepare_sm120_overlay.sh`
+# (`worker/third_party/flashinfer_sm120_overlay_ae58183f.tar.xz`).
+gpu = [
+    "torch>=2.13.0",
+    "triton>=3.6.0",
+    "safetensors>=0.4.5",
 ]
 
 [tool.setuptools.packages.find]
