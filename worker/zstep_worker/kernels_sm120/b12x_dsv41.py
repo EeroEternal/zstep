@@ -1628,6 +1628,449 @@ def _prepare_sm12x_mega_gate(
     return len(eligible), len(specs_to_compile), min_tokens
 
 
+_MHC_STATE_BY_DEV: dict[int, Any] = {}
+
+
+def _compute_mhc_split_cap(compute_splits_fn: Any, cap: int) -> int:
+    """Compute the exact upper bound of `splits * n` across `1 <= n <= cap`."""
+    mcap = max(32768, int(cap))
+    for n in range(1, int(cap) + 1):
+        prod = int(compute_splits_fn(20480, n)) * n
+        if prod > mcap:
+            mcap = prod
+    return mcap
+
+
+def _sync_mhc_state_in(s: Any, main_s: torch.cuda.Stream | None) -> None:
+    if getattr(s, "deferred", None) is not None:
+        s.flush(main_s)
+    if getattr(s, "pending", False):
+        if main_s is not None:
+            main_s.wait_stream(s.mhc_stream)
+        s.pending = False
+
+
+def _wrap_mhc_forward_join(target_mod: torch.nn.Module, dev_idx: int) -> None:
+    """Ensure `mhc_stream` always joins `main_s` before `forward` exits or unwinds."""
+    if getattr(target_mod, "_zstep_sm120_mhc_fwd_wrapped", False):
+        return
+    orig_fwd = target_mod.forward
+
+    def _wrapped_forward(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return orig_fwd(*args, **kwargs)
+        except BaseException:
+            s = _MHC_STATE_BY_DEV.get(dev_idx)
+            if s is not None:
+                s.deferred = None
+                if getattr(s, "pending", False):
+                    if (
+                        getattr(s, "dev", None) is not None
+                        and s.dev.type == "cuda"
+                        and torch.cuda.is_available()
+                        and not torch.cuda.is_current_stream_capturing()
+                    ):
+                        torch.cuda.current_stream(s.dev).wait_stream(s.mhc_stream)
+                    s.pending = False
+            raise
+        finally:
+            s = _MHC_STATE_BY_DEV.get(dev_idx)
+            if s is not None and (
+                getattr(s, "deferred", None) is not None or getattr(s, "pending", False)
+            ):
+                main_s = (
+                    torch.cuda.current_stream(s.dev)
+                    if getattr(s, "dev", None) is not None
+                    and s.dev.type == "cuda"
+                    and torch.cuda.is_available()
+                    else None
+                )
+                _sync_mhc_state_in(s, main_s)
+
+    target_mod._zstep_sm120_orig_forward = orig_fwd  # type: ignore[attr-defined]
+    target_mod._zstep_sm120_mhc_fwd_wrapped = True  # type: ignore[attr-defined]
+    target_mod.forward = _wrapped_forward  # type: ignore[method-assign]
+
+
+def flush_sm120_mhc_before_ar(device_idx: int | None) -> None:
+    """Flush any deferred `n > 256` mHC Sinkhorn projection into the `shm_ar` window."""
+    s = _MHC_STATE_BY_DEV.get(0 if device_idx is None else device_idx)
+    if s is not None and getattr(s, "deferred", None) is not None:
+        stream = (
+            torch.cuda.current_stream(s.dev)
+            if getattr(s, "dev", None) is not None
+            and s.dev.type == "cuda"
+            and torch.cuda.is_available()
+            else None
+        )
+        s.flush(stream)
+
+
+def _prepare_sm120_mhc_overlap(
+    model: torch.nn.Module, *, device: torch.device, max_tokens: int
+) -> None:
+    """Install 1-pass in-place SM120 mHC post+collapse+RMSNorm and side-stream Sinkhorn overlap."""
+    if not (
+        _env_flag("ZSTEP_ENABLE_SM120_MHC_OVERLAP", default=True)
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability() == (12, 0)
+    ):
+        return
+    try:
+        from vllm.forward_context import in_piecewise_cudagraph
+        from vllm.model_executor.kernels.mhc.warmup import compute_mhc_pre_num_splits
+        from vllm.models.deepseek_v41.nvidia import model as dsv41_model
+        from vllm.models.deepseek_v41.nvidia.ops import mhc as dsv41_mhc
+        from vllm.utils.deep_gemm import is_deep_gemm_supported, tf32_hc_prenorm_gemm
+        from zstep_worker.kernels_sm120.shm_allreduce import (
+            get_host_mapped_allreduce_extension,
+        )
+    except ImportError:
+        return
+    if not is_deep_gemm_supported():
+        return
+
+    cap = max(int(max_tokens), 8192)
+    dev_idx = 0 if device.index is None else int(device.index)
+    mcap = _compute_mhc_split_cap(compute_mhc_pre_num_splits, cap)
+    f32 = {"dtype": torch.float32, "device": device}
+
+    st = _MHC_STATE_BY_DEV.get(dev_idx)
+    if st is None:
+        st = types.SimpleNamespace(
+            dev=device,
+            mhc_stream=torch.cuda.Stream(device=device),
+            mix_flat=torch.empty((mcap * 24,), **f32),
+            sqr_flat=torch.empty((mcap,), **f32),
+            empty_aux=torch.empty((0, 5120), dtype=torch.bfloat16, device=device),
+            post_buf=(torch.empty((cap, 4, 1), **f32), torch.empty((cap, 4, 1), **f32)),
+            comb_buf=(torch.empty((cap, 4, 4), **f32), torch.empty((cap, 4, 4), **f32)),
+            pre_buf=(torch.empty((cap, 4), **f32), torch.empty((cap, 4), **f32)),
+            cap=cap,
+            slot=0,
+            pending=False,
+            deferred=None,
+            ext=None,
+            owners={id(model)},
+        )
+
+        def _flush(main_s: torch.cuda.Stream) -> None:
+            if st.deferred is not None:
+                (
+                    n,
+                    res,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    np_,
+                    nc,
+                    npr,
+                    r_eps,
+                    pre_eps,
+                    sk_eps,
+                    p_mult,
+                    sk_rep,
+                ) = st.deferred
+                st.deferred = None
+                splits = int(compute_mhc_pre_num_splits(20480, n))
+                needed = splits * n
+                if needed > st.sqr_flat.numel():
+                    if torch.cuda.is_current_stream_capturing():
+                        raise RuntimeError(
+                            f"mHC split workspace {needed} exceeds {st.sqr_flat.numel()} in capture"
+                        )
+                    st.mix_flat = torch.empty((needed * 24,), dtype=torch.float32, device=st.dev)
+                    st.sqr_flat = torch.empty((needed,), dtype=torch.float32, device=st.dev)
+                mix_v = st.mix_flat[: needed * 24].view(splits, n, 24)
+                sqr_v = st.sqr_flat[: needed].view(splits, n)
+                st.mhc_stream.wait_stream(main_s)
+                with torch.cuda.stream(st.mhc_stream):
+                    tf32_hc_prenorm_gemm(res.view(n, 20480), fn, mix_v, sqr_v, splits)
+                    st.ext.launch_mhc_sinkhorn_stats(
+                        mix_v,
+                        sqr_v,
+                        hc_scale,
+                        hc_base,
+                        np_.view(n, 4),
+                        nc.view(n, 16),
+                        npr,
+                        20480,
+                        r_eps,
+                        pre_eps,
+                        sk_eps,
+                        p_mult,
+                        sk_rep,
+                        1,
+                        st.mhc_stream.cuda_stream,
+                    )
+                st.pending = True
+
+        st.flush = _flush
+        _MHC_STATE_BY_DEV[dev_idx] = st
+    else:
+        owners = getattr(st, "owners", None)
+        if not isinstance(owners, set):
+            owners = set()
+            st.owners = owners
+        owners.add(id(model))
+        if not torch.cuda.is_current_stream_capturing():
+            if cap > st.cap:
+                st.post_buf = (torch.empty((cap, 4, 1), **f32), torch.empty((cap, 4, 1), **f32))
+                st.comb_buf = (torch.empty((cap, 4, 4), **f32), torch.empty((cap, 4, 4), **f32))
+                st.pre_buf = (torch.empty((cap, 4), **f32), torch.empty((cap, 4), **f32))
+                st.cap = cap
+            if mcap > st.sqr_flat.numel():
+                st.mix_flat = torch.empty((mcap * 24,), **f32)
+                st.sqr_flat = torch.empty((mcap,), **f32)
+
+    model._sm120_mhc_dev = dev_idx  # type: ignore[attr-defined]
+    _wrap_mhc_forward_join(model, dev_idx)
+    inner_model = getattr(model, "model", None)
+    if isinstance(inner_model, torch.nn.Module):
+        _wrap_mhc_forward_join(inner_model, dev_idx)
+
+    if not getattr(dsv41_model, "_zstep_sm120_mhc_patched", False):
+        orig_post = dsv41_model.mhc_post_tilelang
+        orig_shifted = dsv41_model.mhc_shifted_post_pre
+
+        def _patched_post(x, residual, post_layer_mix, comb_res_mix):
+            if isinstance(residual, torch.Tensor) and residual.is_cuda:
+                r_idx = 0 if residual.device.index is None else int(residual.device.index)
+                s = _MHC_STATE_BY_DEV.get(r_idx)
+            else:
+                s = None
+            if s is not None:
+                main_s = torch.cuda.current_stream(residual.device)
+                _sync_mhc_state_in(s, main_s)
+                n = int(residual.shape[0]) if residual.ndim == 3 else -1
+                if (
+                    residual.ndim == 3
+                    and residual.shape[1:] == (4, 5120)
+                    and isinstance(x, torch.Tensor)
+                    and x.is_cuda
+                    and x.shape == (n, 5120)
+                    and x.dtype == torch.bfloat16
+                    and residual.dtype == torch.bfloat16
+                    and isinstance(post_layer_mix, torch.Tensor)
+                    and post_layer_mix.is_cuda
+                    and post_layer_mix.dtype == torch.float32
+                    and post_layer_mix.numel() == n * 4
+                    and isinstance(comb_res_mix, torch.Tensor)
+                    and comb_res_mix.is_cuda
+                    and comb_res_mix.dtype == torch.float32
+                    and comb_res_mix.numel() == n * 16
+                    and all(
+                        t.is_contiguous()
+                        for t in (x, residual, post_layer_mix, comb_res_mix)
+                    )
+                    and (x.data_ptr() & 15) == 0
+                    and (residual.data_ptr() & 15) == 0
+                ):
+                    if n > 0:
+                        s.ext = s.ext or get_host_mapped_allreduce_extension()
+                        s.ext.launch_mhc_post_collapse_rmsnorm(
+                            x,
+                            residual,
+                            post_layer_mix,
+                            comb_res_mix,
+                            post_layer_mix,
+                            s.empty_aux,
+                            s.empty_aux,
+                            s.empty_aux,
+                            1e-6,
+                            0,
+                            1,
+                            main_s.cuda_stream,
+                        )
+                    return residual
+            return orig_post(x, residual, post_layer_mix, comb_res_mix)
+
+        def _patched_shifted(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            pre_mix=None,
+            norm_weight=None,
+            norm_eps=1e-6,
+            capture_aux=False,
+            *,
+            stream=None,
+            reduce_results=False,
+        ):
+            if isinstance(residual, torch.Tensor) and residual.is_cuda:
+                r_idx = 0 if residual.device.index is None else int(residual.device.index)
+                s = _MHC_STATE_BY_DEV.get(r_idx)
+            else:
+                s = None
+            if s is not None:
+                _sync_mhc_state_in(s, torch.cuda.current_stream(residual.device))
+            n = int(residual.shape[0]) if (isinstance(residual, torch.Tensor) and residual.ndim == 3) else -1
+            if (
+                s is not None
+                and isinstance(x, torch.Tensor)
+                and x.is_cuda
+                and not reduce_results
+                and stream is None
+                and pre_mix is not None
+                and norm_weight is not None
+                and isinstance(fn, torch.Tensor)
+                and fn.is_cuda
+                and fn.shape == (24, 20480)
+                and residual.shape[1:] == (4, 5120)
+                and x.shape == (n, 5120)
+                and 0 < n <= s.cap
+                and x.dtype == torch.bfloat16
+                and residual.dtype == torch.bfloat16
+                and isinstance(norm_weight, torch.Tensor)
+                and norm_weight.is_cuda
+                and norm_weight.dtype == torch.bfloat16
+                and norm_weight.shape == (5120,)
+                and isinstance(post_layer_mix, torch.Tensor)
+                and post_layer_mix.is_cuda
+                and post_layer_mix.dtype == torch.float32
+                and post_layer_mix.numel() == n * 4
+                and isinstance(comb_res_mix, torch.Tensor)
+                and comb_res_mix.is_cuda
+                and comb_res_mix.dtype == torch.float32
+                and comb_res_mix.numel() == n * 16
+                and isinstance(pre_mix, torch.Tensor)
+                and pre_mix.is_cuda
+                and pre_mix.dtype == torch.float32
+                and pre_mix.numel() == n * 4
+                and isinstance(hc_scale, torch.Tensor)
+                and hc_scale.is_cuda
+                and hc_scale.dtype == torch.float32
+                and hc_scale.is_contiguous()
+                and hc_scale.numel() >= 3
+                and isinstance(hc_base, torch.Tensor)
+                and hc_base.is_cuda
+                and hc_base.dtype == torch.float32
+                and hc_base.is_contiguous()
+                and hc_base.numel() >= 24
+                and int(sinkhorn_repeat) >= 1
+                and not in_piecewise_cudagraph()
+                and all(
+                    t.is_contiguous()
+                    for t in (x, residual, post_layer_mix, comb_res_mix, pre_mix, norm_weight)
+                )
+                and (x.data_ptr() & 15) == 0
+                and (residual.data_ptr() & 15) == 0
+                and (norm_weight.data_ptr() & 15) == 0
+            ):
+                s.ext = s.ext or get_host_mapped_allreduce_extension()
+                main_s = torch.cuda.current_stream(residual.device)
+                layer_in = torch.empty(
+                    (n, 5120), dtype=torch.bfloat16, device=residual.device
+                )
+                aux_buf = torch.empty_like(layer_in) if capture_aux else s.empty_aux
+                s.ext.launch_mhc_post_collapse_rmsnorm(
+                    x,
+                    residual,
+                    post_layer_mix,
+                    comb_res_mix,
+                    pre_mix,
+                    norm_weight,
+                    layer_in,
+                    aux_buf,
+                    float(norm_eps),
+                    1 if capture_aux else 0,
+                    0,
+                    main_s.cuda_stream,
+                )
+                p, s.slot = s.slot, s.slot ^ 1
+                next_post = s.post_buf[p][:n]
+                next_comb = s.comb_buf[p][:n]
+                next_pre = s.pre_buf[p][:n]
+                s.deferred = (
+                    n,
+                    residual,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    next_post,
+                    next_comb,
+                    next_pre,
+                    float(rms_eps),
+                    float(hc_pre_eps),
+                    float(hc_sinkhorn_eps),
+                    float(hc_post_mult_value),
+                    int(sinkhorn_repeat),
+                )
+                if n <= 256:
+                    s.flush(main_s)
+                return (
+                    residual,
+                    next_post,
+                    next_comb,
+                    layer_in,
+                    next_pre,
+                    aux_buf if capture_aux else None,
+                )
+            return orig_shifted(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                pre_mix=pre_mix,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                capture_aux=capture_aux,
+                stream=stream,
+                reduce_results=reduce_results,
+            )
+
+        dsv41_model.mhc_post_tilelang = _patched_post
+        dsv41_model.mhc_shifted_post_pre = _patched_shifted
+        dsv41_mhc.mhc_shifted_post_pre = _patched_shifted
+        if hasattr(dsv41_mhc, "mhc_post_tilelang"):
+            dsv41_mhc.mhc_post_tilelang = _patched_post
+        for mod_name in (
+            "vllm.model_executor.kernels.mhc.tilelang",
+            "vllm.model_executor.kernels.mhc",
+        ):
+            src_mod = sys.modules.get(mod_name)
+            if src_mod is not None and getattr(src_mod, "mhc_post_tilelang", None) is orig_post:
+                src_mod.mhc_post_tilelang = _patched_post  # type: ignore[attr-defined]
+        dsv41_model._zstep_sm120_mhc_fns = (  # type: ignore[attr-defined]
+            orig_post,
+            orig_shifted,
+            _patched_post,
+            _patched_shifted,
+        )
+        dsv41_model._zstep_sm120_mhc_patched = True
+
+    patched_fns = getattr(dsv41_model, "_zstep_sm120_mhc_fns", None)
+    if patched_fns is not None:
+        orig_p, orig_s, patch_p, patch_s = patched_fns
+        visited_mods = {
+            sys.modules.get(type(sub).__module__) for sub in model.modules()
+        }
+        for mod in visited_mods:
+            if mod is None:
+                continue
+            if getattr(mod, "mhc_post_tilelang", None) is orig_p:
+                mod.mhc_post_tilelang = patch_p  # type: ignore[attr-defined]
+            if getattr(mod, "mhc_shifted_post_pre", None) is orig_s:
+                mod.mhc_shifted_post_pre = patch_s  # type: ignore[attr-defined]
+
+
 def prepare_b12x_dsv41_model(
     model: torch.nn.Module,
     *,
@@ -1639,6 +2082,7 @@ def prepare_b12x_dsv41_model(
 ) -> B12xPrepareSummary:
     """Compile/autotune all SM120 `b12x`, `sm12x_mega_gate` & `sm120_dsa_indexer` plans (rank 0 first)."""
     t0 = time.perf_counter()
+    _prepare_sm120_mhc_overlap(model, device=device, max_tokens=max_tokens)
     dsa_enabled = _prepare_sm120_dsa_indexer(
         rank=rank,
         device=device,
@@ -2042,6 +2486,25 @@ def close_b12x_dsv41_model(model: torch.nn.Module | None) -> None:
             model._b12x_scratch_arenas = None  # type: ignore[attr-defined]
         if hasattr(model, "_sm120_mega_gate_state"):
             model._sm120_mega_gate_state = None  # type: ignore[attr-defined]
+        for target_mod in (model, getattr(model, "model", None)):
+            if isinstance(target_mod, torch.nn.Module) and hasattr(
+                target_mod, "_zstep_sm120_orig_forward"
+            ):
+                target_mod.forward = target_mod._zstep_sm120_orig_forward  # type: ignore[method-assign]
+                delattr(target_mod, "_zstep_sm120_orig_forward")
+                target_mod._zstep_sm120_mhc_fwd_wrapped = False  # type: ignore[attr-defined]
+        mhc_dev = getattr(model, "_sm120_mhc_dev", None)
+        if mhc_dev is not None:
+            st = _MHC_STATE_BY_DEV.get(mhc_dev)
+            if st is not None:
+                owners = getattr(st, "owners", None)
+                if isinstance(owners, set):
+                    owners.discard(id(model))
+                    if not owners:
+                        _MHC_STATE_BY_DEV.pop(mhc_dev, None)
+                else:
+                    _MHC_STATE_BY_DEV.pop(mhc_dev, None)
+            model._sm120_mhc_dev = None  # type: ignore[attr-defined]
 
     dsa_api = sys.modules.get("flashinfer.experimental.sm120_dsa_indexer._api")
     if dsa_api is not None:

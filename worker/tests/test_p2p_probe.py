@@ -76,6 +76,55 @@ def test_shm_allreduce_partial_init_cleanup_preserves_exception(tmp_path: Path) 
         assert not leaked_file.exists()
 
 
+def test_shm_allgather_attach_pxb_ipc_tracks_owner_liveness() -> None:
+    from types import SimpleNamespace
+    from zstep_worker.kernels_sm120.shm_allreduce import (
+        HostMappedShmAllGather,
+        HostMappedShmAllReduce,
+    )
+
+    ag = object.__new__(HostMappedShmAllGather)
+    ag.rank = 0
+    ag.world_size = 8
+    ag.device = torch.device("cpu")
+    ag._closed = False
+    ag._registered = False
+    ag._pxb_ar_ref = None
+
+    ar = object.__new__(HostMappedShmAllReduce)
+    ar.rank = 0
+    ar.world_size = 8
+    ar.device = torch.device("cpu")
+    ar._closed = False
+    ar._pxb_enabled = True
+    ar._my_hbm_ptr = 0x1000_0000
+    ar._pt_hbm_ptr = 0x2000_0000
+    ar.pxb_slot_stride_bytes = 4096
+
+    ag.attach_pxb_ipc(ar)
+    assert ag._my_hbm_ptr == 0x1000_0000
+    assert ag._pt_hbm_ptr == 0x2000_0000
+    assert ag._pxb_cap_bytes == 8192
+
+    # Mismatched rank/world/device must fail loudly.
+    bad_ar = SimpleNamespace(
+        rank=1,
+        world_size=8,
+        device=torch.device("cpu"),
+        pxb_enabled=True,
+        _closed=False,
+    )
+    with pytest.raises(ValueError, match="attach_pxb_ipc rank/world/device mismatch"):
+        ag.attach_pxb_ipc(bad_ar)  # type: ignore[arg-type]
+
+    # Closing `ar` before `ag` immediately zeroes IPC pointers (no dangling UAF).
+    ar._closed = True
+    ar._pxb_enabled = False
+    assert ag._my_hbm_ptr == 0
+    assert ag._pt_hbm_ptr == 0
+    assert ag._pxb_cap_bytes == 0
+
+
 def test_classify_pci_pair_relation_matches_cx8_6000d_hierarchy() -> None:
     gpu0 = "/sys/devices/pci0000:16/0000:16:01.0/0000:17:00.0/0000:18:00.0/0000:19:00.0/0000:1a:00.0/0000:1b:00.0"
     gpu1 = "/sys/devices/pci0000:16/0000:16:01.0/0000:17:00.0/0000:18:00.0/0000:19:00.0/0000:1d:00.0/0000:1e:00.0"
@@ -247,7 +296,10 @@ def test_configure_adaptive_p2p_env_selects_pxb_phb_and_rejects_slow_acs(
 
 
 def _pxb_8gpu_worker(rank: int, init_file: str, shm_name: str) -> None:
-    from zstep_worker.kernels_sm120.shm_allreduce import HostMappedShmAllReduce
+    from zstep_worker.kernels_sm120.shm_allreduce import (
+        HostMappedShmAllGather,
+        HostMappedShmAllReduce,
+    )
 
     for k in list(os.environ.keys()):
         if k.startswith("NCCL_P2P"):
@@ -368,8 +420,213 @@ def _pxb_8gpu_worker(rank: int, init_file: str, shm_name: str) -> None:
                     assert ctrl_small == [small_steps] * 8, (
                         f"small_pxb lockstep broken: {ctrl_small} != {small_steps}"
                     )
+                    # Verify PXB partner-relayed AllGather (`attach_pxb_ipc`) interleaved
+                    # back-to-back with `comm.all_reduce` on the shared 2-slot IPC ring,
+                    # including `use_pxb=True -> False (ag_m=1152) -> True (ag_m=24)` transitions.
+                    with HostMappedShmAllGather(
+                        name=f"{shm_name}_ag_{cfg_idx}",
+                        rank=rank,
+                        world_size=8,
+                        capacity_input_elements=1280 * 3200,
+                        blocks=32,
+                        threads=512,
+                        exchange_group=dist.group.WORLD,
+                    ) as ag:
+                        ag.attach_pxb_ipc(comm)
+                        assert ag._my_hbm_ptr == comm._my_hbm_ptr and ag._my_hbm_ptr != 0
+                        for ag_m in (1, 8, 16, 32, 128, 1152, 24):
+                            torch.manual_seed(900 + ag_m * 17 + rank)
+                            ag_in = torch.randn(
+                                (ag_m, 3200), dtype=torch.bfloat16, device=device
+                            )
+                            ref_list = [
+                                torch.empty((ag_m, 3200), dtype=torch.bfloat16)
+                                for _ in range(8)
+                            ]
+                            dist.all_gather(ref_list, ag_in.cpu(), group=dist.group.WORLD)
+                            ag_out0 = ag.all_gather(ag_in, dim=0)
+                            ref0 = torch.cat(ref_list, dim=0)
+                            assert float((ag_out0.cpu().float() - ref0.float()).abs().max()) == 0.0
+                            ag_out_last = ag.all_gather(ag_in, dim=-1)
+                            ref_last = torch.cat(ref_list, dim=-1)
+                            assert (
+                                float((ag_out_last.cpu().float() - ref_last.float()).abs().max())
+                                == 0.0
+                            )
+
+                            # 3D inner-dim AllGather (`dim=1`, matching Engram `[T, G, H]`)
+                            ag_in_3d = torch.randn(
+                                (ag_m, 3, 256), dtype=torch.bfloat16, device=device
+                            )
+                            ref_3d_list = [
+                                torch.empty((ag_m, 3, 256), dtype=torch.bfloat16)
+                                for _ in range(8)
+                            ]
+                            dist.all_gather(ref_3d_list, ag_in_3d.cpu(), group=dist.group.WORLD)
+                            ag_out_3d = ag.all_gather(ag_in_3d, dim=1)
+                            ref_3d = torch.cat(ref_3d_list, dim=1)
+                            assert (
+                                float((ag_out_3d.cpu().float() - ref_3d.float()).abs().max())
+                                == 0.0
+                            )
+
+                            # Interleave AllReduce immediately after PXB AllGather on same ring
+                            ar_m = min(ag_m, 768)
+                            ar_x = torch.randn(
+                                (ar_m, 5120), dtype=torch.bfloat16, device=device
+                            ) * 0.125
+                            ar_ref = ar_x.float().cpu()
+                            dist.all_reduce(ar_ref, group=dist.group.WORLD)
+                            ar_out = torch.empty_like(ar_x)
+                            comm.all_reduce(ar_x, output=ar_out)
+                            assert float((ar_out.float().cpu() - ar_ref).abs().max()) < 0.03
     finally:
         dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="Requires an sm_120 CUDA device",
+)
+def test_sm120_mhc_fused_kernels_parity() -> None:
+    from zstep_worker.kernels_sm120.shm_allreduce import (
+        get_host_mapped_allreduce_extension,
+    )
+
+    device = torch.device("cuda:0")
+    ext = get_host_mapped_allreduce_extension()
+    stream = torch.cuda.current_stream(device).cuda_stream
+
+    for num_toks in (1, 17, 128):
+        torch.manual_seed(1200 + num_toks)
+        x = torch.randn((num_toks, 5120), dtype=torch.bfloat16, device=device) * 0.25
+        res0 = torch.randn((num_toks, 4, 5120), dtype=torch.bfloat16, device=device) * 0.25
+        post_mix = torch.sigmoid(
+            torch.randn((num_toks, 4), dtype=torch.float32, device=device)
+        ) * 2.0
+        comb_raw = torch.softmax(
+            torch.randn((num_toks, 4, 4), dtype=torch.float32, device=device), dim=-1
+        )
+        pre_mix = torch.sigmoid(
+            torch.randn((num_toks, 4), dtype=torch.float32, device=device)
+        ) + 1e-4
+        norm_w = torch.randn((5120,), dtype=torch.bfloat16, device=device) * 0.5 + 1.0
+        eps = 1e-6
+
+        ref_res = (
+            torch.einsum("tkc,tkj->tjc", res0.float(), comb_raw)
+            + post_mix.unsqueeze(-1) * x.float().unsqueeze(1)
+        ).to(torch.bfloat16)
+        ref_aux = (ref_res.float().sum(dim=1) * 0.25).to(torch.bfloat16)
+        ref_col = (
+            (pre_mix.unsqueeze(-1) * ref_res.float()).sum(dim=1).to(torch.bfloat16)
+        )
+        ref_inv = torch.rsqrt(ref_col.float().pow(2).mean(dim=-1, keepdim=True) + eps)
+        ref_in = (ref_col.float() * ref_inv * norm_w.float()).to(torch.bfloat16)
+
+        for write_aux in (0, 1):
+            res_cur = res0.clone()
+            layer_in = torch.empty_like(x)
+            aux_out = (
+                torch.empty_like(x)
+                if write_aux
+                else torch.empty((0, 5120), dtype=torch.bfloat16, device=device)
+            )
+            ext.launch_mhc_post_collapse_rmsnorm(
+                x,
+                res_cur,
+                post_mix,
+                comb_raw.contiguous(),
+                pre_mix,
+                norm_w,
+                layer_in,
+                aux_out,
+                eps,
+                write_aux,
+                0,
+                stream,
+            )
+            assert float((res_cur.float() - ref_res.float()).abs().max().item()) <= 0.008
+            exact_aux = (res_cur.float().sum(dim=1) * 0.25).to(torch.bfloat16)
+            assert float((layer_in.float() - ref_in.float()).abs().max().item()) <= 0.016
+            if write_aux:
+                assert float((aux_out.float() - exact_aux.float()).abs().max().item()) == 0.0
+                assert float((aux_out.float() - ref_aux.float()).abs().max().item()) <= 0.008
+
+        res_post = res0.clone()
+        empty_aux = torch.empty((0, 5120), dtype=torch.bfloat16, device=device)
+        ext.launch_mhc_post_collapse_rmsnorm(
+            x,
+            res_post,
+            post_mix,
+            comb_raw.contiguous(),
+            post_mix,
+            empty_aux,
+            empty_aux,
+            empty_aux,
+            eps,
+            0,
+            1,
+            stream,
+        )
+        assert float((res_post.float() - res_cur.float()).abs().max().item()) == 0.0
+        assert float((res_post.float() - ref_res.float()).abs().max().item()) <= 0.008
+
+    for n_splits in (1, 4, 16):
+        for num_toks in (1, 17, 128):
+            torch.manual_seed(3400 + n_splits * 31 + num_toks)
+            gemm_mul = torch.randn(
+                (n_splits, num_toks, 24), dtype=torch.float32, device=device
+            ) * 0.2
+            gemm_sqr = (
+                torch.rand((n_splits, num_toks), dtype=torch.float32, device=device)
+                * 5000.0
+                + 100.0
+            )
+            hc_scale = torch.tensor([0.5, 0.7, 0.3], dtype=torch.float32, device=device)
+            hc_base = torch.randn((24,), dtype=torch.float32, device=device) * 0.1
+            rms_eps = 1e-20
+            pre_eps = 1e-4
+            sk_eps = 1e-6
+            post_mult = 2.0
+            sk_rep = 20
+
+            post_out = torch.empty((num_toks, 4), dtype=torch.float32, device=device)
+            comb_out = torch.empty((num_toks, 16), dtype=torch.float32, device=device)
+            pre_out = torch.empty((num_toks, 4), dtype=torch.float32, device=device)
+            ext.launch_mhc_sinkhorn_stats(
+                gemm_mul,
+                gemm_sqr,
+                hc_scale,
+                hc_base,
+                post_out,
+                comb_out,
+                pre_out,
+                20480,
+                rms_eps,
+                pre_eps,
+                sk_eps,
+                post_mult,
+                sk_rep,
+                1,
+                stream,
+            )
+
+            rms = torch.rsqrt(gemm_sqr.sum(dim=0) * (1.0 / 20480.0) + rms_eps).unsqueeze(-1)
+            mix = gemm_mul.sum(dim=0) * rms
+            ref_pre = torch.sigmoid(mix[:, 0:4] * hc_scale[0] + hc_base[0:4]) + pre_eps
+            ref_post = torch.sigmoid(mix[:, 4:8] * hc_scale[1] + hc_base[4:8]) * post_mult
+            cm = (mix[:, 8:24] * hc_scale[2] + hc_base[8:24]).view(num_toks, 4, 4)
+            cm = torch.exp(cm - cm.amax(dim=-1, keepdim=True))
+            cm = cm / cm.sum(dim=-1, keepdim=True) + sk_eps
+            cm = cm / (cm.sum(dim=-2, keepdim=True) + sk_eps)
+            for _ in range(sk_rep - 1):
+                cm = cm / (cm.sum(dim=-1, keepdim=True) + sk_eps)
+                cm = cm / (cm.sum(dim=-2, keepdim=True) + sk_eps)
+
+            assert float((pre_out - ref_pre).abs().max().item()) < 1e-5
+            assert float((post_out - ref_post).abs().max().item()) < 1e-5
+            assert float((comb_out.view(num_toks, 4, 4) - cm).abs().max().item()) < 1e-5
 
 
 @pytest.mark.skipif(
