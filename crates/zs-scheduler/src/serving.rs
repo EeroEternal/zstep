@@ -32,7 +32,7 @@ use std::time::Instant;
 use zs_kv::{BlockLease, BlockPool, CacheGroupKind, PrefixLease, PrefixTree};
 use zs_wire::{
     DECODE_GRAPH_BUCKETS, MAX_DECODE_GRAPH_SEQS, STEP_FLAG_DECODE_ONLY, STEP_FLAG_DEVICE_TOKENS,
-    STEP_FLAG_NEXT_PREPUBLISHED, StepHeader, StepOpcode,
+    STEP_FLAG_NEXT_PREPUBLISHED, STEP_FLAG_SAMPLING, StepHeader, StepOpcode,
 };
 
 use crate::coordinator::{
@@ -140,10 +140,51 @@ struct HarvestedOutput {
     runner_up_logprob_bits: u32,
 }
 
+/// Per-request sampling configuration forwarded to GPU workers via SHM v4.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplingParams {
+    /// Softmax temperature (`0.0` = zero-overhead greedy argmax fast path).
+    pub temperature: f32,
+    /// Nucleus cumulative probability threshold in `(0.0, 1.0]`.
+    pub top_p: f32,
+    /// Top-K truncation (`0` or `-1` = disabled; `>= 1` = keep top-k tokens).
+    pub top_k: i32,
+    /// Deterministic base PRNG seed for per-step SplitMix64 sampling.
+    pub seed: u64,
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            seed: 0,
+        }
+    }
+}
+
+impl SamplingParams {
+    #[inline]
+    pub fn is_stochastic(self) -> bool {
+        self.temperature > 0.0
+    }
+
+    /// Deterministic per-step 64-bit RNG seed for generation index `step_idx` (`0, 1, 2, ...`).
+    #[inline]
+    pub fn step_seed(self, step_idx: u64) -> u64 {
+        splitmix64(
+            self.seed
+                .wrapping_add(step_idx.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+        )
+    }
+}
+
 struct PendingRequest {
     request_id: usize,
     prompt_tokens: Vec<i32>,
     target_output_len: usize,
+    sampling: SamplingParams,
     permit_time: Instant,
     submit_time: Instant,
 }
@@ -175,6 +216,7 @@ struct ActiveSequence {
     pending_draft_tokens: Vec<i32>,
     staged_verify: Option<(usize, usize)>,
     target_output_len: usize,
+    sampling: SamplingParams,
     /// KV pages promised at admission for the whole request; only part may be allocated yet.
     reserved_pages: usize,
     permit_time: Instant,
@@ -302,6 +344,9 @@ impl ActiveSequence {
 
     fn refresh_draft_tokens(&mut self, neural_drafts: &[i32], config: &SpeculativeConfig) {
         self.pending_draft_tokens.clear();
+        if self.sampling.is_stochastic() {
+            return;
+        }
         match config.method {
             SpeculativeMethod::None => {}
             SpeculativeMethod::Mtp | SpeculativeMethod::Dspark => {
@@ -542,6 +587,7 @@ fn admit_request_into_sequence(
         pending_draft_tokens: Vec::new(),
         staged_verify: None,
         target_output_len: req.target_output_len,
+        sampling: req.sampling,
         reserved_pages: demand_pages,
         permit_time: req.permit_time,
         submit_time: req.submit_time,
@@ -1078,6 +1124,7 @@ impl ServingEngine {
                 request_id: idx,
                 prompt_tokens: prompt.clone(),
                 target_output_len,
+                sampling: SamplingParams::default(),
                 permit_time: now,
                 submit_time: now,
             })
@@ -1153,6 +1200,7 @@ impl ServingEngine {
                     request_id: req_id,
                     prompt_tokens: prompt,
                     target_output_len: spec.output_len,
+                    sampling: SamplingParams::default(),
                     permit_time: wall_start,
                     submit_time: wall_start,
                 });
@@ -1594,6 +1642,7 @@ impl ServingEngine {
                             request_id: req_id,
                             prompt_tokens: prompt,
                             target_output_len: target_out,
+                            sampling: SamplingParams::default(),
                             permit_time: now,
                             submit_time,
                         });
@@ -1624,6 +1673,7 @@ impl ServingEngine {
         let mut token_cursor = 0usize;
         let mut num_seqs = 0usize;
         let mut num_sample_rows = 0usize;
+        let mut any_stochastic = false;
 
         for seq in active.iter_mut() {
             let Some((chunk_start, chunk_end)) = prefill_chunk_range(
@@ -1639,6 +1689,9 @@ impl ServingEngine {
                 num_sample_rows += 1;
                 row
             });
+            if sample_row_index.is_some() && seq.sampling.is_stochastic() {
+                any_stochastic = true;
+            }
             self.stage_prefill_row(
                 step_id,
                 seq,
@@ -1713,6 +1766,9 @@ impl ServingEngine {
                 num_sample_rows += 1;
                 row
             });
+            if sample_row_index.is_some() && seq.sampling.is_stochastic() {
+                any_stochastic = true;
+            }
             self.stage_prefill_row(
                 step_id,
                 &mut seq,
@@ -1755,7 +1811,11 @@ impl ServingEngine {
             decoder_graph_bucket: 0,
             num_sample_rows: num_sample_rows as u32,
             is_dspark_verify: u32::from(self.speculative.method.is_neural()),
-            flags: 0,
+            flags: if any_stochastic {
+                STEP_FLAG_SAMPLING
+            } else {
+                0
+            },
             _reserved: [0; 3],
         };
         Ok(())
@@ -1814,6 +1874,7 @@ impl ServingEngine {
         let mut token_cursor = 0usize;
         let mut num_seqs = 0usize;
         let mut num_sample_rows = 0usize;
+        let mut any_stochastic = false;
         let has_recurrent_pool = self.recurrent_pool.is_some();
 
         if decode_active_count > 0 {
@@ -1822,6 +1883,10 @@ impl ServingEngine {
             let mut staged_slots = Vec::with_capacity(decode_active_count);
             let mut staged_lookbacks = Vec::with_capacity(decode_active_count * 3);
             let mut staged_seq_lens = Vec::with_capacity(decode_active_count);
+            let mut staged_temps = Vec::with_capacity(decode_active_count);
+            let mut staged_top_p = Vec::with_capacity(decode_active_count);
+            let mut staged_top_k = Vec::with_capacity(decode_active_count);
+            let mut staged_seeds = Vec::with_capacity(decode_active_count);
             for seq in active
                 .iter_mut()
                 .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
@@ -1830,11 +1895,19 @@ impl ServingEngine {
                 let lookback = seq.lookback_window(start_pos);
                 let pos = start_pos as i32;
                 let next_len = pos + 1;
+                let step_idx = start_pos.saturating_sub(seq.prompt_tokens.len()) as u64 + 1;
+                if seq.sampling.is_stochastic() {
+                    any_stochastic = true;
+                }
                 staged_tokens.push(seq.last_token);
                 staged_positions.push(pos);
                 staged_slots.push(seq.slot_lease.id() as i32);
                 staged_lookbacks.extend_from_slice(&lookback);
                 staged_seq_lens.push(next_len);
+                staged_temps.push(seq.sampling.temperature);
+                staged_top_p.push(seq.sampling.top_p);
+                staged_top_k.push(seq.sampling.top_k);
+                staged_seeds.push(seq.sampling.step_seed(step_idx));
                 seq.current_seq_len = next_len as usize;
                 token_cursor += 1;
                 num_seqs += 1;
@@ -1846,6 +1919,10 @@ impl ServingEngine {
             plan.req_slot_ids_mut()?[..num_seqs].copy_from_slice(&staged_slots);
             plan.engram_prev_window_mut()?[..num_seqs * 3].copy_from_slice(&staged_lookbacks);
             plan.seq_lens_mut()?[..num_seqs].copy_from_slice(&staged_seq_lens);
+            plan.temperatures_mut()?[..num_seqs].copy_from_slice(&staged_temps);
+            plan.top_p_mut()?[..num_seqs].copy_from_slice(&staged_top_p);
+            plan.top_k_mut()?[..num_seqs].copy_from_slice(&staged_top_k);
+            plan.rng_seeds_mut()?[..num_seqs].copy_from_slice(&staged_seeds);
             if has_recurrent_pool {
                 plan.compressor_slot_ids_mut()?[..num_seqs].fill(-1);
                 plan.replay_mask_mut()?[..token_cursor].fill(0xFF);
@@ -1894,6 +1971,9 @@ impl ServingEngine {
                 num_sample_rows += 1;
                 row
             });
+            if sample_row_index.is_some() && seq.sampling.is_stochastic() {
+                any_stochastic = true;
+            }
             self.stage_prefill_row(
                 step_id,
                 seq,
@@ -1975,6 +2055,9 @@ impl ServingEngine {
                 num_sample_rows += 1;
                 row
             });
+            if sample_row_index.is_some() && seq.sampling.is_stochastic() {
+                any_stochastic = true;
+            }
             self.stage_prefill_row(
                 step_id,
                 &mut seq,
@@ -2006,11 +2089,14 @@ impl ServingEngine {
             0
         };
         let is_pure_decode_fallback = candidate_decode && bucket > 0;
-        let flags = if is_pure_decode_fallback {
+        let mut flags = if is_pure_decode_fallback {
             STEP_FLAG_DECODE_ONLY
         } else {
             0
         };
+        if any_stochastic {
+            flags |= STEP_FLAG_SAMPLING;
+        }
 
         let mut plan = self.coordinator.plan_slot_mut(step_id)?;
         plan.query_start_loc_mut()?[num_seqs] = token_cursor as i32;
@@ -2149,6 +2235,10 @@ impl ServingEngine {
         }
         if let Some(sample_row) = sample_row_index {
             plan.sample_row_indices_mut()?[sample_row] = (token_cursor + chunk_len - 1) as i32;
+            plan.temperatures_mut()?[sample_row] = seq.sampling.temperature;
+            plan.top_p_mut()?[sample_row] = seq.sampling.top_p;
+            plan.top_k_mut()?[sample_row] = seq.sampling.top_k;
+            plan.rng_seeds_mut()?[sample_row] = seq.sampling.step_seed(0);
         }
         seq.prefilled_tokens = chunk_end;
         seq.current_seq_len = chunk_end;
@@ -2266,11 +2356,15 @@ impl ServingEngine {
         max_pages_per_seq: usize,
         commit_tokens_immediately: bool,
     ) -> Result<()> {
-        let has_drafts = active.iter().any(|seq| {
-            seq.prefilled_tokens == seq.prompt_tokens.len()
-                && !seq.pending_draft_tokens.is_empty()
-                && seq.generated_tokens.len() + 1 < seq.target_output_len
+        let any_stochastic = active.iter().any(|seq| {
+            seq.prefilled_tokens == seq.prompt_tokens.len() && seq.sampling.is_stochastic()
         });
+        let has_drafts = !any_stochastic
+            && active.iter().any(|seq| {
+                seq.prefilled_tokens == seq.prompt_tokens.len()
+                    && !seq.pending_draft_tokens.is_empty()
+                    && seq.generated_tokens.len() + 1 < seq.target_output_len
+            });
         if self.speculative.enabled() {
             if !commit_tokens_immediately {
                 return Err(EngineError::Protocol(
@@ -2330,6 +2424,10 @@ impl ServingEngine {
         let mut staged_slots = Vec::with_capacity(num_seqs);
         let mut staged_lookbacks = Vec::with_capacity(num_seqs * 3);
         let mut staged_seq_lens = Vec::with_capacity(num_seqs);
+        let mut staged_temps = Vec::with_capacity(if any_stochastic { num_seqs } else { 0 });
+        let mut staged_top_p = Vec::with_capacity(if any_stochastic { num_seqs } else { 0 });
+        let mut staged_top_k = Vec::with_capacity(if any_stochastic { num_seqs } else { 0 });
+        let mut staged_seeds = Vec::with_capacity(if any_stochastic { num_seqs } else { 0 });
         for seq in active
             .iter_mut()
             .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
@@ -2346,6 +2444,13 @@ impl ServingEngine {
             staged_slots.push(seq.slot_lease.id() as i32);
             staged_lookbacks.extend_from_slice(&lookback);
             staged_seq_lens.push(next_len);
+            if any_stochastic {
+                let step_idx = start_pos.saturating_sub(seq.prompt_tokens.len()) as u64 + 1;
+                staged_temps.push(seq.sampling.temperature);
+                staged_top_p.push(seq.sampling.top_p);
+                staged_top_k.push(seq.sampling.top_k);
+                staged_seeds.push(seq.sampling.step_seed(step_idx));
+            }
         }
 
         let mut plan = self.coordinator.plan_slot_mut(step_id)?;
@@ -2356,6 +2461,12 @@ impl ServingEngine {
         plan.req_slot_ids_mut()?[..num_seqs].copy_from_slice(&staged_slots);
         plan.engram_prev_window_mut()?[..num_seqs * 3].copy_from_slice(&staged_lookbacks);
         plan.seq_lens_mut()?[..num_seqs].copy_from_slice(&staged_seq_lens);
+        if any_stochastic {
+            plan.temperatures_mut()?[..num_seqs].copy_from_slice(&staged_temps);
+            plan.top_p_mut()?[..num_seqs].copy_from_slice(&staged_top_p);
+            plan.top_k_mut()?[..num_seqs].copy_from_slice(&staged_top_k);
+            plan.rng_seeds_mut()?[..num_seqs].copy_from_slice(&staged_seeds);
+        }
         {
             let sample_rows = plan.sample_row_indices_mut()?;
             for (row, dst) in sample_rows[..num_seqs].iter_mut().enumerate() {
@@ -2376,6 +2487,10 @@ impl ServingEngine {
             &self.shadow_page_table,
             &mut self.dirty_pt_slots,
         )?;
+        let mut flags = STEP_FLAG_DECODE_ONLY;
+        if any_stochastic {
+            flags |= STEP_FLAG_SAMPLING;
+        }
         *plan.header_mut()? = StepHeader {
             step_id: AtomicU64::new(0),
             opcode: StepOpcode::NormalStep as u32,
@@ -2386,7 +2501,7 @@ impl ServingEngine {
             decoder_graph_bucket: bucket,
             num_sample_rows: num_seqs as u32,
             is_dspark_verify: 0,
-            flags: STEP_FLAG_DECODE_ONLY,
+            flags,
             _reserved: [0; 3],
         };
         Ok(())
@@ -2481,7 +2596,9 @@ fn should_schedule_prefill(
     })
 }
 
-fn splitmix64(mut x: u64) -> u64 {
+/// SplitMix64 bit-mixing hash used for deterministic prompt generation and sampling seeds.
+#[inline]
+pub fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

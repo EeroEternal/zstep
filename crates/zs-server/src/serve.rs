@@ -27,10 +27,10 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use zs_scheduler::{
     DEFAULT_HEARTBEAT_TIMEOUT, EngineConfig, EngineState, LoopEvent, LoopFinishReason,
-    OnlineConfig, OnlineMetrics, ServeLoopHandle, ServingEngine, SpeculativeConfig,
+    OnlineConfig, OnlineMetrics, SamplingParams, ServeLoopHandle, ServingEngine, SpeculativeConfig,
     SpeculativeMethod, SubmitError, SubmitRequest, TPOT_BUCKET_BOUNDS_SECS,
     TTFT_BUCKET_BOUNDS_SECS, WorkerLaunchConfig, request_kv_page_demand,
-    spawn_serve_loop_with_state,
+    spawn_serve_loop_with_state, splitmix64,
 };
 use zs_tokenizer::{
     ChatMessage, ChatTemplateFormat, ChatTemplateOptions, FinishReason as TokenizerFinishReason,
@@ -354,6 +354,8 @@ struct ChatRequest {
     #[serde(default)]
     top_p: Option<f64>,
     #[serde(default)]
+    top_k: Option<i32>,
+    #[serde(default)]
     n: Option<u32>,
     #[serde(default)]
     seed: Option<i64>,
@@ -427,22 +429,6 @@ fn reject_unsupported(request: &ChatRequest) -> Option<Response> {
             &format!("n={n} is not supported"),
         ));
     }
-    if request.temperature.is_some_and(|value| value != 0.0) {
-        return Some(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "invalid_parameter",
-            "temperature sampling is not supported in P0 (greedy temperature=0 only)",
-        ));
-    }
-    if request.top_p.is_some_and(|value| value != 1.0) {
-        return Some(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "invalid_parameter",
-            "top_p sampling is not supported in P0 (greedy only)",
-        ));
-    }
     if request.presence_penalty.is_some_and(|value| value != 0.0)
         || request.frequency_penalty.is_some_and(|value| value != 0.0)
     {
@@ -514,6 +500,65 @@ fn reject_unsupported(request: &ChatRequest) -> Option<Response> {
         ));
     }
     None
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_sampling_params(
+    request: &ChatRequest,
+    state: &AppState,
+) -> Result<SamplingParams, Response> {
+    let temperature = request.temperature.unwrap_or(0.0);
+    if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_parameter",
+            "temperature must be finite and within [0.0, 2.0]",
+        ));
+    }
+    let top_p = request.top_p.unwrap_or(1.0);
+    let top_p_f32 = top_p as f32;
+    if !top_p.is_finite() || !top_p_f32.is_finite() || top_p_f32 <= 0.0 || top_p_f32 > 1.0 {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_parameter",
+            "top_p must be finite and within (0.0, 1.0]",
+        ));
+    }
+    let raw_top_k = request.top_k.unwrap_or(0);
+    if raw_top_k < -1 {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_parameter",
+            "top_k must be -1, 0 (disabled), or >= 1",
+        ));
+    }
+    let top_k = if raw_top_k <= 0 { 0 } else { raw_top_k };
+    let temperature_f32 = temperature as f32;
+    let seed = if temperature_f32 <= 0.0 {
+        0
+    } else if let Some(explicit) = request.seed {
+        explicit as u64
+    } else {
+        let counter = state.request_counter.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0);
+        splitmix64(
+            nanos
+                ^ counter.rotate_left(29)
+                ^ u64::from(std::process::id()).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        )
+    };
+    Ok(SamplingParams {
+        temperature: temperature_f32,
+        top_p: top_p_f32,
+        top_k,
+        seed,
+    })
 }
 
 #[allow(clippy::result_large_err)]
@@ -714,6 +759,10 @@ async fn chat_completions(
     if let Some(response) = reject_unsupported(&request) {
         return with_request_id(response, &request_id);
     }
+    let sampling = match resolve_sampling_params(&request, &state) {
+        Ok(sampling) => sampling,
+        Err(response) => return with_request_id(response, &request_id),
+    };
     let stops = match normalise_stops(request.stop.clone()) {
         Ok(stops) => stops,
         Err(response) => return with_request_id(response, &request_id),
@@ -845,6 +894,7 @@ async fn chat_completions(
         let loop_request_id = match handle.submit(SubmitRequest {
             prompt_tokens: prompt_ids,
             max_new_tokens,
+            sampling,
             sink,
         }) {
             Ok(id) => {
@@ -1110,6 +1160,7 @@ async fn chat_completions(
     let loop_request_id = match handle.submit(SubmitRequest {
         prompt_tokens: prompt_ids,
         max_new_tokens,
+        sampling,
         sink,
     }) {
         Ok(id) => id,

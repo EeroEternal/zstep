@@ -53,6 +53,7 @@ fn active_sequence_kv_page_growth_and_raii_release() {
             generated_top2: Vec::new(),
             pending_draft_tokens: Vec::new(),
             staged_verify: None,
+            sampling: SamplingParams::default(),
             target_output_len: 10,
             reserved_pages: 0,
             permit_time: Instant::now(),
@@ -129,6 +130,7 @@ fn overlapped_decode_lookback_includes_token_from_inflight_step() {
         generated_top2: Vec::new(),
         pending_draft_tokens: Vec::new(),
         staged_verify: None,
+        sampling: SamplingParams::default(),
         target_output_len: 4,
         reserved_pages: 0,
         permit_time: now,
@@ -180,6 +182,7 @@ fn decode_sequences_force_single_prefill_interleaving() {
             request_id,
             prompt_tokens: vec![256; 1024],
             target_output_len: 8,
+            sampling: SamplingParams::default(),
             permit_time: now,
             submit_time: now,
         })
@@ -336,6 +339,7 @@ fn engram_lookback_window_spans_prompt_boundary_and_generated_tokens() {
         generated_top2: Vec::new(),
         pending_draft_tokens: Vec::new(),
         staged_verify: None,
+        sampling: SamplingParams::default(),
         target_output_len: 8,
         reserved_pages: 0,
         permit_time: Instant::now(),
@@ -396,6 +400,7 @@ fn decode_continues_for_all_respects_inflight_prefill_and_waiting() {
             generated_top2: Vec::new(),
             pending_draft_tokens: Vec::new(),
             staged_verify: None,
+            sampling: SamplingParams::default(),
             target_output_len: target,
             reserved_pages: 0,
             permit_time: now,
@@ -471,6 +476,7 @@ fn admission_reserves_whole_request_against_earlier_promises() {
         generated_top2: Vec::new(),
         pending_draft_tokens: Vec::new(),
         staged_verify: None,
+        sampling: SamplingParams::default(),
         target_output_len: 65,
         reserved_pages: request_kv_page_demand(32, 65, 16),
         permit_time: now,
@@ -566,6 +572,7 @@ fn inadmissible_waiting_request_keeps_overlap_open_until_retirement() {
             generated_top2: Vec::new(),
             pending_draft_tokens: Vec::new(),
             staged_verify: None,
+            sampling: SamplingParams::default(),
             target_output_len: 33, // demand = ceil((16 + 32) / 16) = 3 pages
             reserved_pages: request_kv_page_demand(16, 33, 16),
             permit_time: now,
@@ -585,6 +592,7 @@ fn inadmissible_waiting_request_keeps_overlap_open_until_retirement() {
         request_id: 1,
         prompt_tokens: vec![1; 32],
         target_output_len: 65, // demand = 6 pages > 5 unreserved pages
+        sampling: SamplingParams::default(),
         permit_time: now,
         submit_time: now,
     });
@@ -655,6 +663,7 @@ fn apc_admission_reservation_protects_evictable_headroom_and_shares_pinned_prefi
             request_id: 1,
             prompt_tokens: vec![9; 16],
             target_output_len: 65,
+            sampling: SamplingParams::default(),
             permit_time: now,
             submit_time: now,
         },
@@ -697,6 +706,7 @@ fn apc_admission_reservation_protects_evictable_headroom_and_shares_pinned_prefi
         request_id: 2,
         prompt_tokens: prompt_b.clone(),
         target_output_len: 1,
+        sampling: SamplingParams::default(),
         permit_time: now,
         submit_time: now,
     });
@@ -797,6 +807,7 @@ fn apc_admission_reservation_protects_evictable_headroom_and_shares_pinned_prefi
         request_id: 3,
         prompt_tokens: prompt_b,
         target_output_len: 17, // demand = ceil((48 + 16)/16) = 4, matched = 2, extra = 2 <= 3
+        sampling: SamplingParams::default(),
         permit_time: now,
         submit_time: now,
     });
@@ -833,6 +844,7 @@ fn duplicate_cold_promotion_canonicalizes_pages_and_hybrid_checkpoints_roundtrip
                 request_id,
                 prompt_tokens: shared_prompt.clone(),
                 target_output_len: 8,
+                sampling: SamplingParams::default(),
                 permit_time: now,
                 submit_time: now,
             },
@@ -928,6 +940,7 @@ fn duplicate_cold_promotion_canonicalizes_pages_and_hybrid_checkpoints_roundtrip
             request_id: 10,
             prompt_tokens: hybrid_prompt.clone(),
             target_output_len: 4,
+            sampling: SamplingParams::default(),
             permit_time: now,
             submit_time: now,
         },
@@ -987,6 +1000,7 @@ fn duplicate_cold_promotion_canonicalizes_pages_and_hybrid_checkpoints_roundtrip
             request_id: 11,
             prompt_tokens: hybrid_prompt,
             target_output_len: 4,
+            sampling: SamplingParams::default(),
             permit_time: now,
             submit_time: now,
         },
@@ -1030,6 +1044,7 @@ fn rewind_rejected_suffix_pages_reclaims_exclusive_pages_after_prefix_promotion(
             request_id: 21,
             prompt_tokens: prompt,
             target_output_len: 16,
+            sampling: SamplingParams::default(),
             permit_time: now,
             submit_time: now,
         },
@@ -1135,6 +1150,7 @@ fn promote_completed_prefixes_holds_incomplete_mtp_chunk_boundary_until_next_chu
             request_id: 31,
             prompt_tokens: prompt,
             target_output_len: 4,
+            sampling: SamplingParams::default(),
             permit_time: now,
             submit_time: now,
         },
@@ -1269,4 +1285,64 @@ fn provenance_collects_zstep_env_overrides_and_redacts_secrets() {
     assert!(json.contains("\"ZSTEP_P2P_MODE\": \"auto\""));
     assert!(json.contains("\"ZSTEP_API_KEY\": \"[REDACTED]\""));
     assert!(!json.contains("sk-live-secret"));
+}
+
+#[test]
+fn sampling_params_step_seed_is_deterministic_and_suppresses_spec_drafts() {
+    let greedy = SamplingParams::default();
+    assert!(!greedy.is_stochastic());
+    let stochastic = SamplingParams {
+        temperature: 0.8,
+        top_p: 0.9,
+        top_k: 40,
+        seed: 42,
+    };
+    assert!(stochastic.is_stochastic());
+    assert_eq!(stochastic.step_seed(0), stochastic.step_seed(0));
+    assert_ne!(stochastic.step_seed(0), stochastic.step_seed(1));
+    assert_ne!(stochastic.step_seed(1), stochastic.step_seed(2));
+
+    let slot_pool = SlotPool::new(2);
+    let now = Instant::now();
+    let mut seq = ActiveSequence {
+        request_id: 1,
+        slot_lease: slot_pool.allocate().expect("slot"),
+        prefix_lease: None,
+        kv_leases: Vec::new(),
+        page_ids: Vec::new(),
+        prompt_tokens: vec![1, 2, 3],
+        prefilled_tokens: 3,
+        computed_prompt_tokens: 3,
+        cached_prefix_tokens: 0,
+        restore_checkpoint_id: -1,
+        pending_checkpoints: Vec::new(),
+        checkpoint_alloc_stopped: false,
+        current_seq_len: 3,
+        last_token: 3,
+        generated_tokens: Vec::new(),
+        generated_top2: Vec::new(),
+        pending_draft_tokens: vec![10, 11],
+        staged_verify: None,
+        sampling: stochastic,
+        target_output_len: 8,
+        reserved_pages: 1,
+        permit_time: now,
+        submit_time: now,
+        first_token_time: None,
+        last_token_time: None,
+    };
+    let spec = SpeculativeConfig {
+        method: SpeculativeMethod::Mtp,
+        num_speculative_tokens: 3,
+        ..SpeculativeConfig::default()
+    };
+    seq.refresh_draft_tokens(&[100, 101, 102], &spec);
+    assert!(
+        seq.pending_draft_tokens.is_empty(),
+        "stochastic requests must suppress speculative draft submission"
+    );
+
+    seq.sampling = greedy;
+    seq.refresh_draft_tokens(&[100, 101, 102], &spec);
+    assert_eq!(seq.pending_draft_tokens, vec![100, 101, 102]);
 }

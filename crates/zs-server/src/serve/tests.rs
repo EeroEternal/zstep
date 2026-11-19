@@ -536,7 +536,12 @@ async fn unsupported_unknown_and_malformed_requests_return_400_json() {
     let state = test_state(EngineState::Ready, Some(handle.clone()));
     let address = spawn_server(state).await;
     let cases = [
-        chat_body("hi", false, r#","temperature":0.7"#),
+        chat_body("hi", false, r#","temperature":-0.1"#),
+        chat_body("hi", false, r#","temperature":2.5"#),
+        chat_body("hi", false, r#","top_p":0.0"#),
+        chat_body("hi", false, r#","top_p":1e-50"#),
+        chat_body("hi", false, r#","top_p":1.5"#),
+        chat_body("hi", false, r#","top_k":-2"#),
         chat_body("hi", false, r#","max_tokens":0"#),
         chat_body("hi", false, r#","n":2"#),
         chat_body("hi", false, r#","tools":[]"#),
@@ -1255,6 +1260,41 @@ async fn poisoned_handle_mutex_recovers_without_panicking_handlers() {
             .expect("join");
     assert_eq!((health_code, metrics_code, drain_code), (200, 200, 200));
     assert_eq!(state.phase(), EngineState::Draining);
+
+    handle.shutdown();
+    let _ = handle.join(Duration::from_secs(2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn valid_sampling_params_accepted_for_stochastic_and_greedy_requests() {
+    let handle = zs_scheduler::spawn_mock(zs_scheduler::MockScript::default());
+    let state = test_state(EngineState::Ready, Some(handle.clone()));
+    let address = spawn_server(state).await;
+    let cases = [
+        chat_body("hi", false, r#","temperature":0.0,"top_p":1.0,"top_k":0"#),
+        chat_body(
+            "hi",
+            false,
+            r#","temperature":0.7,"top_p":0.9,"top_k":40,"seed":42"#,
+        ),
+        chat_body("hi", false, r#","temperature":1.2,"top_k":-1"#),
+        chat_body("hi", false, r#","temperature":2.0,"top_p":0.01,"seed":-7"#),
+    ];
+    for body in cases {
+        let request_body = body.clone();
+        let (status, _, response) = tokio::task::spawn_blocking(move || {
+            http(
+                address,
+                "POST",
+                "/v1/chat/completions",
+                Some(&request_body),
+                &[],
+            )
+        })
+        .await
+        .expect("join");
+        assert_eq!(status, 200, "body={body} response={response}");
+    }
 
     handle.shutdown();
     let _ = handle.join(Duration::from_secs(2));

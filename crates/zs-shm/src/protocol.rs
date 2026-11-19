@@ -401,6 +401,27 @@ impl StepPlanSlotMut<'_> {
         f32,
         |g: ShmGeometry| g.max_seqs as usize
     );
+    plan_accessors!(
+        top_p,
+        top_p_mut,
+        top_p_offset,
+        f32,
+        |g: ShmGeometry| g.max_seqs as usize
+    );
+    plan_accessors!(
+        top_k,
+        top_k_mut,
+        top_k_offset,
+        i32,
+        |g: ShmGeometry| g.max_seqs as usize
+    );
+    plan_accessors!(
+        rng_seeds,
+        rng_seeds_mut,
+        rng_seeds_offset,
+        u64,
+        |g: ShmGeometry| g.max_seqs as usize
+    );
 
     /// Release-publish the step ID after all header fields and payload arrays are complete.
     pub fn publish(self, step_id: u64) -> Result<()> {

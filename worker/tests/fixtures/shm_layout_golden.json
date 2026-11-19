@@ -1,5 +1,5 @@
 {
-  "protocol_version": 3,
+  "protocol_version": 4,
   "pod_offsets": {
     "ShmSuperblock": {
       "magic": 0,
@@ -93,9 +93,12 @@
         "swa_page_table_offset": 267776,
         "compressor_slot_ids_offset": 269824,
         "temperatures_offset": 270336,
+        "top_p_offset": 270848,
+        "top_k_offset": 271360,
+        "rng_seeds_offset": 271872,
         "total_slot_bytes": 274432,
         "result_slot_stride": 16384,
-        "layout_hash_hex": "0x97bd78fcd5f39c04"
+        "layout_hash_hex": "0x521b5e3932642447"
       }
     },
     {
@@ -124,9 +127,12 @@
         "swa_page_table_offset": 2369024,
         "compressor_slot_ids_offset": 2371072,
         "temperatures_offset": 2371584,
+        "top_p_offset": 2372096,
+        "top_k_offset": 2372608,
+        "rng_seeds_offset": 2373120,
         "total_slot_bytes": 2375680,
         "result_slot_stride": 16384,
-        "layout_hash_hex": "0xb534562826707ecf"
+        "layout_hash_hex": "0xb4536dcf0819cda4"
       }
     },
     {
@@ -155,9 +161,12 @@
         "swa_page_table_offset": 2816,
         "compressor_slot_ids_offset": 3072,
         "temperatures_offset": 3328,
-        "total_slot_bytes": 4096,
+        "top_p_offset": 3584,
+        "top_k_offset": 3840,
+        "rng_seeds_offset": 4096,
+        "total_slot_bytes": 8192,
         "result_slot_stride": 4096,
-        "layout_hash_hex": "0x6ad84c4fd7611a5a"
+        "layout_hash_hex": "0x29f900a56c2bca3a"
       }
     }
   ]
