@@ -445,7 +445,10 @@ pub fn spawn_with_state(
     let geometry = engine.coordinator.config().geometry;
     let max_seqs = geometry.max_seqs as usize;
     let max_waiting = config.max_waiting_requests.max(1);
-    let kv_capacity = engine.kv_pool.capacity();
+    let kv_capacity = engine
+        .kv_pool
+        .capacity()
+        .saturating_sub(engine.loading_area_pages());
     let cmd_capacity = (max_seqs + max_waiting).saturating_mul(2).max(32);
     let (tx, rx) = std::sync::mpsc::sync_channel::<LoopCommand>(cmd_capacity);
     let metrics = Arc::new(OnlineMetrics::default());
@@ -1045,6 +1048,20 @@ fn online_step(
         online.consecutive_prefills = 0;
         next_sid
     } else {
+        engine.prepare_dram_tier_for_step(
+            &online.active,
+            &online.waiting,
+            max_seqs,
+            page_block_tokens,
+            step_now,
+        )?;
+        let waiting_admissible = engine.front_request_admissible(
+            &online.active,
+            &online.waiting,
+            max_seqs,
+            page_block_tokens,
+            step_now,
+        );
         engine.step_cursor += 1;
         let sid = engine.step_cursor;
         let decode_active_count = online

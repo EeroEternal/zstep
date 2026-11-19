@@ -22,12 +22,17 @@
 //! Automatic Prefix Cache (`PrefixTree`, `PrefixLease`, `KvCacheManager`), and
 //! SWA 128-token bounded replay planning.
 
+mod dram_tier;
 mod prefix_cache;
 
 use std::sync::{Arc, Mutex};
 
+pub use dram_tier::{
+    DEFAULT_LOADING_AREA_RATIO, DramPrefixCache, DramTierConfig, DramTierStats, KvTransferOp,
+};
 pub use prefix_cache::{
-    KvCacheManager, KvError, PrefillSchedule, PrefixLease, PrefixTree, RequestKvHandle,
+    KvCacheManager, KvError, PrefillSchedule, PrefixLease, PrefixTree, PrefixVictim,
+    RequestKvHandle,
 };
 
 /// Physical cache groups managed by `zs-kv`.

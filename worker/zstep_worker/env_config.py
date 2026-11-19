@@ -126,6 +126,8 @@ class WorkerRuntimeConfig:
     num_spec_tokens: int = 0
     max_model_len: int = 32768
     num_recurrent_checkpoints: int = 0
+    dram_kv_blocks: int = 0
+    enable_sm_h2d: bool = True
     disable_verify_graphs: bool = False
     disable_draft_graphs: bool = False
 
@@ -185,6 +187,11 @@ class WorkerRuntimeConfig:
                 f"(got {num_recurrent_checkpoints})"
             )
 
+        dram_kv_blocks = env_int("ZSTEP_DRAM_KV_BLOCKS", 0, environ=env)
+        if dram_kv_blocks < 0:
+            raise ValueError(f"ZSTEP_DRAM_KV_BLOCKS must be >= 0 (got {dram_kv_blocks})")
+        enable_sm_h2d = env_flag("ZSTEP_ENABLE_SM_H2D", default=True, environ=env)
+
         p2p_mode = env.get("ZSTEP_P2P_MODE", "auto").strip().lower() or "auto"
         if p2p_mode not in VALID_P2P_MODES:
             raise ValueError(
@@ -223,6 +230,8 @@ class WorkerRuntimeConfig:
             num_spec_tokens=num_spec_tokens,
             max_model_len=max_model_len,
             num_recurrent_checkpoints=num_recurrent_checkpoints,
+            dram_kv_blocks=dram_kv_blocks,
+            enable_sm_h2d=enable_sm_h2d,
             disable_verify_graphs=env_flag(
                 "ZSTEP_DISABLE_VERIFY_GRAPHS", default=False, environ=env
             ),

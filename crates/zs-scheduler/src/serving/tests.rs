@@ -1415,6 +1415,7 @@ fn srpt_prefers_shorter_and_apc_hit_requests_over_cold_long_prompt() {
         Some(&tree),
         4,
         16,
+        0,
         policy,
         now,
         None,
@@ -1432,6 +1433,7 @@ fn srpt_prefers_shorter_and_apc_hit_requests_over_cold_long_prompt() {
         Some(&tree),
         4,
         16,
+        0,
         PrefillSchedulingPolicy::fifo(),
         now,
         None,
@@ -1472,6 +1474,7 @@ fn srpt_tie_breaks_equal_uncached_lengths_in_fifo_order() {
         None,
         4,
         16,
+        0,
         PrefillSchedulingPolicy::default(),
         t1,
         None,
@@ -1521,6 +1524,7 @@ fn starvation_cap_promotes_aged_request_and_holds_kv_until_it_fits() {
         None,
         4,
         16,
+        0,
         policy,
         now,
         None,
@@ -1539,6 +1543,7 @@ fn starvation_cap_promotes_aged_request_and_holds_kv_until_it_fits() {
         None,
         4,
         16,
+        0,
         policy,
         now,
         None,
@@ -1560,12 +1565,33 @@ fn starvation_cap_promotes_aged_request_and_holds_kv_until_it_fits() {
         None,
         4,
         16,
+        0,
         policy,
         now,
         None,
     )
     .expect("short request bypass");
     assert_eq!(bypass.index, 1);
+
+    // Case D: 10% Loading Area reserve (e.g., 2 pages reserved out of 2 free pages) prevents
+    // regular admission from consuming the DRAM reload reserve.
+    let blocked_by_loading_area = select_next_waiting_candidate(
+        &[],
+        &fresh_waiting,
+        &slot_pool,
+        &kv_tight,
+        None,
+        4,
+        16,
+        2,
+        policy,
+        now,
+        None,
+    );
+    assert!(
+        blocked_by_loading_area.is_none(),
+        "regular admission must never consume the reserved HBM Loading Area"
+    );
 }
 
 #[test]

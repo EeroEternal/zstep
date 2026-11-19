@@ -1557,6 +1557,17 @@ fn launch_engine(
                 let _ = launch_done_tx.send(());
                 return;
             }
+            if args.dram_tier.is_enabled()
+                && let Err(error) = engine.enable_dram_kv_cache(args.dram_tier)
+            {
+                let _ = engine.shutdown();
+                if !state.shutdown_requested.load(Ordering::Acquire) {
+                    eprintln!("zstep_serve Host DRAM KV tier initialization failed: {error}");
+                    state.set_phase(EngineState::Faulted);
+                }
+                let _ = launch_done_tx.send(());
+                return;
+            }
             engine.set_max_mixed_step_tokens(mixed);
             engine.set_prefill_scheduling_policy(args.prefill_policy);
             engine.set_device_token_overlap(

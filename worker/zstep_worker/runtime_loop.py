@@ -56,6 +56,7 @@ from zstep_worker.shm_bridge import (
 )
 
 OPCODE_NORMAL_STEP = 1
+OPCODE_KV_TRANSFER = 4
 OPCODE_SHUTDOWN = 99
 WORKER_STATUS_READY = 1
 WORKER_STATUS_RUNNING = 2
@@ -582,6 +583,19 @@ class RuntimeLoop:
                         )
                         os.eventfd_write(self.args.done_fd, 1)
                         break
+                    if header.opcode == OPCODE_KV_TRANSFER:
+                        if pending is not None:
+                            self._finish_pending(pending, watched_count)
+                            pending = None
+                        transfer_fn = getattr(self.runner, "execute_kv_transfer", None)
+                        if not callable(transfer_fn):
+                            raise RuntimeError(
+                                f"runner {type(self.runner).__name__} does not support "
+                                "StepOpcode::KvTransfer"
+                            )
+                        gpu_exec_us = int(transfer_fn(plan, header))
+                        self._complete_step(header.step_id, [], gpu_exec_us, watched_count)
+                        continue
                     if header.opcode != OPCODE_NORMAL_STEP:
                         raise RuntimeError(f"unsupported step opcode {header.opcode}")
                     overlap_flags = header.flags & (
