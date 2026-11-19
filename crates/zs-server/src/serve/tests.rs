@@ -549,7 +549,8 @@ async fn unsupported_unknown_and_malformed_requests_return_400_json() {
         chat_body("hi", false, r#","max_tokens":0"#),
         chat_body("hi", false, r#","n":2"#),
         chat_body("hi", false, r#","tools":[]"#),
-        chat_body("hi", false, r#","logprobs":true"#),
+        chat_body("hi", false, r#","top_logprobs":2"#),
+        chat_body("hi", false, r#","logprobs":true,"top_logprobs":6"#),
         chat_body("hi", false, r#","logit_bias":{"1":5}"#),
         chat_body("hi", false, r#","stop":["a","b","c","d","e"]"#),
         r#"{"model":"other-model","messages":[{"role":"user","content":"hi"}]}"#.to_owned(),
@@ -1309,6 +1310,116 @@ async fn valid_sampling_params_accepted_for_stochastic_and_greedy_requests() {
         .expect("join");
         assert_eq!(status, 200, "body={body} response={response}");
     }
+
+    handle.shutdown();
+    let _ = handle.join(Duration::from_secs(2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logprobs_and_top_logprobs_non_streaming_and_streaming() {
+    let handle = zs_scheduler::spawn_mock(zs_scheduler::MockScript::default());
+    let state = test_state(EngineState::Ready, Some(handle.clone()));
+    let address = spawn_server(state).await;
+
+    // 1. Non-streaming with logprobs: true, top_logprobs: 2
+    let body_non_stream = chat_body("hi", false, r#","logprobs":true,"top_logprobs":2"#);
+    let (status, _, resp_str) = tokio::task::spawn_blocking(move || {
+        http(
+            address,
+            "POST",
+            "/v1/chat/completions",
+            Some(&body_non_stream),
+            &[],
+        )
+    })
+    .await
+    .expect("join");
+    assert_eq!(status, 200, "resp={resp_str}");
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).expect("json");
+    let choice = &resp["choices"][0];
+    assert!(choice["logprobs"].is_object(), "must have logprobs object");
+    let content = choice["logprobs"]["content"]
+        .as_array()
+        .expect("content array");
+    assert!(!content.is_empty(), "content array must be non-empty");
+    for item in content {
+        assert!(item["token"].is_string());
+        assert!(item["logprob"].as_f64().unwrap() <= 0.0);
+        assert!(item["bytes"].is_array());
+        let top_lps = item["top_logprobs"].as_array().expect("top_logprobs array");
+        assert!(!top_lps.is_empty());
+        for cand in top_lps {
+            assert!(cand["token"].is_string());
+            assert!(cand["logprob"].as_f64().unwrap() <= 0.0);
+            assert!(cand["bytes"].is_array());
+        }
+    }
+
+    // 2. Non-streaming without logprobs -> choices[0].logprobs is null
+    let body_no_lp = chat_body("hi", false, "");
+    let (status, _, resp_str) = tokio::task::spawn_blocking(move || {
+        http(
+            address,
+            "POST",
+            "/v1/chat/completions",
+            Some(&body_no_lp),
+            &[],
+        )
+    })
+    .await
+    .expect("join");
+    assert_eq!(status, 200);
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).expect("json");
+    assert!(
+        resp["choices"][0]["logprobs"].is_null(),
+        "must be null when not requested"
+    );
+
+    // 3. Streaming with logprobs: true, top_logprobs: 1
+    let body_stream = chat_body("hi", true, r#","logprobs":true,"top_logprobs":1"#);
+    let (status, _, stream_resp) = tokio::task::spawn_blocking(move || {
+        http(
+            address,
+            "POST",
+            "/v1/chat/completions",
+            Some(&body_stream),
+            &[],
+        )
+    })
+    .await
+    .expect("join");
+    assert_eq!(status, 200);
+    let chunks: Vec<serde_json::Value> = stream_resp
+        .split("\n\n")
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.starts_with("data: ") && !line.ends_with("[DONE]") {
+                serde_json::from_str(line.strip_prefix("data: ").unwrap()).ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(!chunks.is_empty());
+    // Role chunk should have null logprobs
+    assert!(chunks[0]["choices"][0]["logprobs"].is_null());
+    // Content chunk should have valid logprobs
+    let mut saw_logprobs = false;
+    for chunk in &chunks[1..] {
+        if let Some(choices) = chunk["choices"].as_array()
+            && let Some(c) = choices.first()
+            && let Some(lp) = c.get("logprobs")
+            && !lp.is_null()
+        {
+            saw_logprobs = true;
+            let content = lp["content"].as_array().expect("content array");
+            assert!(!content.is_empty());
+            assert!(content[0]["token"].is_string());
+            assert!(content[0]["logprob"].as_f64().unwrap() <= 0.0);
+            assert_eq!(content[0]["top_logprobs"].as_array().unwrap().len(), 1);
+        }
+    }
+    assert!(saw_logprobs, "at least one chunk must contain logprobs");
 
     handle.shutdown();
     let _ = handle.join(Duration::from_secs(2));

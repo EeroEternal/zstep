@@ -1260,7 +1260,7 @@ class DeepSeekV41StepRunner:
             reset_gpu = self.sample_reset_gpu[:count]
             pres_gpu = self.sample_pres_pen_gpu[:count]
             freq_gpu = self.sample_freq_pen_gpu[:count]
-        sampled = sample_tp8_logits(
+        sampled, sampled_lps, ru_toks, ru_lps = sample_tp8_logits(
             local_logits,
             temperatures=self.sample_temp_gpu[:count],
             top_p=self.sample_top_p_gpu[:count],
@@ -1274,8 +1274,12 @@ class DeepSeekV41StepRunner:
             reset_mask=reset_gpu,
             presence_penalties=pres_gpu,
             frequency_penalties=freq_gpu,
+            return_top2=True,
         )
         self.out_tokens_gpu[:count, 0].copy_(sampled)
+        self.out_tokens_gpu[:count, 1].copy_(ru_toks)
+        self.out_logprobs_gpu[:count, 0].copy_(sampled_lps.view(torch.int32))
+        self.out_logprobs_gpu[:count, 1].copy_(ru_lps.view(torch.int32))
 
     @torch.inference_mode()
     def _warmup_and_capture_decode_graphs(self) -> None:

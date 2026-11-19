@@ -139,7 +139,8 @@ def sample_tp8_logits(
     reset_mask: torch.Tensor | None = None,
     presence_penalties: torch.Tensor | None = None,
     frequency_penalties: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_top2: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sample global token IDs from TP-sharded `[M, V_local]` logits on GPU.
 
     Supports mixed greedy (`temperature == 0.0`) and stochastic (`temperature > 0.0`)
@@ -223,4 +224,21 @@ def sample_tp8_logits(
     final_tokens = torch.where(valid_stochastic, sampled_tokens, greedy_tokens).to(torch.int32)
     if penalty_state is not None and slots is not None:
         penalty_state.record_sampled(slots, final_tokens)
+    if return_top2:
+        sampled_logits = torch.gather(
+            logits_f32,
+            dim=-1,
+            index=final_tokens.to(torch.int64).unsqueeze(-1),
+        ).squeeze(-1)
+        runner_up_tokens = torch.where(
+            final_tokens.to(torch.int64) == greedy_tokens,
+            sorted_indices[:, 1],
+            greedy_tokens,
+        ).to(torch.int32)
+        runner_up_logits = torch.gather(
+            logits_f32,
+            dim=-1,
+            index=runner_up_tokens.to(torch.int64).unsqueeze(-1),
+        ).squeeze(-1)
+        return final_tokens, sampled_logits, runner_up_tokens, runner_up_logits
     return final_tokens
