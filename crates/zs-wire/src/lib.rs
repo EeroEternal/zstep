@@ -70,6 +70,13 @@ pub const DECODE_GRAPH_BUCKETS: [u32; 11] = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96,
 /// Maximum active decode sequences supported by pre-captured decode CUDA Graphs.
 pub const MAX_DECODE_GRAPH_SEQS: u32 = 128;
 
+/// Direction value stored in `StepPlanSlot::req_slot_ids[i]` for [`StepOpcode::KvTransfer`]:
+/// offload HBM KV page `token_ids[i]` into Host DRAM slot `positions[i]`.
+pub const KV_TRANSFER_DIR_D2H: i32 = 0;
+/// Direction value stored in `StepPlanSlot::req_slot_ids[i]` for [`StepOpcode::KvTransfer`]:
+/// reload Host DRAM slot `positions[i]` into HBM KV page `token_ids[i]`.
+pub const KV_TRANSFER_DIR_H2D: i32 = 1;
+
 /// Step operation codes published in [`StepHeader::opcode`].
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +85,7 @@ pub enum StepOpcode {
     NormalStep = 1,
     WarmupCaptureGraphs = 2,
     ReloadForward = 3,
+    KvTransfer = 4,
     Shutdown = 99,
 }
 

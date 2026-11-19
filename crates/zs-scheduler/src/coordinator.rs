@@ -118,6 +118,8 @@ pub struct WorkerLaunchConfig {
     pub model_dir: Option<PathBuf>,
     pub num_kv_pages: u32,
     pub num_recurrent_checkpoints: u32,
+    /// Host DRAM KV cache blocks per GPU (`0` disables DRAM offload and `sm_h2d` channel isolation).
+    pub dram_kv_blocks: usize,
     pub max_model_len: Option<usize>,
     pub cancel_flag: Option<Arc<AtomicBool>>,
 }
@@ -807,6 +809,12 @@ fn spawn_workers(
             command.env(
                 "ZSTEP_NUM_RECURRENT_CHECKPOINTS",
                 config.launch.num_recurrent_checkpoints.to_string(),
+            );
+        }
+        if config.launch.dram_kv_blocks > 0 {
+            command.env(
+                "ZSTEP_DRAM_KV_BLOCKS",
+                config.launch.dram_kv_blocks.to_string(),
             );
         }
         command

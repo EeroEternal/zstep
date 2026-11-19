@@ -145,3 +145,52 @@ def pin_process_to_device_numa(device_index: int) -> DeviceNumaTopology:
     )
     _PINNED_CACHE[cache_key] = topo
     return topo
+
+
+# Linux `mbind` constants (from <linux/mempolicy.h>)
+_MPOL_PREFERRED: int = 1
+_MPOL_MF_MOVE: int = 1 << 1
+
+
+def bind_memory_to_numa_node(address: int, nbytes: int, numa_node: int) -> bool:
+    """Best-effort `mbind(MPOL_PREFERRED)` binding `[address, address + nbytes)` to `numa_node`.
+
+    Returns `True` if `mbind` succeeded, or `False` on non-Linux / single-NUMA / missing `libnuma`.
+    """
+    if numa_node < 0 or address <= 0 or nbytes <= 0:
+        return False
+    try:
+        lib_name = ctypes.util.find_library("numa") or "libnuma.so.1"
+        libnuma = ctypes.CDLL(lib_name)
+        mbind = libnuma.mbind
+        mbind.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.c_ulong,
+            ctypes.c_uint,
+        ]
+        mbind.restype = ctypes.c_long
+    except (OSError, AttributeError):
+        return False
+
+    page_size = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
+    aligned_addr = address & ~(page_size - 1)
+    aligned_len = ((address + nbytes - aligned_addr + page_size - 1) // page_size) * page_size
+    word_bits = ctypes.sizeof(ctypes.c_ulong) * 8
+    num_words = (numa_node // word_bits) + 1
+    mask = (ctypes.c_ulong * num_words)()
+    mask[numa_node // word_bits] = 1 << (numa_node % word_bits)
+    maxnode = num_words * word_bits + 1
+    rc = int(
+        mbind(
+            ctypes.c_void_p(aligned_addr),
+            ctypes.c_ulong(aligned_len),
+            ctypes.c_int(_MPOL_PREFERRED),
+            mask,
+            ctypes.c_ulong(maxnode),
+            ctypes.c_uint(_MPOL_MF_MOVE),
+        )
+    )
+    return rc == 0

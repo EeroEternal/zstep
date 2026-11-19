@@ -1477,7 +1477,7 @@ fn serve_cli_parses_prefill_scheduling_policy_flags() {
     let err = ServeArgs::parse_with_env(
         &[
             "--model-dir".to_owned(),
-            model_dir,
+            model_dir.clone(),
             "--prefill-policy".to_owned(),
             "sjf".to_owned(),
         ],
@@ -1486,6 +1486,38 @@ fn serve_cli_parses_prefill_scheduling_policy_flags() {
     )
     .unwrap_err();
     assert!(err.contains("unsupported --prefill-policy"));
+
+    let dram_args = ServeArgs::parse_with_env(
+        &[
+            "--model-dir".to_owned(),
+            model_dir.clone(),
+            "--dram-kv-blocks".to_owned(),
+            "1024".to_owned(),
+            "--kv-loading-area-ratio".to_owned(),
+            "0.15".to_owned(),
+        ],
+        None,
+        None,
+    )
+    .expect("dram tier serve args");
+    assert!(dram_args.dram_tier.is_enabled());
+    assert_eq!(dram_args.dram_tier.num_dram_blocks, 1024);
+    assert!((dram_args.dram_tier.loading_area_ratio - 0.15).abs() < 1e-9);
+    assert_eq!(dram_args.engine_config(None).launch.dram_kv_blocks, 1024);
+
+    let dram_without_apc = ServeArgs::parse_with_env(
+        &[
+            "--model-dir".to_owned(),
+            model_dir,
+            "--no-enable-prefix-caching".to_owned(),
+            "--dram-kv-blocks".to_owned(),
+            "256".to_owned(),
+        ],
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(dram_without_apc.contains("--enable-prefix-caching"));
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

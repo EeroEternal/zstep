@@ -59,6 +59,9 @@ from zstep_worker.kernels_sm120.shm_allreduce import (
     HostMappedShmArgmax,
     get_host_mapped_allreduce_extension,
 )
+from zstep_worker.kernels_sm120.sm_h2d import SmH2dCopier
+from zstep_worker.kv_dram_tier import HostDramKvTier
+from zstep_worker.numa_pin import pin_process_to_device_numa
 from zstep_worker.p2p_probe import P2pTopologyReport, configure_adaptive_p2p_env
 from zstep_worker.sampler import SlotPenaltyState, sample_tp8_logits
 from zstep_worker.spec_decode import seq_results, verify_batch
@@ -607,6 +610,7 @@ class DeepSeekV41StepRunner:
 
         # Allocate & bind 512B-aligned KV / SWA / Indexer / Compressor caches
         self._kv_raw_buffers: list[torch.Tensor] = []
+        self._paged_kv_raw_buffers: list[torch.Tensor] = []
         self._builder_groups: list[_AttnBuilderGroup] = []
         self._allocate_and_bind_caches_and_builders()
 
@@ -867,6 +871,23 @@ class DeepSeekV41StepRunner:
             )
 
             self.dspark_drafter = DeepSeekV41DSparkDrafter(self)
+
+        self.dram_kv_tier: HostDramKvTier | None = None
+        if self.runtime_config.dram_kv_blocks > 0:
+            try:
+                numa_node = pin_process_to_device_numa(int(self.device.index)).numa_node
+            except Exception:
+                numa_node = -1
+            self.dram_kv_tier = HostDramKvTier(
+                self._paged_kv_raw_buffers,
+                total_hbm_blocks=self.total_128_blocks,
+                num_dram_blocks=self.runtime_config.dram_kv_blocks,
+                device=self.device,
+                numa_node=numa_node,
+            )
+        self._sm_h2d: SmH2dCopier = SmH2dCopier(
+            enabled=self.dram_kv_tier is not None and self.runtime_config.enable_sm_h2d
+        )
         self._warmup_and_capture_decode_graphs()
 
     def _load_flashinfer_autotune_cache(self) -> int:
@@ -1000,6 +1021,7 @@ class DeepSeekV41StepRunner:
                     device=self.device,
                 )
                 self._kv_raw_buffers.append(raw)
+                self._paged_kv_raw_buffers.append(raw)
                 layer.bind_kv_cache(raw)
                 group_key = (kind, builder_cls, spec)
             elif isinstance(layer, fi_sparse.DeepseekV4FlashInferSM120Attention):
@@ -1012,6 +1034,7 @@ class DeepSeekV41StepRunner:
                     device=self.device,
                 )
                 self._kv_raw_buffers.append(raw)
+                self._paged_kv_raw_buffers.append(raw)
                 layer.bind_kv_cache(raw)
                 group_key = (f"mla_cr{cr}", builder_cls, spec)
             elif isinstance(layer, dsv41_attn.DeepseekV4IndexerCache):
@@ -1028,6 +1051,7 @@ class DeepSeekV41StepRunner:
                     device=self.device,
                 )
                 self._kv_raw_buffers.append(raw_2d)
+                self._paged_kv_raw_buffers.append(raw_2d)
                 view_4d = torch.as_strided(
                     raw_2d,
                     size=(eff_blocks, 1, 64, row_bytes),
@@ -1952,22 +1976,40 @@ class DeepSeekV41StepRunner:
                 if bucket > num_seqs:
                     self.token_ids_gpu[num_seqs:bucket].zero_()
                     self.lookback_gpu[num_seqs:bucket].fill_(-1)
+            if self._sm_h2d.enabled:
+                if not use_dev_tok:
+                    self._sm_h2d.copy_async(
+                        self.lookback_gpu[:bucket], self.lookback_cpu[:bucket]
+                    )
+                    self._sm_h2d.copy_async(
+                        self.token_ids_gpu[:bucket], self.token_ids_cpu[:bucket]
+                    )
+                self._sm_h2d.copy_async(
+                    self.positions_gpu[:bucket], self.positions_cpu[:bucket]
+                )
+                self._sm_h2d.copy_async(
+                    self.seq_lens_gpu[:bucket], self.seq_lens_cpu[:bucket]
+                )
+                self._sm_h2d.copy_async(
+                    self.slot_mapping_gpu[:bucket], self.slot_mapping_cpu[:bucket]
+                )
             else:
-                self.lookback_gpu[:bucket].copy_(
-                    self.lookback_cpu[:bucket], non_blocking=True
+                if not use_dev_tok:
+                    self.lookback_gpu[:bucket].copy_(
+                        self.lookback_cpu[:bucket], non_blocking=True
+                    )
+                    self.token_ids_gpu[:bucket].copy_(
+                        self.token_ids_cpu[:bucket], non_blocking=True
+                    )
+                self.positions_gpu[:bucket].copy_(
+                    self.positions_cpu[:bucket], non_blocking=True
                 )
-                self.token_ids_gpu[:bucket].copy_(
-                    self.token_ids_cpu[:bucket], non_blocking=True
+                self.seq_lens_gpu[:bucket].copy_(
+                    self.seq_lens_cpu[:bucket], non_blocking=True
                 )
-            self.positions_gpu[:bucket].copy_(
-                self.positions_cpu[:bucket], non_blocking=True
-            )
-            self.seq_lens_gpu[:bucket].copy_(
-                self.seq_lens_cpu[:bucket], non_blocking=True
-            )
-            self.slot_mapping_gpu[:bucket].copy_(
-                self.slot_mapping_cpu[:bucket], non_blocking=True
-            )
+                self.slot_mapping_gpu[:bucket].copy_(
+                    self.slot_mapping_cpu[:bucket], non_blocking=True
+                )
 
             self._build_step_attn_metadata(
                 num_reqs=bucket,
@@ -2364,6 +2406,27 @@ class DeepSeekV41StepRunner:
             1, int(self.start_events[p].elapsed_time(self.end_events[p]) * 1000.0)
         )
         return outputs, gpu_exec_us
+
+    @torch.inference_mode()
+    def execute_kv_transfer(self, plan: StepPlanView, header: StepHeader) -> int:
+        if self.dram_kv_tier is None:
+            raise RuntimeError(
+                "Received StepOpcode::KvTransfer but HostDramKvTier is disabled "
+                "(set --dram-kv-blocks > 0)"
+            )
+        count = int(header.num_seqs)
+        if count <= 0:
+            return 1
+        hbm_ids = plan.token_ids(count)
+        dram_ids = plan.positions(count)
+        directions = plan.req_slot_ids(count)
+        self.start_events[0].record()
+        self.dram_kv_tier.execute_transfers(hbm_ids, dram_ids, directions, count)
+        self.end_events[0].record()
+        self.end_events[0].synchronize()
+        return max(
+            1, int(self.start_events[0].elapsed_time(self.end_events[0]) * 1000.0)
+        )
 
     def signal_abort(self) -> None:
         if self.argmax_channel is not None:

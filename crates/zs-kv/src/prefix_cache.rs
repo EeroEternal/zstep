@@ -101,9 +101,24 @@ impl PrefixTreeInner {
         }
     }
 
-    fn evict_lru_leaves(&mut self, target_blocks: usize) -> usize {
-        let mut evicted_count = 0;
-        while evicted_count < target_blocks {
+    fn reconstruct_token_path(&self, leaf_idx: usize) -> Vec<i32> {
+        let mut chain = Vec::new();
+        let mut cur = leaf_idx;
+        while cur != 0 {
+            chain.push(cur);
+            cur = self.nodes[cur].parent;
+        }
+        chain.reverse();
+        let mut path = Vec::with_capacity(chain.len() * self.block_tokens);
+        for idx in chain {
+            path.extend_from_slice(&self.nodes[idx].token_key);
+        }
+        path
+    }
+
+    fn evict_lru_victims_inner(&mut self, target_blocks: usize) -> Vec<PrefixVictim> {
+        let mut victims = Vec::with_capacity(target_blocks);
+        while victims.len() < target_blocks {
             let candidate = self
                 .nodes
                 .iter()
@@ -119,22 +134,39 @@ impl PrefixTreeInner {
                 break;
             };
 
+            let token_path = self.reconstruct_token_path(victim_idx);
             let parent_idx = self.nodes[victim_idx].parent;
             let key = self.nodes[victim_idx].token_key.clone();
             self.nodes[parent_idx].children.remove(&key);
-            // Dropping `lease` and `aux_lease` returns physical KV pages and recurrent checkpoint
-            // slots directly to their respective `BlockPool`s.
-            let dropped_lease = self.nodes[victim_idx].lease.take();
-            let dropped_aux = self.nodes[victim_idx].aux_lease.take();
-            drop(dropped_lease);
-            drop(dropped_aux);
+            let lease = self.nodes[victim_idx].lease.take();
+            let aux_lease = self.nodes[victim_idx].aux_lease.take();
             self.nodes[victim_idx].evicted = true;
             self.free_node_slots.push(victim_idx);
             self.cached_blocks = self.cached_blocks.saturating_sub(1);
-            evicted_count += 1;
+            if let Some(lease) = lease {
+                victims.push(PrefixVictim {
+                    token_path,
+                    lease,
+                    aux_lease,
+                });
+            } else {
+                drop(aux_lease);
+            }
         }
-        evicted_count
+        victims
     }
+
+    fn evict_lru_leaves(&mut self, target_blocks: usize) -> usize {
+        self.evict_lru_victims_inner(target_blocks).len()
+    }
+}
+
+/// An unpinned leaf node evicted from [`PrefixTree`], keeping its HBM [`BlockLease`] alive
+/// until the caller finishes any D2H offload to Host DRAM (RAII overwrite-WAR protection).
+pub struct PrefixVictim {
+    pub token_path: Vec<i32>,
+    pub lease: BlockLease,
+    pub aux_lease: Option<BlockLease>,
 }
 
 /// Thread-safe block-aligned prefix cache tree over physical KV pages and optional recurrent
@@ -468,6 +500,17 @@ impl PrefixTree {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.evict_lru_leaves(target_blocks)
+    }
+
+    /// Evict up to `target_blocks` unpinned leaf nodes in strict LRU order, returning each
+    /// victim's full token path and live HBM [`BlockLease`] so callers can safely offload
+    /// KV bytes to Host DRAM before dropping the lease back to the HBM pool.
+    pub fn evict_lru_victims(&self, target_blocks: usize) -> Vec<PrefixVictim> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.evict_lru_victims_inner(target_blocks)
     }
 }
 

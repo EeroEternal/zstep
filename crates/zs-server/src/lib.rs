@@ -751,6 +751,7 @@ fn run_engine(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             model_dir: args.model_dir.clone(),
             num_kv_pages,
             num_recurrent_checkpoints: 0,
+            dram_kv_blocks: 0,
             max_model_len: None,
             cancel_flag: None,
         },

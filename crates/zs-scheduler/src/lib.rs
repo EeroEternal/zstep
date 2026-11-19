@@ -42,6 +42,7 @@ pub use serving::{
     build_deterministic_random_prompts_seeded, compute_step_logprob, request_kv_page_demand,
     spawn_mock, spawn_serve_loop, spawn_serve_loop_with_state, splitmix64,
 };
+pub use zs_kv::{DEFAULT_LOADING_AREA_RATIO, DramTierConfig, DramTierStats};
 
 /// Compatibility alias retained for external branches migrating off legacy `ModeB*` names.
 pub type ModeBConfig = EngineConfig;

@@ -25,6 +25,8 @@ Usage: zstep serve --model-dir <PATH> [OPTIONS]\n\
   --tokenizer-mode MODE          auto | deepseek_v41 | chatml (default: auto)\n\
   --enable-prefix-caching        Enable Automatic Prefix Caching (APC, default: enabled)\n\
   --no-enable-prefix-caching     Disable Automatic Prefix Caching (APC)\n\
+  --dram-kv-blocks N             Host DRAM KV blocks per GPU (default: 0 = disabled; enables Exclusive DRAM + sm_h2d)\n\
+  --kv-loading-area-ratio F      HBM fraction reserved for DRAM->HBM reloads in (0.0, 0.5] (default: 0.10)\n\
   --max-waiting-requests N       Bounded HTTP waiting queue depth (default: 1024)\n\
   --prefill-policy MODE          Waiting prefill policy: srpt | fifo (default: srpt)\n\
   --prefill-starvation-cap-ms N  Max wait (ms) before long prompt preempts SRPT (default: 60000, 0=off)\n\
@@ -96,6 +98,7 @@ pub struct ServeArgs {
     pub step_timeout: Duration,
     pub max_mixed_step_tokens: Option<usize>,
     pub prefill_policy: zs_scheduler::PrefillSchedulingPolicy,
+    pub dram_tier: zs_scheduler::DramTierConfig,
     pub allreduce_blocks: u32,
     pub allreduce_threads: u32,
     pub speculative: SpeculativeConfig,
@@ -158,6 +161,8 @@ pub fn validate_known_flags(argv: &[String]) -> Result<BTreeMap<String, String>,
         "--max-mixed-step-tokens",
         "--prefill-policy",
         "--prefill-starvation-cap-ms",
+        "--dram-kv-blocks",
+        "--kv-loading-area-ratio",
         "--allreduce-blocks",
         "--allreduce-threads",
         "--speculative-method",
@@ -378,6 +383,18 @@ impl ServeArgs {
             }
             policy
         };
+        let dram_kv_blocks: usize = parse_map_number(&values, "--dram-kv-blocks", 0usize)?;
+        let kv_loading_area_ratio: f64 = parse_map_number(
+            &values,
+            "--kv-loading-area-ratio",
+            zs_scheduler::DEFAULT_LOADING_AREA_RATIO,
+        )?;
+        if dram_kv_blocks > 0 && !enable_prefix_caching {
+            return Err("--dram-kv-blocks requires --enable-prefix-caching".to_owned());
+        }
+        let dram_tier =
+            zs_scheduler::DramTierConfig::enabled(dram_kv_blocks, kv_loading_area_ratio)
+                .map_err(|err| err.to_string())?;
         let drain_timeout_secs: u64 = parse_map_number(&values, "--drain-timeout-secs", 30)?;
         let ready_timeout_secs: u64 = parse_map_number(&values, "--ready-timeout-secs", 1800u64)?;
         let step_timeout_secs: u64 = parse_map_number(&values, "--step-timeout-secs", 300u64)?;
@@ -514,6 +531,7 @@ impl ServeArgs {
                 .transpose()
                 .map_err(|_| "--max-mixed-step-tokens must be an integer".to_owned())?,
             prefill_policy,
+            dram_tier,
             allreduce_blocks: parse_map_number(&values, "--allreduce-blocks", 8u32)?,
             allreduce_threads: parse_map_number(&values, "--allreduce-threads", 256u32)?,
             speculative,
@@ -603,6 +621,7 @@ impl ServeArgs {
                 model_dir: Some(self.model_dir.clone()),
                 num_kv_pages,
                 num_recurrent_checkpoints,
+                dram_kv_blocks: self.dram_tier.num_dram_blocks,
                 max_model_len: Some(self.max_model_len),
                 cancel_flag,
             },

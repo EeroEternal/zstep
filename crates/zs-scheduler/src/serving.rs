@@ -29,10 +29,14 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use zs_kv::{BlockLease, BlockPool, CacheGroupKind, PrefixLease, PrefixTree};
+use zs_kv::{
+    BlockLease, BlockPool, CacheGroupKind, DramPrefixCache, DramTierConfig, DramTierStats,
+    KvTransferOp, PrefixLease, PrefixTree,
+};
 use zs_wire::{
-    DECODE_GRAPH_BUCKETS, MAX_DECODE_GRAPH_SEQS, STEP_FLAG_DECODE_ONLY, STEP_FLAG_DEVICE_TOKENS,
-    STEP_FLAG_NEXT_PREPUBLISHED, STEP_FLAG_PENALTY, STEP_FLAG_SAMPLING, StepHeader, StepOpcode,
+    DECODE_GRAPH_BUCKETS, KV_TRANSFER_DIR_D2H, KV_TRANSFER_DIR_H2D, MAX_DECODE_GRAPH_SEQS,
+    STEP_FLAG_DECODE_ONLY, STEP_FLAG_DEVICE_TOKENS, STEP_FLAG_NEXT_PREPUBLISHED, STEP_FLAG_PENALTY,
+    STEP_FLAG_SAMPLING, StepHeader, StepOpcode,
 };
 
 use crate::coordinator::{
@@ -509,6 +513,7 @@ pub struct ServingEngine {
     slot_pool: SlotPool,
     kv_pool: BlockPool,
     prefix_tree: Option<PrefixTree>,
+    dram_cache: Option<DramPrefixCache>,
     recurrent_pool: Option<BlockPool>,
     pages_per_prefix_node: usize,
     prefix_cache_queries_tokens: u64,
@@ -925,6 +930,7 @@ fn select_next_waiting_candidate(
     prefix_tree: Option<&PrefixTree>,
     max_seqs: usize,
     page_block_tokens: usize,
+    loading_area_reserve: usize,
     policy: PrefillSchedulingPolicy,
     now: Instant,
     // Optional `(remaining_budget, max_prefill_chunk, num_seqs_already_staged)` filter.
@@ -933,7 +939,9 @@ fn select_next_waiting_candidate(
     if waiting_permitted.is_empty() || active.len() >= max_seqs || slot_pool.available() == 0 {
         return None;
     }
-    let outstanding = outstanding_reserved_pages(active);
+    // Reserve the 10% HBM Loading Area exclusively for DRAM -> HBM reloads so regular new
+    // sequence admissions cannot exhaust it and trigger a reload/eviction deadlock.
+    let outstanding = outstanding_reserved_pages(active).saturating_add(loading_area_reserve);
 
     let budget_accepts = |prompt_len: usize, cached_tokens: usize| -> bool {
         let Some((remaining_budget, max_prefill_chunk, num_seqs_staged)) = budget_filter else {
@@ -1056,6 +1064,7 @@ fn front_request_admissible_in_pools(
         prefix_tree,
         max_seqs,
         page_block_tokens,
+        0,
         PrefillSchedulingPolicy::fifo(),
         Instant::now(),
         None,
@@ -1138,6 +1147,7 @@ impl ServingEngine {
             slot_pool: SlotPool::new(geometry.max_seqs),
             kv_pool: BlockPool::new(CacheGroupKind::GlobalAndIndex, num_kv_pages),
             prefix_tree: None,
+            dram_cache: None,
             recurrent_pool: None,
             pages_per_prefix_node: 1,
             prefix_cache_queries_tokens: 0,
@@ -1194,6 +1204,278 @@ impl ServingEngine {
 
     pub fn has_prefix_cache(&self) -> bool {
         self.prefix_tree.is_some()
+    }
+
+    /// Enable the Exclusive Host DRAM KV tier with Victim Chain demotion and a reserved
+    /// HBM Loading Area (Issue #40 Proposals 1 & 2).
+    pub fn enable_dram_kv_cache(&mut self, config: DramTierConfig) -> Result<()> {
+        if !config.is_enabled() {
+            self.dram_cache = None;
+            return Ok(());
+        }
+        let Some(ref tree) = self.prefix_tree else {
+            return Err(EngineError::Protocol(
+                "enable_dram_kv_cache requires enable_prefix_caching to be called first".to_owned(),
+            ));
+        };
+        if self.pages_per_prefix_node != 1 {
+            return Err(EngineError::Protocol(format!(
+                "Host DRAM KV tier currently requires pages_per_prefix_node == 1 (got {})",
+                self.pages_per_prefix_node
+            )));
+        }
+        let cache = DramPrefixCache::new(tree.block_tokens(), self.kv_pool.capacity(), config)
+            .map_err(|err| EngineError::Protocol(err.to_string()))?;
+        self.dram_cache = Some(cache);
+        Ok(())
+    }
+
+    pub fn dram_tier_stats(&self) -> Option<DramTierStats> {
+        self.dram_cache.as_ref().map(DramPrefixCache::stats)
+    }
+
+    /// Number of HBM KV pages reserved exclusively for DRAM -> HBM reloads (`0` when disabled).
+    pub fn loading_area_pages(&self) -> usize {
+        self.dram_cache
+            .as_ref()
+            .map_or(0, DramPrefixCache::loading_area_pages)
+    }
+
+    /// Publish and await one or more [`StepOpcode::KvTransfer`] micro-steps across all workers.
+    fn execute_kv_transfer(&mut self, ops: &[KvTransferOp]) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let max_ops_per_step = (self.coordinator.config().geometry.max_step_tokens as usize).max(1);
+        for chunk in ops.chunks(max_ops_per_step) {
+            self.step_cursor += 1;
+            let transfer_sid = self.step_cursor;
+            {
+                let mut plan = self.coordinator.plan_slot_mut(transfer_sid)?;
+                {
+                    let token_ids = plan.token_ids_mut()?;
+                    for (i, op) in chunk.iter().enumerate() {
+                        token_ids[i] = op.hbm_page_id;
+                    }
+                }
+                {
+                    let positions = plan.positions_mut()?;
+                    for (i, op) in chunk.iter().enumerate() {
+                        positions[i] = op.dram_slot_id;
+                    }
+                }
+                {
+                    let directions = plan.req_slot_ids_mut()?;
+                    for (i, op) in chunk.iter().enumerate() {
+                        directions[i] = if op.is_h2d {
+                            KV_TRANSFER_DIR_H2D
+                        } else {
+                            KV_TRANSFER_DIR_D2H
+                        };
+                    }
+                }
+                *plan.header_mut()? = StepHeader {
+                    step_id: AtomicU64::new(0),
+                    opcode: StepOpcode::KvTransfer as u32,
+                    num_seqs: chunk.len() as u32,
+                    num_encoder_tokens: chunk.len() as u32,
+                    encoder_graph_bucket: 0,
+                    num_decoder_rows: chunk.len() as u32,
+                    decoder_graph_bucket: 0,
+                    num_sample_rows: 0,
+                    is_dspark_verify: 0,
+                    flags: 0,
+                    _reserved: [0; 3],
+                };
+            }
+            self.coordinator.publish_step(transfer_sid)?;
+            self.coordinator.wait_step_completed(transfer_sid)?;
+        }
+        Ok(())
+    }
+
+    /// When HBM free pages are below `needed_pages` and Host DRAM tier is active, demote
+    /// unpinned LRU HBM prefix leaves into Exclusive Host DRAM via D2H `KvTransfer` while
+    /// keeping their HBM `BlockLease`s pinned until the transfer completes.
+    fn prepare_hbm_for_pages(&mut self, needed_pages: usize) -> Result<()> {
+        if needed_pages == 0 || self.kv_pool.available() >= needed_pages {
+            return Ok(());
+        }
+        if self.dram_cache.is_none() || self.prefix_tree.is_none() {
+            return Ok(());
+        }
+        let deficit = needed_pages.saturating_sub(self.kv_pool.available());
+        let victims = self
+            .prefix_tree
+            .as_ref()
+            .map(|tree| tree.evict_lru_victims(deficit))
+            .unwrap_or_default();
+        if victims.is_empty() {
+            return Ok(());
+        }
+        let mut ops = Vec::with_capacity(victims.len());
+        let mut admitted_paths = Vec::with_capacity(victims.len());
+        if let Some(dram) = self.dram_cache.as_mut() {
+            for victim in &victims {
+                if let Some(&hbm_page_id) = victim.lease.ids().first()
+                    && let Some(op) = dram.admit_victim(victim.token_path.clone(), hbm_page_id)
+                {
+                    ops.push(op);
+                    admitted_paths.push(victim.token_path.clone());
+                }
+            }
+        }
+        if !ops.is_empty()
+            && let Err(err) = self.execute_kv_transfer(&ops)
+        {
+            if let Some(dram) = self.dram_cache.as_mut() {
+                for path in &admitted_paths {
+                    dram.rollback_failed_offload(path);
+                }
+            }
+            drop(victims);
+            return Err(err);
+        }
+        self.prefix_cache_evictions_pages += victims.len() as u64;
+        // Dropping `victims` returns the offloaded HBM `BlockLease`s back to `self.kv_pool`
+        // strictly after the worker's D2H transfer has completed.
+        drop(victims);
+        Ok(())
+    }
+
+    /// Reload contiguous DRAM-resident prefix blocks immediately following the current HBM
+    /// prefix match into HBM (drawing from the 10% Loading Area / free HBM pool) and promote
+    /// them into `PrefixTree` before staging prefill.
+    fn reload_dram_prefix_into_hbm(&mut self, prompt_tokens: &[i32]) -> Result<usize> {
+        if self.dram_cache.is_none() || self.prefix_tree.is_none() || prompt_tokens.len() <= 1 {
+            return Ok(0);
+        }
+        let hbm_matched_tokens = {
+            let tree = self.prefix_tree.as_ref().expect("checked");
+            let max_nodes = (prompt_tokens.len() - 1) / (tree.block_tokens() as usize);
+            let (matched_nodes, _) = tree.peek_prefix_bounded(prompt_tokens, max_nodes);
+            matched_nodes * (tree.block_tokens() as usize)
+        };
+        let avail_dram_blocks = self.dram_cache.as_ref().map_or(0, |d| {
+            d.peek_continuation_blocks(prompt_tokens, hbm_matched_tokens)
+        });
+        if avail_dram_blocks == 0 {
+            return Ok(0);
+        }
+        let max_reload = avail_dram_blocks.min(self.kv_pool.available());
+        if max_reload == 0 {
+            return Ok(0);
+        }
+        let mut hbm_leases = Vec::with_capacity(max_reload);
+        for _ in 0..max_reload {
+            if let Some(lease) = self.kv_pool.allocate(1) {
+                hbm_leases.push(lease);
+            } else {
+                break;
+            }
+        }
+        if hbm_leases.is_empty() {
+            return Ok(0);
+        }
+        let taken = self
+            .dram_cache
+            .as_mut()
+            .expect("checked")
+            .take_continuation_for_reload(prompt_tokens, hbm_matched_tokens, hbm_leases.len());
+        hbm_leases.truncate(taken.len());
+        if taken.is_empty() {
+            return Ok(0);
+        }
+        let dram_slots: Vec<i32> = taken.iter().map(|(_, slot)| *slot).collect();
+        let h2d_ops: Vec<KvTransferOp> = hbm_leases
+            .iter()
+            .zip(taken.iter())
+            .map(|(lease, (_, dram_slot_id))| KvTransferOp {
+                hbm_page_id: lease.ids()[0],
+                dram_slot_id: *dram_slot_id,
+                is_h2d: true,
+            })
+            .collect();
+        let transfer_res = self.execute_kv_transfer(&h2d_ops);
+        if let Some(dram) = self.dram_cache.as_mut() {
+            dram.release_dram_slots(&dram_slots);
+        }
+        transfer_res?;
+
+        let reloaded_blocks = hbm_leases.len();
+        if let Some(tree) = self.prefix_tree.as_ref() {
+            let full_len = hbm_matched_tokens + reloaded_blocks * (tree.block_tokens() as usize);
+            let base_lease = tree.match_prefix_bounded(
+                prompt_tokens,
+                hbm_matched_tokens / (tree.block_tokens() as usize),
+            );
+            let _promoted = tree
+                .extend_prefix(
+                    base_lease,
+                    &prompt_tokens[hbm_matched_tokens..full_len],
+                    hbm_leases,
+                )
+                .map_err(|err| EngineError::Protocol(err.to_string()))?;
+        }
+        Ok(reloaded_blocks)
+    }
+
+    /// Pre-step DRAM tier maintenance (executed strictly *before* allocating the next
+    /// `NormalStep` `step_id` so `KvTransfer` steps stay strictly monotonic in SHM ring slots).
+    fn prepare_dram_tier_for_step(
+        &mut self,
+        active: &[ActiveSequence],
+        waiting_permitted: &VecDeque<PendingRequest>,
+        max_seqs: usize,
+        page_block_tokens: usize,
+        now: Instant,
+    ) -> Result<()> {
+        if self.dram_cache.is_none() || self.prefix_tree.is_none() {
+            return Ok(());
+        }
+        // 1. Demote HBM LRU victims to DRAM if active decode/partial-prefill sequences need new pages.
+        let mut needed_hbm_pages = 0usize;
+        for seq in active {
+            if seq.prefilled_tokens == seq.prompt_tokens.len() {
+                let next_pages = (seq.current_seq_len + 1).div_ceil(page_block_tokens);
+                needed_hbm_pages += next_pages.saturating_sub(seq.page_ids.len());
+            }
+        }
+        if needed_hbm_pages > 0 {
+            self.prepare_hbm_for_pages(needed_hbm_pages)?;
+        }
+        // 2. If a waiting request is admissible, reload any contiguous DRAM prefix continuation
+        //    into HBM (drawing from the 10% Loading Area) and demote victims if needed for its
+        //    remaining uncached pages.
+        if let Some(sel) = select_next_waiting_candidate(
+            active,
+            waiting_permitted,
+            &self.slot_pool,
+            &self.kv_pool,
+            self.prefix_tree.as_ref(),
+            max_seqs,
+            page_block_tokens,
+            self.loading_area_pages(),
+            self.prefill_policy,
+            now,
+            None,
+        ) {
+            let prompt = waiting_permitted[sel.index].prompt_tokens.clone();
+            let target_output_len = waiting_permitted[sel.index].target_output_len;
+            let _ = self.reload_dram_prefix_into_hbm(&prompt)?;
+            let (_, _, extra_demand, _) = peek_request_admission(
+                &prompt,
+                target_output_len,
+                page_block_tokens,
+                &self.kv_pool,
+                self.prefix_tree.as_ref(),
+            );
+            let total_needed = needed_hbm_pages.saturating_add(extra_demand);
+            if total_needed > 0 {
+                self.prepare_hbm_for_pages(total_needed)?;
+            }
+        }
+        Ok(())
     }
 
     /// Free physical KV pages plus unpinned `PrefixTree` pages reclaimable via LRU eviction.
@@ -1344,6 +1626,7 @@ impl ServingEngine {
             self.prefix_tree.as_ref(),
             max_seqs,
             page_block_tokens,
+            self.loading_area_pages(),
             self.prefill_policy,
             now,
             None,
@@ -1363,7 +1646,9 @@ impl ServingEngine {
             requests,
             page_block_tokens,
             max_pages_per_seq,
-            self.kv_pool.capacity(),
+            self.kv_pool
+                .capacity()
+                .saturating_sub(self.loading_area_pages()),
         )
     }
 
@@ -1625,6 +1910,13 @@ impl ServingEngine {
                 ready_step
             } else {
                 let step_now = Instant::now();
+                self.prepare_dram_tier_for_step(
+                    &active,
+                    waiting_permitted,
+                    max_seqs,
+                    page_block_tokens,
+                    step_now,
+                )?;
                 let waiting_admissible = self.front_request_admissible(
                     &active,
                     waiting_permitted,
@@ -2042,6 +2334,7 @@ impl ServingEngine {
                 self.prefix_tree.as_ref(),
                 max_seqs,
                 page_block_tokens,
+                self.loading_area_pages(),
                 self.prefill_policy,
                 now,
                 Some((max_step_tokens - token_cursor, max_prefill_chunk, 0)),
@@ -2365,6 +2658,7 @@ impl ServingEngine {
                 self.prefix_tree.as_ref(),
                 max_seqs,
                 page_block_tokens,
+                self.loading_area_pages(),
                 self.prefill_policy,
                 now,
                 Some((remaining_budget, max_prefill_chunk, num_seqs)),
