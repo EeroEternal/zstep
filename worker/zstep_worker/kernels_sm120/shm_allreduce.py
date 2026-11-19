@@ -70,7 +70,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v20_ext",
+            name="zstep_shm_allreduce_sm120_v21_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -492,7 +492,7 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
             return False
         vecs_per_row = hidden // 8
         num_vecs = rows * vecs_per_row
-        small_pxb = self._pxb_enabled and self.blocks == 32 and num_vecs <= 40960
+        small_pxb = self._pxb_enabled and 32 <= self.blocks <= 56 and num_vecs <= 40960
         eff_blocks = 8 if small_pxb else self.blocks
         capped_threads = 512 if self.threads > 512 else self.threads
         eff_threads = 256 if small_pxb else capped_threads
@@ -547,7 +547,7 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
             num_vecs = rows * vecs_per_row
             eff_blocks = (
                 8
-                if (self._pxb_enabled and self.blocks == 32 and num_vecs <= 40960)
+                if (self._pxb_enabled and 32 <= self.blocks <= 56 and num_vecs <= 40960)
                 else self.blocks
             )
             use_cluster = (

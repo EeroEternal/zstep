@@ -733,9 +733,9 @@ def _pxb_8gpu_worker(rank: int, init_file: str, shm_name: str) -> None:
                 assert bool(torch.isnan(pkts_out[:, 3, 3]).all())
                 assert float(pkts_out[:, 3, 4].abs().max().item()) == 0.0
 
-                gathered_edge = [torch.empty((16, 5120), dtype=torch.uint16) for _ in range(8)]
+                gathered_edge = [torch.empty((16, 5120), dtype=torch.int16) for _ in range(8)]
                 dist.all_gather(
-                    gathered_edge, out_edge.cpu().view(torch.uint16), group=dist.group.WORLD
+                    gathered_edge, out_edge.cpu().view(torch.int16), group=dist.group.WORLD
                 )
                 for peer_r in range(1, 8):
                     assert torch.equal(gathered_edge[0], gathered_edge[peer_r]), (

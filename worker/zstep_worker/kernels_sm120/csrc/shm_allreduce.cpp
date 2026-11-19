@@ -361,7 +361,7 @@ void launch_shm_v5_pxb_allreduce_add_rmsnorm(
     const int64_t vecs_per_row = hidden / 8;
     TORCH_CHECK(vecs_per_row <= 1536, "hidden exceeds 3-iter epilogue limit (12288)");
     const int64_t eff_blocks =
-        (my_hbm_ptr != 0 && blocks == 32 && rows * vecs_per_row <= 40960) ? 8 : blocks;
+        (my_hbm_ptr != 0 && blocks >= 32 && blocks <= 56 && rows * vecs_per_row <= 40960) ? 8 : blocks;
     if (rows < eff_blocks) {
         TORCH_CHECK(eff_blocks % rows == 0, "rows < eff_blocks requires eff_blocks % rows == 0");
     }
