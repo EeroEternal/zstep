@@ -23,12 +23,17 @@
 //! SWA 128-token bounded replay planning.
 
 mod dram_tier;
+mod hybrid_alias;
 mod prefix_cache;
 
 use std::sync::{Arc, Mutex};
 
 pub use dram_tier::{
     DEFAULT_LOADING_AREA_RATIO, DramPrefixCache, DramTierConfig, DramTierStats, KvTransferOp,
+};
+pub use hybrid_alias::{
+    GDN_FINE_GRAINED_TOKENS, HybridBlockAliasEntry, HybridBlockAliasTable, SubPageAllocator,
+    SubPageLease,
 };
 pub use prefix_cache::{
     KvCacheManager, KvError, PrefillSchedule, PrefixLease, PrefixTree, PrefixVictim,
@@ -556,6 +561,56 @@ mod tests {
         assert_eq!(tree.evict_lru(3), 3);
         assert_eq!(kv_pool.available(), 24);
         assert_eq!(aux_pool.available(), 6);
+        assert_eq!(tree.alias_count(), 0);
+    }
+
+    #[test]
+    fn hybrid_128_token_gdn_prefix_tree_maintains_unified_block_id_aliases() {
+        let kv_pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 32);
+        let aux_pool = BlockPool::new(CacheGroupKind::RecurrentState, 4);
+        // Qwen3.5 128-token fine-grained GDN node = 8 * 16-token KV pages + 1 recurrent slot.
+        let tree = PrefixTree::with_pages_per_node(GDN_FINE_GRAINED_TOKENS, 8)
+            .expect("128-token node, 8 pages/node");
+        let tokens: Vec<i32> = (0..256).map(|i| i + 1_000).collect(); // 2 nodes * 128 tokens
+
+        let kv = kv_pool.allocate(16).expect("kv").split_chunks(8);
+        let aux = aux_pool.allocate(2).expect("aux").split_individual();
+        let lease = tree
+            .extend_prefix_with_aux(tree.match_prefix(&[]), &tokens, kv, Some(aux))
+            .expect("promote 2 128-token GDN nodes");
+
+        assert_eq!(tree.alias_count(), 2);
+        assert_eq!(lease.matched_tokens(), 256);
+        let leaf_anchor = lease.leaf_anchor_block_id().expect("leaf anchor block id");
+        let leaf_aux = lease.leaf_aux_id().expect("leaf aux slot");
+        assert_eq!(leaf_anchor, lease.block_ids()[8]);
+        assert_eq!(tree.resolve_aux_for_kv_block(leaf_anchor), Some(leaf_aux));
+        assert_eq!(
+            tree.resolve_kv_pages_for_aux_slot(leaf_aux),
+            Some(lease.block_ids()[8..16].to_vec())
+        );
+
+        // Matched prefix via `match_prefix_bounded` resolves identically through the unified alias.
+        let hit = tree.match_prefix_bounded(&tokens, 1);
+        let hit_anchor = hit.leaf_anchor_block_id().expect("first node anchor");
+        let hit_aux = hit.leaf_aux_id().expect("first node aux");
+        assert_eq!(hit_anchor, lease.block_ids()[0]);
+        assert_eq!(tree.resolve_aux_for_kv_block(hit_anchor), Some(hit_aux));
+        assert_ne!(hit_aux, leaf_aux);
+
+        drop(hit);
+        drop(lease);
+        let victims = tree.evict_lru_victims(1);
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0].anchor_block_id(), Some(leaf_anchor));
+        assert_eq!(tree.alias_count(), 1);
+        assert_eq!(tree.resolve_aux_for_kv_block(leaf_anchor), None);
+        assert_eq!(tree.resolve_kv_pages_for_aux_slot(leaf_aux), None);
+        drop(victims);
+        assert_eq!(tree.evict_lru(1), 1);
+        assert_eq!(tree.alias_count(), 0);
+        assert_eq!(kv_pool.available(), 32);
+        assert_eq!(aux_pool.available(), 4);
     }
 
     #[test]

@@ -635,11 +635,23 @@ fn admit_request_into_sequence(
                 )));
             }
             if has_recurrent_pool {
-                restore_checkpoint_id = lease.leaf_aux_id().ok_or_else(|| {
+                let anchor_block_id = lease.leaf_anchor_block_id().ok_or_else(|| {
                     EngineError::Protocol(
-                        "hybrid prefix node missing recurrent checkpoint slot".to_owned(),
+                        "hybrid prefix node missing canonical anchor KV Block-ID".to_owned(),
                     )
                 })?;
+                let aliased_slot = tree.resolve_aux_for_kv_block(anchor_block_id).ok_or_else(|| {
+                    EngineError::Protocol(format!(
+                        "hybrid prefix anchor block {anchor_block_id} missing unified recurrent alias"
+                    ))
+                })?;
+                if lease.leaf_aux_id() != Some(aliased_slot) {
+                    return Err(EngineError::Protocol(format!(
+                        "hybrid prefix alias mismatch: anchor block {anchor_block_id} mapped to slot {aliased_slot}, leaf_aux_id={:?}",
+                        lease.leaf_aux_id()
+                    )));
+                }
+                restore_checkpoint_id = aliased_slot;
             }
             page_ids.extend_from_slice(lease.block_ids());
             let row_base = slot_id * max_pages_per_seq;

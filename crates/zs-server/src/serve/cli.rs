@@ -25,6 +25,7 @@ Usage: zstep serve --model-dir <PATH> [OPTIONS]\n\
   --tokenizer-mode MODE          auto | deepseek_v41 | chatml (default: auto)\n\
   --enable-prefix-caching        Enable Automatic Prefix Caching (APC, default: enabled)\n\
   --no-enable-prefix-caching     Disable Automatic Prefix Caching (APC)\n\
+  --apc-gdn-node-tokens N        GDN hybrid APC node granularity: 64 | 128 (default: 128)\n\
   --dram-kv-blocks N             Host DRAM KV blocks per GPU (default: 0 = disabled; enables Exclusive DRAM + sm_h2d)\n\
   --kv-loading-area-ratio F      HBM fraction reserved for DRAM->HBM reloads in (0.0, 0.5] (default: 0.10)\n\
   --max-waiting-requests N       Bounded HTTP waiting queue depth (default: 1024)\n\
@@ -90,6 +91,7 @@ pub struct ServeArgs {
     pub kv_cache_dtype: String,
     pub tokenizer_mode: String,
     pub enable_prefix_caching: bool,
+    pub apc_gdn_node_tokens: u32,
     pub max_waiting_requests: usize,
     pub drain_timeout: Duration,
     pub python: String,
@@ -149,6 +151,7 @@ pub fn validate_known_flags(argv: &[String]) -> Result<BTreeMap<String, String>,
         "--max-step-tokens",
         "--max-prefill-chunk",
         "--page-block-tokens",
+        "--apc-gdn-node-tokens",
         "--num-kv-pages",
         "--kv-cache-dtype",
         "--tokenizer-mode",
@@ -354,6 +357,16 @@ impl ServeArgs {
         let enable_prefix_caching = values
             .get("--enable-prefix-caching")
             .is_none_or(|raw| raw == "true");
+        let apc_gdn_node_tokens: u32 = parse_map_number(
+            &values,
+            "--apc-gdn-node-tokens",
+            zs_kv::GDN_FINE_GRAINED_TOKENS,
+        )?;
+        if !matches!(apc_gdn_node_tokens, 64 | 128) {
+            return Err(format!(
+                "--apc-gdn-node-tokens must be 64 or 128 (got {apc_gdn_node_tokens})"
+            ));
+        }
         let max_waiting_requests: usize =
             parse_map_number(&values, "--max-waiting-requests", 1024)?;
         if max_waiting_requests == 0 {
@@ -513,6 +526,7 @@ impl ServeArgs {
             kv_cache_dtype,
             tokenizer_mode,
             enable_prefix_caching,
+            apc_gdn_node_tokens,
             max_waiting_requests,
             drain_timeout: Duration::from_secs(drain_timeout_secs),
             python: values
@@ -554,13 +568,16 @@ impl ServeArgs {
             }
             Ok((1, 0))
         } else {
-            if self.page_block_tokens > 64 || 64 % self.page_block_tokens != 0 {
+            let gdn_node_tokens = self.apc_gdn_node_tokens;
+            if self.page_block_tokens > gdn_node_tokens
+                || gdn_node_tokens % self.page_block_tokens != 0
+            {
                 return Err(format!(
-                    "--enable-prefix-caching on hybrid GDN runner requires --page-block-tokens dividing 64 (got {})",
+                    "--enable-prefix-caching on hybrid GDN runner requires --page-block-tokens dividing --apc-gdn-node-tokens {gdn_node_tokens} (got {})",
                     self.page_block_tokens
                 ));
             }
-            Ok(((64 / self.page_block_tokens) as usize, 255))
+            Ok(((gdn_node_tokens / self.page_block_tokens) as usize, 255))
         }
     }
 
