@@ -43,4 +43,5 @@ jobs:
             worker/tests/test_b12x_dsv41_lifecycle.py \
             worker/tests/test_coordinator_e2e.py \
             worker/tests/test_env_config.py \
-            worker/tests/test_hotpath_ast_guards.py
+            worker/tests/test_hotpath_ast_guards.py \
+            worker/tests/test_sampler.py

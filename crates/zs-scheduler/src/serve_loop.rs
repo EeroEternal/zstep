@@ -76,6 +76,7 @@ pub type EventSink = Arc<dyn Fn(LoopEvent) + Send + Sync>;
 pub struct SubmitRequest {
     pub prompt_tokens: Vec<i32>,
     pub max_new_tokens: usize,
+    pub sampling: SamplingParams,
     pub sink: EventSink,
 }
 
@@ -465,6 +466,7 @@ fn run_loop(
                             request_id: request_id as usize,
                             prompt_tokens: request.prompt_tokens,
                             target_output_len: request.max_new_tokens.max(1),
+                            sampling: request.sampling,
                             permit_time: now,
                             submit_time: now,
                         });
@@ -1575,6 +1577,7 @@ mod tests {
                     request_id: id as usize,
                     prompt_tokens: vec![11; prompt_len],
                     target_output_len: target_out,
+                    sampling: SamplingParams::default(),
                     permit_time: Instant::now(),
                     submit_time: Instant::now(),
                 });
@@ -1617,6 +1620,7 @@ mod tests {
                     generated_top2: Vec::new(),
                     pending_draft_tokens: Vec::new(),
                     staged_verify: None,
+                    sampling: SamplingParams::default(),
                     target_output_len: req.target_output_len,
                     reserved_pages: demand,
                     permit_time: req.permit_time,
@@ -1792,6 +1796,7 @@ mod tests {
             generated_top2: Vec::new(),
             pending_draft_tokens: Vec::new(),
             staged_verify: None,
+            sampling: SamplingParams::default(),
             target_output_len: 64,
             reserved_pages: 5,
             permit_time: Instant::now(),
@@ -1840,6 +1845,7 @@ mod tests {
             .submit(SubmitRequest {
                 prompt_tokens: vec![1, 2],
                 max_new_tokens: 10,
+                sampling: SamplingParams::default(),
                 sink: Arc::new(move |ev| done_clone.lock().expect("lock").push(ev)),
             })
             .expect("submit");
@@ -1854,6 +1860,7 @@ mod tests {
         let rejected = handle.submit(SubmitRequest {
             prompt_tokens: vec![1],
             max_new_tokens: 4,
+            sampling: SamplingParams::default(),
             sink: Arc::new(|_| {}),
         });
         assert_eq!(
@@ -1931,6 +1938,7 @@ mod tests {
                     request_id: id as usize,
                     prompt_tokens: prompt,
                     target_output_len: target_out,
+                    sampling: SamplingParams::default(),
                     permit_time: Instant::now(),
                     submit_time: Instant::now(),
                 });
@@ -2155,6 +2163,7 @@ mod tests {
             generated_top2: Vec::new(),
             pending_draft_tokens: Vec::new(),
             staged_verify: None,
+            sampling: SamplingParams::default(),
             target_output_len: 64,
             reserved_pages: 5,
             permit_time: Instant::now(),
@@ -2190,6 +2199,7 @@ mod tests {
             generated_top2: Vec::new(),
             pending_draft_tokens: Vec::new(),
             staged_verify: None,
+            sampling: SamplingParams::default(),
             target_output_len: 64,
             reserved_pages: 5,
             permit_time: Instant::now(),

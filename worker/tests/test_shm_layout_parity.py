@@ -41,6 +41,7 @@ from zstep_worker.shm_bridge import (
     STEP_FLAG_DECODE_ONLY,
     STEP_FLAG_DEVICE_TOKENS,
     STEP_FLAG_NEXT_PREPUBLISHED,
+    STEP_FLAG_SAMPLING,
     STEP_HEADER_BYTES,
     STEP_HEADER_FLAGS_OFFSET,
     STEP_RESULT_HEADER_BYTES,
@@ -94,6 +95,9 @@ def _assert_layout_invariants(geom: ShmGeometry, layout: StepPlanLayout) -> None
         (layout.swa_page_table_offset, geom.max_seqs * 16),
         (layout.compressor_slot_ids_offset, geom.max_seqs * 4),
         (layout.temperatures_offset, geom.max_seqs * 4),
+        (layout.top_p_offset, geom.max_seqs * 4),
+        (layout.top_k_offset, geom.max_seqs * 4),
+        (layout.rng_seeds_offset, geom.max_seqs * 8),
     ]
     for (prev_off, prev_len), (next_off, _next_len) in zip(
         regions, regions[1:], strict=False
@@ -220,6 +224,9 @@ def test_cross_language_golden_layout_and_hash_parity() -> None:
             "swa_page_table_offset",
             "compressor_slot_ids_offset",
             "temperatures_offset",
+            "top_p_offset",
+            "top_k_offset",
+            "rng_seeds_offset",
             "total_slot_bytes",
         ):
             actual = getattr(layout, field_name)
@@ -317,6 +324,7 @@ def test_select_decode_bucket_never_clamps_overflow() -> None:
     assert STEP_FLAG_DECODE_ONLY == (1 << 0)
     assert STEP_FLAG_DEVICE_TOKENS == (1 << 1)
     assert STEP_FLAG_NEXT_PREPUBLISHED == (1 << 2)
+    assert STEP_FLAG_SAMPLING == (1 << 3)
     assert select_decode_bucket(1, 128) == 1
     assert select_decode_bucket(3, 128) == 4
     assert select_decode_bucket(17, 128) == 24

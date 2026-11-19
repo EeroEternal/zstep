@@ -60,11 +60,13 @@ from zstep_worker.kernels_sm120.shm_allreduce import (
     get_host_mapped_allreduce_extension,
 )
 from zstep_worker.p2p_probe import P2pTopologyReport, configure_adaptive_p2p_env
+from zstep_worker.sampler import sample_tp8_logits
 from zstep_worker.spec_decode import seq_results, verify_batch
 from zstep_worker.shm_bridge import (
     DECODE_GRAPH_BUCKETS,
     STEP_FLAG_DECODE_ONLY,
     STEP_FLAG_DEVICE_TOKENS,
+    STEP_FLAG_SAMPLING,
     SeqResult,
     ShmBridge,
     StepHeader,
@@ -516,7 +518,9 @@ class DeepSeekV41StepRunner:
             raise ValueError(
                 f"vocab_size={vocab_size} must be divisible by world_size={self.world_size}"
             )
+        self.vocab_size: int = vocab_size
         self.vocab_per_rank: int = vocab_size // self.world_size
+        self.hidden_size: int = int(self.vllm_config.model_config.get_hidden_size())
 
         # Load cached FlashInfer autotune configs if present in ~/.cache/flashinfer
         self._autotune_loaded_files: int = self._load_flashinfer_autotune_cache()
@@ -568,7 +572,9 @@ class DeepSeekV41StepRunner:
         self.shm_ag_calls: int = 0
         self.nccl_eager_large_calls: int = 0
         self.nccl_fallback_calls: int = 0
-        self._install_tp_shm_collectives(get_tp_group())
+        tp_group = get_tp_group()
+        self.tp_device_group = tp_group.device_group
+        self._install_tp_shm_collectives(tp_group)
         if self.spec_method == "dspark":
             from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
@@ -747,6 +753,51 @@ class DeepSeekV41StepRunner:
         ]
         self._h2d_done_event: torch.cuda.Event = torch.cuda.Event()
         self.max_graph_bucket: int = min(self.geometry.max_seqs, 128)
+        self.decode_hidden_gpu: torch.Tensor = torch.empty(
+            (self.max_graph_bucket, self.hidden_size),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self.sample_temp_cpu: torch.Tensor = torch.zeros(
+            (2, ms), dtype=torch.float32, pin_memory=True
+        )
+        self.sample_top_p_cpu: torch.Tensor = torch.ones(
+            (2, ms), dtype=torch.float32, pin_memory=True
+        )
+        self.sample_top_k_cpu: torch.Tensor = torch.zeros(
+            (2, ms), dtype=torch.int32, pin_memory=True
+        )
+        self.sample_seed_cpu: torch.Tensor = torch.zeros(
+            (2, ms), dtype=torch.int64, pin_memory=True
+        )
+        self._sample_temp_np: list[np.ndarray] = [
+            self.sample_temp_cpu[0].numpy(),
+            self.sample_temp_cpu[1].numpy(),
+        ]
+        self._sample_top_p_np: list[np.ndarray] = [
+            self.sample_top_p_cpu[0].numpy(),
+            self.sample_top_p_cpu[1].numpy(),
+        ]
+        self._sample_top_k_np: list[np.ndarray] = [
+            self.sample_top_k_cpu[0].numpy(),
+            self.sample_top_k_cpu[1].numpy(),
+        ]
+        self._sample_seed_np: list[np.ndarray] = [
+            self.sample_seed_cpu[0].numpy(),
+            self.sample_seed_cpu[1].numpy(),
+        ]
+        self.sample_temp_gpu: torch.Tensor = torch.zeros(
+            ms, dtype=torch.float32, device=self.device
+        )
+        self.sample_top_p_gpu: torch.Tensor = torch.ones(
+            ms, dtype=torch.float32, device=self.device
+        )
+        self.sample_top_k_gpu: torch.Tensor = torch.zeros(
+            ms, dtype=torch.int32, device=self.device
+        )
+        self.sample_seed_gpu: torch.Tensor = torch.zeros(
+            ms, dtype=torch.int64, device=self.device
+        )
         self.decode_graph_max_seq_len: int = (
             min(self.max_model_len, SM120_DSA_CANDIDATE_COVER_TOKENS)
             if self.b12x_summary.dsa_decode_enabled
@@ -1087,9 +1138,10 @@ class DeepSeekV41StepRunner:
         count: int,
         *,
         all_ranks: bool = False,
-    ) -> None:
+        return_local_logits: bool = False,
+    ) -> torch.Tensor | None:
         if count <= 0:
-            return
+            return None
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
         sampled_h = (
@@ -1097,6 +1149,8 @@ class DeepSeekV41StepRunner:
             if sample_rows is None
             else hidden_states.index_select(0, sample_rows)
         )
+        if sample_rows is None and count <= self.max_graph_bucket:
+            self.decode_hidden_gpu[:count].copy_(sampled_h)
         local_logits = self.model.compute_logits_local(sampled_h)
         self.argmax_channel.gather_top2_from_logits(
             local_logits,
@@ -1107,6 +1161,42 @@ class DeepSeekV41StepRunner:
             vocab_per_rank=self.vocab_per_rank,
             all_ranks=all_ranks,
         )
+        return local_logits if return_local_logits else None
+
+    def _apply_stochastic_sampling(
+        self,
+        plan: StepPlanView,
+        local_logits: torch.Tensor,
+        count: int,
+        parity: int,
+    ) -> None:
+        np.copyto(self._sample_temp_np[parity][:count], plan.temperatures(count))
+        np.copyto(self._sample_top_p_np[parity][:count], plan.top_p(count))
+        np.copyto(self._sample_top_k_np[parity][:count], plan.top_k(count))
+        np.copyto(self._sample_seed_np[parity][:count], plan.rng_seeds(count).view(np.int64))
+        self.sample_temp_gpu[:count].copy_(
+            self.sample_temp_cpu[parity, :count], non_blocking=True
+        )
+        self.sample_top_p_gpu[:count].copy_(
+            self.sample_top_p_cpu[parity, :count], non_blocking=True
+        )
+        self.sample_top_k_gpu[:count].copy_(
+            self.sample_top_k_cpu[parity, :count], non_blocking=True
+        )
+        self.sample_seed_gpu[:count].copy_(
+            self.sample_seed_cpu[parity, :count], non_blocking=True
+        )
+        sampled = sample_tp8_logits(
+            local_logits,
+            temperatures=self.sample_temp_gpu[:count],
+            top_p=self.sample_top_p_gpu[:count],
+            top_k=self.sample_top_k_gpu[:count],
+            rng_seeds=self.sample_seed_gpu[:count],
+            tp_group=self.tp_device_group,
+            world_size=self.world_size,
+            vocab_size=self.vocab_size,
+        )
+        self.out_tokens_gpu[:count, 0].copy_(sampled)
 
     @torch.inference_mode()
     def _warmup_and_capture_decode_graphs(self) -> None:
@@ -1695,6 +1785,7 @@ class DeepSeekV41StepRunner:
         is_decode = (
             (header.flags & STEP_FLAG_DECODE_ONLY) != 0 and not is_spec_step
         )
+        is_sampling = (header.flags & STEP_FLAG_SAMPLING) != 0
         use_dev_tok = is_decode and (header.flags & STEP_FLAG_DEVICE_TOKENS) != 0
         width = self.num_spec_tokens + 1
         q_lens = q_start_np[1:] - q_start_np[:-1]
@@ -1818,6 +1909,11 @@ class DeepSeekV41StepRunner:
             )
             self._h2d_done_event.record()
             self.decode_graphs[bucket].replay()
+            if is_sampling:
+                local_logits = self.model.compute_logits_local(
+                    self.decode_hidden_gpu[:num_seqs]
+                )
+                self._apply_stochastic_sampling(plan, local_logits, num_seqs, parity)
             self._commit_decode_slot_state(num_seqs)
 
             if self.rank == 0:
@@ -2096,12 +2192,17 @@ class DeepSeekV41StepRunner:
                 else:
                     hidden = model_output
                 if num_sample > 0:
-                    self._sample_rows_into_argmax(
+                    local_logits = self._sample_rows_into_argmax(
                         hidden,
                         self.sample_rows_gpu[:num_sample],
                         num_sample,
                         all_ranks=(is_spec_step or is_decode),
+                        return_local_logits=is_sampling,
                     )
+                    if is_sampling and local_logits is not None:
+                        self._apply_stochastic_sampling(
+                            plan, local_logits, num_sample, parity
+                        )
             if is_decode:
                 self._commit_decode_slot_state(num_seqs)
 

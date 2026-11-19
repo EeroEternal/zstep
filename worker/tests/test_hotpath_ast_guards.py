@@ -30,6 +30,7 @@ CSRC_DIR = WORKER_PKG / "kernels_sm120" / "csrc"
 HOTPATH_MODEL_FILES: tuple[str, ...] = (
     "models/deepseek_v41.py",
     "models/qwen35_moe.py",
+    "sampler.py",
     "spec_decode.py",
     "models/deepseek_v41_dspark.py",
     "models/qwen35_mtp.py",
@@ -46,6 +47,9 @@ STEP_EXECUTION_METHODS: frozenset[str] = frozenset(
         "_forward_gpu",
         "_run_decode_bucket_forward",
         "_run_prefill_varlen_forward",
+        "_apply_stochastic_sampling",
+        "sample_tp8_logits",
+        "splitmix64_uniform_f32",
     }
 )
 

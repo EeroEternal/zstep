@@ -179,7 +179,7 @@ fn cross_language_golden_layout_and_hash_parity() {
     struct GoldenCase {
         name: &'static str,
         geom: ShmGeometry,
-        expected_offsets: [usize; 14],
+        expected_offsets: [usize; 17],
         total_slot_bytes: usize,
         result_slot_stride: usize,
         layout_hash: u64,
@@ -212,22 +212,22 @@ fn cross_language_golden_layout_and_hash_parity() {
             },
             expected_offsets: [
                 0, 256, 16640, 33024, 49408, 53504, 102656, 119040, 135424, 135936, 136704, 267776,
-                269824, 270336,
+                269824, 270336, 270848, 271360, 271872,
             ],
             total_slot_bytes: 274432,
             result_slot_stride: 16384,
-            layout_hash: 0x97bd_78fc_d5f3_9c04,
+            layout_hash: 0x521b_5e39_3264_2447,
         },
         GoldenCase {
             name: "qwen35_tp8_vram32g",
             geom: qwen_geom,
             expected_offsets: [
                 0, 256, 33024, 65792, 98560, 106752, 205056, 237824, 270592, 271104, 271872,
-                2369024, 2371072, 2371584,
+                2369024, 2371072, 2371584, 2372096, 2372608, 2373120,
             ],
             total_slot_bytes: 2375680,
             result_slot_stride: 16384,
-            layout_hash: 0xb534_5628_2670_7ecf,
+            layout_hash: 0xb453_6dcf_0819_cda4,
         },
         GoldenCase {
             name: "odd_prime_bounds",
@@ -241,11 +241,12 @@ fn cross_language_golden_layout_and_hash_parity() {
                 spec_verify_width: 1,
             },
             expected_offsets: [
-                0, 256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328,
+                0, 256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328, 3584,
+                3840, 4096,
             ],
-            total_slot_bytes: 4096,
+            total_slot_bytes: 8192,
             result_slot_stride: 4096,
-            layout_hash: 0x6ad8_4c4f_d761_1a5a,
+            layout_hash: 0x29f9_00a5_6c2b_ca3a,
         },
     ];
 
@@ -267,6 +268,9 @@ fn cross_language_golden_layout_and_hash_parity() {
             p.swa_page_table_offset,
             p.compressor_slot_ids_offset,
             p.temperatures_offset,
+            p.top_p_offset,
+            p.top_k_offset,
+            p.rng_seeds_offset,
         ];
         assert_eq!(actual, c.expected_offsets, "{} offsets mismatch", c.name);
         assert_eq!(

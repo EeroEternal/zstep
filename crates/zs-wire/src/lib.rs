@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 /// ASCII `"ZSTEP_V1"` in little-endian (`0x5A53_5445_505F_5631`).
 pub const ZSTEP_SHM_MAGIC: u64 = 0x5A53_5445_505F_5631;
 /// Wire ABI version. Must match exactly between master and GPU workers.
-pub const ZSTEP_PROTOCOL_VERSION: u32 = 3;
+pub const ZSTEP_PROTOCOL_VERSION: u32 = 4;
 /// Maximum GPU workers supported per single-node shared-memory segment.
 pub const MAX_WORKERS: usize = 8;
 /// Token ID sentinel indicating the GPU worker should self-bootstrap the token
@@ -58,6 +58,10 @@ pub const STEP_FLAG_DEVICE_TOKENS: u32 = 1 << 1;
 /// [`StepHeader::flags`] bit promising that the master publishes step `step_id + 1` before it
 /// waits for this step's result, so a worker may launch that next step before completing this one.
 pub const STEP_FLAG_NEXT_PREPUBLISHED: u32 = 1 << 2;
+/// [`StepHeader::flags`] bit indicating at least one sampled sequence in this step uses
+/// stochastic GPU sampling (`temperature > 0.0`) via `temperatures`, `top_p`, `top_k`, `rng_seeds`.
+/// When unset, workers execute the zero-overhead greedy Top-2 argmax fast path.
+pub const STEP_FLAG_SAMPLING: u32 = 1 << 3;
 /// Canonical CUDA Graph batch buckets for decode-only steps.
 pub const DECODE_GRAPH_BUCKETS: [u32; 11] = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128];
 /// Maximum active decode sequences supported by pre-captured decode CUDA Graphs.
@@ -168,6 +172,9 @@ pub struct StepPlanLayout {
     pub swa_page_table_offset: usize,
     pub compressor_slot_ids_offset: usize,
     pub temperatures_offset: usize,
+    pub top_p_offset: usize,
+    pub top_k_offset: usize,
+    pub rng_seeds_offset: usize,
 }
 
 /// Geometry parameters that size the shared-memory segment.
@@ -288,7 +295,16 @@ impl StepPlanLayout {
         cursor = align_up(cursor + max_b * 4, VEC_ALIGN);
 
         let temperatures_offset = cursor;
-        cursor = align_up(cursor + max_b * 4, 4096);
+        cursor = align_up(cursor + max_b * 4, VEC_ALIGN);
+
+        let top_p_offset = cursor;
+        cursor = align_up(cursor + max_b * 4, VEC_ALIGN);
+
+        let top_k_offset = cursor;
+        cursor = align_up(cursor + max_b * 4, VEC_ALIGN);
+
+        let rng_seeds_offset = cursor;
+        cursor = align_up(cursor + max_b * 8, 4096);
 
         Self {
             total_slot_bytes: cursor,
@@ -306,6 +322,9 @@ impl StepPlanLayout {
             swa_page_table_offset,
             compressor_slot_ids_offset,
             temperatures_offset,
+            top_p_offset,
+            top_k_offset,
+            rng_seeds_offset,
         }
     }
 
@@ -345,6 +364,7 @@ impl StepPlanLayout {
             STEP_FLAG_DECODE_ONLY as u64,
             STEP_FLAG_DEVICE_TOKENS as u64,
             STEP_FLAG_NEXT_PREPUBLISHED as u64,
+            STEP_FLAG_SAMPLING as u64,
             MAX_DECODE_GRAPH_SEQS as u64,
             std::mem::offset_of!(ShmSuperblock, total_shm_bytes) as u64,
             std::mem::offset_of!(ShmSuperblock, plan_slot_offsets) as u64,
@@ -375,6 +395,9 @@ impl StepPlanLayout {
             self.swa_page_table_offset as u64,
             self.compressor_slot_ids_offset as u64,
             self.temperatures_offset as u64,
+            self.top_p_offset as u64,
+            self.top_k_offset as u64,
+            self.rng_seeds_offset as u64,
             result_slot_stride as u64,
         ];
 
@@ -733,6 +756,9 @@ mod tests {
                     geom.max_seqs as usize * 4,
                 ),
                 (layout.temperatures_offset, geom.max_seqs as usize * 4),
+                (layout.top_p_offset, geom.max_seqs as usize * 4),
+                (layout.top_k_offset, geom.max_seqs as usize * 4),
+                (layout.rng_seeds_offset, geom.max_seqs as usize * 8),
             ];
             for window in regions.windows(2) {
                 let (prev_off, prev_len) = window[0];
@@ -763,5 +789,45 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn golden_layout_hashes_match_python_fixture() {
+        let dsv = StepPlanLayout::compute(ShmGeometry {
+            world_size: 8,
+            max_seqs: 128,
+            max_step_tokens: 4096,
+            max_decoder_rows: 4096,
+            max_pages_per_seq: 256,
+            page_block_tokens: 128,
+            spec_verify_width: 1,
+        });
+        assert_eq!(dsv.layout_hash(16384), 0x521b_5e39_3264_2447);
+
+        let qwen_geom = ShmGeometry::from_vram_budget(VramGeometrySpec {
+            world_size: 8,
+            per_gpu_vram_mb: 32_607,
+            reserved_weights_and_workspace_mb: 12_288,
+            kv_bytes_per_token_per_gpu: 10_240,
+            max_seqs: 128,
+            max_step_tokens: 8_192,
+            max_decoder_rows: 8_192,
+            page_block_tokens: 64,
+            spec_verify_width: 4,
+        })
+        .expect("qwen35 32g vram geometry");
+        let qwen = StepPlanLayout::compute(qwen_geom);
+        assert_eq!(qwen.layout_hash(16384), 0xb453_6dcf_0819_cda4);
+
+        let odd = StepPlanLayout::compute(ShmGeometry {
+            world_size: 1,
+            max_seqs: 3,
+            max_step_tokens: 19,
+            max_decoder_rows: 7,
+            max_pages_per_seq: 11,
+            page_block_tokens: 64,
+            spec_verify_width: 1,
+        });
+        assert_eq!(odd.layout_hash(4096), 0x29f9_00a5_6c2b_ca3a);
     }
 }
