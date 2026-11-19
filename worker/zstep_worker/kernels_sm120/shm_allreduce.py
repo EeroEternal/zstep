@@ -50,7 +50,7 @@ SHM_V5_HEADER_BYTES = 131072
 SHM_V5_ABORT_OFFSET = 98304
 ARGMAX_SHM_ABORT_OFFSET = 128
 DEFAULT_ONE_SHOT_MAX_VECS = 4096  # Up to 64 KiB (e.g. M <= 16 at H=2048 or M <= 6 at H=5120 BF16)
-DEFAULT_PXB_MAX_ELEMENTS = 3072 * 5120  # Up to 30.0 MiB (~122.6 MiB 2-slot dual-regime CUDA-IPC HBM ring)
+DEFAULT_PXB_MAX_ELEMENTS = 4096 * 5120  # Up to 40.0 MiB (~163.5 MiB 2-slot dual-regime CUDA-IPC HBM ring)
 
 _CPP_SOURCE = r"""
 #include <torch/extension.h>
@@ -95,6 +95,7 @@ void launch_shm_v5_allreduce_cuda(
     int threads,
     int one_shot_max_vecs,
     int64_t pxb_max_vecs,
+    int pxb_bfp,
     std::uintptr_t stream_handle);
 
 void launch_shm_v5_allreduce_add_rmsnorm_cuda(
@@ -168,6 +169,28 @@ void launch_mhc_sinkhorn_stats_cuda(
     float hc_post_mult,
     int sinkhorn_repeat,
     int save_pre_mix,
+    std::uintptr_t stream_handle);
+void launch_ar_mhc_cluster8_cuda(
+    const void* x_ptr,
+    void* residual_ptr,
+    const float* post_mix_ptr,
+    const float* comb_mix_ptr,
+    const float* pre_mix_ptr,
+    const void* norm_weight_ptr,
+    void* layer_input_ptr,
+    void* aux_out_ptr,
+    uint64_t* control_ptr,
+    const std::uintptr_t* rank_shm_dev_ptrs,
+    std::uintptr_t my_hbm_ptr,
+    std::uintptr_t pt_hbm_ptr,
+    int64_t slot_stride_bytes,
+    int64_t pxb_slot_stride_bytes,
+    int rows,
+    float norm_eps,
+    int write_aux,
+    int post_only,
+    int rank,
+    int flag_base,
     std::uintptr_t stream_handle);
 
 void launch_local_top2_bf16_cuda(
@@ -278,6 +301,7 @@ void launch_shm_v5_pxb_allreduce(
     int64_t threads,
     int64_t one_shot_max_vecs,
     int64_t pxb_max_vecs,
+    int64_t pxb_bfp,
     std::uintptr_t stream_handle) {
     TORCH_CHECK(input.is_cuda() && output.is_cuda(), "input/output must be CUDA tensors");
     TORCH_CHECK(input.scalar_type() == at::kBFloat16 && output.scalar_type() == at::kBFloat16, "BF16 required");
@@ -289,6 +313,7 @@ void launch_shm_v5_pxb_allreduce(
         reinterpret_cast<std::uintptr_t>(output.data_ptr()) % 16 == 0,
         "input/output pointers must be 16-byte aligned");
     TORCH_CHECK(input.numel() * 2 <= slot_stride_bytes / 2, "input exceeds SHM slot capacity");
+    TORCH_CHECK(pxb_bfp >= 0 && pxb_bfp <= 2, "pxb_bfp must be 0, 1, or 2");
 
     launch_shm_v5_allreduce_cuda(
         input.data_ptr(),
@@ -306,6 +331,7 @@ void launch_shm_v5_pxb_allreduce(
         static_cast<int>(threads),
         static_cast<int>(one_shot_max_vecs),
         pxb_max_vecs,
+        static_cast<int>(pxb_bfp),
         stream_handle);
 }
 
@@ -335,6 +361,7 @@ void launch_shm_v5_allreduce(
         blocks,
         threads,
         one_shot_max_vecs,
+        0,
         0,
         stream_handle);
 }
@@ -650,6 +677,110 @@ void launch_mhc_sinkhorn_stats(
         static_cast<float>(hc_post_mult),
         static_cast<int>(sinkhorn_repeat),
         static_cast<int>(save_pre_mix),
+        stream_handle);
+}
+
+void launch_ar_mhc_cluster8(
+    torch::Tensor x,
+    torch::Tensor residual,
+    torch::Tensor post_mix,
+    torch::Tensor comb_mix,
+    torch::Tensor pre_mix,
+    torch::Tensor norm_weight,
+    torch::Tensor layer_input,
+    torch::Tensor aux_out,
+    torch::Tensor control,
+    torch::Tensor rank_shm_ptrs_u64,
+    std::uintptr_t my_hbm_ptr,
+    std::uintptr_t pt_hbm_ptr,
+    int64_t slot_stride_bytes,
+    int64_t pxb_slot_stride_bytes,
+    double norm_eps,
+    int64_t write_aux,
+    int64_t post_only,
+    int64_t rank,
+    int64_t flag_base,
+    std::uintptr_t stream_handle) {
+    TORCH_CHECK(x.is_cuda() && residual.is_cuda(), "x/residual must be CUDA tensors");
+    TORCH_CHECK(
+        x.scalar_type() == at::kBFloat16 && residual.scalar_type() == at::kBFloat16,
+        "x/residual must be BF16");
+    TORCH_CHECK(x.is_contiguous() && residual.is_contiguous(), "x/residual must be contiguous");
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == 5120, "x must have shape [rows, 5120]");
+    const int64_t rows = x.size(0);
+    TORCH_CHECK(rows == 1 || rows == 2 || rows == 4, "cluster8 AR+mHC requires rows in {1, 2, 4}");
+    TORCH_CHECK(
+        residual.dim() == 3 && residual.size(0) == rows &&
+        residual.size(1) == 4 && residual.size(2) == 5120,
+        "residual must have shape [rows, 4, 5120]");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(x.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<std::uintptr_t>(residual.data_ptr()) % 16 == 0,
+        "x/residual pointers must be 16-byte aligned");
+    TORCH_CHECK(
+        control.is_cuda() && control.scalar_type() == at::kLong &&
+        control.is_contiguous() && flag_base >= 0 && flag_base + 8 <= control.numel(),
+        "control must hold at least flag_base + 8 int64 counters");
+    TORCH_CHECK(
+        rank_shm_ptrs_u64.is_cuda() && rank_shm_ptrs_u64.scalar_type() == at::kLong &&
+        rank_shm_ptrs_u64.is_contiguous() && rank_shm_ptrs_u64.numel() >= 8 &&
+        rank >= 0 && rank < 8,
+        "rank_shm_ptrs_u64 must have 8 int64 device pointers and rank in [0, 7]");
+    TORCH_CHECK(x.numel() * 2 <= slot_stride_bytes / 2, "x exceeds SHM slot capacity");
+    TORCH_CHECK(
+        post_mix.is_cuda() && post_mix.scalar_type() == at::kFloat &&
+        post_mix.is_contiguous() && post_mix.numel() == rows * 4,
+        "post_mix must be contiguous FP32 CUDA tensor of numel rows * 4");
+    TORCH_CHECK(
+        comb_mix.is_cuda() && comb_mix.scalar_type() == at::kFloat &&
+        comb_mix.is_contiguous() && comb_mix.numel() == rows * 16,
+        "comb_mix must be contiguous FP32 CUDA tensor of numel rows * 16");
+    if (!post_only) {
+        TORCH_CHECK(
+            pre_mix.is_cuda() && pre_mix.scalar_type() == at::kFloat &&
+            pre_mix.is_contiguous() && pre_mix.numel() == rows * 4,
+            "pre_mix must be contiguous FP32 CUDA tensor of numel rows * 4");
+        TORCH_CHECK(
+            norm_weight.is_cuda() && norm_weight.scalar_type() == at::kBFloat16 &&
+            norm_weight.is_contiguous() && norm_weight.numel() == 5120 &&
+            reinterpret_cast<std::uintptr_t>(norm_weight.data_ptr()) % 16 == 0,
+            "norm_weight must be 16B-aligned contiguous BF16 CUDA tensor of numel 5120");
+        TORCH_CHECK(
+            layer_input.is_cuda() && layer_input.scalar_type() == at::kBFloat16 &&
+            layer_input.is_contiguous() && layer_input.dim() == 2 &&
+            layer_input.size(0) == rows && layer_input.size(1) == 5120 &&
+            reinterpret_cast<std::uintptr_t>(layer_input.data_ptr()) % 16 == 0,
+            "layer_input must be 16B-aligned contiguous BF16 CUDA tensor [rows, 5120]");
+        if (write_aux) {
+            TORCH_CHECK(
+                aux_out.is_cuda() && aux_out.scalar_type() == at::kBFloat16 &&
+                aux_out.is_contiguous() && aux_out.dim() == 2 &&
+                aux_out.size(0) == rows && aux_out.size(1) == 5120 &&
+                reinterpret_cast<std::uintptr_t>(aux_out.data_ptr()) % 16 == 0,
+                "aux_out must be 16B-aligned contiguous BF16 CUDA tensor [rows, 5120]");
+        }
+    }
+    launch_ar_mhc_cluster8_cuda(
+        x.data_ptr(),
+        residual.data_ptr(),
+        post_mix.data_ptr<float>(),
+        comb_mix.data_ptr<float>(),
+        post_only ? nullptr : pre_mix.data_ptr<float>(),
+        post_only ? nullptr : norm_weight.data_ptr(),
+        post_only ? nullptr : layer_input.data_ptr(),
+        (!post_only && write_aux) ? aux_out.data_ptr() : nullptr,
+        reinterpret_cast<uint64_t*>(control.data_ptr<int64_t>()),
+        reinterpret_cast<const std::uintptr_t*>(rank_shm_ptrs_u64.data_ptr<int64_t>()),
+        my_hbm_ptr,
+        pt_hbm_ptr,
+        slot_stride_bytes,
+        pxb_slot_stride_bytes,
+        static_cast<int>(rows),
+        static_cast<float>(norm_eps),
+        static_cast<int>(write_aux),
+        static_cast<int>(post_only),
+        static_cast<int>(rank),
+        static_cast<int>(flag_base),
         stream_handle);
 }
 
@@ -1010,6 +1141,112 @@ __global__ void host_mapped_two_shot_fused_kernel(
 // [65536 .. 98304): done_flag[block][peer] (64B per (block, peer))
 // [98304 .. 98368): abort_flag             (64B cacheline-isolated cluster abort word)
 // [131072 .. ):     4 ring slots * (in_data + red_data)
+// Inline 128-bit `FP12 + BFP7` packet (`1x uint4` = 16B per 16 BF16s = 50% cross-SHM size):
+// - `hdr16 = (h1_big << 15) | (fp12 << 3) | (sh & 7)`
+//   * `fp12`: 8-bit FP32 exponent + 4-bit FP32 mantissa rounded up from `big_max / 63.0f`
+//   * `sh`:   3-bit `4^sh` relative shift between sub-blocks `v[0..7]` and `v[8..15]` (up to 16,384x)
+// - `payload`: 16x 7-bit two's-complement signed integers `[-63..+63]`
+__device__ __forceinline__ uint4 pack_fp12_bfp7(const float (&v)[16]) {
+    float amax0 = 0.0f;
+    float amax1 = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        amax0 = fmaxf(amax0, fabsf(v[i]));
+        amax1 = fmaxf(amax1, fabsf(v[i + 8]));
+    }
+    const uint32_t h1_big = (amax1 > amax0) ? 1U : 0U;
+    const float big_max = h1_big ? amax1 : amax0;
+    const float sml_max = h1_big ? amax0 : amax1;
+    if (big_max < 1.0e-36f) {
+        return make_uint4(0U, 0U, 0U, 0U);
+    }
+    const uint32_t raw_bits = __float_as_uint(big_max * (1.0f / 63.0f));
+    uint32_t fp12 = min(0xFD0U, (raw_bits + 0x0007FFFFU) >> 19);
+    if (fp12 < 16U) {
+        return make_uint4(0U, 0U, 0U, 0U);
+    }
+    uint32_t sh = 7U;
+    if (sml_max > 1.0e-36f) {
+        const int log2_r =
+            static_cast<int>((__float_as_uint(big_max / sml_max) >> 23) & 0xFFU) - 127;
+        sh = static_cast<uint32_t>(min(7, max(0, log2_r >> 1)));
+    }
+    const float inv_big = 1.0f / __uint_as_float(fp12 << 19);
+    const float inv_sml = inv_big * __uint_as_float((127U + 2U * sh) << 23);
+    const float inv0 = h1_big ? inv_sml : inv_big;
+    const float inv1 = h1_big ? inv_big : inv_sml;
+
+    uint32_t q[16];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        q[i] = static_cast<uint32_t>(max(-63, min(63, __float2int_rn(v[i] * inv0)))) & 0x7FU;
+        q[i + 8] =
+            static_cast<uint32_t>(max(-63, min(63, __float2int_rn(v[i + 8] * inv1)))) & 0x7FU;
+    }
+    const uint32_t hdr16 = (h1_big << 15) | ((fp12 & 0xFFFU) << 3) | (sh & 0x7U);
+    const uint32_t w0 = hdr16 | (q[0] << 16) | (q[1] << 23) | ((q[2] & 0x3U) << 30);
+    const uint32_t w1 =
+        (q[2] >> 2) | (q[3] << 5) | (q[4] << 12) | (q[5] << 19) | ((q[6] & 0x3FU) << 26);
+    const uint32_t w2 = (q[6] >> 6) | (q[7] << 1) | (q[8] << 8) | (q[9] << 15) |
+        (q[10] << 22) | ((q[11] & 0x7U) << 29);
+    const uint32_t w3 =
+        (q[11] >> 3) | (q[12] << 4) | (q[13] << 11) | (q[14] << 18) | (q[15] << 25);
+    return make_uint4(w0, w1, w2, w3);
+}
+
+__device__ __forceinline__ int sign_ext7(uint32_t u) {
+    return static_cast<int>((u ^ 0x40U) - 0x40U);
+}
+
+__device__ __forceinline__ void unpack_accum_fp12_bfp7(uint4 pkt, float (&acc)[16]) {
+    const uint32_t hdr16 = pkt.x & 0xFFFFU;
+    const uint32_t fp12 = (hdr16 >> 3) & 0xFFFU;
+    if (fp12 == 0U) {
+        return;
+    }
+    const float s_big = __uint_as_float(fp12 << 19);
+    const float s_sml = s_big * __uint_as_float((127U - 2U * (hdr16 & 0x7U)) << 23);
+    const float s0 = (hdr16 & 0x8000U) ? s_sml : s_big;
+    const float s1 = (hdr16 & 0x8000U) ? s_big : s_sml;
+
+    const uint32_t q[16] = {
+        (pkt.x >> 16) & 0x7FU,
+        (pkt.x >> 23) & 0x7FU,
+        ((pkt.x >> 30) | (pkt.y << 2)) & 0x7FU,
+        (pkt.y >> 5) & 0x7FU,
+        (pkt.y >> 12) & 0x7FU,
+        (pkt.y >> 19) & 0x7FU,
+        ((pkt.y >> 26) | (pkt.z << 6)) & 0x7FU,
+        (pkt.z >> 1) & 0x7FU,
+        (pkt.z >> 8) & 0x7FU,
+        (pkt.z >> 15) & 0x7FU,
+        (pkt.z >> 22) & 0x7FU,
+        ((pkt.z >> 29) | (pkt.w << 3)) & 0x7FU,
+        (pkt.w >> 4) & 0x7FU,
+        (pkt.w >> 11) & 0x7FU,
+        (pkt.w >> 18) & 0x7FU,
+        (pkt.w >> 25) & 0x7FU,
+    };
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        acc[i] += static_cast<float>(sign_ext7(q[i])) * s0;
+        acc[i + 8] += static_cast<float>(sign_ext7(q[i + 8])) * s1;
+    }
+}
+
+__device__ __forceinline__ void unpack_to_bf16_pair(uint4 pkt, uint4& out0, uint4& out1) {
+    float tmp[16] = {0.f};
+    unpack_accum_fp12_bfp7(pkt, tmp);
+    Pack128Bf16 p0, p1;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        p0.pairs[j] = __floats2bfloat162_rn(tmp[2 * j], tmp[2 * j + 1]);
+        p1.pairs[j] = __floats2bfloat162_rn(tmp[8 + 2 * j], tmp[8 + 2 * j + 1]);
+    }
+    out0 = p0.u4;
+    out1 = p1.u4;
+}
+
 __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
     const uint4* __restrict__ input_vec,
     uint4* __restrict__ output_vec,
@@ -1024,7 +1261,8 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
     int world_size,
     int one_shot_max_vecs,
     int64_t pxb_max_vecs,
-    int flag_base) {
+    int flag_base,
+    int pxb_bfp) {
     const int b_local = blockIdx.x;
     const int b = flag_base + b_local;
     __shared__ uint64_t s_step;
@@ -1178,6 +1416,253 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
 
     // Hybrid CX8-partner P2P + 4-pair Host-SHM 2-Shot (`>= 128 KiB`, up to `pxb_max_vecs`)
     if (can_pxb && num_vecs >= kPxbTwoShotMinVecs) {
+        if (pxb_bfp != 0 && flag_base == 0 && (num_vecs & 15) == 0) {
+            const int bfp_mode = (pxb_bfp == 2 || num_vecs > 655360) ? 2 : 1;
+            const int parity = rank & 1;
+            const int pair_id = rank >> 1;
+            const int tid = threadIdx.x;
+            const int64_t g16 = num_vecs >> 4;
+            const int64_t fb = ((g16 * b_local) / gridDim.x) << 4;
+            const int64_t fe =
+                (b_local + 1 == gridDim.x) ? num_vecs : (((g16 * (b_local + 1)) / gridDim.x) << 4);
+            const int64_t fm = fb + (((fe - fb) >> 2) << 1);
+            const int64_t my_hb = (parity == 0) ? fb : fm;
+            const int64_t my_he = (parity == 0) ? fm : fe;
+            const int64_t pt_hb = (parity == 0) ? fm : fb;
+            const int64_t pt_he = (parity == 0) ? fe : fm;
+            const int64_t my_pairs = (my_he - my_hb) >> 1;
+            const int64_t pt_pairs = (pt_he - pt_hb) >> 1;
+            const int64_t my_pb = my_hb >> 1;
+            const int64_t own_pb = my_pb + (my_pairs * pair_id) / 4;
+            const int64_t own_pe = my_pb + (my_pairs * (pair_id + 1)) / 4;
+            const int64_t half_pxb = cur_pxb_stride / 2;
+
+            uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + pxb_base_off);
+            for (int64_t idx = pt_hb + tid; idx < pt_he; idx += blockDim.x) {
+                st_wt_uint4(pt_in + idx, input_vec[idx]);
+            }
+            __syncthreads();
+            if (tid == 0) {
+                __threadfence_system();
+                sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + b * 64), step);
+                if (!spin_wait_ge_u64(
+                        reinterpret_cast<const uint64_t*>(my_hbm + b * 64), step, abort_flag)) {
+                    s_aborted = 1;
+                }
+            }
+            __syncthreads();
+            if (s_aborted) {
+                return;
+            }
+
+            const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + pxb_base_off);
+            uint4* my_hbm_red = reinterpret_cast<uint4*>(my_hbm + pxb_base_off + half_pxb);
+            uint4* pt_hbm_red = reinterpret_cast<uint4*>(pt_hbm + pxb_base_off + half_pxb);
+            uint4* my_shm_red =
+                reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes + half_slot);
+
+            for (int64_t p = my_pb + tid; p < my_pb + my_pairs; p += blockDim.x) {
+                const int64_t idx0 = p << 1;
+                Pack128Bf16 a0, a1, b0, b1;
+                a0.u4 = input_vec[idx0];
+                a1.u4 = input_vec[idx0 + 1];
+                b0.u4 = ld_cv_uint4(from_pt + idx0);
+                b1.u4 = ld_cv_uint4(from_pt + idx0 + 1);
+                float v[16];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 fa0 = __bfloat1622float2(a0.pairs[j]);
+                    const float2 fb0 = __bfloat1622float2(b0.pairs[j]);
+                    const float2 fa1 = __bfloat1622float2(a1.pairs[j]);
+                    const float2 fb1 = __bfloat1622float2(b1.pairs[j]);
+                    v[2 * j] = fa0.x + fb0.x;
+                    v[2 * j + 1] = fa0.y + fb0.y;
+                    v[8 + 2 * j] = fa1.x + fb1.x;
+                    v[8 + 2 * j + 1] = fa1.y + fb1.y;
+                }
+                if (p >= own_pb && p < own_pe) {
+                    Pack128Bf16 s0, s1;
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        s0.pairs[j] = __floats2bfloat162_rn(v[2 * j], v[2 * j + 1]);
+                        s1.pairs[j] = __floats2bfloat162_rn(v[8 + 2 * j], v[8 + 2 * j + 1]);
+                    }
+                    my_hbm_red[idx0] = s0.u4;
+                    my_hbm_red[idx0 + 1] = s1.u4;
+                } else {
+                    st_wt_uint4(my_in + p, pack_fp12_bfp7(v));
+                }
+            }
+            __syncthreads();
+            if (tid == 0) {
+                __threadfence_system();
+            }
+            __syncthreads();
+            if (tid < 4 && tid != pair_id) {
+                const int dst_r = tid * 2 + parity;
+                sys_store_release_u64(
+                    reinterpret_cast<uint64_t*>(s_peer_shm[dst_r] + (b * 8 + rank) * 64), step);
+                if (!spin_wait_ge_u64(
+                        reinterpret_cast<const uint64_t*>(my_shm + (b * 8 + dst_r) * 64),
+                        step,
+                        abort_flag)) {
+                    s_aborted = 1;
+                }
+            }
+            __syncthreads();
+            if (s_aborted) {
+                return;
+            }
+
+            for (int64_t p = own_pb + tid; p < own_pe; p += blockDim.x) {
+                const int64_t idx0 = p << 1;
+                Pack128Bf16 own0, own1;
+                own0.u4 = my_hbm_red[idx0];
+                own1.u4 = my_hbm_red[idx0 + 1];
+                float acc[16];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f0 = __bfloat1622float2(own0.pairs[j]);
+                    const float2 f1 = __bfloat1622float2(own1.pairs[j]);
+                    acc[2 * j] = f0.x;
+                    acc[2 * j + 1] = f0.y;
+                    acc[8 + 2 * j] = f1.x;
+                    acc[8 + 2 * j + 1] = f1.y;
+                }
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    if (q == pair_id) continue;
+                    const uint4* p_in = reinterpret_cast<const uint4*>(
+                        s_peer_shm[q * 2 + parity] + 131072 + slot * slot_stride_bytes);
+                    unpack_accum_fp12_bfp7(ld_cv_uint4(p_in + p), acc);
+                }
+                if (bfp_mode == 1) {
+                    const uint4 rq = pack_fp12_bfp7(acc);
+                    st_wt_uint4(my_shm_red + p, rq);
+                    uint4 out0, out1;
+                    // Reconstruct owner's output from `rq` for 0-ULP cross-rank bit identity.
+                    unpack_to_bf16_pair(rq, out0, out1);
+                    output_vec[idx0] = out0;
+                    output_vec[idx0 + 1] = out1;
+                    st_wt_uint4(pt_hbm_red + idx0, out0);
+                    st_wt_uint4(pt_hbm_red + idx0 + 1, out1);
+                } else {
+                    Pack128Bf16 out0, out1;
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        out0.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+                        out1.pairs[j] =
+                            __floats2bfloat162_rn(acc[8 + 2 * j], acc[8 + 2 * j + 1]);
+                    }
+                    output_vec[idx0] = out0.u4;
+                    output_vec[idx0 + 1] = out1.u4;
+                    st_wt_uint4(pt_hbm_red + idx0, out0.u4);
+                    st_wt_uint4(pt_hbm_red + idx0 + 1, out1.u4);
+                    st_wt_uint4(my_shm_red + idx0, out0.u4);
+                    st_wt_uint4(my_shm_red + idx0 + 1, out1.u4);
+                }
+            }
+            __syncthreads();
+            if (tid == 0) {
+                __threadfence_system();
+            }
+            __syncthreads();
+            if (tid < 4) {
+                if (tid == pair_id) {
+                    sys_store_release_u64(
+                        reinterpret_cast<uint64_t*>(pt_hbm + 32768 + b * 64), step);
+                    if (!spin_wait_ge_u64(
+                            reinterpret_cast<const uint64_t*>(my_hbm + 32768 + b * 64),
+                            step,
+                            abort_flag)) {
+                        s_aborted = 1;
+                    }
+                } else {
+                    const int dst_r = tid * 2 + parity;
+                    sys_store_release_u64(
+                        reinterpret_cast<uint64_t*>(
+                            s_peer_shm[dst_r] + 32768 + (b * 8 + rank) * 64),
+                        step);
+                    if (!spin_wait_ge_u64(
+                            reinterpret_cast<const uint64_t*>(
+                                my_shm + 32768 + (b * 8 + dst_r) * 64),
+                            step,
+                            abort_flag)) {
+                        s_aborted = 1;
+                    }
+                }
+            }
+            __syncthreads();
+            if (s_aborted) {
+                return;
+            }
+
+            for (int q = 0; q < 4; ++q) {
+                if (q == pair_id) continue;
+                const uint4* o_red = reinterpret_cast<const uint4*>(
+                    s_peer_shm[q * 2 + parity] + 131072 + slot * slot_stride_bytes + half_slot);
+                if (bfp_mode == 1) {
+                    const int64_t qb = my_pb + (my_pairs * q) / 4;
+                    const int64_t qe = my_pb + (my_pairs * (q + 1)) / 4;
+                    for (int64_t p = qb + tid; p < qe; p += blockDim.x) {
+                        const int64_t idx0 = p << 1;
+                        uint4 out0, out1;
+                        unpack_to_bf16_pair(ld_cv_uint4(o_red + p), out0, out1);
+                        output_vec[idx0] = out0;
+                        output_vec[idx0 + 1] = out1;
+                        st_wt_uint4(pt_hbm_red + idx0, out0);
+                        st_wt_uint4(pt_hbm_red + idx0 + 1, out1);
+                    }
+                } else {
+                    const int64_t qb = (my_pb + (my_pairs * q) / 4) << 1;
+                    const int64_t qe = (my_pb + (my_pairs * (q + 1)) / 4) << 1;
+                    for (int64_t idx = qb + tid; idx < qe; idx += blockDim.x) {
+                        const uint4 v = ld_cv_uint4(o_red + idx);
+                        output_vec[idx] = v;
+                        st_wt_uint4(pt_hbm_red + idx, v);
+                    }
+                }
+            }
+            const int64_t pt_pb = pt_hb >> 1;
+            const int64_t pt_own_b = (pt_pb + (pt_pairs * pair_id) / 4) << 1;
+            const int64_t pt_own_e = (pt_pb + (pt_pairs * (pair_id + 1)) / 4) << 1;
+            for (int64_t idx = pt_own_b + tid; idx < pt_own_e; idx += blockDim.x) {
+                output_vec[idx] = ld_cv_uint4(my_hbm_red + idx);
+            }
+            __syncthreads();
+            if (tid == 0) {
+                __threadfence_system();
+                sys_store_release_u64(
+                    reinterpret_cast<uint64_t*>(pt_hbm + 65536 + b * 64), step);
+                if (!spin_wait_ge_u64(
+                        reinterpret_cast<const uint64_t*>(my_hbm + 65536 + b * 64),
+                        step,
+                        abort_flag)) {
+                    s_aborted = 1;
+                }
+            }
+            __syncthreads();
+            if (s_aborted) {
+                return;
+            }
+
+            for (int q = 0; q < 4; ++q) {
+                if (q == pair_id) continue;
+                const int64_t qb = (pt_pb + (pt_pairs * q) / 4) << 1;
+                const int64_t qe = (pt_pb + (pt_pairs * (q + 1)) / 4) << 1;
+                for (int64_t idx = qb + tid; idx < qe; idx += blockDim.x) {
+                    output_vec[idx] = ld_cv_uint4(my_hbm_red + idx);
+                }
+            }
+            __syncthreads();
+            if (tid < 8) {
+                sys_store_release_u64(
+                    reinterpret_cast<uint64_t*>(
+                        s_peer_shm[tid] + 65536 + (b * 8 + rank) * 64),
+                    step);
+            }
+            return;
+        }
         const int parity = rank & 1;
         const int pair_id = rank >> 1;
         const int64_t c_mid = c_begin + c_len / 2;
@@ -2832,6 +3317,349 @@ __global__ __launch_bounds__(128, 8) void sm120_mhc_sinkhorn_stats_kernel(
         comb_mix[tok * 16 + lane] = cm;
     }
 }
+
+// SM120 Cluster-8 DSMEM fused `AllReduce + in-place mHC post/comb + collapse + RMSNorm`
+// for low-concurrency decode / speculative verify (`rows in {1, 2, 4}`, `H = 5120`).
+__global__ __cluster_dims__(8, 1, 1) __launch_bounds__(320, 1) void shm_v5_ar_mhc_cluster8_kernel(
+    const uint4* __restrict__ input_vec,
+    uint4* __restrict__ res_vec,
+    const float* __restrict__ post_mix,
+    const float* __restrict__ comb_mix,
+    const float* __restrict__ pre_mix,
+    const uint4* __restrict__ norm_weight_vec,
+    uint4* __restrict__ layer_input_vec,
+    uint4* __restrict__ aux_out_vec,
+    uint64_t* __restrict__ control,
+    char* const* __restrict__ rank_shm,
+    char* __restrict__ my_hbm,
+    char* __restrict__ pt_hbm,
+    int64_t slot_stride_bytes,
+    int64_t pxb_slot_stride_bytes,
+    int rows,
+    float norm_eps,
+    int write_aux,
+    int post_only,
+    int rank,
+    int flag_base) {
+    cg::cluster_group cluster = cg::this_cluster();
+    const int b_local = cluster.block_rank();
+    const int b = flag_base + b_local;
+    const int tid = threadIdx.x;
+    const int k_grp = 8 / rows;
+    const int tok = b_local / k_grp;
+    const int grp_sub = b_local % k_grp;
+
+    __shared__ uint64_t s_step;
+    __shared__ int s_aborted_local;
+    __shared__ int s_aborted_any;
+    __shared__ char* s_peer_shm[kMaxRanks];
+    __shared__ float s_post[4];
+    __shared__ float s_comb[16];
+    __shared__ float s_pre[4];
+    __shared__ float s_warp_sq[10];
+    __shared__ float s_cta_sq;
+    __shared__ float s_inv_rms;
+
+    if (tid < kMaxRanks) {
+        s_peer_shm[tid] = rank_shm[tid];
+    }
+    if (tid == 0) {
+        const uint64_t ns = control[b] + 1ULL;
+        control[b] = ns;
+        s_step = ns;
+        s_aborted_local = 0;
+        s_aborted_any = 0;
+    }
+    if (tid < 4) {
+        s_post[tid] = post_mix[tok * 4 + tid];
+        if (!post_only) {
+            s_pre[tid] = pre_mix[tok * 4 + tid];
+        }
+    }
+    if (tid < 16) {
+        s_comb[tid] = comb_mix[tok * 16 + tid];
+    }
+    __syncthreads();
+
+    const uint64_t step = s_step;
+    const uint64_t ring_depth = (flag_base > 0 || my_hbm != nullptr) ? 2ULL : 4ULL;
+    const int slot = (flag_base > 0)
+        ? (2 + static_cast<int>((step - 1ULL) & 1))
+        : static_cast<int>((step - 1ULL) & 3);
+    char* my_shm = s_peer_shm[rank];
+    const uint64_t* abort_flag = reinterpret_cast<const uint64_t*>(my_shm + kShmV5AbortOffset);
+
+    if (step > ring_depth) {
+        if (tid < kMaxRanks &&
+            !spin_wait_ge_u64(
+                reinterpret_cast<const uint64_t*>(my_shm + 65536 + (b * 8 + tid) * 64),
+                step - ring_depth,
+                abort_flag)) {
+            s_aborted_local = 1;
+        }
+        __syncthreads();
+    }
+
+    const int64_t num_vecs = static_cast<int64_t>(rows) * 640;
+    const int64_t c_begin = (num_vecs * b_local) / 8;
+    const int64_t c_end = (num_vecs * (b_local + 1)) / 8;
+    const int64_t slice_len = c_end - c_begin;
+    const int col = grp_sub * static_cast<int>(slice_len) + tid;
+
+    uint4* my_in = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes);
+    float collapsed[8] = {0.f};
+    float thread_sq = 0.0f;
+
+    if (!s_aborted_local) {
+        Pack128Bf16 dx;
+        if (my_hbm != nullptr && pt_hbm != nullptr && num_vecs > kPxbOneShotMinVecs) {
+            const int parity = rank & 1;
+            const int p_slot = static_cast<int>((step - 1ULL) & 1);
+            const int64_t c_mid = c_begin + slice_len / 2;
+            const int64_t my_hb = (parity == 0) ? c_begin : c_mid;
+            const int64_t my_he = (parity == 0) ? c_mid : c_end;
+            const int64_t pt_hb = (parity == 0) ? c_mid : c_begin;
+            const int64_t pt_he = (parity == 0) ? c_end : c_mid;
+            const int64_t cur_pxb_stride = (flag_base > 0) ? 1310720LL : pxb_slot_stride_bytes;
+            const int64_t pxb_base_off = 131072LL + (
+                (flag_base > 0)
+                    ? (2LL * pxb_slot_stride_bytes + p_slot * cur_pxb_stride)
+                    : (p_slot * pxb_slot_stride_bytes)
+            );
+            const int64_t half_pxb = cur_pxb_stride / 2;
+
+            uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + pxb_base_off);
+            if (pt_hb + tid < pt_he) {
+                st_wt_uint4(pt_in + pt_hb + tid, input_vec[pt_hb + tid]);
+            }
+            __syncthreads();
+            if (tid == 0) {
+                __threadfence_system();
+                sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + b * 64), step);
+                if (!spin_wait_ge_u64(
+                        reinterpret_cast<const uint64_t*>(my_hbm + b * 64), step, abort_flag)) {
+                    s_aborted_local = 1;
+                }
+            }
+            __syncthreads();
+            if (!s_aborted_local) {
+                const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + pxb_base_off);
+                uint4* my_hbm_sum = reinterpret_cast<uint4*>(my_hbm + pxb_base_off + half_pxb);
+                const int64_t idx_my = my_hb + tid;
+                if (idx_my < my_he) {
+                    Pack128Bf16 a, bp, psum;
+                    a.u4 = input_vec[idx_my];
+                    bp.u4 = ld_cv_uint4(from_pt + idx_my);
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float2 fa = __bfloat1622float2(a.pairs[j]);
+                        const float2 fb = __bfloat1622float2(bp.pairs[j]);
+                        psum.pairs[j] = __floats2bfloat162_rn(fa.x + fb.x, fa.y + fb.y);
+                    }
+                    my_hbm_sum[idx_my] = psum.u4;
+                    st_wt_uint4(my_in + idx_my, psum.u4);
+                }
+                __syncthreads();
+                if (tid == 0) {
+                    __threadfence_system();
+                }
+                __syncthreads();
+                if (tid < 8) {
+                    sys_store_release_u64(
+                        reinterpret_cast<uint64_t*>(s_peer_shm[tid] + (b * 8 + rank) * 64), step);
+                    if (!spin_wait_ge_u64(
+                            reinterpret_cast<const uint64_t*>(my_shm + (b * 8 + tid) * 64),
+                            step,
+                            abort_flag)) {
+                        s_aborted_local = 1;
+                    }
+                }
+                __syncthreads();
+                if (!s_aborted_local && tid < slice_len) {
+                    const int64_t idx = c_begin + tid;
+                    const int h_par = (idx < c_mid) ? 0 : 1;
+                    float acc[8] = {0.f};
+                    #pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        const int src_r = q * 2 + h_par;
+                        Pack128Bf16 pv;
+                        pv.u4 = (src_r == rank)
+                            ? my_hbm_sum[idx]
+                            : ld_cv_uint4(
+                                  reinterpret_cast<const uint4*>(
+                                      s_peer_shm[src_r] + 131072 + slot * slot_stride_bytes) +
+                                  idx);
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const float2 f = __bfloat1622float2(pv.pairs[j]);
+                            acc[2 * j] += f.x;
+                            acc[2 * j + 1] += f.y;
+                        }
+                    }
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        dx.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+                    }
+                }
+            }
+        } else {
+            if (tid < slice_len) {
+                st_wt_uint4(my_in + c_begin + tid, input_vec[c_begin + tid]);
+            }
+            __syncthreads();
+            if (tid == 0) {
+                __threadfence_system();
+            }
+            __syncthreads();
+            if (tid < kMaxRanks) {
+                sys_store_release_u64(
+                    reinterpret_cast<uint64_t*>(s_peer_shm[tid] + (b * 8 + rank) * 64), step);
+                if (!spin_wait_ge_u64(
+                        reinterpret_cast<const uint64_t*>(my_shm + (b * 8 + tid) * 64),
+                        step,
+                        abort_flag)) {
+                    s_aborted_local = 1;
+                }
+            }
+            __syncthreads();
+            if (!s_aborted_local && tid < slice_len) {
+                const int64_t idx = c_begin + tid;
+                float acc[8] = {0.f};
+                #pragma unroll
+                for (int p = 0; p < kMaxRanks; ++p) {
+                    Pack128Bf16 pv;
+                    pv.u4 = (p == rank)
+                        ? input_vec[idx]
+                        : ld_cv_uint4(
+                              reinterpret_cast<const uint4*>(
+                                  s_peer_shm[p] + 131072 + slot * slot_stride_bytes) +
+                              idx);
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float2 f = __bfloat1622float2(pv.pairs[j]);
+                        acc[2 * j] += f.x;
+                        acc[2 * j + 1] += f.y;
+                    }
+                }
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    dx.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+                }
+            }
+        }
+
+        if (!s_aborted_local && tid < slice_len) {
+            const int64_t base_r = static_cast<int64_t>(tok) * 2560 + col;
+            const int64_t base_x = static_cast<int64_t>(tok) * 640 + col;
+            Pack128Bf16 b0, b1, b2, b3, nr0, nr1, nr2, nr3, aux_pack;
+            b0.u4 = res_vec[base_r];
+            b1.u4 = res_vec[base_r + 640];
+            b2.u4 = res_vec[base_r + 1280];
+            b3.u4 = res_vec[base_r + 1920];
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const float df = __bfloat162float(dx.elems[e]);
+                const float r0 = __bfloat162float(b0.elems[e]);
+                const float r1 = __bfloat162float(b1.elems[e]);
+                const float r2 = __bfloat162float(b2.elems[e]);
+                const float r3 = __bfloat162float(b3.elems[e]);
+                const __nv_bfloat16 o0 = __float2bfloat16_rn(
+                    s_post[0] * df + s_comb[0] * r0 + s_comb[4] * r1 + s_comb[8] * r2 +
+                    s_comb[12] * r3);
+                const __nv_bfloat16 o1 = __float2bfloat16_rn(
+                    s_post[1] * df + s_comb[1] * r0 + s_comb[5] * r1 + s_comb[9] * r2 +
+                    s_comb[13] * r3);
+                const __nv_bfloat16 o2 = __float2bfloat16_rn(
+                    s_post[2] * df + s_comb[2] * r0 + s_comb[6] * r1 + s_comb[10] * r2 +
+                    s_comb[14] * r3);
+                const __nv_bfloat16 o3 = __float2bfloat16_rn(
+                    s_post[3] * df + s_comb[3] * r0 + s_comb[7] * r1 + s_comb[11] * r2 +
+                    s_comb[15] * r3);
+                nr0.elems[e] = o0;
+                nr1.elems[e] = o1;
+                nr2.elems[e] = o2;
+                nr3.elems[e] = o3;
+                if (!post_only) {
+                    const float x0 = __bfloat162float(o0);
+                    const float x1 = __bfloat162float(o1);
+                    const float x2 = __bfloat162float(o2);
+                    const float x3 = __bfloat162float(o3);
+                    if (write_aux) {
+                        aux_pack.elems[e] = __float2bfloat16_rn((x0 + x1 + x2 + x3) * 0.25f);
+                    }
+                    const float val = __bfloat162float(
+                        __float2bfloat16_rn(
+                            s_pre[0] * x0 + s_pre[1] * x1 + s_pre[2] * x2 + s_pre[3] * x3));
+                    collapsed[e] = val;
+                    thread_sq += val * val;
+                }
+            }
+            res_vec[base_r] = nr0.u4;
+            res_vec[base_r + 640] = nr1.u4;
+            res_vec[base_r + 1280] = nr2.u4;
+            res_vec[base_r + 1920] = nr3.u4;
+            if (!post_only && write_aux) {
+                aux_out_vec[base_x] = aux_pack.u4;
+            }
+        }
+
+        if (!s_aborted_local && !post_only) {
+            const float w_sq = warp_reduce_sum(thread_sq);
+            const int warp_id = tid >> 5;
+            const int lane = tid & 31;
+            if (lane == 0) {
+                s_warp_sq[warp_id] = w_sq;
+            }
+            __syncthreads();
+            if (warp_id == 0) {
+                const float acc = warp_reduce_sum((lane < 10) ? s_warp_sq[lane] : 0.0f);
+                if (lane == 0) {
+                    s_cta_sq = acc;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    cluster.sync();
+    if (tid == 0) {
+        int any_ab = 0;
+        for (int c = 0; c < 8; ++c) {
+            any_ab |= *cluster.map_shared_rank(&s_aborted_local, c);
+        }
+        s_aborted_any = any_ab;
+        if (!any_ab && !post_only) {
+            float row_sq = 0.0f;
+            const int grp_base = tok * k_grp;
+            for (int c = 0; c < k_grp; ++c) {
+                row_sq += *cluster.map_shared_rank(&s_cta_sq, grp_base + c);
+            }
+            s_inv_rms = rsqrtf(row_sq * (1.0f / 5120.0f) + norm_eps);
+        }
+    }
+    __syncthreads();
+    cluster.sync();
+    if (s_aborted_any) {
+        return;
+    }
+
+    if (!post_only && tid < slice_len) {
+        Pack128Bf16 w_pack, out_pack;
+        w_pack.u4 = norm_weight_vec[col];
+        const float inv_rms = s_inv_rms;
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            out_pack.elems[e] =
+                __float2bfloat16_rn(collapsed[e] * inv_rms * __bfloat162float(w_pack.elems[e]));
+        }
+        layer_input_vec[static_cast<int64_t>(tok) * 640 + col] = out_pack.u4;
+    }
+    __syncthreads();
+    if (tid < kMaxRanks) {
+        sys_store_release_u64(
+            reinterpret_cast<uint64_t*>(s_peer_shm[tid] + 65536 + (b * 8 + rank) * 64), step);
+    }
+}
 }  // namespace
 
 std::uintptr_t register_mapped_host_cuda(std::uintptr_t host_address, int64_t bytes) {
@@ -2951,6 +3779,7 @@ void launch_shm_v5_allreduce_cuda(
     int threads,
     int one_shot_max_vecs,
     int64_t pxb_max_vecs,
+    int pxb_bfp,
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     const bool small_pxb = (my_hbm_ptr != 0 && blocks == 32 && num_vecs <= 40960);
@@ -2975,7 +3804,8 @@ void launch_shm_v5_allreduce_cuda(
         world_size,
         one_shot_max_vecs,
         pxb_max_vecs,
-        flag_base);
+        flag_base,
+        pxb_bfp);
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -3178,6 +4008,66 @@ void launch_mhc_sinkhorn_stats_cuda(
         hc_post_mult,
         sinkhorn_repeat,
         save_pre_mix);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_ar_mhc_cluster8_cuda(
+    const void* x_ptr,
+    void* residual_ptr,
+    const float* post_mix_ptr,
+    const float* comb_mix_ptr,
+    const float* pre_mix_ptr,
+    const void* norm_weight_ptr,
+    void* layer_input_ptr,
+    void* aux_out_ptr,
+    uint64_t* control_ptr,
+    const std::uintptr_t* rank_shm_dev_ptrs,
+    std::uintptr_t my_hbm_ptr,
+    std::uintptr_t pt_hbm_ptr,
+    int64_t slot_stride_bytes,
+    int64_t pxb_slot_stride_bytes,
+    int rows,
+    float norm_eps,
+    int write_aux,
+    int post_only,
+    int rank,
+    int flag_base,
+    std::uintptr_t stream_handle) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    int dev = 0;
+    ZSTEP_CUDA_CHECK(cudaGetDevice(&dev));
+    static std::atomic<uint64_t> attr_init_mask{0ULL};
+    const uint64_t bit = (dev >= 0 && dev < 64) ? (1ULL << dev) : 0ULL;
+    if (bit == 0ULL || (attr_init_mask.load(std::memory_order_acquire) & bit) == 0ULL) {
+        ZSTEP_CUDA_CHECK(cudaFuncSetAttribute(
+            shm_v5_ar_mhc_cluster8_kernel,
+            cudaFuncAttributeNonPortableClusterSizeAllowed,
+            1));
+        if (bit != 0ULL) {
+            attr_init_mask.fetch_or(bit, std::memory_order_release);
+        }
+    }
+    shm_v5_ar_mhc_cluster8_kernel<<<8, 320, 0, stream>>>(
+        reinterpret_cast<const uint4*>(x_ptr),
+        reinterpret_cast<uint4*>(residual_ptr),
+        post_mix_ptr,
+        comb_mix_ptr,
+        pre_mix_ptr,
+        reinterpret_cast<const uint4*>(norm_weight_ptr),
+        reinterpret_cast<uint4*>(layer_input_ptr),
+        reinterpret_cast<uint4*>(aux_out_ptr),
+        control_ptr,
+        reinterpret_cast<char* const*>(rank_shm_dev_ptrs),
+        reinterpret_cast<char*>(my_hbm_ptr),
+        reinterpret_cast<char*>(pt_hbm_ptr),
+        slot_stride_bytes,
+        pxb_slot_stride_bytes,
+        rows,
+        norm_eps,
+        write_aux,
+        post_only,
+        rank,
+        flag_base);
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -3412,7 +4302,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v18_ext",
+            name="zstep_shm_allreduce_sm120_v19_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -3430,6 +4320,7 @@ def get_host_mapped_allreduce_extension():
                 "launch_shm_v5_allgather",
                 "launch_mhc_post_collapse_rmsnorm",
                 "launch_mhc_sinkhorn_stats",
+                "launch_ar_mhc_cluster8",
                 "launch_local_top2_bf16",
                 "launch_tp8_argmax_gather_shm",
             ],
@@ -3575,6 +4466,7 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
         one_shot_max_vecs: int = DEFAULT_ONE_SHOT_MAX_VECS,
         enable_pxb_p2p: bool = False,
         pxb_max_elements: int = DEFAULT_PXB_MAX_ELEMENTS,
+        enable_pxb_bfp: int | bool = 0,
     ) -> None:
         if world_size < 2 or world_size > MAX_RANKS or not 0 <= rank < world_size:
             raise ValueError(f"rank={rank} / world_size={world_size} invalid (max {MAX_RANKS})")
@@ -3584,6 +4476,9 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
             raise ValueError(f"blocks must be in [1, {MAX_BLOCKS}]")
         if threads <= 0 or threads > 1024 or threads % 32 != 0:
             raise ValueError("threads must be a warp multiple in [32, 1024]")
+        pxb_bfp_mode = int(enable_pxb_bfp)
+        if pxb_bfp_mode not in (0, 1, 2):
+            raise ValueError(f"enable_pxb_bfp must be 0, 1, or 2 (got {enable_pxb_bfp!r})")
 
         device = torch.device("cuda", torch.cuda.current_device())
         self.numa_topology: DeviceNumaTopology = pin_process_to_device_numa(device.index)
@@ -3607,6 +4502,7 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
         self._pt_hbm_ptr: int = 0
         self.pxb_slot_stride_bytes: int = 0
         self.pxb_max_vecs: int = 0
+        self._pxb_bfp: int = pxb_bfp_mode
         self._extension = get_host_mapped_allreduce_extension()
 
         try:
@@ -3799,6 +4695,7 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
                 self.threads,
                 self.one_shot_max_vecs,
                 self.pxb_max_vecs if self._pxb_enabled else 0,
+                self._pxb_bfp if self._pxb_enabled else 0,
                 stream_handle,
             )
         else:

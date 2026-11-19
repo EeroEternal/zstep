@@ -99,6 +99,24 @@ def parse_qwen_gdn_decode_mode(environ: Mapping[str, str] | None = None) -> str:
     return mode_cfg
 
 
+def parse_pxb_bfp_mode(environ: Mapping[str, str] | None = None) -> int:
+    """Parse `ZSTEP_SHM_ENABLE_PXB_BFP` (`0`/`off`, `1`/`on` hybrid, or `2` Stage-1-only)."""
+    env = os.environ if environ is None else environ
+    raw = env.get("ZSTEP_SHM_ENABLE_PXB_BFP")
+    if raw is None or not raw.strip():
+        return 1
+    token = raw.strip().lower()
+    if token in ("0", "false", "no", "off"):
+        return 0
+    if token in ("1", "true", "yes", "on"):
+        return 1
+    if token == "2":
+        return 2
+    raise ValueError(
+        f"Unsupported ZSTEP_SHM_ENABLE_PXB_BFP={raw!r}; expected 0/false/off, 1/true/on, or 2"
+    )
+
+
 @dataclass(frozen=True)
 class WorkerRuntimeConfig:
     """Typed snapshot of effective `ZSTEP_*` worker runtime configuration."""
@@ -115,6 +133,7 @@ class WorkerRuntimeConfig:
     p2p_mode: str = "auto"
     p2p_min_pxb_bi_gbps: float = DEFAULT_MIN_PXB_BI_GBPS
     shm_enable_pxb_p2p: bool = True
+    shm_pxb_bfp_mode: int = 1
     shm_max_ar_numel: int | None = None
     shm_max_ag_numel: int | None = None
 
@@ -128,6 +147,7 @@ class WorkerRuntimeConfig:
     mega_gate_min_tokens: int = 1
     mega_gate_enable_pdl: bool = False
     enable_sm120_mhc_overlap: bool = True
+    enable_sm120_fuse_mhc_ar: bool = True
     b12x_compat_dir: str = ""
     b12x_cache_dir: str | None = None
     b12x_autotune: bool = True
@@ -214,6 +234,7 @@ class WorkerRuntimeConfig:
             shm_enable_pxb_p2p=env_flag(
                 "ZSTEP_SHM_ENABLE_PXB_P2P", default=True, environ=env
             ),
+            shm_pxb_bfp_mode=parse_pxb_bfp_mode(env),
             shm_max_ar_numel=shm_max_ar_numel,
             shm_max_ag_numel=shm_max_ag_numel,
             enable_b12x=env_flag("ZSTEP_ENABLE_B12X", default=True, environ=env),
@@ -237,6 +258,9 @@ class WorkerRuntimeConfig:
             enable_sm120_mhc_overlap=env_flag(
                 "ZSTEP_ENABLE_SM120_MHC_OVERLAP", default=True, environ=env
             ),
+            enable_sm120_fuse_mhc_ar=env_flag(
+                "ZSTEP_ENABLE_SM120_FUSE_MHC_AR", default=True, environ=env
+            ),
             b12x_compat_dir=env.get("ZSTEP_B12X_COMPAT_DIR", "").strip(),
             b12x_cache_dir=b12x_cache_dir,
             b12x_autotune=env_flag("ZSTEP_B12X_AUTOTUNE", default=True, environ=env),
@@ -256,6 +280,7 @@ class WorkerRuntimeConfig:
             f"max_model_len={self.max_model_len} "
             f"recurrent_ckpts={self.num_recurrent_checkpoints} "
             f"p2p_mode={self.p2p_mode} pxb_shm={int(self.shm_enable_pxb_p2p)} "
+            f"pxb_bfp={self.shm_pxb_bfp_mode} "
             f"min_pxb_gbps={self.p2p_min_pxb_bi_gbps:.1f} "
             f"shm_max_ar={self.shm_max_ar_numel if self.shm_max_ar_numel is not None else 'auto'} "
             f"shm_max_ag={self.shm_max_ag_numel if self.shm_max_ag_numel is not None else 'auto'} "
@@ -263,7 +288,7 @@ class WorkerRuntimeConfig:
             f"sm120_exp_req={int(self.require_sm120_exp)} "
             f"dsa_decode={int(self.enable_sm120_dsa_decode)} "
             f"mega_gate={int(self.enable_sm12x_mega_gate)}(min_m={self.mega_gate_min_tokens},pdl={int(self.mega_gate_enable_pdl)}) "
-            f"mhc_overlap={int(self.enable_sm120_mhc_overlap)} "
+            f"mhc_overlap={int(self.enable_sm120_mhc_overlap)}(fuse_ar={int(self.enable_sm120_fuse_mhc_ar)}) "
             f"qwen_gdn={int(self.qwen_enable_fused_gdn)}:{self.qwen_gdn_decode_mode} "
             f"verify_graphs={int(not self.disable_verify_graphs)} "
             f"draft_graphs={int(not self.disable_draft_graphs)}"

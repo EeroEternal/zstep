@@ -23,6 +23,7 @@ from zstep_worker.kernels_sm120.b12x_dsv41 import (  # noqa: E402
     _slice_arena_for_specs,
     _specs_nbytes,
     _wrap_mhc_forward_join,
+    attach_sm120_mhc_shm_ar,
     close_b12x_dsv41_model,
     flush_sm120_mhc_before_ar,
     is_sm120_dsa_decode_available,
@@ -333,3 +334,47 @@ def test_dsv41_runner_abort_close_survives_early_init_failure(
         )
     assert "close:argmax:True" in closed_channels
     assert "close:ar:True" in closed_channels
+
+
+def test_attach_sm120_mhc_shm_ar_uses_weakrefs_and_cleans_up() -> None:
+    import gc
+
+    class _Box:
+        pass
+
+    dev_idx = 79
+    owner = torch.nn.Linear(4, 4, bias=False)
+    owner._sm120_mhc_dev = dev_idx  # type: ignore[attr-defined]
+    _MHC_STATE_BY_DEV[dev_idx] = types.SimpleNamespace(
+        dev=torch.device("cpu"),
+        mhc_stream=None,
+        deferred=None,
+        pending=False,
+        flush=lambda _s: None,
+        owners={id(owner)},
+        shm_ar_ref=None,
+        runner_ref=None,
+    )
+    try:
+        attach_sm120_mhc_shm_ar(None, None, None)
+        ar_obj = _Box()
+        runner_obj = _Box()
+        attach_sm120_mhc_shm_ar(dev_idx, ar_obj, runner_obj)
+        st = _MHC_STATE_BY_DEV[dev_idx]
+        assert callable(st.shm_ar_ref) and st.shm_ar_ref() is ar_obj
+        assert callable(st.runner_ref) and st.runner_ref() is runner_obj
+
+        del ar_obj
+        del runner_obj
+        gc.collect()
+        assert st.shm_ar_ref() is None
+        assert st.runner_ref() is None
+
+        attach_sm120_mhc_shm_ar(dev_idx, None, None)
+        assert st.shm_ar_ref is None
+        assert st.runner_ref is None
+
+        close_b12x_dsv41_model(owner)
+        assert dev_idx not in _MHC_STATE_BY_DEV
+    finally:
+        _MHC_STATE_BY_DEV.pop(dev_idx, None)
