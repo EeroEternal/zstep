@@ -1356,3 +1356,293 @@ fn sampling_params_step_seed_is_deterministic_and_suppresses_spec_drafts() {
     seq.refresh_draft_tokens(&[100, 101, 102], &spec);
     assert_eq!(seq.pending_draft_tokens, vec![100, 101, 102]);
 }
+
+#[test]
+fn srpt_prefers_shorter_and_apc_hit_requests_over_cold_long_prompt() {
+    let slot_pool = SlotPool::new(4);
+    let kv_pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 64);
+    let tree = PrefixTree::with_pages_per_node(16, 1).expect("prefix tree");
+
+    // Populate APC with a 48-token prefix (3 blocks of 16).
+    let shared_prefix: Vec<i32> = (100..148).collect();
+    let leases: Vec<BlockLease> = (0..3).map(|_| kv_pool.allocate(1).expect("page")).collect();
+    let empty_lease = tree.match_prefix(&shared_prefix);
+    let _pinned = tree
+        .extend_prefix(empty_lease, &shared_prefix, leases)
+        .expect("extend prefix");
+
+    let now = Instant::now();
+    // Request 1: cold 64-token prompt (64 uncached).
+    let cold_long = PendingRequest {
+        request_id: 1,
+        prompt_tokens: (1..=64).collect(),
+        target_output_len: 4,
+        sampling: SamplingParams::default(),
+        permit_time: now,
+        submit_time: now,
+    };
+    // Request 2: cold 32-token prompt (32 uncached).
+    let cold_mid = PendingRequest {
+        request_id: 2,
+        prompt_tokens: (1000..1032).collect(),
+        target_output_len: 4,
+        sampling: SamplingParams::default(),
+        permit_time: now,
+        submit_time: now,
+    };
+    // Request 3: 56-token prompt hitting 48 cached tokens -> only 8 uncached tokens!
+    let mut apc_hit_prompt = shared_prefix.clone();
+    apc_hit_prompt.extend(500..508);
+    let apc_hit = PendingRequest {
+        request_id: 3,
+        prompt_tokens: apc_hit_prompt,
+        target_output_len: 4,
+        sampling: SamplingParams::default(),
+        permit_time: now,
+        submit_time: now,
+    };
+
+    let waiting = VecDeque::from([cold_long, cold_mid, apc_hit]);
+    let policy = PrefillSchedulingPolicy::default();
+
+    // SRPT must pick request 3 (index 2, 8 uncached tokens) even though its raw prompt (56)
+    // is longer than request 2 (32).
+    let sel = select_next_waiting_candidate(
+        &[],
+        &waiting,
+        &slot_pool,
+        &kv_pool,
+        Some(&tree),
+        4,
+        16,
+        policy,
+        now,
+        None,
+    )
+    .expect("candidate");
+    assert_eq!(sel.index, 2);
+    assert_eq!(sel.cached_tokens, 48);
+
+    // FIFO policy still picks index 0.
+    let sel_fifo = select_next_waiting_candidate(
+        &[],
+        &waiting,
+        &slot_pool,
+        &kv_pool,
+        Some(&tree),
+        4,
+        16,
+        PrefillSchedulingPolicy::fifo(),
+        now,
+        None,
+    )
+    .expect("fifo candidate");
+    assert_eq!(sel_fifo.index, 0);
+}
+
+#[test]
+fn srpt_tie_breaks_equal_uncached_lengths_in_fifo_order() {
+    let slot_pool = SlotPool::new(4);
+    let kv_pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 32);
+    let t0 = Instant::now();
+    let t1 = t0 + std::time::Duration::from_millis(5);
+    let waiting = VecDeque::from([
+        PendingRequest {
+            request_id: 10,
+            prompt_tokens: vec![1; 32],
+            target_output_len: 4,
+            sampling: SamplingParams::default(),
+            permit_time: t0,
+            submit_time: t0,
+        },
+        PendingRequest {
+            request_id: 11,
+            prompt_tokens: vec![2; 32],
+            target_output_len: 4,
+            sampling: SamplingParams::default(),
+            permit_time: t1,
+            submit_time: t1,
+        },
+    ]);
+    let sel = select_next_waiting_candidate(
+        &[],
+        &waiting,
+        &slot_pool,
+        &kv_pool,
+        None,
+        4,
+        16,
+        PrefillSchedulingPolicy::default(),
+        t1,
+        None,
+    )
+    .expect("candidate");
+    assert_eq!(sel.index, 0);
+}
+
+#[test]
+fn starvation_cap_promotes_aged_request_and_holds_kv_until_it_fits() {
+    let slot_pool = SlotPool::new(4);
+    let now = Instant::now();
+    let aged_submit = now - std::time::Duration::from_secs(65);
+    let waiting = VecDeque::from([
+        // Aged long request: needs 4 pages (64 tokens / 16).
+        PendingRequest {
+            request_id: 1,
+            prompt_tokens: vec![1; 64],
+            target_output_len: 1,
+            sampling: SamplingParams::default(),
+            permit_time: aged_submit,
+            submit_time: aged_submit,
+        },
+        // Fresh short request: needs 1 page (8 tokens / 16).
+        PendingRequest {
+            request_id: 2,
+            prompt_tokens: vec![2; 8],
+            target_output_len: 1,
+            sampling: SamplingParams::default(),
+            permit_time: now,
+            submit_time: now,
+        },
+    ]);
+    let policy = PrefillSchedulingPolicy {
+        srpt_enabled: true,
+        starvation_cap_ms: 60_000,
+        ..PrefillSchedulingPolicy::default()
+    };
+
+    // Case A: KV pool has 8 pages -> aged request fits and preempts the shorter request.
+    let kv_plenty = BlockPool::new(CacheGroupKind::GlobalAndIndex, 8);
+    let sel = select_next_waiting_candidate(
+        &[],
+        &waiting,
+        &slot_pool,
+        &kv_plenty,
+        None,
+        4,
+        16,
+        policy,
+        now,
+        None,
+    )
+    .expect("starved candidate");
+    assert_eq!(sel.index, 0, "aged request must preempt SRPT");
+
+    // Case B: KV pool has only 2 pages -> aged request (needs 4) cannot fit yet.
+    // Admission must hold (return None) rather than letting the short request starve it further.
+    let kv_tight = BlockPool::new(CacheGroupKind::GlobalAndIndex, 2);
+    let held = select_next_waiting_candidate(
+        &[],
+        &waiting,
+        &slot_pool,
+        &kv_tight,
+        None,
+        4,
+        16,
+        policy,
+        now,
+        None,
+    );
+    assert!(
+        held.is_none(),
+        "must hold admission while starved request waits for KV pages to drain"
+    );
+
+    // Case C: If the long request is NOT starved yet, the shorter request that fits in 2 pages
+    // can bypass KV head-of-line blocking.
+    let mut fresh_waiting = waiting;
+    fresh_waiting[0].submit_time = now;
+    let bypass = select_next_waiting_candidate(
+        &[],
+        &fresh_waiting,
+        &slot_pool,
+        &kv_tight,
+        None,
+        4,
+        16,
+        policy,
+        now,
+        None,
+    )
+    .expect("short request bypass");
+    assert_eq!(bypass.index, 1);
+}
+
+#[test]
+fn dynamic_mixed_step_budget_ramps_linearly_between_backlog_thresholds() {
+    let policy = PrefillSchedulingPolicy {
+        srpt_enabled: true,
+        starvation_cap_ms: 60_000,
+        dynamic_budget_enabled: true,
+        backlog_low_tokens: 2000,
+        backlog_high_tokens: 10000,
+    };
+    assert_eq!(
+        compute_dynamic_mixed_step_budget(2048, 4096, 0, policy),
+        2048
+    );
+    assert_eq!(
+        compute_dynamic_mixed_step_budget(2048, 4096, 2000, policy),
+        2048
+    );
+    assert_eq!(
+        compute_dynamic_mixed_step_budget(2048, 4096, 6000, policy),
+        3072
+    );
+    assert_eq!(
+        compute_dynamic_mixed_step_budget(2048, 4096, 10000, policy),
+        4096
+    );
+    assert_eq!(
+        compute_dynamic_mixed_step_budget(2048, 4096, 50000, policy),
+        4096
+    );
+
+    let fixed = PrefillSchedulingPolicy::fifo();
+    assert_eq!(
+        compute_dynamic_mixed_step_budget(2048, 4096, 50000, fixed),
+        2048
+    );
+}
+
+#[test]
+fn ordered_partial_prefill_indices_uses_srpt_with_starvation_promotion() {
+    let slot_pool = SlotPool::new(4);
+    let now = Instant::now();
+    let mk_seq =
+        |request_id: usize, prompt_len: usize, prefilled: usize, submit: Instant| ActiveSequence {
+            request_id,
+            slot_lease: slot_pool.allocate().expect("slot"),
+            prefix_lease: None,
+            kv_leases: Vec::new(),
+            page_ids: Vec::new(),
+            prompt_tokens: vec![1; prompt_len],
+            prefilled_tokens: prefilled,
+            computed_prompt_tokens: prefilled,
+            cached_prefix_tokens: 0,
+            restore_checkpoint_id: -1,
+            pending_checkpoints: Vec::new(),
+            checkpoint_alloc_stopped: false,
+            current_seq_len: prefilled,
+            last_token: 1,
+            generated_tokens: Vec::new(),
+            generated_top2: Vec::new(),
+            pending_draft_tokens: Vec::new(),
+            staged_verify: None,
+            sampling: SamplingParams::default(),
+            target_output_len: 4,
+            reserved_pages: 1,
+            permit_time: submit,
+            submit_time: submit,
+            first_token_time: None,
+            last_token_time: None,
+        };
+    let active = vec![
+        mk_seq(1, 1000, 100, now), // 900 remaining
+        mk_seq(2, 500, 300, now),  // 200 remaining
+        mk_seq(3, 4000, 100, now - std::time::Duration::from_secs(70)), // 3900 remaining, STARVED
+        mk_seq(4, 128, 128, now),  // prompt-complete (excluded)
+    ];
+    let order = ordered_partial_prefill_indices(&active, PrefillSchedulingPolicy::default(), now);
+    assert_eq!(order, vec![2, 1, 0]);
+}

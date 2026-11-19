@@ -1424,3 +1424,68 @@ async fn logprobs_and_top_logprobs_non_streaming_and_streaming() {
     handle.shutdown();
     let _ = handle.join(Duration::from_secs(2));
 }
+
+#[test]
+fn serve_cli_parses_prefill_scheduling_policy_flags() {
+    let tmp = std::env::temp_dir().join("zstep_prefill_policy_cli_test");
+    let _ = std::fs::create_dir_all(&tmp);
+    let model_dir = tmp.to_string_lossy().into_owned();
+
+    let default_args =
+        ServeArgs::parse_with_env(&["--model-dir".to_owned(), model_dir.clone()], None, None)
+            .expect("default serve args");
+    assert!(default_args.prefill_policy.srpt_enabled);
+    assert_eq!(
+        default_args.prefill_policy.starvation_cap_ms,
+        zs_scheduler::DEFAULT_PREFILL_STARVATION_CAP_MS
+    );
+    assert!(default_args.prefill_policy.dynamic_budget_enabled);
+
+    let fifo_args = ServeArgs::parse_with_env(
+        &[
+            "--model-dir".to_owned(),
+            model_dir.clone(),
+            "--prefill-policy".to_owned(),
+            "fifo".to_owned(),
+        ],
+        None,
+        None,
+    )
+    .expect("fifo serve args");
+    assert!(!fifo_args.prefill_policy.srpt_enabled);
+    assert_eq!(fifo_args.prefill_policy.starvation_cap_ms, 0);
+    assert!(!fifo_args.prefill_policy.dynamic_budget_enabled);
+
+    let custom_srpt = ServeArgs::parse_with_env(
+        &[
+            "--model-dir".to_owned(),
+            model_dir.clone(),
+            "--prefill-policy".to_owned(),
+            "srpt".to_owned(),
+            "--prefill-starvation-cap-ms".to_owned(),
+            "15000".to_owned(),
+            "--no-dynamic-prefill-budget".to_owned(),
+        ],
+        None,
+        None,
+    )
+    .expect("custom srpt serve args");
+    assert!(custom_srpt.prefill_policy.srpt_enabled);
+    assert_eq!(custom_srpt.prefill_policy.starvation_cap_ms, 15_000);
+    assert!(!custom_srpt.prefill_policy.dynamic_budget_enabled);
+
+    let err = ServeArgs::parse_with_env(
+        &[
+            "--model-dir".to_owned(),
+            model_dir,
+            "--prefill-policy".to_owned(),
+            "sjf".to_owned(),
+        ],
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(err.contains("unsupported --prefill-policy"));
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

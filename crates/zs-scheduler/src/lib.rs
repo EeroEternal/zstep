@@ -32,14 +32,15 @@ pub use coordinator::{
 };
 pub use serving::{
     AggregateMetric, BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierResult,
-    BenchmarkTierSpec, DEFAULT_PREFILL_COALESCE_WAIT_MS, EngineState, EventSink,
+    BenchmarkTierSpec, DEFAULT_BACKLOG_HIGH_TOKENS, DEFAULT_BACKLOG_LOW_TOKENS,
+    DEFAULT_PREFILL_COALESCE_WAIT_MS, DEFAULT_PREFILL_STARVATION_CAP_MS, EngineState, EventSink,
     GenerationScheduleStats, GreedyTop2Batch, LoopEvent, LoopFinishReason, MockScript,
-    OnlineConfig, OnlineMetrics, SamplingParams, ServeLoopHandle, ServingBenchmarkReport,
-    ServingEngine, SlotLease, SlotPool, StepLogprob, StepTop2Logits, StepTopLogprob, SubmitError,
-    SubmitRequest, TPOT_BUCKET_BOUNDS_SECS, TTFT_BUCKET_BOUNDS_SECS, TierAggregateStats,
-    build_deterministic_random_prompts, build_deterministic_random_prompts_seeded,
-    compute_step_logprob, request_kv_page_demand, spawn_mock, spawn_serve_loop,
-    spawn_serve_loop_with_state, splitmix64,
+    OnlineConfig, OnlineMetrics, PrefillSchedulingPolicy, SamplingParams, ServeLoopHandle,
+    ServingBenchmarkReport, ServingEngine, SlotLease, SlotPool, StepLogprob, StepTop2Logits,
+    StepTopLogprob, SubmitError, SubmitRequest, TPOT_BUCKET_BOUNDS_SECS, TTFT_BUCKET_BOUNDS_SECS,
+    TierAggregateStats, build_deterministic_random_prompts,
+    build_deterministic_random_prompts_seeded, compute_step_logprob, request_kv_page_demand,
+    spawn_mock, spawn_serve_loop, spawn_serve_loop_with_state, splitmix64,
 };
 
 /// Compatibility alias retained for external branches migrating off legacy `ModeB*` names.

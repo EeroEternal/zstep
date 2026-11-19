@@ -205,6 +205,58 @@ impl SamplingParams {
     }
 }
 
+/// Default hard starvation cap (ms) before an aged waiting request preempts SRPT ordering.
+pub const DEFAULT_PREFILL_STARVATION_CAP_MS: u64 = 60_000;
+/// Default remaining prefill backlog (tokens) at or below which mixed steps stay at `mixed_cap`.
+pub const DEFAULT_BACKLOG_LOW_TOKENS: usize = 2_048;
+/// Default remaining prefill backlog (tokens) at or above which mixed steps scale to `max_step_tokens`.
+pub const DEFAULT_BACKLOG_HIGH_TOKENS: usize = 16_384;
+
+/// Prefill scheduling policy for mixed-length and APC-heavy workloads (Issue #40 Proposal 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillSchedulingPolicy {
+    /// Order waiting/partial-prefill requests by Shortest Remaining Processing Time (SRPT)
+    /// over effective uncached prompt tokens (`prompt_len - cached_prefix_tokens`).
+    /// Equal uncached lengths tie-break by `(submit_time, request_id)` (exact FIFO).
+    pub srpt_enabled: bool,
+    /// Hard starvation cap in milliseconds. Any waiting request whose age since `submit_time`
+    /// reaches this cap preempts SRPT ordering (oldest starved request first) and holds back
+    /// shorter admissions until KV pages drain enough to admit it. `0` disables starvation promotion.
+    pub starvation_cap_ms: u64,
+    /// Dynamically ramp mixed-step token budget from `mixed_cap` up to `max_step_tokens`
+    /// as remaining prefill backlog grows from `backlog_low_tokens` to `backlog_high_tokens`.
+    pub dynamic_budget_enabled: bool,
+    /// Remaining prefill backlog (tokens) at or below which mixed steps stay at `mixed_cap`.
+    pub backlog_low_tokens: usize,
+    /// Remaining prefill backlog (tokens) at or above which mixed steps use `max_step_tokens`.
+    pub backlog_high_tokens: usize,
+}
+
+impl Default for PrefillSchedulingPolicy {
+    fn default() -> Self {
+        Self {
+            srpt_enabled: true,
+            starvation_cap_ms: DEFAULT_PREFILL_STARVATION_CAP_MS,
+            dynamic_budget_enabled: true,
+            backlog_low_tokens: DEFAULT_BACKLOG_LOW_TOKENS,
+            backlog_high_tokens: DEFAULT_BACKLOG_HIGH_TOKENS,
+        }
+    }
+}
+
+impl PrefillSchedulingPolicy {
+    /// Strict FIFO waiting admission with fixed `mixed_cap` budget (legacy baseline behavior).
+    pub const fn fifo() -> Self {
+        Self {
+            srpt_enabled: false,
+            starvation_cap_ms: 0,
+            dynamic_budget_enabled: false,
+            backlog_low_tokens: DEFAULT_BACKLOG_LOW_TOKENS,
+            backlog_high_tokens: DEFAULT_BACKLOG_HIGH_TOKENS,
+        }
+    }
+}
+
 struct PendingRequest {
     request_id: usize,
     prompt_tokens: Vec<i32>,
@@ -469,6 +521,7 @@ pub struct ServingEngine {
     worker_numa_nodes: Vec<i32>,
     max_mixed_step_tokens: Option<usize>,
     max_prefill_coalesce_wait_ms: u64,
+    prefill_policy: PrefillSchedulingPolicy,
     device_token_overlap: bool,
     speculative: SpeculativeConfig,
     poisoned: bool,
@@ -763,6 +816,229 @@ fn kv_demand_fits(kv_available: usize, outstanding_reserved: usize, demand_pages
     kv_available.saturating_sub(outstanding_reserved) >= demand_pages
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WaitingSelection {
+    index: usize,
+    demand_pages: usize,
+    cached_tokens: usize,
+}
+
+#[inline]
+fn is_starved(submit_time: Instant, now: Instant, starvation_cap_ms: u64) -> bool {
+    starvation_cap_ms > 0
+        && now.saturating_duration_since(submit_time).as_millis() >= u128::from(starvation_cap_ms)
+}
+
+/// Compute the effective mixed-step token budget under [`PrefillSchedulingPolicy`].
+///
+/// Scales linearly from `base_budget` (at `backlog_tokens <= policy.backlog_low_tokens`)
+/// up to `max_step_tokens` (at `backlog_tokens >= policy.backlog_high_tokens`).
+pub(crate) fn compute_dynamic_mixed_step_budget(
+    base_budget: usize,
+    max_step_tokens: usize,
+    backlog_tokens: usize,
+    policy: PrefillSchedulingPolicy,
+) -> usize {
+    let base = base_budget.min(max_step_tokens);
+    if !policy.dynamic_budget_enabled || base >= max_step_tokens {
+        return base;
+    }
+    let low = policy.backlog_low_tokens;
+    let high = policy.backlog_high_tokens.max(low);
+    if backlog_tokens <= low {
+        return base;
+    }
+    if backlog_tokens >= high || high == low {
+        return max_step_tokens;
+    }
+    let span = high - low;
+    let excess = backlog_tokens - low;
+    let extra = (max_step_tokens - base).saturating_mul(excess) / span;
+    base.saturating_add(extra).min(max_step_tokens)
+}
+
+fn estimate_prefill_backlog_tokens(
+    active: &[ActiveSequence],
+    waiting_permitted: &VecDeque<PendingRequest>,
+    page_block_tokens: usize,
+    kv_pool: &BlockPool,
+    prefix_tree: Option<&PrefixTree>,
+    stop_at: usize,
+) -> usize {
+    let mut backlog = 0usize;
+    for seq in active {
+        backlog =
+            backlog.saturating_add(seq.prompt_tokens.len().saturating_sub(seq.prefilled_tokens));
+        if backlog >= stop_at {
+            return backlog;
+        }
+    }
+    for req in waiting_permitted {
+        let (_, cached_tokens, _, _) = peek_request_admission(
+            &req.prompt_tokens,
+            req.target_output_len,
+            page_block_tokens,
+            kv_pool,
+            prefix_tree,
+        );
+        backlog = backlog.saturating_add(req.prompt_tokens.len().saturating_sub(cached_tokens));
+        if backlog >= stop_at {
+            return backlog;
+        }
+    }
+    backlog
+}
+
+fn ordered_partial_prefill_indices(
+    active: &[ActiveSequence],
+    policy: PrefillSchedulingPolicy,
+    now: Instant,
+) -> Vec<usize> {
+    let mut indices: Vec<usize> = active
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, seq)| (seq.prefilled_tokens < seq.prompt_tokens.len()).then_some(idx))
+        .collect();
+    if policy.srpt_enabled && indices.len() > 1 {
+        indices.sort_by_key(|&idx| {
+            let seq = &active[idx];
+            let starved = is_starved(seq.submit_time, now, policy.starvation_cap_ms);
+            let remaining = seq.prompt_tokens.len().saturating_sub(seq.prefilled_tokens);
+            // Starved requests come first (oldest submit_time first); otherwise SRPT.
+            (
+                !starved,
+                if starved { 0 } else { remaining },
+                seq.submit_time,
+                seq.request_id,
+            )
+        });
+    }
+    indices
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_next_waiting_candidate(
+    active: &[ActiveSequence],
+    waiting_permitted: &VecDeque<PendingRequest>,
+    slot_pool: &SlotPool,
+    kv_pool: &BlockPool,
+    prefix_tree: Option<&PrefixTree>,
+    max_seqs: usize,
+    page_block_tokens: usize,
+    policy: PrefillSchedulingPolicy,
+    now: Instant,
+    // Optional `(remaining_budget, max_prefill_chunk, num_seqs_already_staged)` filter.
+    budget_filter: Option<(usize, usize, usize)>,
+) -> Option<WaitingSelection> {
+    if waiting_permitted.is_empty() || active.len() >= max_seqs || slot_pool.available() == 0 {
+        return None;
+    }
+    let outstanding = outstanding_reserved_pages(active);
+
+    let budget_accepts = |prompt_len: usize, cached_tokens: usize| -> bool {
+        let Some((remaining_budget, max_prefill_chunk, num_seqs_staged)) = budget_filter else {
+            return true;
+        };
+        let uncached_prompt_len = prompt_len.saturating_sub(cached_tokens);
+        if num_seqs_staged > 0 && remaining_budget < 16 && uncached_prompt_len > remaining_budget {
+            return false;
+        }
+        prefill_chunk_range(
+            prompt_len,
+            cached_tokens,
+            remaining_budget,
+            max_prefill_chunk,
+        )
+        .is_some()
+    };
+
+    if !policy.srpt_enabled {
+        let front = waiting_permitted.front()?;
+        let (demand_pages, cached_tokens, extra_demand, reclaimable_after_pin) =
+            peek_request_admission(
+                &front.prompt_tokens,
+                front.target_output_len,
+                page_block_tokens,
+                kv_pool,
+                prefix_tree,
+            );
+        if !kv_demand_fits(reclaimable_after_pin, outstanding, extra_demand)
+            || !budget_accepts(front.prompt_tokens.len(), cached_tokens)
+        {
+            return None;
+        }
+        return Some(WaitingSelection {
+            index: 0,
+            demand_pages,
+            cached_tokens,
+        });
+    }
+
+    // Starvation barrier: if any waiting request has waited >= `starvation_cap_ms`, the oldest
+    // starved request gets exclusive admission priority. If it cannot fit in KV yet, hold
+    // admission so active sequences drain and free pages for it instead of starving it forever.
+    if policy.starvation_cap_ms > 0 {
+        let oldest_starved = waiting_permitted
+            .iter()
+            .enumerate()
+            .filter(|(_, req)| is_starved(req.submit_time, now, policy.starvation_cap_ms))
+            .min_by_key(|&(idx, req)| (req.submit_time, req.request_id, idx));
+        if let Some((idx, req)) = oldest_starved {
+            let (demand_pages, cached_tokens, extra_demand, reclaimable_after_pin) =
+                peek_request_admission(
+                    &req.prompt_tokens,
+                    req.target_output_len,
+                    page_block_tokens,
+                    kv_pool,
+                    prefix_tree,
+                );
+            if kv_demand_fits(reclaimable_after_pin, outstanding, extra_demand)
+                && budget_accepts(req.prompt_tokens.len(), cached_tokens)
+            {
+                return Some(WaitingSelection {
+                    index: idx,
+                    demand_pages,
+                    cached_tokens,
+                });
+            }
+            return None;
+        }
+    }
+
+    // SRPT: pick the admissible waiting request with the fewest remaining uncached prompt tokens,
+    // tie-breaking by `(submit_time, request_id)` (exact FIFO for equal effective lengths).
+    let mut best: Option<((usize, Instant, usize), WaitingSelection)> = None;
+    for (idx, req) in waiting_permitted.iter().enumerate() {
+        let (demand_pages, cached_tokens, extra_demand, reclaimable_after_pin) =
+            peek_request_admission(
+                &req.prompt_tokens,
+                req.target_output_len,
+                page_block_tokens,
+                kv_pool,
+                prefix_tree,
+            );
+        if !kv_demand_fits(reclaimable_after_pin, outstanding, extra_demand)
+            || !budget_accepts(req.prompt_tokens.len(), cached_tokens)
+        {
+            continue;
+        }
+        let uncached_tokens = req.prompt_tokens.len().saturating_sub(cached_tokens);
+        let key = (uncached_tokens, req.submit_time, req.request_id);
+        if best.is_none_or(|(best_key, _)| key < best_key) {
+            best = Some((
+                key,
+                WaitingSelection {
+                    index: idx,
+                    demand_pages,
+                    cached_tokens,
+                },
+            ));
+        }
+    }
+    best.map(|(_, sel)| sel)
+}
+
+#[cfg(test)]
 fn front_request_admissible_in_pools(
     active: &[ActiveSequence],
     waiting_permitted: &VecDeque<PendingRequest>,
@@ -772,23 +1048,19 @@ fn front_request_admissible_in_pools(
     max_seqs: usize,
     page_block_tokens: usize,
 ) -> bool {
-    waiting_permitted.front().is_some_and(|req| {
-        if active.len() >= max_seqs || slot_pool.available() == 0 {
-            return false;
-        }
-        let (_, _, extra_demand, reclaimable_after_pin) = peek_request_admission(
-            &req.prompt_tokens,
-            req.target_output_len,
-            page_block_tokens,
-            kv_pool,
-            prefix_tree,
-        );
-        kv_demand_fits(
-            reclaimable_after_pin,
-            outstanding_reserved_pages(active),
-            extra_demand,
-        )
-    })
+    select_next_waiting_candidate(
+        active,
+        waiting_permitted,
+        slot_pool,
+        kv_pool,
+        prefix_tree,
+        max_seqs,
+        page_block_tokens,
+        PrefillSchedulingPolicy::fifo(),
+        Instant::now(),
+        None,
+    )
+    .is_some()
 }
 
 fn validate_request_kv_demand_with_limits(
@@ -878,6 +1150,7 @@ impl ServingEngine {
             worker_numa_nodes,
             max_mixed_step_tokens: None,
             max_prefill_coalesce_wait_ms: DEFAULT_PREFILL_COALESCE_WAIT_MS,
+            prefill_policy: PrefillSchedulingPolicy::default(),
             device_token_overlap: false,
             speculative,
             poisoned: false,
@@ -988,6 +1261,14 @@ impl ServingEngine {
         self.max_prefill_coalesce_wait_ms = wait_ms;
     }
 
+    pub fn prefill_scheduling_policy(&self) -> PrefillSchedulingPolicy {
+        self.prefill_policy
+    }
+
+    pub fn set_prefill_scheduling_policy(&mut self, policy: PrefillSchedulingPolicy) {
+        self.prefill_policy = policy;
+    }
+
     /// Publish decode steps before the previous step's result is read.
     ///
     /// Workers must implement `launch`/`finish`, `STEP_FLAG_DEVICE_TOKENS`, and
@@ -1046,15 +1327,16 @@ impl ServingEngine {
         Ok(())
     }
 
-    /// Whether the next waiting request can be admitted now (slot and whole-request KV pages).
+    /// Whether any waiting request can be admitted now under [`Self::prefill_scheduling_policy`].
     fn front_request_admissible(
         &self,
         active: &[ActiveSequence],
         waiting_permitted: &VecDeque<PendingRequest>,
         max_seqs: usize,
         page_block_tokens: usize,
+        now: Instant,
     ) -> bool {
-        front_request_admissible_in_pools(
+        select_next_waiting_candidate(
             active,
             waiting_permitted,
             &self.slot_pool,
@@ -1062,7 +1344,11 @@ impl ServingEngine {
             self.prefix_tree.as_ref(),
             max_seqs,
             page_block_tokens,
+            self.prefill_policy,
+            now,
+            None,
         )
+        .is_some()
     }
 
     /// Reject requests that could never be admitted before any step is published, so the
@@ -1338,11 +1624,13 @@ impl ServingEngine {
                 *overlapped_out += 1;
                 ready_step
             } else {
+                let step_now = Instant::now();
                 let waiting_admissible = self.front_request_admissible(
                     &active,
                     waiting_permitted,
                     max_seqs,
                     page_block_tokens,
+                    step_now,
                 );
                 self.step_cursor += 1;
                 let sid = self.step_cursor;
@@ -1364,6 +1652,7 @@ impl ServingEngine {
                             waiting_permitted,
                             page_block_tokens,
                             max_pages_per_seq,
+                            step_now,
                         )? {
                             MixedStepOutcome::MixedOrPrefill {
                                 had_decodes,
@@ -1428,6 +1717,7 @@ impl ServingEngine {
                             waiting_permitted,
                             page_block_tokens,
                             max_pages_per_seq,
+                            step_now,
                         )?;
                         self.last_generation_schedule.prefill_steps += 1;
                         if continued_chunk
@@ -1465,6 +1755,7 @@ impl ServingEngine {
                 waiting_permitted,
                 max_seqs,
                 page_block_tokens,
+                Instant::now(),
             );
 
             let has_prefix_cache = self.has_prefix_cache();
@@ -1681,6 +1972,7 @@ impl ServingEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn stage_prefill_step(
         &mut self,
         step_id: u64,
@@ -1689,6 +1981,7 @@ impl ServingEngine {
         waiting_permitted: &mut VecDeque<PendingRequest>,
         page_block_tokens: usize,
         max_pages_per_seq: usize,
+        now: Instant,
     ) -> Result<()> {
         let geometry = self.coordinator.config().geometry;
         let max_seqs = geometry.max_seqs as usize;
@@ -1701,7 +1994,9 @@ impl ServingEngine {
         let mut any_sampling = false;
         let mut any_penalty = false;
 
-        for seq in active.iter_mut() {
+        let partial_indices = ordered_partial_prefill_indices(active, self.prefill_policy, now);
+        for active_idx in partial_indices {
+            let seq = &mut active[active_idx];
             let Some((chunk_start, chunk_end)) = prefill_chunk_range(
                 seq.prompt_tokens.len(),
                 seq.prefilled_tokens,
@@ -1739,41 +2034,35 @@ impl ServingEngine {
         }
 
         while active.len() < max_seqs && token_cursor < max_step_tokens {
-            let Some(front) = waiting_permitted.front() else {
+            let Some(sel) = select_next_waiting_candidate(
+                active,
+                waiting_permitted,
+                &self.slot_pool,
+                &self.kv_pool,
+                self.prefix_tree.as_ref(),
+                max_seqs,
+                page_block_tokens,
+                self.prefill_policy,
+                now,
+                Some((max_step_tokens - token_cursor, max_prefill_chunk, 0)),
+            ) else {
                 break;
             };
-            let prompt_len = front.prompt_tokens.len();
+            let prompt_len = waiting_permitted[sel.index].prompt_tokens.len();
             if prompt_len == 0 {
                 return Err(EngineError::Protocol(
                     "prompt length must be positive".to_owned(),
                 ));
             }
-            let (demand_pages, cached_tokens, extra_demand, reclaimable_after_pin) =
-                peek_request_admission(
-                    &front.prompt_tokens,
-                    front.target_output_len,
-                    page_block_tokens,
-                    &self.kv_pool,
-                    self.prefix_tree.as_ref(),
-                );
             let Some((chunk_start, chunk_end)) = prefill_chunk_range(
                 prompt_len,
-                cached_tokens,
+                sel.cached_tokens,
                 max_step_tokens - token_cursor,
                 max_prefill_chunk,
             ) else {
                 break;
             };
-            if self.slot_pool.available() == 0
-                || !kv_demand_fits(
-                    reclaimable_after_pin,
-                    outstanding_reserved_pages(active),
-                    extra_demand,
-                )
-            {
-                break;
-            }
-            let req = waiting_permitted.pop_front().ok_or_else(|| {
+            let req = waiting_permitted.remove(sel.index).ok_or_else(|| {
                 EngineError::Protocol("waiting queue unexpectedly empty".to_owned())
             })?;
             let slot_lease = self.slot_pool.allocate().ok_or_else(|| {
@@ -1783,7 +2072,7 @@ impl ServingEngine {
             let mut seq = admit_request_into_sequence(
                 req,
                 slot_lease,
-                demand_pages,
+                sel.demand_pages,
                 max_pages_per_seq,
                 self.prefix_tree.as_mut(),
                 self.recurrent_pool.is_some(),
@@ -1870,6 +2159,7 @@ impl ServingEngine {
         waiting_permitted: &mut VecDeque<PendingRequest>,
         page_block_tokens: usize,
         max_pages_per_seq: usize,
+        now: Instant,
     ) -> Result<MixedStepOutcome> {
         let geometry = self.coordinator.config().geometry;
         let max_seqs = geometry.max_seqs as usize;
@@ -1886,7 +2176,27 @@ impl ServingEngine {
         });
 
         let step_budget = if decode_active_count > 0 {
-            mixed_cap.max(decode_active_count + 1).min(max_step_tokens)
+            let base_budget = mixed_cap.max(decode_active_count + 1).min(max_step_tokens);
+            if self.prefill_policy.dynamic_budget_enabled && base_budget < max_step_tokens {
+                let backlog_tokens = estimate_prefill_backlog_tokens(
+                    active,
+                    waiting_permitted,
+                    page_block_tokens,
+                    &self.kv_pool,
+                    self.prefix_tree.as_ref(),
+                    self.prefill_policy
+                        .backlog_high_tokens
+                        .max(self.prefill_policy.backlog_low_tokens),
+                );
+                compute_dynamic_mixed_step_budget(
+                    base_budget,
+                    max_step_tokens,
+                    backlog_tokens,
+                    self.prefill_policy,
+                )
+            } else {
+                base_budget
+            }
         } else {
             max_step_tokens
         };
@@ -1994,15 +2304,13 @@ impl ServingEngine {
         let mut prefill_seqs_staged = 0usize;
 
         // Pass 2 (Region 2 / 0): Stage partial-prefill continuations (`first_pos > 0`).
-        for seq in active.iter_mut() {
+        let partial_indices = ordered_partial_prefill_indices(active, self.prefill_policy, now);
+        for active_idx in partial_indices {
             if token_cursor >= step_budget {
                 break;
             }
-            if seq.prefilled_tokens >= seq.prompt_tokens.len() {
-                continue;
-            }
-            let prompt_len = seq.prompt_tokens.len();
-            let prefilled = seq.prefilled_tokens;
+            let prompt_len = active[active_idx].prompt_tokens.len();
+            let prefilled = active[active_idx].prefilled_tokens;
             let Some((chunk_start, chunk_end)) = prefill_chunk_range(
                 prompt_len,
                 prefilled,
@@ -2012,10 +2320,11 @@ impl ServingEngine {
                 continue;
             };
             let needed_pages = chunk_end.div_ceil(page_block_tokens);
-            let extra_pages = needed_pages.saturating_sub(seq.page_ids.len());
+            let extra_pages = needed_pages.saturating_sub(active[active_idx].page_ids.len());
             if extra_pages > self.reclaimable_kv_pages() {
                 continue;
             }
+            let seq = &mut active[active_idx];
             let sample_row_index = (chunk_end == prompt_len).then(|| {
                 let row = num_sample_rows;
                 num_sample_rows += 1;
@@ -2047,46 +2356,36 @@ impl ServingEngine {
 
         // Pass 3 (Region 3 / 1): Admit new waiting requests.
         while active.len() < max_seqs && token_cursor < step_budget {
-            let Some(front) = waiting_permitted.front() else {
+            let remaining_budget = step_budget - token_cursor;
+            let Some(sel) = select_next_waiting_candidate(
+                active,
+                waiting_permitted,
+                &self.slot_pool,
+                &self.kv_pool,
+                self.prefix_tree.as_ref(),
+                max_seqs,
+                page_block_tokens,
+                self.prefill_policy,
+                now,
+                Some((remaining_budget, max_prefill_chunk, num_seqs)),
+            ) else {
                 break;
             };
-            let prompt_len = front.prompt_tokens.len();
+            let prompt_len = waiting_permitted[sel.index].prompt_tokens.len();
             if prompt_len == 0 {
                 return Err(EngineError::Protocol(
                     "prompt length must be positive".to_owned(),
                 ));
             }
-            let (demand_pages, cached_tokens, extra_demand, reclaimable_after_pin) =
-                peek_request_admission(
-                    &front.prompt_tokens,
-                    front.target_output_len,
-                    page_block_tokens,
-                    &self.kv_pool,
-                    self.prefix_tree.as_ref(),
-                );
-            let uncached_prompt_len = prompt_len - cached_tokens;
-            let remaining_budget = step_budget - token_cursor;
-            if num_seqs > 0 && remaining_budget < 16 && uncached_prompt_len > remaining_budget {
-                break;
-            }
             let Some((chunk_start, chunk_end)) = prefill_chunk_range(
                 prompt_len,
-                cached_tokens,
+                sel.cached_tokens,
                 remaining_budget,
                 max_prefill_chunk,
             ) else {
                 break;
             };
-            if self.slot_pool.available() == 0
-                || !kv_demand_fits(
-                    reclaimable_after_pin,
-                    outstanding_reserved_pages(active),
-                    extra_demand,
-                )
-            {
-                break;
-            }
-            let req = waiting_permitted.pop_front().ok_or_else(|| {
+            let req = waiting_permitted.remove(sel.index).ok_or_else(|| {
                 EngineError::Protocol("waiting queue unexpectedly empty".to_owned())
             })?;
             let slot_lease = self.slot_pool.allocate().ok_or_else(|| {
@@ -2096,7 +2395,7 @@ impl ServingEngine {
             let mut seq = admit_request_into_sequence(
                 req,
                 slot_lease,
-                demand_pages,
+                sel.demand_pages,
                 max_pages_per_seq,
                 self.prefix_tree.as_mut(),
                 self.recurrent_pool.is_some(),
