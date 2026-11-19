@@ -128,6 +128,8 @@ class WorkerRuntimeConfig:
     num_recurrent_checkpoints: int = 0
     dram_kv_blocks: int = 0
     enable_sm_h2d: bool = True
+    enable_driver_batch_memcpy: bool = True
+    prefill_runahead_depth: int = 2
     disable_verify_graphs: bool = False
     disable_draft_graphs: bool = False
 
@@ -191,6 +193,14 @@ class WorkerRuntimeConfig:
         if dram_kv_blocks < 0:
             raise ValueError(f"ZSTEP_DRAM_KV_BLOCKS must be >= 0 (got {dram_kv_blocks})")
         enable_sm_h2d = env_flag("ZSTEP_ENABLE_SM_H2D", default=True, environ=env)
+        enable_driver_batch_memcpy = env_flag(
+            "ZSTEP_ENABLE_DRIVER_BATCH_MEMCPY", default=True, environ=env
+        )
+        prefill_runahead_depth = env_int("ZSTEP_PREFILL_RUNAHEAD_DEPTH", 2, environ=env)
+        if prefill_runahead_depth < 0:
+            raise ValueError(
+                f"ZSTEP_PREFILL_RUNAHEAD_DEPTH must be >= 0 (got {prefill_runahead_depth})"
+            )
 
         p2p_mode = env.get("ZSTEP_P2P_MODE", "auto").strip().lower() or "auto"
         if p2p_mode not in VALID_P2P_MODES:
@@ -232,6 +242,8 @@ class WorkerRuntimeConfig:
             num_recurrent_checkpoints=num_recurrent_checkpoints,
             dram_kv_blocks=dram_kv_blocks,
             enable_sm_h2d=enable_sm_h2d,
+            enable_driver_batch_memcpy=enable_driver_batch_memcpy,
+            prefill_runahead_depth=prefill_runahead_depth,
             disable_verify_graphs=env_flag(
                 "ZSTEP_DISABLE_VERIFY_GRAPHS", default=False, environ=env
             ),
@@ -300,5 +312,7 @@ class WorkerRuntimeConfig:
             f"mhc_overlap={int(self.enable_sm120_mhc_overlap)}(fuse_ar={int(self.enable_sm120_fuse_mhc_ar)}) "
             f"qwen_gdn={int(self.qwen_enable_fused_gdn)}:{self.qwen_gdn_decode_mode} "
             f"verify_graphs={int(not self.disable_verify_graphs)} "
-            f"draft_graphs={int(not self.disable_draft_graphs)}"
+            f"draft_graphs={int(not self.disable_draft_graphs)} "
+            f"prefill_runahead={self.prefill_runahead_depth} "
+            f"driver_batch_memcpy={int(self.enable_driver_batch_memcpy)}"
         )

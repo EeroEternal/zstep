@@ -339,6 +339,7 @@ class DeepSeekV41StepRunner:
         self.verify_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.verify_graph_aux: dict[int, list[torch.Tensor] | None] = {}
         self.dspark_drafter: Any | None = None
+        self.dram_kv_tier: HostDramKvTier | None = None
         self._builder_groups: list[_AttnBuilderGroup] = []
 
         try:
@@ -884,6 +885,7 @@ class DeepSeekV41StepRunner:
                 num_dram_blocks=self.runtime_config.dram_kv_blocks,
                 device=self.device,
                 numa_node=numa_node,
+                enable_driver_batch_memcpy=self.runtime_config.enable_driver_batch_memcpy,
             )
         self._sm_h2d: SmH2dCopier = SmH2dCopier(
             enabled=self.dram_kv_tier is not None and self.runtime_config.enable_sm_h2d
@@ -2446,6 +2448,8 @@ class DeepSeekV41StepRunner:
         self.verify_graph_aux.clear()
         if self.dspark_drafter is not None:
             self.dspark_drafter.close()
+        if self.dram_kv_tier is not None:
+            self.dram_kv_tier.close()
         close_b12x_dsv41_model(getattr(self, "dspark_model", None))
         close_b12x_dsv41_model(getattr(self, "model", None))
         self.dspark_model = None
@@ -2481,6 +2485,8 @@ class DeepSeekV41StepRunner:
         self.verify_graph_aux.clear()
         if self.dspark_drafter is not None:
             self.dspark_drafter.close()
+        if self.dram_kv_tier is not None:
+            self.dram_kv_tier.close()
         close_b12x_dsv41_model(getattr(self, "dspark_model", None))
         close_b12x_dsv41_model(getattr(self, "model", None))
         self.dspark_model = None

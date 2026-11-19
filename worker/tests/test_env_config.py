@@ -43,6 +43,8 @@ def test_worker_runtime_config_defaults_and_summary() -> None:
     assert cfg.b12x_autotune is True
     assert cfg.qwen_enable_fused_gdn is True
     assert cfg.qwen_gdn_decode_mode == "auto"
+    assert cfg.enable_driver_batch_memcpy is True
+    assert cfg.prefill_runahead_depth == 2
 
     line = cfg.format_log_line()
     assert line.startswith("zstep_worker_config ")
@@ -50,6 +52,8 @@ def test_worker_runtime_config_defaults_and_summary() -> None:
     assert "pxb_bfp=1" in line
     assert "mhc_overlap=1(fuse_ar=1)" in line
     assert "shm_max_ar=auto" in line
+    assert "prefill_runahead=2" in line
+    assert "driver_batch_memcpy=1" in line
 
 
 def test_worker_runtime_config_overrides_and_helpers() -> None:
@@ -80,6 +84,8 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
         "ZSTEP_B12X_AUTOTUNE": "0",
         "ZSTEP_QWEN_ENABLE_FUSED_GDN": "0",
         "ZSTEP_QWEN_GDN_DECODE_MODE": "cluster2",
+        "ZSTEP_ENABLE_DRIVER_BATCH_MEMCPY": "0",
+        "ZSTEP_PREFILL_RUNAHEAD_DEPTH": "4",
     }
     cfg = WorkerRuntimeConfig.from_env(env)
     assert cfg.spec_method == "dspark"
@@ -111,12 +117,15 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
     assert cfg.b12x_autotune is False
     assert parse_qwen_fused_gdn_enabled(env) is False
     assert parse_qwen_gdn_decode_mode(env) == "cluster2"
+    assert cfg.enable_driver_batch_memcpy is False
+    assert cfg.prefill_runahead_depth == 4
 
 
 @pytest.mark.parametrize(
     ("env", "match"),
     [
         ({"ZSTEP_SPEC_METHOD": "medusa"}, "ZSTEP_SPEC_METHOD"),
+        ({"ZSTEP_PREFILL_RUNAHEAD_DEPTH": "-1"}, "ZSTEP_PREFILL_RUNAHEAD_DEPTH"),
         ({"ZSTEP_SPEC_METHOD": "ngram", "ZSTEP_NUM_SPEC_TOKENS": "0"}, "1..=7"),
         ({"ZSTEP_SPEC_METHOD": "mtp", "ZSTEP_NUM_SPEC_TOKENS": "8"}, "1..=7"),
         ({"ZSTEP_MAX_MODEL_LEN": "0"}, "ZSTEP_MAX_MODEL_LEN"),
