@@ -50,6 +50,8 @@ STEP_EXECUTION_METHODS: frozenset[str] = frozenset(
         "_apply_stochastic_sampling",
         "sample_tp8_logits",
         "splitmix64_uniform_f32",
+        "reset_and_apply_penalties",
+        "record_sampled",
     }
 )
 

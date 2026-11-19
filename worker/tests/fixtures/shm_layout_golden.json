@@ -1,5 +1,5 @@
 {
-  "protocol_version": 4,
+  "protocol_version": 5,
   "pod_offsets": {
     "ShmSuperblock": {
       "magic": 0,
@@ -96,9 +96,12 @@
         "top_p_offset": 270848,
         "top_k_offset": 271360,
         "rng_seeds_offset": 271872,
+        "presence_penalties_offset": 272896,
+        "frequency_penalties_offset": 273408,
+        "penalty_reset_mask_offset": 273920,
         "total_slot_bytes": 274432,
         "result_slot_stride": 16384,
-        "layout_hash_hex": "0x521b5e3932642447"
+        "layout_hash_hex": "0x8ccf19913d8a7d3e"
       }
     },
     {
@@ -130,9 +133,12 @@
         "top_p_offset": 2372096,
         "top_k_offset": 2372608,
         "rng_seeds_offset": 2373120,
+        "presence_penalties_offset": 2374144,
+        "frequency_penalties_offset": 2374656,
+        "penalty_reset_mask_offset": 2375168,
         "total_slot_bytes": 2375680,
         "result_slot_stride": 16384,
-        "layout_hash_hex": "0xb4536dcf0819cda4"
+        "layout_hash_hex": "0x4450af2474ee3c85"
       }
     },
     {
@@ -164,9 +170,12 @@
         "top_p_offset": 3584,
         "top_k_offset": 3840,
         "rng_seeds_offset": 4096,
+        "presence_penalties_offset": 4352,
+        "frequency_penalties_offset": 4608,
+        "penalty_reset_mask_offset": 4864,
         "total_slot_bytes": 8192,
         "result_slot_stride": 4096,
-        "layout_hash_hex": "0x29f900a56c2bca3a"
+        "layout_hash_hex": "0xb538be80431c1a1b"
       }
     }
   ]

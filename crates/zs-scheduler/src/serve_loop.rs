@@ -851,7 +851,8 @@ fn retire_completed_sequences(
             let request_id = seq.request_id as u64;
             let prefill_done = seq.prefilled_tokens == seq.prompt_tokens.len();
             let generated = seq.generated_tokens.len();
-            let eos = prefill_done
+            let eos = !seq.sampling.ignore_eos
+                && prefill_done
                 && generated > 0
                 && online.eos_tokens.contains(&(seq.last_token as u32));
             if generated >= seq.target_output_len || eos {
@@ -869,7 +870,7 @@ fn retire_completed_sequences(
     let mut any_retired = false;
     let mut index = 0;
     while index < online.active.len() {
-        let (request_id, prefill_done, generated, target, last_token) = {
+        let (request_id, prefill_done, generated, target, last_token, ignore_eos) = {
             let seq = &online.active[index];
             (
                 seq.request_id as u64,
@@ -877,10 +878,14 @@ fn retire_completed_sequences(
                 seq.generated_tokens.len(),
                 seq.target_output_len,
                 seq.last_token,
+                seq.sampling.ignore_eos,
             )
         };
         let drained = online.draining_finished.remove(&request_id);
-        let eos = prefill_done && generated > 0 && online.eos_tokens.contains(&(last_token as u32));
+        let eos = !ignore_eos
+            && prefill_done
+            && generated > 0
+            && online.eos_tokens.contains(&(last_token as u32));
         if drained.is_some() || generated >= target || eos {
             rewind_post_eos_pages(
                 &mut online.active[index],
@@ -1179,7 +1184,7 @@ fn online_step(
                 seq.request_id as u64
             };
             token_events.push((request_id, token));
-            if eos_tokens.contains(&(token as u32)) {
+            if !seq.sampling.ignore_eos && eos_tokens.contains(&(token as u32)) {
                 break;
             }
         }

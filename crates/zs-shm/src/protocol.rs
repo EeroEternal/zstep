@@ -422,6 +422,27 @@ impl StepPlanSlotMut<'_> {
         u64,
         |g: ShmGeometry| g.max_seqs as usize
     );
+    plan_accessors!(
+        presence_penalties,
+        presence_penalties_mut,
+        presence_penalties_offset,
+        f32,
+        |g: ShmGeometry| g.max_seqs as usize
+    );
+    plan_accessors!(
+        frequency_penalties,
+        frequency_penalties_mut,
+        frequency_penalties_offset,
+        f32,
+        |g: ShmGeometry| g.max_seqs as usize
+    );
+    plan_accessors!(
+        penalty_reset_mask,
+        penalty_reset_mask_mut,
+        penalty_reset_mask_offset,
+        u8,
+        |g: ShmGeometry| g.max_seqs as usize
+    );
 
     /// Release-publish the step ID after all header fields and payload arrays are complete.
     pub fn publish(self, step_id: u64) -> Result<()> {

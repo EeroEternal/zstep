@@ -59,6 +59,71 @@ def splitmix64_uniform_f32(seeds_i64: torch.Tensor) -> torch.Tensor:
     return (u23 + 0.5) * _INV_2POW23
 
 
+class SlotPenaltyState:
+    """Per-slot GPU ring buffer tracking generated tokens for presence/frequency penalties.
+
+    Lazily instantiated only when a step sets `STEP_FLAG_PENALTY`, consuming zero VRAM
+    on workloads without penalties. All operations are pure GPU tensor ops with zero
+    host-device sync and full compatibility with `STEP_FLAG_DEVICE_TOKENS` overlap.
+    """
+
+    def __init__(
+        self,
+        max_seqs: int,
+        *,
+        device: torch.device,
+        max_history: int = 4096,
+    ) -> None:
+        self.max_seqs = max_seqs
+        self.max_history = max_history
+        self.slot_tokens: torch.Tensor = torch.zeros(
+            (max_seqs, max_history), dtype=torch.int32, device=device
+        )
+        self.slot_counts: torch.Tensor = torch.zeros(max_seqs, dtype=torch.int32, device=device)
+        self.slot_write_pos: torch.Tensor = torch.zeros(max_seqs, dtype=torch.int32, device=device)
+        self._col_idx: torch.Tensor = torch.arange(
+            max_history, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+
+    def reset_and_apply_penalties(
+        self,
+        logits_f32: torch.Tensor,
+        *,
+        slots: torch.Tensor,
+        reset_mask: torch.Tensor,
+        presence_penalties: torch.Tensor,
+        frequency_penalties: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reset new-sequence slots and apply OpenAI presence/frequency penalties in float32."""
+        num_rows, vocab_dim = logits_f32.shape
+        keep = (reset_mask == 0).to(torch.int32)
+        cur_counts = self.slot_counts.index_select(0, slots) * keep
+        cur_write = self.slot_write_pos.index_select(0, slots) * keep
+        self.slot_counts.index_copy_(0, slots, cur_counts)
+        self.slot_write_pos.index_copy_(0, slots, cur_write)
+
+        hist = self.slot_tokens.index_select(0, slots)
+        valid = (self._col_idx < cur_counts.unsqueeze(-1)) & (hist >= 0) & (hist < vocab_dim)
+        safe_idx = torch.where(valid, hist, torch.zeros_like(hist)).to(torch.int64)
+        counts = torch.zeros((num_rows, vocab_dim), dtype=torch.float32, device=logits_f32.device)
+        counts.scatter_add_(1, safe_idx, valid.to(torch.float32))
+        present = (counts > 0.0).to(torch.float32)
+        return (
+            logits_f32
+            - frequency_penalties.float().unsqueeze(-1) * counts
+            - presence_penalties.float().unsqueeze(-1) * present
+        )
+
+    def record_sampled(self, slots: torch.Tensor, sampled_tokens: torch.Tensor) -> None:
+        """Append newly sampled tokens into each slot's GPU history ring buffer."""
+        wpos = self.slot_write_pos.index_select(0, slots).to(torch.int64)
+        self.slot_tokens[slots, wpos] = sampled_tokens.to(torch.int32)
+        new_wpos = torch.remainder(wpos.to(torch.int32) + 1, self.max_history)
+        new_counts = (self.slot_counts.index_select(0, slots) + 1).clamp(max=self.max_history)
+        self.slot_write_pos.index_copy_(0, slots, new_wpos)
+        self.slot_counts.index_copy_(0, slots, new_counts)
+
+
 def sample_tp8_logits(
     local_logits: torch.Tensor,
     *,
@@ -69,11 +134,16 @@ def sample_tp8_logits(
     tp_group: Any | None = None,
     world_size: int = 1,
     vocab_size: int | None = None,
+    penalty_state: SlotPenaltyState | None = None,
+    slots: torch.Tensor | None = None,
+    reset_mask: torch.Tensor | None = None,
+    presence_penalties: torch.Tensor | None = None,
+    frequency_penalties: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample global token IDs from TP-sharded `[M, V_local]` logits on GPU.
 
     Supports mixed greedy (`temperature == 0.0`) and stochastic (`temperature > 0.0`)
-    rows within the same batch with zero host-device synchronization.
+    rows as well as OpenAI presence/frequency penalties with zero host-device sync.
     """
     num_rows, local_v = local_logits.shape
     if world_size > 1:
@@ -92,6 +162,20 @@ def sample_tp8_logits(
 
     vocab_dim = full_logits.shape[1]
     logits_f32 = full_logits.float()
+    if (
+        penalty_state is not None
+        and slots is not None
+        and reset_mask is not None
+        and presence_penalties is not None
+        and frequency_penalties is not None
+    ):
+        logits_f32 = penalty_state.reset_and_apply_penalties(
+            logits_f32,
+            slots=slots,
+            reset_mask=reset_mask,
+            presence_penalties=presence_penalties,
+            frequency_penalties=frequency_penalties,
+        )
     greedy_tokens = torch.argmax(logits_f32, dim=-1)
 
     safe_temp = torch.clamp(temperatures.float(), min=1e-6).unsqueeze(-1)
@@ -136,5 +220,7 @@ def sample_tp8_logits(
     valid_stochastic = (
         (temperatures > 0.0) & torch.isfinite(total_prob_flat) & (total_prob_flat > 0.0)
     )
-    final_tokens = torch.where(valid_stochastic, sampled_tokens, greedy_tokens)
-    return final_tokens.to(torch.int32)
+    final_tokens = torch.where(valid_stochastic, sampled_tokens, greedy_tokens).to(torch.int32)
+    if penalty_state is not None and slots is not None:
+        penalty_state.record_sampled(slots, final_tokens)
+    return final_tokens
