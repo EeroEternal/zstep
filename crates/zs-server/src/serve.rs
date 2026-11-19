@@ -429,16 +429,6 @@ fn reject_unsupported(request: &ChatRequest) -> Option<Response> {
             &format!("n={n} is not supported"),
         ));
     }
-    if request.presence_penalty.is_some_and(|value| value != 0.0)
-        || request.frequency_penalty.is_some_and(|value| value != 0.0)
-    {
-        return Some(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "invalid_parameter",
-            "presence/frequency penalties are not supported",
-        ));
-    }
     if request.tools.is_some() || request.tool_choice.is_some() {
         return Some(error_response(
             StatusCode::BAD_REQUEST,
@@ -461,14 +451,6 @@ fn reject_unsupported(request: &ChatRequest) -> Option<Response> {
             "invalid_request_error",
             "invalid_parameter",
             "logprobs are not supported",
-        ));
-    }
-    if request.ignore_eos.is_some_and(|v| v) {
-        return Some(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "invalid_parameter",
-            "ignore_eos is not supported",
         ));
     }
     if let Some(opts) = &request.stream_options
@@ -536,6 +518,25 @@ fn resolve_sampling_params(
         ));
     }
     let top_k = if raw_top_k <= 0 { 0 } else { raw_top_k };
+    let presence_penalty = request.presence_penalty.unwrap_or(0.0);
+    if !presence_penalty.is_finite() || !(-2.0..=2.0).contains(&presence_penalty) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_parameter",
+            "presence_penalty must be finite and within [-2.0, 2.0]",
+        ));
+    }
+    let frequency_penalty = request.frequency_penalty.unwrap_or(0.0);
+    if !frequency_penalty.is_finite() || !(-2.0..=2.0).contains(&frequency_penalty) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_parameter",
+            "frequency_penalty must be finite and within [-2.0, 2.0]",
+        ));
+    }
+    let ignore_eos = request.ignore_eos.unwrap_or(false);
     let temperature_f32 = temperature as f32;
     let seed = if temperature_f32 <= 0.0 {
         0
@@ -558,6 +559,9 @@ fn resolve_sampling_params(
         top_p: top_p_f32,
         top_k,
         seed,
+        presence_penalty: presence_penalty as f32,
+        frequency_penalty: frequency_penalty as f32,
+        ignore_eos,
     })
 }
 

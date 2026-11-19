@@ -62,12 +62,13 @@ from zstep_worker.kernels_sm120.shm_allreduce import (
     get_host_mapped_allreduce_extension,
 )
 from zstep_worker.p2p_probe import P2pTopologyReport, configure_adaptive_p2p_env
-from zstep_worker.sampler import sample_tp8_logits
+from zstep_worker.sampler import SlotPenaltyState, sample_tp8_logits
 from zstep_worker.spec_decode import VerifiedSequence, seq_results, verify_batch
 from zstep_worker.shm_bridge import (
     DECODE_GRAPH_BUCKETS,
     STEP_FLAG_DECODE_ONLY,
     STEP_FLAG_DEVICE_TOKENS,
+    STEP_FLAG_PENALTY,
     STEP_FLAG_SAMPLING,
     SeqResult,
     ShmBridge,
@@ -778,6 +779,47 @@ class Qwen35MoeStepRunner:
         self.sample_seed_gpu: torch.Tensor = torch.zeros(
             ms, dtype=torch.int64, device=self.device
         )
+        self.sample_pres_pen_cpu: torch.Tensor = torch.zeros(
+            (2, ms), dtype=torch.float32, pin_memory=True
+        )
+        self.sample_freq_pen_cpu: torch.Tensor = torch.zeros(
+            (2, ms), dtype=torch.float32, pin_memory=True
+        )
+        self.sample_reset_cpu: torch.Tensor = torch.zeros(
+            (2, ms), dtype=torch.uint8, pin_memory=True
+        )
+        self.sample_slots_cpu: torch.Tensor = torch.zeros(
+            (2, ms), dtype=torch.int64, pin_memory=True
+        )
+        self._sample_pres_pen_np: list[np.ndarray] = [
+            self.sample_pres_pen_cpu[0].numpy(),
+            self.sample_pres_pen_cpu[1].numpy(),
+        ]
+        self._sample_freq_pen_np: list[np.ndarray] = [
+            self.sample_freq_pen_cpu[0].numpy(),
+            self.sample_freq_pen_cpu[1].numpy(),
+        ]
+        self._sample_reset_np: list[np.ndarray] = [
+            self.sample_reset_cpu[0].numpy(),
+            self.sample_reset_cpu[1].numpy(),
+        ]
+        self._sample_slots_np: list[np.ndarray] = [
+            self.sample_slots_cpu[0].numpy(),
+            self.sample_slots_cpu[1].numpy(),
+        ]
+        self.sample_pres_pen_gpu: torch.Tensor = torch.zeros(
+            ms, dtype=torch.float32, device=self.device
+        )
+        self.sample_freq_pen_gpu: torch.Tensor = torch.zeros(
+            ms, dtype=torch.float32, device=self.device
+        )
+        self.sample_reset_gpu: torch.Tensor = torch.zeros(
+            ms, dtype=torch.uint8, device=self.device
+        )
+        self.sample_slots_gpu: torch.Tensor = torch.zeros(
+            ms, dtype=torch.int64, device=self.device
+        )
+        self._penalty_state: SlotPenaltyState | None = None
 
         self.start_events: list[torch.cuda.Event] = [
             torch.cuda.Event(enable_timing=True) for _ in range(2)
@@ -1500,7 +1542,13 @@ class Qwen35MoeStepRunner:
         )
 
     def _apply_stochastic_sampling(
-        self, plan: StepPlanView, count: int, parity: int
+        self,
+        plan: StepPlanView,
+        count: int,
+        parity: int,
+        *,
+        use_penalty: bool = False,
+        sample_slots_np: np.ndarray | None = None,
     ) -> None:
         np.copyto(self._sample_temp_np[parity][:count], plan.temperatures(count))
         np.copyto(self._sample_top_p_np[parity][:count], plan.top_p(count))
@@ -1518,6 +1566,35 @@ class Qwen35MoeStepRunner:
         self.sample_seed_gpu[:count].copy_(
             self.sample_seed_cpu[parity, :count], non_blocking=True
         )
+        penalty_state: SlotPenaltyState | None = None
+        slots_gpu: torch.Tensor | None = None
+        reset_gpu: torch.Tensor | None = None
+        pres_gpu: torch.Tensor | None = None
+        freq_gpu: torch.Tensor | None = None
+        if use_penalty and sample_slots_np is not None:
+            if self._penalty_state is None:
+                self._penalty_state = SlotPenaltyState(self.max_seqs, device=self.device)
+            penalty_state = self._penalty_state
+            np.copyto(self._sample_pres_pen_np[parity][:count], plan.presence_penalties(count))
+            np.copyto(self._sample_freq_pen_np[parity][:count], plan.frequency_penalties(count))
+            np.copyto(self._sample_reset_np[parity][:count], plan.penalty_reset_mask(count))
+            self._sample_slots_np[parity][:count] = sample_slots_np
+            self.sample_pres_pen_gpu[:count].copy_(
+                self.sample_pres_pen_cpu[parity, :count], non_blocking=True
+            )
+            self.sample_freq_pen_gpu[:count].copy_(
+                self.sample_freq_pen_cpu[parity, :count], non_blocking=True
+            )
+            self.sample_reset_gpu[:count].copy_(
+                self.sample_reset_cpu[parity, :count], non_blocking=True
+            )
+            self.sample_slots_gpu[:count].copy_(
+                self.sample_slots_cpu[parity, :count], non_blocking=True
+            )
+            slots_gpu = self.sample_slots_gpu[:count]
+            reset_gpu = self.sample_reset_gpu[:count]
+            pres_gpu = self.sample_pres_pen_gpu[:count]
+            freq_gpu = self.sample_freq_pen_gpu[:count]
         sampled = sample_tp8_logits(
             self.logits_local_buf[:count],
             temperatures=self.sample_temp_gpu[:count],
@@ -1527,6 +1604,11 @@ class Qwen35MoeStepRunner:
             tp_group=self.nccl_group,
             world_size=self.world_size,
             vocab_size=self.config.vocab_size,
+            penalty_state=penalty_state,
+            slots=slots_gpu,
+            reset_mask=reset_gpu,
+            presence_penalties=pres_gpu,
+            frequency_penalties=freq_gpu,
         )
         self.out_tokens_gpu[:count, 0].copy_(sampled)
 
@@ -1557,6 +1639,7 @@ class Qwen35MoeStepRunner:
 
         is_decode = (header.flags & STEP_FLAG_DECODE_ONLY) != 0
         is_sampling = (header.flags & STEP_FLAG_SAMPLING) != 0
+        is_penalty = (header.flags & STEP_FLAG_PENALTY) != 0
         restored_seq_indices: frozenset[int] = frozenset()
         pt_end = max_slot_end * self.max_pages_per_seq
         np.copyto(self._page_table_np[parity][:max_slot_end], pt_np)
@@ -1581,7 +1664,13 @@ class Qwen35MoeStepRunner:
 
             self.decode_graphs[bucket].replay()
             if is_sampling:
-                self._apply_stochastic_sampling(plan, num_seqs, parity)
+                self._apply_stochastic_sampling(
+                    plan,
+                    num_seqs,
+                    parity,
+                    use_penalty=is_penalty,
+                    sample_slots_np=slot_np,
+                )
                 ext = get_qwen35_cuda_ext()
                 stream_handle = torch.cuda.current_stream(self.device).cuda_stream
                 ext.launch_decode_publish_tokens(
@@ -1742,7 +1831,13 @@ class Qwen35MoeStepRunner:
                     max_q_len=max_q_len,
                 )
                 if is_sampling and num_sample > 0:
-                    self._apply_stochastic_sampling(plan, num_sample, parity)
+                    self._apply_stochastic_sampling(
+                        plan,
+                        num_sample,
+                        parity,
+                        use_penalty=is_penalty,
+                        sample_slots_np=slot_np[sample_rows_np],
+                    )
                 if (self.rank == 0 or header.is_dspark_verify != 0) and num_sample > 0:
                     self._copy_out_io_to_host(num_sample, parity)
 

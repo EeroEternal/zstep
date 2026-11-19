@@ -32,7 +32,7 @@ use std::time::Instant;
 use zs_kv::{BlockLease, BlockPool, CacheGroupKind, PrefixLease, PrefixTree};
 use zs_wire::{
     DECODE_GRAPH_BUCKETS, MAX_DECODE_GRAPH_SEQS, STEP_FLAG_DECODE_ONLY, STEP_FLAG_DEVICE_TOKENS,
-    STEP_FLAG_NEXT_PREPUBLISHED, STEP_FLAG_SAMPLING, StepHeader, StepOpcode,
+    STEP_FLAG_NEXT_PREPUBLISHED, STEP_FLAG_PENALTY, STEP_FLAG_SAMPLING, StepHeader, StepOpcode,
 };
 
 use crate::coordinator::{
@@ -140,10 +140,10 @@ struct HarvestedOutput {
     runner_up_logprob_bits: u32,
 }
 
-/// Per-request sampling configuration forwarded to GPU workers via SHM v4.
+/// Per-request sampling configuration forwarded to GPU workers via SHM v5.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplingParams {
-    /// Softmax temperature (`0.0` = zero-overhead greedy argmax fast path).
+    /// Softmax temperature (`0.0` = zero-overhead greedy argmax fast path when penalties are 0).
     pub temperature: f32,
     /// Nucleus cumulative probability threshold in `(0.0, 1.0]`.
     pub top_p: f32,
@@ -151,6 +151,12 @@ pub struct SamplingParams {
     pub top_k: i32,
     /// Deterministic base PRNG seed for per-step SplitMix64 sampling.
     pub seed: u64,
+    /// OpenAI presence penalty in `[-2.0, 2.0]` (`0.0` = disabled).
+    pub presence_penalty: f32,
+    /// OpenAI frequency penalty in `[-2.0, 2.0]` (`0.0` = disabled).
+    pub frequency_penalty: f32,
+    /// Continue generating past EOS tokens until `max_tokens` or caller stop strings.
+    pub ignore_eos: bool,
 }
 
 impl Default for SamplingParams {
@@ -160,6 +166,9 @@ impl Default for SamplingParams {
             top_p: 1.0,
             top_k: 0,
             seed: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            ignore_eos: false,
         }
     }
 }
@@ -168,6 +177,16 @@ impl SamplingParams {
     #[inline]
     pub fn is_stochastic(self) -> bool {
         self.temperature > 0.0
+    }
+
+    #[inline]
+    pub fn has_penalty(self) -> bool {
+        self.presence_penalty != 0.0 || self.frequency_penalty != 0.0
+    }
+
+    #[inline]
+    pub fn needs_sampler(self) -> bool {
+        self.is_stochastic() || self.has_penalty()
     }
 
     /// Deterministic per-step 64-bit RNG seed for generation index `step_idx` (`0, 1, 2, ...`).
@@ -344,7 +363,7 @@ impl ActiveSequence {
 
     fn refresh_draft_tokens(&mut self, neural_drafts: &[i32], config: &SpeculativeConfig) {
         self.pending_draft_tokens.clear();
-        if self.sampling.is_stochastic() {
+        if self.sampling.needs_sampler() {
             return;
         }
         match config.method {
@@ -1673,7 +1692,8 @@ impl ServingEngine {
         let mut token_cursor = 0usize;
         let mut num_seqs = 0usize;
         let mut num_sample_rows = 0usize;
-        let mut any_stochastic = false;
+        let mut any_sampling = false;
+        let mut any_penalty = false;
 
         for seq in active.iter_mut() {
             let Some((chunk_start, chunk_end)) = prefill_chunk_range(
@@ -1689,8 +1709,13 @@ impl ServingEngine {
                 num_sample_rows += 1;
                 row
             });
-            if sample_row_index.is_some() && seq.sampling.is_stochastic() {
-                any_stochastic = true;
+            if sample_row_index.is_some() {
+                if seq.sampling.needs_sampler() {
+                    any_sampling = true;
+                }
+                if seq.sampling.has_penalty() {
+                    any_penalty = true;
+                }
             }
             self.stage_prefill_row(
                 step_id,
@@ -1766,8 +1791,13 @@ impl ServingEngine {
                 num_sample_rows += 1;
                 row
             });
-            if sample_row_index.is_some() && seq.sampling.is_stochastic() {
-                any_stochastic = true;
+            if sample_row_index.is_some() {
+                if seq.sampling.needs_sampler() {
+                    any_sampling = true;
+                }
+                if seq.sampling.has_penalty() {
+                    any_penalty = true;
+                }
             }
             self.stage_prefill_row(
                 step_id,
@@ -1801,6 +1831,13 @@ impl ServingEngine {
             &self.shadow_page_table,
             &mut self.dirty_pt_slots,
         )?;
+        let mut flags = 0u32;
+        if any_sampling {
+            flags |= STEP_FLAG_SAMPLING;
+        }
+        if any_penalty {
+            flags |= STEP_FLAG_PENALTY;
+        }
         *plan.header_mut()? = StepHeader {
             step_id: AtomicU64::new(0),
             opcode: StepOpcode::NormalStep as u32,
@@ -1811,11 +1848,7 @@ impl ServingEngine {
             decoder_graph_bucket: 0,
             num_sample_rows: num_sample_rows as u32,
             is_dspark_verify: u32::from(self.speculative.method.is_neural()),
-            flags: if any_stochastic {
-                STEP_FLAG_SAMPLING
-            } else {
-                0
-            },
+            flags,
             _reserved: [0; 3],
         };
         Ok(())
@@ -1874,7 +1907,8 @@ impl ServingEngine {
         let mut token_cursor = 0usize;
         let mut num_seqs = 0usize;
         let mut num_sample_rows = 0usize;
-        let mut any_stochastic = false;
+        let mut any_sampling = false;
+        let mut any_penalty = false;
         let has_recurrent_pool = self.recurrent_pool.is_some();
 
         if decode_active_count > 0 {
@@ -1887,6 +1921,8 @@ impl ServingEngine {
             let mut staged_top_p = Vec::with_capacity(decode_active_count);
             let mut staged_top_k = Vec::with_capacity(decode_active_count);
             let mut staged_seeds = Vec::with_capacity(decode_active_count);
+            let mut staged_pres_pen = Vec::with_capacity(decode_active_count);
+            let mut staged_freq_pen = Vec::with_capacity(decode_active_count);
             for seq in active
                 .iter_mut()
                 .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
@@ -1896,8 +1932,11 @@ impl ServingEngine {
                 let pos = start_pos as i32;
                 let next_len = pos + 1;
                 let step_idx = start_pos.saturating_sub(seq.prompt_tokens.len()) as u64 + 1;
-                if seq.sampling.is_stochastic() {
-                    any_stochastic = true;
+                if seq.sampling.needs_sampler() {
+                    any_sampling = true;
+                }
+                if seq.sampling.has_penalty() {
+                    any_penalty = true;
                 }
                 staged_tokens.push(seq.last_token);
                 staged_positions.push(pos);
@@ -1908,6 +1947,8 @@ impl ServingEngine {
                 staged_top_p.push(seq.sampling.top_p);
                 staged_top_k.push(seq.sampling.top_k);
                 staged_seeds.push(seq.sampling.step_seed(step_idx));
+                staged_pres_pen.push(seq.sampling.presence_penalty);
+                staged_freq_pen.push(seq.sampling.frequency_penalty);
                 seq.current_seq_len = next_len as usize;
                 token_cursor += 1;
                 num_seqs += 1;
@@ -1923,6 +1964,9 @@ impl ServingEngine {
             plan.top_p_mut()?[..num_seqs].copy_from_slice(&staged_top_p);
             plan.top_k_mut()?[..num_seqs].copy_from_slice(&staged_top_k);
             plan.rng_seeds_mut()?[..num_seqs].copy_from_slice(&staged_seeds);
+            plan.presence_penalties_mut()?[..num_seqs].copy_from_slice(&staged_pres_pen);
+            plan.frequency_penalties_mut()?[..num_seqs].copy_from_slice(&staged_freq_pen);
+            plan.penalty_reset_mask_mut()?[..num_seqs].fill(0);
             if has_recurrent_pool {
                 plan.compressor_slot_ids_mut()?[..num_seqs].fill(-1);
                 plan.replay_mask_mut()?[..token_cursor].fill(0xFF);
@@ -1971,8 +2015,13 @@ impl ServingEngine {
                 num_sample_rows += 1;
                 row
             });
-            if sample_row_index.is_some() && seq.sampling.is_stochastic() {
-                any_stochastic = true;
+            if sample_row_index.is_some() {
+                if seq.sampling.needs_sampler() {
+                    any_sampling = true;
+                }
+                if seq.sampling.has_penalty() {
+                    any_penalty = true;
+                }
             }
             self.stage_prefill_row(
                 step_id,
@@ -2055,8 +2104,13 @@ impl ServingEngine {
                 num_sample_rows += 1;
                 row
             });
-            if sample_row_index.is_some() && seq.sampling.is_stochastic() {
-                any_stochastic = true;
+            if sample_row_index.is_some() {
+                if seq.sampling.needs_sampler() {
+                    any_sampling = true;
+                }
+                if seq.sampling.has_penalty() {
+                    any_penalty = true;
+                }
             }
             self.stage_prefill_row(
                 step_id,
@@ -2094,8 +2148,11 @@ impl ServingEngine {
         } else {
             0
         };
-        if any_stochastic {
+        if any_sampling {
             flags |= STEP_FLAG_SAMPLING;
+        }
+        if any_penalty {
+            flags |= STEP_FLAG_PENALTY;
         }
 
         let mut plan = self.coordinator.plan_slot_mut(step_id)?;
@@ -2239,6 +2296,9 @@ impl ServingEngine {
             plan.top_p_mut()?[sample_row] = seq.sampling.top_p;
             plan.top_k_mut()?[sample_row] = seq.sampling.top_k;
             plan.rng_seeds_mut()?[sample_row] = seq.sampling.step_seed(0);
+            plan.presence_penalties_mut()?[sample_row] = seq.sampling.presence_penalty;
+            plan.frequency_penalties_mut()?[sample_row] = seq.sampling.frequency_penalty;
+            plan.penalty_reset_mask_mut()?[sample_row] = 1;
         }
         seq.prefilled_tokens = chunk_end;
         seq.current_seq_len = chunk_end;
@@ -2356,10 +2416,13 @@ impl ServingEngine {
         max_pages_per_seq: usize,
         commit_tokens_immediately: bool,
     ) -> Result<()> {
-        let any_stochastic = active.iter().any(|seq| {
-            seq.prefilled_tokens == seq.prompt_tokens.len() && seq.sampling.is_stochastic()
+        let any_sampling = active.iter().any(|seq| {
+            seq.prefilled_tokens == seq.prompt_tokens.len() && seq.sampling.needs_sampler()
         });
-        let has_drafts = !any_stochastic
+        let any_penalty = active.iter().any(|seq| {
+            seq.prefilled_tokens == seq.prompt_tokens.len() && seq.sampling.has_penalty()
+        });
+        let has_drafts = !any_sampling
             && active.iter().any(|seq| {
                 seq.prefilled_tokens == seq.prompt_tokens.len()
                     && !seq.pending_draft_tokens.is_empty()
@@ -2424,10 +2487,12 @@ impl ServingEngine {
         let mut staged_slots = Vec::with_capacity(num_seqs);
         let mut staged_lookbacks = Vec::with_capacity(num_seqs * 3);
         let mut staged_seq_lens = Vec::with_capacity(num_seqs);
-        let mut staged_temps = Vec::with_capacity(if any_stochastic { num_seqs } else { 0 });
-        let mut staged_top_p = Vec::with_capacity(if any_stochastic { num_seqs } else { 0 });
-        let mut staged_top_k = Vec::with_capacity(if any_stochastic { num_seqs } else { 0 });
-        let mut staged_seeds = Vec::with_capacity(if any_stochastic { num_seqs } else { 0 });
+        let mut staged_temps = Vec::with_capacity(if any_sampling { num_seqs } else { 0 });
+        let mut staged_top_p = Vec::with_capacity(if any_sampling { num_seqs } else { 0 });
+        let mut staged_top_k = Vec::with_capacity(if any_sampling { num_seqs } else { 0 });
+        let mut staged_seeds = Vec::with_capacity(if any_sampling { num_seqs } else { 0 });
+        let mut staged_pres_pen = Vec::with_capacity(if any_penalty { num_seqs } else { 0 });
+        let mut staged_freq_pen = Vec::with_capacity(if any_penalty { num_seqs } else { 0 });
         for seq in active
             .iter_mut()
             .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
@@ -2444,12 +2509,16 @@ impl ServingEngine {
             staged_slots.push(seq.slot_lease.id() as i32);
             staged_lookbacks.extend_from_slice(&lookback);
             staged_seq_lens.push(next_len);
-            if any_stochastic {
+            if any_sampling {
                 let step_idx = start_pos.saturating_sub(seq.prompt_tokens.len()) as u64 + 1;
                 staged_temps.push(seq.sampling.temperature);
                 staged_top_p.push(seq.sampling.top_p);
                 staged_top_k.push(seq.sampling.top_k);
                 staged_seeds.push(seq.sampling.step_seed(step_idx));
+                if any_penalty {
+                    staged_pres_pen.push(seq.sampling.presence_penalty);
+                    staged_freq_pen.push(seq.sampling.frequency_penalty);
+                }
             }
         }
 
@@ -2461,11 +2530,16 @@ impl ServingEngine {
         plan.req_slot_ids_mut()?[..num_seqs].copy_from_slice(&staged_slots);
         plan.engram_prev_window_mut()?[..num_seqs * 3].copy_from_slice(&staged_lookbacks);
         plan.seq_lens_mut()?[..num_seqs].copy_from_slice(&staged_seq_lens);
-        if any_stochastic {
+        if any_sampling {
             plan.temperatures_mut()?[..num_seqs].copy_from_slice(&staged_temps);
             plan.top_p_mut()?[..num_seqs].copy_from_slice(&staged_top_p);
             plan.top_k_mut()?[..num_seqs].copy_from_slice(&staged_top_k);
             plan.rng_seeds_mut()?[..num_seqs].copy_from_slice(&staged_seeds);
+            if any_penalty {
+                plan.presence_penalties_mut()?[..num_seqs].copy_from_slice(&staged_pres_pen);
+                plan.frequency_penalties_mut()?[..num_seqs].copy_from_slice(&staged_freq_pen);
+                plan.penalty_reset_mask_mut()?[..num_seqs].fill(0);
+            }
         }
         {
             let sample_rows = plan.sample_row_indices_mut()?;
@@ -2488,8 +2562,11 @@ impl ServingEngine {
             &mut self.dirty_pt_slots,
         )?;
         let mut flags = STEP_FLAG_DECODE_ONLY;
-        if any_stochastic {
+        if any_sampling {
             flags |= STEP_FLAG_SAMPLING;
+        }
+        if any_penalty {
+            flags |= STEP_FLAG_PENALTY;
         }
         *plan.header_mut()? = StepHeader {
             step_id: AtomicU64::new(0),

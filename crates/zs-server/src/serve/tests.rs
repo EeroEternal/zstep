@@ -542,6 +542,10 @@ async fn unsupported_unknown_and_malformed_requests_return_400_json() {
         chat_body("hi", false, r#","top_p":1e-50"#),
         chat_body("hi", false, r#","top_p":1.5"#),
         chat_body("hi", false, r#","top_k":-2"#),
+        chat_body("hi", false, r#","presence_penalty":-2.1"#),
+        chat_body("hi", false, r#","presence_penalty":2.1"#),
+        chat_body("hi", false, r#","frequency_penalty":-2.1"#),
+        chat_body("hi", false, r#","frequency_penalty":2.1"#),
         chat_body("hi", false, r#","max_tokens":0"#),
         chat_body("hi", false, r#","n":2"#),
         chat_body("hi", false, r#","tools":[]"#),
@@ -1279,6 +1283,16 @@ async fn valid_sampling_params_accepted_for_stochastic_and_greedy_requests() {
         ),
         chat_body("hi", false, r#","temperature":1.2,"top_k":-1"#),
         chat_body("hi", false, r#","temperature":2.0,"top_p":0.01,"seed":-7"#),
+        chat_body(
+            "hi",
+            false,
+            r#","temperature":0.0,"presence_penalty":0.5,"frequency_penalty":-0.5,"ignore_eos":true"#,
+        ),
+        chat_body(
+            "hi",
+            false,
+            r#","presence_penalty":2.0,"frequency_penalty":-2.0,"ignore_eos":false"#,
+        ),
     ];
     for body in cases {
         let request_body = body.clone();

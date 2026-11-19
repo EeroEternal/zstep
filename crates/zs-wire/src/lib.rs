@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 /// ASCII `"ZSTEP_V1"` in little-endian (`0x5A53_5445_505F_5631`).
 pub const ZSTEP_SHM_MAGIC: u64 = 0x5A53_5445_505F_5631;
 /// Wire ABI version. Must match exactly between master and GPU workers.
-pub const ZSTEP_PROTOCOL_VERSION: u32 = 4;
+pub const ZSTEP_PROTOCOL_VERSION: u32 = 5;
 /// Maximum GPU workers supported per single-node shared-memory segment.
 pub const MAX_WORKERS: usize = 8;
 /// Token ID sentinel indicating the GPU worker should self-bootstrap the token
@@ -59,9 +59,12 @@ pub const STEP_FLAG_DEVICE_TOKENS: u32 = 1 << 1;
 /// waits for this step's result, so a worker may launch that next step before completing this one.
 pub const STEP_FLAG_NEXT_PREPUBLISHED: u32 = 1 << 2;
 /// [`StepHeader::flags`] bit indicating at least one sampled sequence in this step uses
-/// stochastic GPU sampling (`temperature > 0.0`) via `temperatures`, `top_p`, `top_k`, `rng_seeds`.
+/// stochastic GPU sampling (`temperature > 0.0`) or logit penalties via the GPU sampler.
 /// When unset, workers execute the zero-overhead greedy Top-2 argmax fast path.
 pub const STEP_FLAG_SAMPLING: u32 = 1 << 3;
+/// [`StepHeader::flags`] bit indicating at least one sampled sequence in this step has a
+/// non-zero `presence_penalty` or `frequency_penalty` (always paired with [`STEP_FLAG_SAMPLING`]).
+pub const STEP_FLAG_PENALTY: u32 = 1 << 4;
 /// Canonical CUDA Graph batch buckets for decode-only steps.
 pub const DECODE_GRAPH_BUCKETS: [u32; 11] = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128];
 /// Maximum active decode sequences supported by pre-captured decode CUDA Graphs.
@@ -175,6 +178,9 @@ pub struct StepPlanLayout {
     pub top_p_offset: usize,
     pub top_k_offset: usize,
     pub rng_seeds_offset: usize,
+    pub presence_penalties_offset: usize,
+    pub frequency_penalties_offset: usize,
+    pub penalty_reset_mask_offset: usize,
 }
 
 /// Geometry parameters that size the shared-memory segment.
@@ -304,7 +310,16 @@ impl StepPlanLayout {
         cursor = align_up(cursor + max_b * 4, VEC_ALIGN);
 
         let rng_seeds_offset = cursor;
-        cursor = align_up(cursor + max_b * 8, 4096);
+        cursor = align_up(cursor + max_b * 8, VEC_ALIGN);
+
+        let presence_penalties_offset = cursor;
+        cursor = align_up(cursor + max_b * 4, VEC_ALIGN);
+
+        let frequency_penalties_offset = cursor;
+        cursor = align_up(cursor + max_b * 4, VEC_ALIGN);
+
+        let penalty_reset_mask_offset = cursor;
+        cursor = align_up(cursor + max_b, 4096);
 
         Self {
             total_slot_bytes: cursor,
@@ -325,6 +340,9 @@ impl StepPlanLayout {
             top_p_offset,
             top_k_offset,
             rng_seeds_offset,
+            presence_penalties_offset,
+            frequency_penalties_offset,
+            penalty_reset_mask_offset,
         }
     }
 
@@ -365,6 +383,7 @@ impl StepPlanLayout {
             STEP_FLAG_DEVICE_TOKENS as u64,
             STEP_FLAG_NEXT_PREPUBLISHED as u64,
             STEP_FLAG_SAMPLING as u64,
+            STEP_FLAG_PENALTY as u64,
             MAX_DECODE_GRAPH_SEQS as u64,
             std::mem::offset_of!(ShmSuperblock, total_shm_bytes) as u64,
             std::mem::offset_of!(ShmSuperblock, plan_slot_offsets) as u64,
@@ -398,6 +417,9 @@ impl StepPlanLayout {
             self.top_p_offset as u64,
             self.top_k_offset as u64,
             self.rng_seeds_offset as u64,
+            self.presence_penalties_offset as u64,
+            self.frequency_penalties_offset as u64,
+            self.penalty_reset_mask_offset as u64,
             result_slot_stride as u64,
         ];
 
@@ -759,6 +781,12 @@ mod tests {
                 (layout.top_p_offset, geom.max_seqs as usize * 4),
                 (layout.top_k_offset, geom.max_seqs as usize * 4),
                 (layout.rng_seeds_offset, geom.max_seqs as usize * 8),
+                (layout.presence_penalties_offset, geom.max_seqs as usize * 4),
+                (
+                    layout.frequency_penalties_offset,
+                    geom.max_seqs as usize * 4,
+                ),
+                (layout.penalty_reset_mask_offset, geom.max_seqs as usize),
             ];
             for window in regions.windows(2) {
                 let (prev_off, prev_len) = window[0];
@@ -802,7 +830,7 @@ mod tests {
             page_block_tokens: 128,
             spec_verify_width: 1,
         });
-        assert_eq!(dsv.layout_hash(16384), 0x521b_5e39_3264_2447);
+        assert_eq!(dsv.layout_hash(16384), 0x8ccf_1991_3d8a_7d3e);
 
         let qwen_geom = ShmGeometry::from_vram_budget(VramGeometrySpec {
             world_size: 8,
@@ -817,7 +845,7 @@ mod tests {
         })
         .expect("qwen35 32g vram geometry");
         let qwen = StepPlanLayout::compute(qwen_geom);
-        assert_eq!(qwen.layout_hash(16384), 0xb453_6dcf_0819_cda4);
+        assert_eq!(qwen.layout_hash(16384), 0x4450_af24_74ee_3c85);
 
         let odd = StepPlanLayout::compute(ShmGeometry {
             world_size: 1,
@@ -828,6 +856,6 @@ mod tests {
             page_block_tokens: 64,
             spec_verify_width: 1,
         });
-        assert_eq!(odd.layout_hash(4096), 0x29f9_00a5_6c2b_ca3a);
+        assert_eq!(odd.layout_hash(4096), 0xb538_be80_431c_1a1b);
     }
 }

@@ -26,7 +26,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from zstep_worker.sampler import sample_tp8_logits, splitmix64_uniform_f32  # noqa: E402
+from zstep_worker.sampler import (  # noqa: E402
+    SlotPenaltyState,
+    sample_tp8_logits,
+    splitmix64_uniform_f32,
+)
 
 
 def _splitmix64_py(x: int) -> int:
@@ -219,3 +223,140 @@ def test_max_uniform_never_samples_masked_out_tail_and_nonfinite_falls_back(
     )
     assert out[0].item() in {7, 13}
     assert out[1].item() == 42
+
+
+def test_presence_and_frequency_penalties_with_slot_reset_and_ring_wrap() -> None:
+    """Verify exact OpenAI presence/frequency penalty progression, slot reset, and ring wrap."""
+    state = SlotPenaltyState(max_seqs=4, device=torch.device("cpu"), max_history=3)
+    # Token 2 has highest base logit (3.0), token 0 has 2.2, token 1 has 1.6
+    logits = torch.tensor([[2.2, 1.6, 3.0, 0.0]], dtype=torch.float32)
+    zeros_temp = torch.tensor([0.0], dtype=torch.float32)
+    ones_p = torch.tensor([1.0], dtype=torch.float32)
+    zeros_k = torch.tensor([0], dtype=torch.int32)
+    seeds = torch.tensor([1], dtype=torch.int64)
+    slots = torch.tensor([1], dtype=torch.int64)
+
+    # Step 0 (prefill completion, reset=1): no prior tokens -> picks token 2 (logit 3.0)
+    t0 = sample_tp8_logits(
+        logits,
+        temperatures=zeros_temp,
+        top_p=ones_p,
+        top_k=zeros_k,
+        rng_seeds=seeds,
+        penalty_state=state,
+        slots=slots,
+        reset_mask=torch.tensor([1], dtype=torch.uint8),
+        presence_penalties=torch.tensor([1.0], dtype=torch.float32),
+        frequency_penalties=torch.tensor([0.0], dtype=torch.float32),
+    )
+    assert t0.tolist() == [2]
+
+    # Step 1 (decode, reset=0): token 2 now penalized by presence=1.0 -> 3.0-1.0=2.0 < 2.2 -> picks token 0
+    t1 = sample_tp8_logits(
+        logits,
+        temperatures=zeros_temp,
+        top_p=ones_p,
+        top_k=zeros_k,
+        rng_seeds=seeds,
+        penalty_state=state,
+        slots=slots,
+        reset_mask=torch.tensor([0], dtype=torch.uint8),
+        presence_penalties=torch.tensor([1.0], dtype=torch.float32),
+        frequency_penalties=torch.tensor([0.0], dtype=torch.float32),
+    )
+    assert t1.tolist() == [0]
+
+    # Step 2 (frequency penalty=0.5, presence=0.0): token 2 (count=1 -> 2.5) beats token 0 (count=1 -> 1.7)
+    t2 = sample_tp8_logits(
+        logits,
+        temperatures=zeros_temp,
+        top_p=ones_p,
+        top_k=zeros_k,
+        rng_seeds=seeds,
+        penalty_state=state,
+        slots=slots,
+        reset_mask=torch.tensor([0], dtype=torch.uint8),
+        presence_penalties=torch.tensor([0.0], dtype=torch.float32),
+        frequency_penalties=torch.tensor([0.5], dtype=torch.float32),
+    )
+    assert t2.tolist() == [2]
+
+    # Step 3 (frequency penalty=0.5): token 2 now count=2 -> 3.0 - 1.0 = 2.0 > token 0 (2.2 - 0.5 = 1.7) -> token 2
+    # And write cursor wraps cleanly modulo max_history=3 without out-of-bounds!
+    t3 = sample_tp8_logits(
+        logits,
+        temperatures=zeros_temp,
+        top_p=ones_p,
+        top_k=zeros_k,
+        rng_seeds=seeds,
+        penalty_state=state,
+        slots=slots,
+        reset_mask=torch.tensor([0], dtype=torch.uint8),
+        presence_penalties=torch.tensor([0.0], dtype=torch.float32),
+        frequency_penalties=torch.tensor([0.5], dtype=torch.float32),
+    )
+    assert t3.tolist() == [2]
+
+    # Slot reuse with reset=1 clears history completely -> picks token 2 again even under strong penalty
+    t_reset = sample_tp8_logits(
+        logits,
+        temperatures=zeros_temp,
+        top_p=ones_p,
+        top_k=zeros_k,
+        rng_seeds=seeds,
+        penalty_state=state,
+        slots=slots,
+        reset_mask=torch.tensor([1], dtype=torch.uint8),
+        presence_penalties=torch.tensor([2.0], dtype=torch.float32),
+        frequency_penalties=torch.tensor([2.0], dtype=torch.float32),
+    )
+    assert t_reset.tolist() == [2]
+
+    # Mixed batch: row 0 (slot 0, unpenalized), row 1 (slot 1, positive penalty),
+    # row 2 (slot 2, negative penalty encouraging repetition)
+    mix_logits = torch.tensor(
+        [
+            [2.0, 3.0, 1.0, 0.0],  # slot 0: argmax = 1
+            [2.2, 1.6, 3.0, 0.0],  # slot 1: already has token 2 recorded from t_reset
+            [2.0, 2.5, 1.0, 0.0],  # slot 2: reset=1 first, then negative penalty reinforces token 1
+        ],
+        dtype=torch.float32,
+    )
+    mix_slots = torch.tensor([0, 1, 2], dtype=torch.int64)
+    mix_out = sample_tp8_logits(
+        mix_logits,
+        temperatures=torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32),
+        top_p=torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32),
+        top_k=torch.tensor([0, 0, 0], dtype=torch.int32),
+        rng_seeds=torch.tensor([1, 2, 3], dtype=torch.int64),
+        penalty_state=state,
+        slots=mix_slots,
+        reset_mask=torch.tensor([1, 0, 1], dtype=torch.uint8),
+        presence_penalties=torch.tensor([0.0, 1.0, -1.5], dtype=torch.float32),
+        frequency_penalties=torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32),
+    )
+    # Row 0 unpenalized -> 1; Row 1 penalized token 2 (3.0-1.0=2.0 < 2.2) -> 0; Row 2 fresh -> 1
+    assert mix_out.tolist() == [1, 0, 1]
+
+    # Next step with slot 2 having token 1 boosted by negative presence_penalty=-1.5 (+1.5 to token 1)
+    mix_logits_step2 = torch.tensor(
+        [
+            [2.0, 3.0, 1.0, 0.0],  # slot 0 unpenalized -> still 1
+            [2.2, 1.6, 3.0, 0.0],  # slot 1 has {2, 0} penalized -> 2.0 vs 1.2 vs 1.6 -> 2
+            [3.5, 2.5, 1.0, 0.0],  # slot 2 token 1 boosted: 2.5 - (-1.5) = 4.0 > 3.5 -> 1
+        ],
+        dtype=torch.float32,
+    )
+    mix_out2 = sample_tp8_logits(
+        mix_logits_step2,
+        temperatures=torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32),
+        top_p=torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32),
+        top_k=torch.tensor([0, 0, 0], dtype=torch.int32),
+        rng_seeds=torch.tensor([4, 5, 6], dtype=torch.int64),
+        penalty_state=state,
+        slots=mix_slots,
+        reset_mask=torch.tensor([0, 0, 0], dtype=torch.uint8),
+        presence_penalties=torch.tensor([0.0, 1.0, -1.5], dtype=torch.float32),
+        frequency_penalties=torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32),
+    )
+    assert mix_out2.tolist() == [1, 2, 1]

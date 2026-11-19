@@ -33,7 +33,7 @@ from typing import Any
 import numpy as np
 
 ZSTEP_SHM_MAGIC: int = 0x5A53_5445_505F_5631
-ZSTEP_PROTOCOL_VERSION: int = 4
+ZSTEP_PROTOCOL_VERSION: int = 5
 SHM_SUPERBLOCK_STRUCT_BYTES: int = 128
 SHM_SUPERBLOCK_REGION_BYTES: int = 4096
 SUPERBLOCK_TOTAL_BYTES_OFFSET: int = 48
@@ -70,6 +70,7 @@ STEP_FLAG_DECODE_ONLY: int = 1
 STEP_FLAG_DEVICE_TOKENS: int = 1 << 1
 STEP_FLAG_NEXT_PREPUBLISHED: int = 1 << 2
 STEP_FLAG_SAMPLING: int = 1 << 3
+STEP_FLAG_PENALTY: int = 1 << 4
 DECODE_GRAPH_BUCKETS: tuple[int, ...] = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128)
 MAX_DECODE_GRAPH_SEQS: int = 128
 
@@ -178,6 +179,9 @@ class StepPlanLayout:
     top_p_offset: int
     top_k_offset: int
     rng_seeds_offset: int
+    presence_penalties_offset: int
+    frequency_penalties_offset: int
+    penalty_reset_mask_offset: int
 
     @classmethod
     def compute(cls, g: ShmGeometry) -> StepPlanLayout:
@@ -235,7 +239,16 @@ class StepPlanLayout:
         cursor = _align_up(cursor + max_b * 4, VEC_ALIGN)
 
         rng_seeds_offset = cursor
-        cursor = _align_up(cursor + max_b * 8, 4096)
+        cursor = _align_up(cursor + max_b * 8, VEC_ALIGN)
+
+        presence_penalties_offset = cursor
+        cursor = _align_up(cursor + max_b * 4, VEC_ALIGN)
+
+        frequency_penalties_offset = cursor
+        cursor = _align_up(cursor + max_b * 4, VEC_ALIGN)
+
+        penalty_reset_mask_offset = cursor
+        cursor = _align_up(cursor + max_b, 4096)
 
         return cls(
             total_slot_bytes=cursor,
@@ -256,6 +269,9 @@ class StepPlanLayout:
             top_p_offset=top_p_offset,
             top_k_offset=top_k_offset,
             rng_seeds_offset=rng_seeds_offset,
+            presence_penalties_offset=presence_penalties_offset,
+            frequency_penalties_offset=frequency_penalties_offset,
+            penalty_reset_mask_offset=penalty_reset_mask_offset,
         )
 
 
@@ -292,6 +308,7 @@ def compute_layout_hash(layout: StepPlanLayout, result_slot_stride: int) -> int:
         STEP_FLAG_DEVICE_TOKENS,
         STEP_FLAG_NEXT_PREPUBLISHED,
         STEP_FLAG_SAMPLING,
+        STEP_FLAG_PENALTY,
         MAX_DECODE_GRAPH_SEQS,
         SUPERBLOCK_TOTAL_BYTES_OFFSET,
         SUPERBLOCK_PLAN_OFFSETS_OFFSET,
@@ -325,6 +342,9 @@ def compute_layout_hash(layout: StepPlanLayout, result_slot_stride: int) -> int:
         layout.top_p_offset,
         layout.top_k_offset,
         layout.rng_seeds_offset,
+        layout.presence_penalties_offset,
+        layout.frequency_penalties_offset,
+        layout.penalty_reset_mask_offset,
         result_slot_stride,
     )
     for word in words:
@@ -726,6 +746,27 @@ class StepPlanView:
             offset=self.base + self.layout.rng_seeds_offset,
             count=num_seqs,
             dtype=np.dtype(np.uint64),
+        )
+
+    def presence_penalties(self, num_seqs: int) -> np.ndarray:
+        return self.bridge.array(
+            offset=self.base + self.layout.presence_penalties_offset,
+            count=num_seqs,
+            dtype=np.dtype(np.float32),
+        )
+
+    def frequency_penalties(self, num_seqs: int) -> np.ndarray:
+        return self.bridge.array(
+            offset=self.base + self.layout.frequency_penalties_offset,
+            count=num_seqs,
+            dtype=np.dtype(np.float32),
+        )
+
+    def penalty_reset_mask(self, num_seqs: int) -> np.ndarray:
+        return self.bridge.array(
+            offset=self.base + self.layout.penalty_reset_mask_offset,
+            count=num_seqs,
+            dtype=np.dtype(np.uint8),
         )
 
 

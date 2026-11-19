@@ -60,12 +60,13 @@ from zstep_worker.kernels_sm120.shm_allreduce import (
     get_host_mapped_allreduce_extension,
 )
 from zstep_worker.p2p_probe import P2pTopologyReport, configure_adaptive_p2p_env
-from zstep_worker.sampler import sample_tp8_logits
+from zstep_worker.sampler import SlotPenaltyState, sample_tp8_logits
 from zstep_worker.spec_decode import seq_results, verify_batch
 from zstep_worker.shm_bridge import (
     DECODE_GRAPH_BUCKETS,
     STEP_FLAG_DECODE_ONLY,
     STEP_FLAG_DEVICE_TOKENS,
+    STEP_FLAG_PENALTY,
     STEP_FLAG_SAMPLING,
     SeqResult,
     ShmBridge,
@@ -798,6 +799,47 @@ class DeepSeekV41StepRunner:
         self.sample_seed_gpu: torch.Tensor = torch.zeros(
             ms, dtype=torch.int64, device=self.device
         )
+        self.sample_pres_pen_cpu: torch.Tensor = torch.zeros(
+            (2, ms), dtype=torch.float32, pin_memory=True
+        )
+        self.sample_freq_pen_cpu: torch.Tensor = torch.zeros(
+            (2, ms), dtype=torch.float32, pin_memory=True
+        )
+        self.sample_reset_cpu: torch.Tensor = torch.zeros(
+            (2, ms), dtype=torch.uint8, pin_memory=True
+        )
+        self.sample_slots_cpu: torch.Tensor = torch.zeros(
+            (2, ms), dtype=torch.int64, pin_memory=True
+        )
+        self._sample_pres_pen_np: list[np.ndarray] = [
+            self.sample_pres_pen_cpu[0].numpy(),
+            self.sample_pres_pen_cpu[1].numpy(),
+        ]
+        self._sample_freq_pen_np: list[np.ndarray] = [
+            self.sample_freq_pen_cpu[0].numpy(),
+            self.sample_freq_pen_cpu[1].numpy(),
+        ]
+        self._sample_reset_np: list[np.ndarray] = [
+            self.sample_reset_cpu[0].numpy(),
+            self.sample_reset_cpu[1].numpy(),
+        ]
+        self._sample_slots_np: list[np.ndarray] = [
+            self.sample_slots_cpu[0].numpy(),
+            self.sample_slots_cpu[1].numpy(),
+        ]
+        self.sample_pres_pen_gpu: torch.Tensor = torch.zeros(
+            ms, dtype=torch.float32, device=self.device
+        )
+        self.sample_freq_pen_gpu: torch.Tensor = torch.zeros(
+            ms, dtype=torch.float32, device=self.device
+        )
+        self.sample_reset_gpu: torch.Tensor = torch.zeros(
+            ms, dtype=torch.uint8, device=self.device
+        )
+        self.sample_slots_gpu: torch.Tensor = torch.zeros(
+            ms, dtype=torch.int64, device=self.device
+        )
+        self._penalty_state: SlotPenaltyState | None = None
         self.decode_graph_max_seq_len: int = (
             min(self.max_model_len, SM120_DSA_CANDIDATE_COVER_TOKENS)
             if self.b12x_summary.dsa_decode_enabled
@@ -1169,6 +1211,9 @@ class DeepSeekV41StepRunner:
         local_logits: torch.Tensor,
         count: int,
         parity: int,
+        *,
+        use_penalty: bool = False,
+        sample_slots_np: np.ndarray | None = None,
     ) -> None:
         np.copyto(self._sample_temp_np[parity][:count], plan.temperatures(count))
         np.copyto(self._sample_top_p_np[parity][:count], plan.top_p(count))
@@ -1186,6 +1231,35 @@ class DeepSeekV41StepRunner:
         self.sample_seed_gpu[:count].copy_(
             self.sample_seed_cpu[parity, :count], non_blocking=True
         )
+        penalty_state: SlotPenaltyState | None = None
+        slots_gpu: torch.Tensor | None = None
+        reset_gpu: torch.Tensor | None = None
+        pres_gpu: torch.Tensor | None = None
+        freq_gpu: torch.Tensor | None = None
+        if use_penalty and sample_slots_np is not None:
+            if self._penalty_state is None:
+                self._penalty_state = SlotPenaltyState(self.max_seqs, device=self.device)
+            penalty_state = self._penalty_state
+            np.copyto(self._sample_pres_pen_np[parity][:count], plan.presence_penalties(count))
+            np.copyto(self._sample_freq_pen_np[parity][:count], plan.frequency_penalties(count))
+            np.copyto(self._sample_reset_np[parity][:count], plan.penalty_reset_mask(count))
+            self._sample_slots_np[parity][:count] = sample_slots_np
+            self.sample_pres_pen_gpu[:count].copy_(
+                self.sample_pres_pen_cpu[parity, :count], non_blocking=True
+            )
+            self.sample_freq_pen_gpu[:count].copy_(
+                self.sample_freq_pen_cpu[parity, :count], non_blocking=True
+            )
+            self.sample_reset_gpu[:count].copy_(
+                self.sample_reset_cpu[parity, :count], non_blocking=True
+            )
+            self.sample_slots_gpu[:count].copy_(
+                self.sample_slots_cpu[parity, :count], non_blocking=True
+            )
+            slots_gpu = self.sample_slots_gpu[:count]
+            reset_gpu = self.sample_reset_gpu[:count]
+            pres_gpu = self.sample_pres_pen_gpu[:count]
+            freq_gpu = self.sample_freq_pen_gpu[:count]
         sampled = sample_tp8_logits(
             local_logits,
             temperatures=self.sample_temp_gpu[:count],
@@ -1195,6 +1269,11 @@ class DeepSeekV41StepRunner:
             tp_group=self.tp_device_group,
             world_size=self.world_size,
             vocab_size=self.vocab_size,
+            penalty_state=penalty_state,
+            slots=slots_gpu,
+            reset_mask=reset_gpu,
+            presence_penalties=pres_gpu,
+            frequency_penalties=freq_gpu,
         )
         self.out_tokens_gpu[:count, 0].copy_(sampled)
 
@@ -1786,6 +1865,7 @@ class DeepSeekV41StepRunner:
             (header.flags & STEP_FLAG_DECODE_ONLY) != 0 and not is_spec_step
         )
         is_sampling = (header.flags & STEP_FLAG_SAMPLING) != 0
+        is_penalty = (header.flags & STEP_FLAG_PENALTY) != 0
         use_dev_tok = is_decode and (header.flags & STEP_FLAG_DEVICE_TOKENS) != 0
         width = self.num_spec_tokens + 1
         q_lens = q_start_np[1:] - q_start_np[:-1]
@@ -1913,7 +1993,14 @@ class DeepSeekV41StepRunner:
                 local_logits = self.model.compute_logits_local(
                     self.decode_hidden_gpu[:num_seqs]
                 )
-                self._apply_stochastic_sampling(plan, local_logits, num_seqs, parity)
+                self._apply_stochastic_sampling(
+                    plan,
+                    local_logits,
+                    num_seqs,
+                    parity,
+                    use_penalty=is_penalty,
+                    sample_slots_np=slot_np,
+                )
             self._commit_decode_slot_state(num_seqs)
 
             if self.rank == 0:
@@ -2201,7 +2288,12 @@ class DeepSeekV41StepRunner:
                     )
                     if is_sampling and local_logits is not None:
                         self._apply_stochastic_sampling(
-                            plan, local_logits, num_sample, parity
+                            plan,
+                            local_logits,
+                            num_sample,
+                            parity,
+                            use_penalty=is_penalty,
+                            sample_slots_np=slot_np[sample_rows_np],
                         )
             if is_decode:
                 self._commit_decode_slot_state(num_seqs)

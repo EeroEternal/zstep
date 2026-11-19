@@ -1296,8 +1296,18 @@ fn sampling_params_step_seed_is_deterministic_and_suppresses_spec_drafts() {
         top_p: 0.9,
         top_k: 40,
         seed: 42,
+        ..SamplingParams::default()
     };
     assert!(stochastic.is_stochastic());
+    assert!(!stochastic.has_penalty());
+    assert!(stochastic.needs_sampler());
+    let penalized_greedy = SamplingParams {
+        presence_penalty: 0.5,
+        ..SamplingParams::default()
+    };
+    assert!(!penalized_greedy.is_stochastic());
+    assert!(penalized_greedy.has_penalty());
+    assert!(penalized_greedy.needs_sampler());
     assert_eq!(stochastic.step_seed(0), stochastic.step_seed(0));
     assert_ne!(stochastic.step_seed(0), stochastic.step_seed(1));
     assert_ne!(stochastic.step_seed(1), stochastic.step_seed(2));
