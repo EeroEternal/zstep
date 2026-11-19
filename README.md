@@ -88,6 +88,7 @@ zstep/
 │   │   ├── spec_decode.py            # Greedy/varlen verification & N-gram suffix drafter
 │   │   ├── models/                   # DeepSeek-V4.1 (+ DSpark) & Qwen3.5-MoE (+ MTP) runners
 │   │   └── kernels_sm120/            # shm_v5 / shm_v5_pxb, b12x, 1-pass mHC, GDN/GQA/MoE
+│   │       └── csrc/                 # Standalone C++/CUDA translation units (.cpp / .cu)
 │   └── tests/                        # CPU parity/AST/env/P2P/spec suites & 8-GPU SM120 harnesses
 └── docs/
     ├── benchmark.md                  # Master SM120 benchmark report (non-P2P + adaptive P2P)
