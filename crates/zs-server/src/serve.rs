@@ -1558,6 +1558,7 @@ fn launch_engine(
                 return;
             }
             engine.set_max_mixed_step_tokens(mixed);
+            engine.set_prefill_scheduling_policy(args.prefill_policy);
             engine.set_device_token_overlap(
                 std::env::var("ZSTEP_DECODE_DEVICE_TOKENS").map_or(true, |v| v != "0"),
             );

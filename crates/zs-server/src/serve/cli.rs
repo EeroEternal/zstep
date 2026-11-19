@@ -26,6 +26,10 @@ Usage: zstep serve --model-dir <PATH> [OPTIONS]\n\
   --enable-prefix-caching        Enable Automatic Prefix Caching (APC, default: enabled)\n\
   --no-enable-prefix-caching     Disable Automatic Prefix Caching (APC)\n\
   --max-waiting-requests N       Bounded HTTP waiting queue depth (default: 1024)\n\
+  --prefill-policy MODE          Waiting prefill policy: srpt | fifo (default: srpt)\n\
+  --prefill-starvation-cap-ms N  Max wait (ms) before long prompt preempts SRPT (default: 60000, 0=off)\n\
+  --dynamic-prefill-budget       Scale mixed-step budget from --max-mixed-step-tokens to --max-step-tokens (default on srpt)\n\
+  --no-dynamic-prefill-budget    Keep mixed-step prefill budget fixed at --max-mixed-step-tokens\n\
   --drain-timeout-secs N         SIGTERM drain grace period in seconds (default: 30)\n\
   --python PATH                  Python executable for GPU workers\n\
   --worker-root PATH             Python zstep_worker package root\n\
@@ -91,6 +95,7 @@ pub struct ServeArgs {
     pub ready_timeout: Duration,
     pub step_timeout: Duration,
     pub max_mixed_step_tokens: Option<usize>,
+    pub prefill_policy: zs_scheduler::PrefillSchedulingPolicy,
     pub allreduce_blocks: u32,
     pub allreduce_threads: u32,
     pub speculative: SpeculativeConfig,
@@ -151,6 +156,8 @@ pub fn validate_known_flags(argv: &[String]) -> Result<BTreeMap<String, String>,
         "--ready-timeout-secs",
         "--step-timeout-secs",
         "--max-mixed-step-tokens",
+        "--prefill-policy",
+        "--prefill-starvation-cap-ms",
         "--allreduce-blocks",
         "--allreduce-threads",
         "--speculative-method",
@@ -163,6 +170,8 @@ pub fn validate_known_flags(argv: &[String]) -> Result<BTreeMap<String, String>,
         "--no-enable-prefix-caching",
         "--allow-remote-metrics",
         "--no-allow-remote-metrics",
+        "--dynamic-prefill-budget",
+        "--no-dynamic-prefill-budget",
     ];
     let mut values = BTreeMap::new();
     let mut index = 0;
@@ -185,6 +194,16 @@ pub fn validate_known_flags(argv: &[String]) -> Result<BTreeMap<String, String>,
         }
         if flag == "--no-allow-remote-metrics" {
             values.insert("--allow-remote-metrics".to_owned(), "false".to_owned());
+            index += 1;
+            continue;
+        }
+        if flag == "--dynamic-prefill-budget" {
+            values.insert("--dynamic-prefill-budget".to_owned(), "true".to_owned());
+            index += 1;
+            continue;
+        }
+        if flag == "--no-dynamic-prefill-budget" {
+            values.insert("--dynamic-prefill-budget".to_owned(), "false".to_owned());
             index += 1;
             continue;
         }
@@ -335,6 +354,30 @@ impl ServeArgs {
         if max_waiting_requests == 0 {
             return Err("--max-waiting-requests must be positive".to_owned());
         }
+        let prefill_policy = {
+            let mut policy = match values
+                .get("--prefill-policy")
+                .map(String::as_str)
+                .unwrap_or("srpt")
+            {
+                "srpt" => zs_scheduler::PrefillSchedulingPolicy::default(),
+                "fifo" => zs_scheduler::PrefillSchedulingPolicy::fifo(),
+                other => {
+                    return Err(format!(
+                        "unsupported --prefill-policy `{other}` (expected `srpt` or `fifo`)"
+                    ));
+                }
+            };
+            if let Some(raw) = values.get("--prefill-starvation-cap-ms") {
+                policy.starvation_cap_ms = raw.parse::<u64>().map_err(|_| {
+                    format!("invalid value `{raw}` for --prefill-starvation-cap-ms")
+                })?;
+            }
+            if let Some(raw) = values.get("--dynamic-prefill-budget") {
+                policy.dynamic_budget_enabled = raw == "true";
+            }
+            policy
+        };
         let drain_timeout_secs: u64 = parse_map_number(&values, "--drain-timeout-secs", 30)?;
         let ready_timeout_secs: u64 = parse_map_number(&values, "--ready-timeout-secs", 1800u64)?;
         let step_timeout_secs: u64 = parse_map_number(&values, "--step-timeout-secs", 300u64)?;
@@ -470,6 +513,7 @@ impl ServeArgs {
                 .map(|raw| raw.parse::<usize>())
                 .transpose()
                 .map_err(|_| "--max-mixed-step-tokens must be an integer".to_owned())?,
+            prefill_policy,
             allreduce_blocks: parse_map_number(&values, "--allreduce-blocks", 8u32)?,
             allreduce_threads: parse_map_number(&values, "--allreduce-threads", 256u32)?,
             speculative,

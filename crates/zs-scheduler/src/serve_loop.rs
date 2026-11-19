@@ -1008,11 +1008,13 @@ fn online_step(
     let page_block_tokens = geometry.page_block_tokens as usize;
     let max_pages_per_seq = geometry.max_pages_per_seq as usize;
 
+    let step_now = Instant::now();
     let waiting_admissible = engine.front_request_admissible(
         &online.active,
         &online.waiting,
         max_seqs,
         page_block_tokens,
+        step_now,
     );
 
     if online.published_ahead.is_none() && online.active.is_empty() && !waiting_admissible {
@@ -1064,6 +1066,7 @@ fn online_step(
                     &mut online.waiting,
                     page_block_tokens,
                     max_pages_per_seq,
+                    step_now,
                 )? {
                     MixedStepOutcome::MixedOrPrefill { .. } => {
                         online.consecutive_prefills += 1;
@@ -1105,6 +1108,7 @@ fn online_step(
                     &mut online.waiting,
                     page_block_tokens,
                     max_pages_per_seq,
+                    step_now,
                 )?;
                 online.consecutive_prefills += 1;
             } else {
@@ -1126,6 +1130,7 @@ fn online_step(
         &online.waiting,
         max_seqs,
         page_block_tokens,
+        Instant::now(),
     );
     let has_prefix_cache = engine.has_prefix_cache();
     let stop_overlap = !online.draining_finished.is_empty()
