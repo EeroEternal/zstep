@@ -31,6 +31,9 @@ gpu = [
 [tool.setuptools.packages.find]
 include = ["zstep_worker*"]
 
+[tool.setuptools.package-data]
+"zstep_worker.kernels_sm120" = ["csrc/*.cpp", "csrc/*.cu", "csrc/*.cuh"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 
