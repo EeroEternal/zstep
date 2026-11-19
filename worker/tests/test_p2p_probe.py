@@ -584,7 +584,6 @@ def _pxb_8gpu_worker(rank: int, init_file: str, shm_name: str) -> None:
                                 comm.pxb_slot_stride_bytes if comm._pxb_enabled else 0,
                                 1e-6,
                                 write_aux,
-                                0,
                                 rank,
                                 flag_base,
                                 stream,
@@ -622,23 +621,24 @@ def _pxb_8gpu_worker(rank: int, init_file: str, shm_name: str) -> None:
                     after_c8 = comm.control[flag_base : flag_base + 8].cpu().tolist()
                     assert after_c8 == [base_c8[0] + c8_calls] * 8
 
-        # Verify `FP12+BFP7` (`pxb_bfp` modes 1 & 2) accuracy, in-place safety, and
-        # 0-ULP cross-rank bit-identity across all 8 ranks.
+        # Verify `FP12+BFP7` (`pxb_bfp` modes 1 & 2, plus automatic `M > 1024` switch to mode 2)
+        # accuracy, sub-threshold / non-finite edge cases, in-place safety, and 0-ULP cross-rank
+        # bit-identity across all 8 ranks.
         for bfp_mode in (1, 2):
             with HostMappedShmAllReduce(
                 name=f"{shm_name}_bfp_{bfp_mode}",
                 rank=rank,
                 world_size=8,
-                capacity_elements=1024 * 5120,
+                capacity_elements=1536 * 5120,
                 blocks=32,
                 threads=512,
                 exchange_group=dist.group.WORLD,
                 enable_pxb_p2p=True,
-                pxb_max_elements=1024 * 5120,
+                pxb_max_elements=1536 * 5120,
                 enable_pxb_bfp=bfp_mode,
             ) as comm_bfp:
                 assert comm_bfp._pxb_bfp == bfp_mode
-                for m, h in ((8, 5120), (96, 5120), (256, 5120), (512, 5120)):
+                for m, h in ((8, 5120), (96, 5120), (256, 5120), (512, 5120), (1280, 5120)):
                     torch.manual_seed(3100 + bfp_mode * 101 + m * 11 + rank)
                     x = torch.randn((m, h), dtype=torch.bfloat16, device=device) * 0.125
                     ref_cpu = x.float().cpu()
@@ -683,6 +683,64 @@ def _pxb_8gpu_worker(rank: int, init_file: str, shm_name: str) -> None:
                     dist.all_gather(gathered_norm, norm_out.cpu(), group=dist.group.WORLD)
                     for peer_r in range(1, 8):
                         assert torch.equal(gathered_norm[0], gathered_norm[peer_r])
+
+                # Sub-block edge cases (`m=16, h=5120` -> `num_vecs=10240 >= 4097` PXB 2-shot):
+                # tile 4 packet archetypes across all 5,120 16-element packets so both owner and
+                # cross-SHM non-owner slices exercise every branch.
+                edge_pkts = torch.zeros((4, 16), dtype=torch.float32)
+                # Packet 0: `big_max = 1e-34` in sub-block 0, exact `0.0` in sub-block 1
+                edge_pkts[0, 0] = 1.0e-34
+                edge_pkts[0, 1] = -1.0e-34
+                # Packet 1: sub-threshold `1e-37` in sub-block 0, `big_max = 1e-34` in sub-block 1
+                edge_pkts[1, :8] = 1.0e-37
+                edge_pkts[1, 8] = 1.0e-34
+                # Packet 2: dual sub-block `±Inf` (`+Inf` in sub-block 0, `-Inf` in sub-block 1)
+                edge_pkts[2, 0] = float("inf")
+                edge_pkts[2, 8] = float("-inf")
+                # Packet 3: `+Inf` on pair 0 vs `-Inf` on pair 2 (`-> NaN`), plus explicit `NaN` on
+                # lane 3 while lane 4 remains `0.0` (must not pollute neighboring lanes).
+                if rank == 0:
+                    edge_pkts[3, 0] = float("inf")
+                elif rank == 4:
+                    edge_pkts[3, 0] = float("-inf")
+                edge_pkts[3, 3] = float("nan")
+
+                x_edge = (
+                    edge_pkts.to(torch.bfloat16)
+                    .repeat(1280, 1)
+                    .reshape(16, 5120)
+                    .to(device=device)
+                    .contiguous()
+                )
+                out_edge = torch.empty_like(x_edge)
+                comm_bfp.all_reduce(x_edge, output=out_edge)
+                pkts_out = out_edge.cpu().reshape(1280, 4, 16).float()
+
+                # Packet 0: sub-block 1 zeros must remain exact 0.0 (never NaN)
+                assert not torch.isnan(pkts_out[:, 0, :]).any()
+                assert float(pkts_out[:, 0, 8:].abs().max().item()) == 0.0
+                assert float((pkts_out[:, 0, 0] - 8.0e-34).abs().max().item()) < 2.0e-35
+                # Packet 1: sub-threshold `<= 1e-36` sub-block flushes to 0 (no `inv_sml` overflow)
+                assert not torch.isnan(pkts_out[:, 1, :]).any()
+                assert float(pkts_out[:, 1, :8].abs().max().item()) <= 2.0e-36
+                assert float((pkts_out[:, 1, 8] - 8.0e-34).abs().max().item()) < 2.0e-35
+                # Packet 2: both `+Inf` and `-Inf` sub-blocks stay infinite
+                assert bool(torch.isposinf(pkts_out[:, 2, 0]).all())
+                assert bool(torch.isneginf(pkts_out[:, 2, 8]).all())
+                assert float(pkts_out[:, 2, 1:8].abs().max().item()) == 0.0
+                # Packet 3: `+Inf + (-Inf)` and `NaN` yield `NaN` without polluting lane 4
+                assert bool(torch.isnan(pkts_out[:, 3, 0]).all())
+                assert bool(torch.isnan(pkts_out[:, 3, 3]).all())
+                assert float(pkts_out[:, 3, 4].abs().max().item()) == 0.0
+
+                gathered_edge = [torch.empty((16, 5120), dtype=torch.uint16) for _ in range(8)]
+                dist.all_gather(
+                    gathered_edge, out_edge.cpu().view(torch.uint16), group=dist.group.WORLD
+                )
+                for peer_r in range(1, 8):
+                    assert torch.equal(gathered_edge[0], gathered_edge[peer_r]), (
+                        f"edge-case bit-identity drift (bfp={bfp_mode}) rank {peer_r}"
+                    )
     finally:
         dist.destroy_process_group()
 

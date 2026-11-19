@@ -2032,7 +2032,6 @@ def _prepare_sm120_mhc_overlap(
                             ar.pxb_slot_stride_bytes if ar._pxb_enabled else 0,
                             float(norm_eps),
                             1 if capture_aux else 0,
-                            0,
                             ar.rank,
                             flag_base,
                             main_s.cuda_stream,

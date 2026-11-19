@@ -188,7 +188,6 @@ void launch_ar_mhc_cluster8_cuda(
     int rows,
     float norm_eps,
     int write_aux,
-    int post_only,
     int rank,
     int flag_base,
     std::uintptr_t stream_handle);
@@ -697,7 +696,6 @@ void launch_ar_mhc_cluster8(
     int64_t pxb_slot_stride_bytes,
     double norm_eps,
     int64_t write_aux,
-    int64_t post_only,
     int64_t rank,
     int64_t flag_base,
     std::uintptr_t stream_handle) {
@@ -735,40 +733,38 @@ void launch_ar_mhc_cluster8(
         comb_mix.is_cuda() && comb_mix.scalar_type() == at::kFloat &&
         comb_mix.is_contiguous() && comb_mix.numel() == rows * 16,
         "comb_mix must be contiguous FP32 CUDA tensor of numel rows * 16");
-    if (!post_only) {
+    TORCH_CHECK(
+        pre_mix.is_cuda() && pre_mix.scalar_type() == at::kFloat &&
+        pre_mix.is_contiguous() && pre_mix.numel() == rows * 4,
+        "pre_mix must be contiguous FP32 CUDA tensor of numel rows * 4");
+    TORCH_CHECK(
+        norm_weight.is_cuda() && norm_weight.scalar_type() == at::kBFloat16 &&
+        norm_weight.is_contiguous() && norm_weight.numel() == 5120 &&
+        reinterpret_cast<std::uintptr_t>(norm_weight.data_ptr()) % 16 == 0,
+        "norm_weight must be 16B-aligned contiguous BF16 CUDA tensor of numel 5120");
+    TORCH_CHECK(
+        layer_input.is_cuda() && layer_input.scalar_type() == at::kBFloat16 &&
+        layer_input.is_contiguous() && layer_input.dim() == 2 &&
+        layer_input.size(0) == rows && layer_input.size(1) == 5120 &&
+        reinterpret_cast<std::uintptr_t>(layer_input.data_ptr()) % 16 == 0,
+        "layer_input must be 16B-aligned contiguous BF16 CUDA tensor [rows, 5120]");
+    if (write_aux) {
         TORCH_CHECK(
-            pre_mix.is_cuda() && pre_mix.scalar_type() == at::kFloat &&
-            pre_mix.is_contiguous() && pre_mix.numel() == rows * 4,
-            "pre_mix must be contiguous FP32 CUDA tensor of numel rows * 4");
-        TORCH_CHECK(
-            norm_weight.is_cuda() && norm_weight.scalar_type() == at::kBFloat16 &&
-            norm_weight.is_contiguous() && norm_weight.numel() == 5120 &&
-            reinterpret_cast<std::uintptr_t>(norm_weight.data_ptr()) % 16 == 0,
-            "norm_weight must be 16B-aligned contiguous BF16 CUDA tensor of numel 5120");
-        TORCH_CHECK(
-            layer_input.is_cuda() && layer_input.scalar_type() == at::kBFloat16 &&
-            layer_input.is_contiguous() && layer_input.dim() == 2 &&
-            layer_input.size(0) == rows && layer_input.size(1) == 5120 &&
-            reinterpret_cast<std::uintptr_t>(layer_input.data_ptr()) % 16 == 0,
-            "layer_input must be 16B-aligned contiguous BF16 CUDA tensor [rows, 5120]");
-        if (write_aux) {
-            TORCH_CHECK(
-                aux_out.is_cuda() && aux_out.scalar_type() == at::kBFloat16 &&
-                aux_out.is_contiguous() && aux_out.dim() == 2 &&
-                aux_out.size(0) == rows && aux_out.size(1) == 5120 &&
-                reinterpret_cast<std::uintptr_t>(aux_out.data_ptr()) % 16 == 0,
-                "aux_out must be 16B-aligned contiguous BF16 CUDA tensor [rows, 5120]");
-        }
+            aux_out.is_cuda() && aux_out.scalar_type() == at::kBFloat16 &&
+            aux_out.is_contiguous() && aux_out.dim() == 2 &&
+            aux_out.size(0) == rows && aux_out.size(1) == 5120 &&
+            reinterpret_cast<std::uintptr_t>(aux_out.data_ptr()) % 16 == 0,
+            "aux_out must be 16B-aligned contiguous BF16 CUDA tensor [rows, 5120]");
     }
     launch_ar_mhc_cluster8_cuda(
         x.data_ptr(),
         residual.data_ptr(),
         post_mix.data_ptr<float>(),
         comb_mix.data_ptr<float>(),
-        post_only ? nullptr : pre_mix.data_ptr<float>(),
-        post_only ? nullptr : norm_weight.data_ptr(),
-        post_only ? nullptr : layer_input.data_ptr(),
-        (!post_only && write_aux) ? aux_out.data_ptr() : nullptr,
+        pre_mix.data_ptr<float>(),
+        norm_weight.data_ptr(),
+        layer_input.data_ptr(),
+        write_aux ? aux_out.data_ptr() : nullptr,
         reinterpret_cast<uint64_t*>(control.data_ptr<int64_t>()),
         reinterpret_cast<const std::uintptr_t*>(rank_shm_ptrs_u64.data_ptr<int64_t>()),
         my_hbm_ptr,
@@ -778,7 +774,6 @@ void launch_ar_mhc_cluster8(
         static_cast<int>(rows),
         static_cast<float>(norm_eps),
         static_cast<int>(write_aux),
-        static_cast<int>(post_only),
         static_cast<int>(rank),
         static_cast<int>(flag_base),
         stream_handle);
@@ -1143,16 +1138,52 @@ __global__ void host_mapped_two_shot_fused_kernel(
 // [131072 .. ):     4 ring slots * (in_data + red_data)
 // Inline 128-bit `FP12 + BFP7` packet (`1x uint4` = 16B per 16 BF16s = 50% cross-SHM size):
 // - `hdr16 = (h1_big << 15) | (fp12 << 3) | (sh & 7)`
-//   * `fp12`: 8-bit FP32 exponent + 4-bit FP32 mantissa rounded up from `big_max / 63.0f`
+//   * `fp12` (`16..0xFD0`): 8-bit FP32 exponent + 4-bit FP32 mantissa rounded up from `big_max / 63.0f`
+//   * `fp12 == 0xFFF`: reserved non-finite escape header (`q[i]`: 0=0.0f, 1=+Inf, 2=-Inf, 3=qNaN)
 //   * `sh`:   3-bit `4^sh` relative shift between sub-blocks `v[0..7]` and `v[8..15]` (up to 16,384x)
 // - `payload`: 16x 7-bit two's-complement signed integers `[-63..+63]`
+__device__ __forceinline__ uint4 pack_fp12_bfp7_words(
+    uint32_t hdr16,
+    const uint32_t (&q)[16]) {
+    const uint32_t w0 = hdr16 | (q[0] << 16) | (q[1] << 23) | ((q[2] & 0x3U) << 30);
+    const uint32_t w1 =
+        (q[2] >> 2) | (q[3] << 5) | (q[4] << 12) | (q[5] << 19) | ((q[6] & 0x3FU) << 26);
+    const uint32_t w2 = (q[6] >> 6) | (q[7] << 1) | (q[8] << 8) | (q[9] << 15) |
+        (q[10] << 22) | ((q[11] & 0x7U) << 29);
+    const uint32_t w3 =
+        (q[11] >> 3) | (q[12] << 4) | (q[13] << 11) | (q[14] << 18) | (q[15] << 25);
+    return make_uint4(w0, w1, w2, w3);
+}
+
 __device__ __forceinline__ uint4 pack_fp12_bfp7(const float (&v)[16]) {
     float amax0 = 0.0f;
     float amax1 = 0.0f;
+    uint32_t has_non_finite = 0U;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        amax0 = fmaxf(amax0, fabsf(v[i]));
-        amax1 = fmaxf(amax1, fabsf(v[i + 8]));
+        const uint32_t b0 = __float_as_uint(v[i]) & 0x7FFFFFFFU;
+        const uint32_t b1 = __float_as_uint(v[i + 8]) & 0x7FFFFFFFU;
+        if (b0 >= 0x7F800000U || b1 >= 0x7F800000U) {
+            has_non_finite = 1U;
+        }
+        amax0 = fmaxf(amax0, __uint_as_float(b0));
+        amax1 = fmaxf(amax1, __uint_as_float(b1));
+    }
+    if (__builtin_expect(has_non_finite != 0U, 0)) {
+        uint32_t q_nf[16];
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const uint32_t bits = __float_as_uint(v[i]);
+            const uint32_t abs_bits = bits & 0x7FFFFFFFU;
+            if (abs_bits > 0x7F800000U) {
+                q_nf[i] = 3U;
+            } else if (abs_bits == 0x7F800000U) {
+                q_nf[i] = (bits & 0x80000000U) ? 2U : 1U;
+            } else {
+                q_nf[i] = 0U;
+            }
+        }
+        return pack_fp12_bfp7_words(0xFFFU << 3, q_nf);
     }
     const uint32_t h1_big = (amax1 > amax0) ? 1U : 0U;
     const float big_max = h1_big ? amax1 : amax0;
@@ -1165,14 +1196,15 @@ __device__ __forceinline__ uint4 pack_fp12_bfp7(const float (&v)[16]) {
     if (fp12 < 16U) {
         return make_uint4(0U, 0U, 0U, 0U);
     }
-    uint32_t sh = 7U;
+    const float inv_big = 1.0f / __uint_as_float(fp12 << 19);
+    uint32_t sh = 0U;
+    float inv_sml = 0.0f;
     if (sml_max > 1.0e-36f) {
         const int log2_r =
             static_cast<int>((__float_as_uint(big_max / sml_max) >> 23) & 0xFFU) - 127;
         sh = static_cast<uint32_t>(min(7, max(0, log2_r >> 1)));
+        inv_sml = inv_big * __uint_as_float((127U + 2U * sh) << 23);
     }
-    const float inv_big = 1.0f / __uint_as_float(fp12 << 19);
-    const float inv_sml = inv_big * __uint_as_float((127U + 2U * sh) << 23);
     const float inv0 = h1_big ? inv_sml : inv_big;
     const float inv1 = h1_big ? inv_big : inv_sml;
 
@@ -1184,14 +1216,7 @@ __device__ __forceinline__ uint4 pack_fp12_bfp7(const float (&v)[16]) {
             static_cast<uint32_t>(max(-63, min(63, __float2int_rn(v[i + 8] * inv1)))) & 0x7FU;
     }
     const uint32_t hdr16 = (h1_big << 15) | ((fp12 & 0xFFFU) << 3) | (sh & 0x7U);
-    const uint32_t w0 = hdr16 | (q[0] << 16) | (q[1] << 23) | ((q[2] & 0x3U) << 30);
-    const uint32_t w1 =
-        (q[2] >> 2) | (q[3] << 5) | (q[4] << 12) | (q[5] << 19) | ((q[6] & 0x3FU) << 26);
-    const uint32_t w2 = (q[6] >> 6) | (q[7] << 1) | (q[8] << 8) | (q[9] << 15) |
-        (q[10] << 22) | ((q[11] & 0x7U) << 29);
-    const uint32_t w3 =
-        (q[11] >> 3) | (q[12] << 4) | (q[13] << 11) | (q[14] << 18) | (q[15] << 25);
-    return make_uint4(w0, w1, w2, w3);
+    return pack_fp12_bfp7_words(hdr16, q);
 }
 
 __device__ __forceinline__ int sign_ext7(uint32_t u) {
@@ -1204,11 +1229,6 @@ __device__ __forceinline__ void unpack_accum_fp12_bfp7(uint4 pkt, float (&acc)[1
     if (fp12 == 0U) {
         return;
     }
-    const float s_big = __uint_as_float(fp12 << 19);
-    const float s_sml = s_big * __uint_as_float((127U - 2U * (hdr16 & 0x7U)) << 23);
-    const float s0 = (hdr16 & 0x8000U) ? s_sml : s_big;
-    const float s1 = (hdr16 & 0x8000U) ? s_big : s_sml;
-
     const uint32_t q[16] = {
         (pkt.x >> 16) & 0x7FU,
         (pkt.x >> 23) & 0x7FU,
@@ -1227,6 +1247,27 @@ __device__ __forceinline__ void unpack_accum_fp12_bfp7(uint4 pkt, float (&acc)[1
         (pkt.w >> 18) & 0x7FU,
         (pkt.w >> 25) & 0x7FU,
     };
+    if (__builtin_expect(fp12 == 0xFFFU, 0)) {
+        const float pos_inf = __uint_as_float(0x7F800000U);
+        const float neg_inf = __uint_as_float(0xFF800000U);
+        const float quiet_nan = __uint_as_float(0x7FC00000U);
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            if (q[i] == 1U) {
+                acc[i] += pos_inf;
+            } else if (q[i] == 2U) {
+                acc[i] += neg_inf;
+            } else if (q[i] == 3U) {
+                acc[i] += quiet_nan;
+            }
+        }
+        return;
+    }
+    const float s_big = __uint_as_float(fp12 << 19);
+    const float s_sml = s_big * __uint_as_float((127U - 2U * (hdr16 & 0x7U)) << 23);
+    const float s0 = (hdr16 & 0x8000U) ? s_sml : s_big;
+    const float s1 = (hdr16 & 0x8000U) ? s_big : s_sml;
+
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
         acc[i] += static_cast<float>(sign_ext7(q[i])) * s0;
@@ -3338,7 +3379,6 @@ __global__ __cluster_dims__(8, 1, 1) __launch_bounds__(320, 1) void shm_v5_ar_mh
     int rows,
     float norm_eps,
     int write_aux,
-    int post_only,
     int rank,
     int flag_base) {
     cg::cluster_group cluster = cg::this_cluster();
@@ -3372,9 +3412,7 @@ __global__ __cluster_dims__(8, 1, 1) __launch_bounds__(320, 1) void shm_v5_ar_mh
     }
     if (tid < 4) {
         s_post[tid] = post_mix[tok * 4 + tid];
-        if (!post_only) {
-            s_pre[tid] = pre_mix[tok * 4 + tid];
-        }
+        s_pre[tid] = pre_mix[tok * 4 + tid];
     }
     if (tid < 16) {
         s_comb[tid] = comb_mix[tok * 16 + tid];
@@ -3579,31 +3617,29 @@ __global__ __cluster_dims__(8, 1, 1) __launch_bounds__(320, 1) void shm_v5_ar_mh
                 nr1.elems[e] = o1;
                 nr2.elems[e] = o2;
                 nr3.elems[e] = o3;
-                if (!post_only) {
-                    const float x0 = __bfloat162float(o0);
-                    const float x1 = __bfloat162float(o1);
-                    const float x2 = __bfloat162float(o2);
-                    const float x3 = __bfloat162float(o3);
-                    if (write_aux) {
-                        aux_pack.elems[e] = __float2bfloat16_rn((x0 + x1 + x2 + x3) * 0.25f);
-                    }
-                    const float val = __bfloat162float(
-                        __float2bfloat16_rn(
-                            s_pre[0] * x0 + s_pre[1] * x1 + s_pre[2] * x2 + s_pre[3] * x3));
-                    collapsed[e] = val;
-                    thread_sq += val * val;
+                const float x0 = __bfloat162float(o0);
+                const float x1 = __bfloat162float(o1);
+                const float x2 = __bfloat162float(o2);
+                const float x3 = __bfloat162float(o3);
+                if (write_aux) {
+                    aux_pack.elems[e] = __float2bfloat16_rn((x0 + x1 + x2 + x3) * 0.25f);
                 }
+                const float val = __bfloat162float(
+                    __float2bfloat16_rn(
+                        s_pre[0] * x0 + s_pre[1] * x1 + s_pre[2] * x2 + s_pre[3] * x3));
+                collapsed[e] = val;
+                thread_sq += val * val;
             }
             res_vec[base_r] = nr0.u4;
             res_vec[base_r + 640] = nr1.u4;
             res_vec[base_r + 1280] = nr2.u4;
             res_vec[base_r + 1920] = nr3.u4;
-            if (!post_only && write_aux) {
+            if (write_aux) {
                 aux_out_vec[base_x] = aux_pack.u4;
             }
         }
 
-        if (!s_aborted_local && !post_only) {
+        if (!s_aborted_local) {
             const float w_sq = warp_reduce_sum(thread_sq);
             const int warp_id = tid >> 5;
             const int lane = tid & 31;
@@ -3628,7 +3664,7 @@ __global__ __cluster_dims__(8, 1, 1) __launch_bounds__(320, 1) void shm_v5_ar_mh
             any_ab |= *cluster.map_shared_rank(&s_aborted_local, c);
         }
         s_aborted_any = any_ab;
-        if (!any_ab && !post_only) {
+        if (!any_ab) {
             float row_sq = 0.0f;
             const int grp_base = tok * k_grp;
             for (int c = 0; c < k_grp; ++c) {
@@ -3643,7 +3679,7 @@ __global__ __cluster_dims__(8, 1, 1) __launch_bounds__(320, 1) void shm_v5_ar_mh
         return;
     }
 
-    if (!post_only && tid < slice_len) {
+    if (tid < slice_len) {
         Pack128Bf16 w_pack, out_pack;
         w_pack.u4 = norm_weight_vec[col];
         const float inv_rms = s_inv_rms;
@@ -4029,7 +4065,6 @@ void launch_ar_mhc_cluster8_cuda(
     int rows,
     float norm_eps,
     int write_aux,
-    int post_only,
     int rank,
     int flag_base,
     std::uintptr_t stream_handle) {
@@ -4065,7 +4100,6 @@ void launch_ar_mhc_cluster8_cuda(
         rows,
         norm_eps,
         write_aux,
-        post_only,
         rank,
         flag_base);
     ZSTEP_CUDA_CHECK(cudaGetLastError());
@@ -4302,7 +4336,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v19_ext",
+            name="zstep_shm_allreduce_sm120_v20_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[

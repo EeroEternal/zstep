@@ -804,12 +804,12 @@ class DeepSeekV41StepRunner:
         shm_ar = self.shm_ar
         shm_ag = self.shm_ag
         runner = self
-        # Route M <= 4096 when CX8 PXB-SHM hybrid is active (or M <= 384 on non-P2P)
-        # plus 100% of CUDAGraph captures through `shm_ar`; route larger eager AR
-        # payloads to topology-aware NCCL (`PXB` on P2P switches, `LOC` on non-P2P).
-        default_ar_rows = 4096 if shm_ar.pxb_enabled else 384
+        # Route up to `shm_ar`'s allocated PXB capacity (M <= 4096 when max_step_tokens >= 4096,
+        # or M <= 384 on non-P2P) plus 100% of CUDAGraph captures through `shm_ar`; route larger
+        # eager AR payloads to topology-aware NCCL (`PXB` on P2P switches, `LOC` on non-P2P).
+        default_ar_numel = shm_ar.pxb_max_vecs * 8 if shm_ar.pxb_enabled else 384 * 5120
         shm_max_ar_numel = self.runtime_config.effective_shm_max_ar_numel(
-            default_ar_rows * 5120
+            default_ar_numel
         )
         default_ag_elems = (
             min(self.max_step_tokens, 4096) * 3200 if shm_ar.pxb_enabled else 1024 * 4096
