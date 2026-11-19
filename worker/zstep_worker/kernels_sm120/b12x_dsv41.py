@@ -75,6 +75,7 @@ import torch
 import torch.distributed as dist
 
 from zstep_worker.env_config import WorkerRuntimeConfig
+from zstep_worker.kernels_sm120.topk_canon import canonicalize_prefill_topk
 
 _LOG = logging.getLogger(__name__)
 
@@ -847,6 +848,29 @@ def install_sm120_dsa_indexer_patches() -> bool:
     indexer_cls = sai.SparseAttnIndexer
     if getattr(indexer_cls, "_zstep_sm120_dsa_patched", False):
         return True
+
+    if WorkerRuntimeConfig.from_env().enable_topk_canon and not getattr(
+        ops.top_k_per_row_prefill, "_zstep_topk_canon_patched", False
+    ):
+        orig_top_k_per_row_prefill = ops.top_k_per_row_prefill
+
+        def _canonical_top_k_per_row_prefill(
+            logits: torch.Tensor,
+            row_starts: torch.Tensor,
+            row_ends: torch.Tensor,
+            indices: torch.Tensor,
+            num_rows: int,
+            stride0: int,
+            stride1: int,
+            top_k: int,
+        ) -> None:
+            orig_top_k_per_row_prefill(
+                logits, row_starts, row_ends, indices, num_rows, stride0, stride1, top_k
+            )
+            canonicalize_prefill_topk(logits, row_starts, row_ends, indices, top_k)
+
+        _canonical_top_k_per_row_prefill._zstep_topk_canon_patched = True  # type: ignore[attr-defined]
+        ops.top_k_per_row_prefill = _canonical_top_k_per_row_prefill
 
     orig_forward_cuda = indexer_cls.forward_cuda
     gather_ws_shapes = sai._gather_workspace_shapes

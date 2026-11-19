@@ -1416,6 +1416,7 @@ fn srpt_prefers_shorter_and_apc_hit_requests_over_cold_long_prompt() {
         4,
         16,
         0,
+        1,
         policy,
         now,
         None,
@@ -1434,6 +1435,7 @@ fn srpt_prefers_shorter_and_apc_hit_requests_over_cold_long_prompt() {
         4,
         16,
         0,
+        1,
         PrefillSchedulingPolicy::fifo(),
         now,
         None,
@@ -1475,6 +1477,7 @@ fn srpt_tie_breaks_equal_uncached_lengths_in_fifo_order() {
         4,
         16,
         0,
+        1,
         PrefillSchedulingPolicy::default(),
         t1,
         None,
@@ -1525,6 +1528,7 @@ fn starvation_cap_promotes_aged_request_and_holds_kv_until_it_fits() {
         4,
         16,
         0,
+        1,
         policy,
         now,
         None,
@@ -1544,6 +1548,7 @@ fn starvation_cap_promotes_aged_request_and_holds_kv_until_it_fits() {
         4,
         16,
         0,
+        1,
         policy,
         now,
         None,
@@ -1566,6 +1571,7 @@ fn starvation_cap_promotes_aged_request_and_holds_kv_until_it_fits() {
         4,
         16,
         0,
+        1,
         policy,
         now,
         None,
@@ -1584,6 +1590,7 @@ fn starvation_cap_promotes_aged_request_and_holds_kv_until_it_fits() {
         4,
         16,
         2,
+        1,
         policy,
         now,
         None,
@@ -1671,4 +1678,25 @@ fn ordered_partial_prefill_indices_uses_srpt_with_starvation_promotion() {
     ];
     let order = ordered_partial_prefill_indices(&active, PrefillSchedulingPolicy::default(), now);
     assert_eq!(order, vec![2, 1, 0]);
+}
+
+#[test]
+fn kpool_chunk_align_keeps_non_final_chunks_multiple_of_4_and_allows_unaligned_tail() {
+    // Non-final chunk with odd mixed budget (19 tokens) rounds down to 16 (multiple of 4).
+    assert_eq!(
+        prefill_chunk_range_aligned(50, 0, 19, 2048, 4),
+        Some((0, 16))
+    );
+    // Subsequent chunk with budget 19 advances to 32 (still multiple of 4).
+    assert_eq!(
+        prefill_chunk_range_aligned(50, 16, 19, 2048, 4),
+        Some((16, 32))
+    );
+    // Final chunk reaches prompt_len=50 exactly even though 50 % 4 != 0.
+    assert_eq!(
+        prefill_chunk_range_aligned(50, 32, 19, 2048, 4),
+        Some((32, 50))
+    );
+    // Tiny leftover mixed budget (< 4) for a non-final chunk defers rather than splitting a kpool group.
+    assert_eq!(prefill_chunk_range_aligned(50, 16, 3, 2048, 4), None);
 }

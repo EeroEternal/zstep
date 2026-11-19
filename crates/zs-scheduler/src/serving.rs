@@ -526,6 +526,7 @@ pub struct ServingEngine {
     worker_numa_nodes: Vec<i32>,
     max_mixed_step_tokens: Option<usize>,
     max_prefill_coalesce_wait_ms: u64,
+    prefill_chunk_align: usize,
     prefill_policy: PrefillSchedulingPolicy,
     device_token_overlap: bool,
     speculative: SpeculativeConfig,
@@ -931,6 +932,7 @@ fn select_next_waiting_candidate(
     max_seqs: usize,
     page_block_tokens: usize,
     loading_area_reserve: usize,
+    chunk_align: usize,
     policy: PrefillSchedulingPolicy,
     now: Instant,
     // Optional `(remaining_budget, max_prefill_chunk, num_seqs_already_staged)` filter.
@@ -951,11 +953,12 @@ fn select_next_waiting_candidate(
         if num_seqs_staged > 0 && remaining_budget < 16 && uncached_prompt_len > remaining_budget {
             return false;
         }
-        prefill_chunk_range(
+        prefill_chunk_range_aligned(
             prompt_len,
             cached_tokens,
             remaining_budget,
             max_prefill_chunk,
+            chunk_align,
         )
         .is_some()
     };
@@ -1065,6 +1068,7 @@ fn front_request_admissible_in_pools(
         max_seqs,
         page_block_tokens,
         0,
+        1,
         PrefillSchedulingPolicy::fifo(),
         Instant::now(),
         None,
@@ -1160,6 +1164,7 @@ impl ServingEngine {
             worker_numa_nodes,
             max_mixed_step_tokens: None,
             max_prefill_coalesce_wait_ms: DEFAULT_PREFILL_COALESCE_WAIT_MS,
+            prefill_chunk_align: 4,
             prefill_policy: PrefillSchedulingPolicy::default(),
             device_token_overlap: false,
             speculative,
@@ -1456,6 +1461,7 @@ impl ServingEngine {
             max_seqs,
             page_block_tokens,
             self.loading_area_pages(),
+            self.prefill_chunk_align,
             self.prefill_policy,
             now,
             None,
@@ -1551,6 +1557,12 @@ impl ServingEngine {
         self.prefill_policy = policy;
     }
 
+    /// Align non-final chunked-prefill boundaries to `align` tokens (default `4` for
+    /// DeepSeek-V4.1 `kpool` `compress_ratio == 4`).
+    pub fn set_prefill_chunk_align(&mut self, align: usize) {
+        self.prefill_chunk_align = align.max(1);
+    }
+
     /// Publish decode steps before the previous step's result is read.
     ///
     /// Workers must implement `launch`/`finish`, `STEP_FLAG_DEVICE_TOKENS`, and
@@ -1627,6 +1639,7 @@ impl ServingEngine {
             max_seqs,
             page_block_tokens,
             self.loading_area_pages(),
+            self.prefill_chunk_align,
             self.prefill_policy,
             now,
             None,
@@ -2289,11 +2302,12 @@ impl ServingEngine {
         let partial_indices = ordered_partial_prefill_indices(active, self.prefill_policy, now);
         for active_idx in partial_indices {
             let seq = &mut active[active_idx];
-            let Some((chunk_start, chunk_end)) = prefill_chunk_range(
+            let Some((chunk_start, chunk_end)) = prefill_chunk_range_aligned(
                 seq.prompt_tokens.len(),
                 seq.prefilled_tokens,
                 max_step_tokens - token_cursor,
                 max_prefill_chunk,
+                self.prefill_chunk_align,
             ) else {
                 continue;
             };
@@ -2335,6 +2349,7 @@ impl ServingEngine {
                 max_seqs,
                 page_block_tokens,
                 self.loading_area_pages(),
+                self.prefill_chunk_align,
                 self.prefill_policy,
                 now,
                 Some((max_step_tokens - token_cursor, max_prefill_chunk, 0)),
@@ -2347,11 +2362,12 @@ impl ServingEngine {
                     "prompt length must be positive".to_owned(),
                 ));
             }
-            let Some((chunk_start, chunk_end)) = prefill_chunk_range(
+            let Some((chunk_start, chunk_end)) = prefill_chunk_range_aligned(
                 prompt_len,
                 sel.cached_tokens,
                 max_step_tokens - token_cursor,
                 max_prefill_chunk,
+                self.prefill_chunk_align,
             ) else {
                 break;
             };
@@ -2604,11 +2620,12 @@ impl ServingEngine {
             }
             let prompt_len = active[active_idx].prompt_tokens.len();
             let prefilled = active[active_idx].prefilled_tokens;
-            let Some((chunk_start, chunk_end)) = prefill_chunk_range(
+            let Some((chunk_start, chunk_end)) = prefill_chunk_range_aligned(
                 prompt_len,
                 prefilled,
                 step_budget - token_cursor,
                 max_prefill_chunk,
+                self.prefill_chunk_align,
             ) else {
                 continue;
             };
@@ -2659,6 +2676,7 @@ impl ServingEngine {
                 max_seqs,
                 page_block_tokens,
                 self.loading_area_pages(),
+                self.prefill_chunk_align,
                 self.prefill_policy,
                 now,
                 Some((remaining_budget, max_prefill_chunk, num_seqs)),
@@ -2671,11 +2689,12 @@ impl ServingEngine {
                     "prompt length must be positive".to_owned(),
                 ));
             }
-            let Some((chunk_start, chunk_end)) = prefill_chunk_range(
+            let Some((chunk_start, chunk_end)) = prefill_chunk_range_aligned(
                 prompt_len,
                 sel.cached_tokens,
                 remaining_budget,
                 max_prefill_chunk,
+                self.prefill_chunk_align,
             ) else {
                 break;
             };
@@ -3208,11 +3227,12 @@ impl ServingEngine {
     }
 }
 
-fn prefill_chunk_range(
+fn prefill_chunk_range_aligned(
     prompt_len: usize,
     prefilled_tokens: usize,
     token_budget: usize,
     max_prefill_chunk: usize,
+    align: usize,
 ) -> Option<(usize, usize)> {
     if prefilled_tokens >= prompt_len || token_budget == 0 || max_prefill_chunk == 0 {
         return None;
@@ -3220,7 +3240,30 @@ fn prefill_chunk_range(
     let chunk_len = (prompt_len - prefilled_tokens)
         .min(token_budget)
         .min(max_prefill_chunk);
-    Some((prefilled_tokens, prefilled_tokens + chunk_len))
+    let raw_end = prefilled_tokens + chunk_len;
+    if raw_end == prompt_len || align <= 1 {
+        return Some((prefilled_tokens, raw_end));
+    }
+    // Keep non-final chunk boundaries aligned to `align` (e.g. 4 tokens for DeepSeek-V4.1
+    // `kpool` `compress_ratio == 4`) so intermediate mixed-step chunks never split a pool group.
+    let aligned_end = (raw_end / align) * align;
+    (aligned_end > prefilled_tokens).then_some((prefilled_tokens, aligned_end))
+}
+
+#[cfg(test)]
+fn prefill_chunk_range(
+    prompt_len: usize,
+    prefilled_tokens: usize,
+    token_budget: usize,
+    max_prefill_chunk: usize,
+) -> Option<(usize, usize)> {
+    prefill_chunk_range_aligned(
+        prompt_len,
+        prefilled_tokens,
+        token_budget,
+        max_prefill_chunk,
+        1,
+    )
 }
 
 fn first_token_latency_us(
