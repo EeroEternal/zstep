@@ -52,12 +52,80 @@ pub enum LoopFinishReason {
     Failed,
 }
 
+/// Candidate token logprob entry for OpenAI `top_logprobs`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepTopLogprob {
+    pub token: u32,
+    pub logprob: f32,
+}
+
+/// Token logprob diagnostics for one output token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepLogprob {
+    pub token: u32,
+    pub logprob: f32,
+    pub top_logprobs: Vec<StepTopLogprob>,
+}
+
+/// Compute numerically stable log probabilities for the chosen token and top competitors.
+pub fn compute_step_logprob(
+    token: i32,
+    token_logit_bits: u32,
+    runner_up_token: i32,
+    runner_up_logit_bits: u32,
+    top_k_req: u32,
+) -> StepLogprob {
+    let z1 = f32::from_bits(token_logit_bits);
+    let mut top_logprobs = Vec::new();
+
+    let (lp1, lp2) = if runner_up_token >= 0 && runner_up_token != token {
+        let z2 = f32::from_bits(runner_up_logit_bits);
+        if z1.is_finite() && z2.is_finite() {
+            let max_z = z1.max(z2);
+            let lse = max_z + ((z1 - max_z).exp() + (z2 - max_z).exp()).ln();
+            let p1 = (z1 - lse).min(0.0);
+            let p2 = (z2 - lse).min(0.0);
+            (p1, p2)
+        } else {
+            (0.0, -100.0)
+        }
+    } else {
+        (0.0, -100.0)
+    };
+
+    if top_k_req >= 1 {
+        top_logprobs.push(StepTopLogprob {
+            token: token as u32,
+            logprob: lp1,
+        });
+        if runner_up_token >= 0 && runner_up_token != token {
+            top_logprobs.push(StepTopLogprob {
+                token: runner_up_token as u32,
+                logprob: lp2,
+            });
+        }
+        top_logprobs.sort_by(|a, b| {
+            b.logprob
+                .partial_cmp(&a.logprob)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        top_logprobs.truncate(top_k_req as usize);
+    }
+
+    StepLogprob {
+        token: token as u32,
+        logprob: lp1,
+        top_logprobs,
+    }
+}
+
 /// Event pushed to the HTTP layer by the loop thread. Sinks must be non-blocking.
 #[derive(Debug, Clone)]
 pub enum LoopEvent {
     Token {
         request_id: u64,
         token: u32,
+        logprob: Option<StepLogprob>,
     },
     Finished {
         request_id: u64,
@@ -1166,7 +1234,7 @@ fn online_step(
         );
         let generated_before = seq.generated_tokens.len();
         let mut token_events = Vec::new();
-        for token in accepted {
+        for (accepted_idx, token) in accepted.into_iter().enumerate() {
             let request_id = {
                 if seq.first_token_time.is_none() {
                     let (ttft_us, _) =
@@ -1183,7 +1251,23 @@ fn online_step(
                 seq.generated_tokens.push(token);
                 seq.request_id as u64
             };
-            token_events.push((request_id, token));
+            let logprob = if seq.sampling.logprobs {
+                let token_logit_bits = output
+                    .accepted_logprobs_bits
+                    .get(accepted_idx)
+                    .copied()
+                    .unwrap_or(0);
+                Some(compute_step_logprob(
+                    token,
+                    token_logit_bits,
+                    output.runner_up_token,
+                    output.runner_up_logprob_bits,
+                    seq.sampling.top_logprobs,
+                ))
+            } else {
+                None
+            };
+            token_events.push((request_id, token, logprob));
             if !seq.sampling.ignore_eos && eos_tokens.contains(&(token as u32)) {
                 break;
             }
@@ -1214,12 +1298,13 @@ fn online_step(
             }
         }
         seq.refresh_draft_tokens(&output.next_draft_tokens, &engine.speculative);
-        for (request_id, token) in token_events {
+        for (request_id, token, logprob) in token_events {
             emit(
                 online,
                 LoopEvent::Token {
                     request_id,
                     token: token as u32,
+                    logprob,
                 },
             );
         }
@@ -1309,9 +1394,10 @@ pub fn spawn_mock(script: MockScript) -> ServeLoopHandle {
                 sink: EventSink,
                 cursor: usize,
                 last_emit: Instant,
+                sampling: SamplingParams,
             }
             let mut active: Vec<MockSeq> = Vec::new();
-            let mut waiting: VecDeque<(u64, EventSink)> = VecDeque::new();
+            let mut waiting: VecDeque<(u64, EventSink, SamplingParams)> = VecDeque::new();
             let mut cancelled: HashSet<u64> = HashSet::new();
             let mut completed_stops: HashSet<u64> = HashSet::new();
             let mut next_id = 1u64;
@@ -1341,7 +1427,7 @@ pub fn spawn_mock(script: MockScript) -> ServeLoopHandle {
                             let id = next_id;
                             next_id += 1;
                             let _ = reply.send(Ok(id));
-                            waiting.push_back((id, request.sink));
+                            waiting.push_back((id, request.sink, request.sampling));
                         }
                         Ok(LoopCommand::Cancel(id)) => {
                             cancelled.insert(id);
@@ -1366,7 +1452,7 @@ pub fn spawn_mock(script: MockScript) -> ServeLoopHandle {
                 }
 
                 if shutting_down {
-                    for (id, _) in &waiting {
+                    for (id, ..) in &waiting {
                         cancelled.insert(*id);
                     }
                     for seq in &active {
@@ -1379,7 +1465,7 @@ pub fn spawn_mock(script: MockScript) -> ServeLoopHandle {
                 while w_idx < waiting.len() {
                     let id = waiting[w_idx].0;
                     if completed_stops.contains(&id) || cancelled.contains(&id) {
-                        let (_, sink) = waiting.remove(w_idx).expect("waiting entry");
+                        let (_, sink, _) = waiting.remove(w_idx).expect("waiting entry");
                         let reason = if completed_stops.contains(&id) {
                             metrics.finished.fetch_add(1, Ordering::Relaxed);
                             LoopFinishReason::StopToken
@@ -1421,7 +1507,7 @@ pub fn spawn_mock(script: MockScript) -> ServeLoopHandle {
                 completed_stops.clear();
 
                 while active.len() < max_seqs {
-                    let Some((id, sink)) = waiting.pop_front() else {
+                    let Some((id, sink, sampling)) = waiting.pop_front() else {
                         break;
                     };
                     active.push(MockSeq {
@@ -1431,6 +1517,7 @@ pub fn spawn_mock(script: MockScript) -> ServeLoopHandle {
                         last_emit: Instant::now()
                             .checked_sub(script.per_token_delay)
                             .unwrap_or_else(Instant::now),
+                        sampling,
                     });
                 }
 
@@ -1474,9 +1561,32 @@ pub fn spawn_mock(script: MockScript) -> ServeLoopHandle {
                         } else {
                             metrics.observe_tpot_us(script.per_token_delay.as_micros() as u64);
                         }
+                        let logprob = if active[idx].sampling.logprobs {
+                            let mut top_logprobs = Vec::new();
+                            if active[idx].sampling.top_logprobs >= 1 {
+                                top_logprobs.push(StepTopLogprob {
+                                    token,
+                                    logprob: -0.25,
+                                });
+                                if active[idx].sampling.top_logprobs >= 2 {
+                                    top_logprobs.push(StepTopLogprob {
+                                        token: token + 1,
+                                        logprob: -1.5,
+                                    });
+                                }
+                            }
+                            Some(StepLogprob {
+                                token,
+                                logprob: -0.25,
+                                top_logprobs,
+                            })
+                        } else {
+                            None
+                        };
                         (active[idx].sink)(LoopEvent::Token {
                             request_id: active[idx].id,
                             token,
+                            logprob,
                         });
                     }
                     if active[idx].cursor >= script.tokens.len() {
@@ -2268,5 +2378,34 @@ mod tests {
         assert_eq!(metrics.finished.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.cancelled.load(Ordering::Relaxed), 1);
         assert!(shadow_pt.iter().all(|&cell| cell == 16));
+    }
+
+    #[test]
+    fn test_compute_step_logprob_greedy_and_top_logprobs() {
+        let t1 = 42i32;
+        let z1 = 20.0f32;
+        let t2 = 99i32;
+        let z2 = 15.0f32;
+
+        let lp = compute_step_logprob(t1, z1.to_bits(), t2, z2.to_bits(), 2);
+        assert_eq!(lp.token, 42);
+        assert!(lp.logprob < 0.0 && lp.logprob > -0.01);
+        assert_eq!(lp.top_logprobs.len(), 2);
+        assert_eq!(lp.top_logprobs[0].token, 42);
+        assert_eq!(lp.top_logprobs[1].token, 99);
+        assert!(lp.top_logprobs[0].logprob > lp.top_logprobs[1].logprob);
+
+        // top_logprobs: 0 returns empty candidate list
+        let lp0 = compute_step_logprob(t1, z1.to_bits(), t2, z2.to_bits(), 0);
+        assert_eq!(lp0.top_logprobs.len(), 0);
+        assert_eq!(lp0.token, 42);
+
+        // Stochastic sampled token runner up sorting
+        let lp_stoch = compute_step_logprob(t2, z2.to_bits(), t1, z1.to_bits(), 2);
+        assert_eq!(lp_stoch.token, 99);
+        assert!(lp_stoch.logprob < -4.5);
+        // Candidate 0 should be t1 (highest probability), candidate 1 should be t2
+        assert_eq!(lp_stoch.top_logprobs[0].token, 42);
+        assert_eq!(lp_stoch.top_logprobs[1].token, 99);
     }
 }

@@ -445,14 +445,6 @@ fn reject_unsupported(request: &ChatRequest) -> Option<Response> {
             "response_format is not supported",
         ));
     }
-    if request.logprobs.is_some_and(|v| v) || request.top_logprobs.is_some() {
-        return Some(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "invalid_parameter",
-            "logprobs are not supported",
-        ));
-    }
     if let Some(opts) = &request.stream_options
         && let Some(unknown) = opts.extra.keys().next()
     {
@@ -537,6 +529,24 @@ fn resolve_sampling_params(
         ));
     }
     let ignore_eos = request.ignore_eos.unwrap_or(false);
+    let logprobs = request.logprobs.unwrap_or(false);
+    let top_logprobs = request.top_logprobs.unwrap_or(0);
+    if request.top_logprobs.is_some() && !logprobs {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_parameter",
+            "top_logprobs can only be specified when logprobs is true",
+        ));
+    }
+    if top_logprobs > 5 {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_parameter",
+            "top_logprobs must be between 0 and 5",
+        ));
+    }
     let temperature_f32 = temperature as f32;
     let seed = if temperature_f32 <= 0.0 {
         0
@@ -562,6 +572,8 @@ fn resolve_sampling_params(
         presence_penalty: presence_penalty as f32,
         frequency_penalty: frequency_penalty as f32,
         ignore_eos,
+        logprobs,
+        top_logprobs,
     })
 }
 
@@ -608,6 +620,7 @@ fn chunk_json(
     created: u64,
     delta: Value,
     finish_reason: Option<&str>,
+    logprobs: Option<Value>,
 ) -> String {
     json!({
         "id": id,
@@ -617,10 +630,43 @@ fn chunk_json(
         "choices": [{
             "index": 0,
             "delta": delta,
+            "logprobs": logprobs,
             "finish_reason": finish_reason,
         }],
     })
     .to_string()
+}
+
+fn format_logprob_item(
+    tokenizer: &Tokenizer,
+    token: u32,
+    logprob_info: Option<&zs_scheduler::StepLogprob>,
+    top_logprobs_requested: bool,
+) -> Value {
+    let (token_str, token_bytes) = tokenizer.decode_single_token(token);
+    let chosen_logprob = logprob_info.map_or(0.0, |lp| lp.logprob);
+    let top_logprobs_val = if top_logprobs_requested {
+        let mut entries = Vec::new();
+        if let Some(lp) = logprob_info {
+            for cand in &lp.top_logprobs {
+                let (cand_str, cand_bytes) = tokenizer.decode_single_token(cand.token);
+                entries.push(json!({
+                    "token": cand_str,
+                    "logprob": cand.logprob,
+                    "bytes": cand_bytes,
+                }));
+            }
+        }
+        json!(entries)
+    } else {
+        json!([])
+    };
+    json!({
+        "token": token_str,
+        "logprob": chosen_logprob,
+        "bytes": token_bytes,
+        "top_logprobs": top_logprobs_val,
+    })
 }
 
 fn usage_chunk_json(
@@ -652,6 +698,25 @@ fn finish_reason_text(reason: LoopFinishReason) -> &'static str {
             "stop"
         }
     }
+}
+
+struct StreamState {
+    rx: mpsc::Receiver<LoopEvent>,
+    decoder: StreamDecoder,
+    guard: CancelGuard,
+    handle: ServeLoopHandle,
+    tokenizer: Tokenizer,
+    loop_id: u64,
+    req_id: String,
+    model: String,
+    created: u64,
+    include_usage: bool,
+    prompt_tokens: usize,
+    enable_logprobs: bool,
+    top_logprobs_requested: bool,
+    buffered_logprobs: Vec<Value>,
+    sent_role: bool,
+    sent_done: bool,
 }
 
 struct CancelGuard {
@@ -927,224 +992,191 @@ async fn chat_completions(
             request_id: loop_request_id,
             armed: true,
         };
-        let req_id_for_stream = request_id.clone();
+        let initial_state = StreamState {
+            rx,
+            decoder,
+            guard,
+            handle,
+            tokenizer: state.tokenizer.clone(),
+            loop_id: loop_request_id,
+            req_id: request_id.clone(),
+            model,
+            created,
+            include_usage,
+            prompt_tokens,
+            enable_logprobs: request.logprobs.unwrap_or(false),
+            top_logprobs_requested: request.top_logprobs.is_some(),
+            buffered_logprobs: Vec::new(),
+            sent_role: false,
+            sent_done: false,
+        };
 
-        let event_stream = stream::unfold(
-            (
-                rx,
-                decoder,
-                guard,
-                handle,
-                loop_request_id,
-                req_id_for_stream,
-                model,
-                created,
-                include_usage,
-                prompt_tokens,
-                false,
-                false,
-            ),
-            |(
-                mut rx,
-                mut decoder,
-                mut guard,
-                handle,
-                loop_id,
-                req_id,
-                model,
-                created,
-                include_usage,
-                prompt_tokens,
-                sent_role,
-                sent_done,
-            )| async move {
-                if sent_done {
-                    return None;
-                }
-                let mut payloads: Vec<String> = Vec::new();
-                match rx.recv().await {
-                    Some(LoopEvent::Token { token, .. }) => {
-                        if !sent_role {
-                            payloads.push(format!(
-                                "data: {}\n\n",
-                                chunk_json(
-                                    &req_id,
-                                    &model,
-                                    created,
-                                    json!({"role": "assistant", "content": ""}),
-                                    None,
-                                )
-                            ));
-                        }
-                        let delta = decoder.push(token);
-                        if !delta.text.is_empty() {
-                            payloads.push(format!(
-                                "data: {}\n\n",
-                                chunk_json(
-                                    &req_id,
-                                    &model,
-                                    created,
-                                    json!({"content": delta.text}),
-                                    None,
-                                )
-                            ));
-                        }
-                        if delta.finished == Some(TokenizerFinishReason::StopString) {
-                            guard.armed = false;
-                            handle.complete_stop(loop_id);
-                            payloads.push(format!(
-                                "data: {}\n\n",
-                                chunk_json(&req_id, &model, created, json!({}), Some("stop"))
-                            ));
-                            if include_usage {
-                                payloads.push(format!(
-                                    "data: {}\n\n",
-                                    usage_chunk_json(
-                                        &req_id,
-                                        &model,
-                                        created,
-                                        prompt_tokens,
-                                        decoder.token_count(),
-                                    )
-                                ));
-                            }
-                            payloads.push("data: [DONE]\n\n".to_owned());
-                            return Some((
-                                Ok::<_, std::convert::Infallible>(bytes_from(payloads)),
-                                (
-                                    rx,
-                                    decoder,
-                                    guard,
-                                    handle,
-                                    loop_id,
-                                    req_id,
-                                    model,
-                                    created,
-                                    include_usage,
-                                    prompt_tokens,
-                                    true,
-                                    true,
-                                ),
-                            ));
-                        }
-                        Some((
-                            Ok::<_, std::convert::Infallible>(bytes_from(payloads)),
-                            (
-                                rx,
-                                decoder,
-                                guard,
-                                handle,
-                                loop_id,
-                                req_id,
-                                model,
-                                created,
-                                include_usage,
-                                prompt_tokens,
-                                true,
-                                false,
-                            ),
-                        ))
-                    }
-                    Some(LoopEvent::Finished { reason, .. }) => {
-                        guard.armed = false;
-                        if !sent_role {
-                            payloads.push(format!(
-                                "data: {}\n\n",
-                                chunk_json(
-                                    &req_id,
-                                    &model,
-                                    created,
-                                    json!({"role": "assistant", "content": ""}),
-                                    None,
-                                )
-                            ));
-                        }
-                        let tail = decoder.finish(finish_reason_to_tokenizer(reason));
-                        if !tail.text.is_empty() {
-                            payloads.push(format!(
-                                "data: {}\n\n",
-                                chunk_json(
-                                    &req_id,
-                                    &model,
-                                    created,
-                                    json!({"content": tail.text}),
-                                    None,
-                                )
-                            ));
-                        }
-                        let final_reason =
-                            if tail.finished == Some(TokenizerFinishReason::StopString) {
-                                "stop"
-                            } else {
-                                finish_reason_text(reason)
-                            };
+        let event_stream = stream::unfold(initial_state, |mut s| async move {
+            if s.sent_done {
+                return None;
+            }
+            let mut payloads: Vec<String> = Vec::new();
+            match s.rx.recv().await {
+                Some(LoopEvent::Token { token, logprob, .. }) => {
+                    if !s.sent_role {
                         payloads.push(format!(
                             "data: {}\n\n",
-                            chunk_json(&req_id, &model, created, json!({}), Some(final_reason))
+                            chunk_json(
+                                &s.req_id,
+                                &s.model,
+                                s.created,
+                                json!({"role": "assistant", "content": ""}),
+                                None,
+                                None,
+                            )
                         ));
-                        if include_usage {
+                        s.sent_role = true;
+                    }
+                    let delta = s.decoder.push(token);
+                    if s.enable_logprobs {
+                        s.buffered_logprobs.push(format_logprob_item(
+                            &s.tokenizer,
+                            token,
+                            logprob.as_ref(),
+                            s.top_logprobs_requested,
+                        ));
+                    }
+                    if !delta.text.is_empty() {
+                        let logprobs_chunk = if s.enable_logprobs {
+                            Some(json!({
+                                "content": std::mem::take(&mut s.buffered_logprobs),
+                            }))
+                        } else {
+                            None
+                        };
+                        payloads.push(format!(
+                            "data: {}\n\n",
+                            chunk_json(
+                                &s.req_id,
+                                &s.model,
+                                s.created,
+                                json!({"content": delta.text}),
+                                None,
+                                logprobs_chunk,
+                            )
+                        ));
+                    }
+                    if delta.finished == Some(TokenizerFinishReason::StopString) {
+                        s.guard.disarm();
+                        s.handle.complete_stop(s.loop_id);
+                        payloads.push(format!(
+                            "data: {}\n\n",
+                            chunk_json(
+                                &s.req_id,
+                                &s.model,
+                                s.created,
+                                json!({}),
+                                Some("stop"),
+                                None
+                            )
+                        ));
+                        if s.include_usage {
                             payloads.push(format!(
                                 "data: {}\n\n",
                                 usage_chunk_json(
-                                    &req_id,
-                                    &model,
-                                    created,
-                                    prompt_tokens,
-                                    decoder.token_count(),
+                                    &s.req_id,
+                                    &s.model,
+                                    s.created,
+                                    s.prompt_tokens,
+                                    s.decoder.token_count(),
                                 )
                             ));
                         }
                         payloads.push("data: [DONE]\n\n".to_owned());
-                        Some((
-                            Ok::<_, std::convert::Infallible>(bytes_from(payloads)),
-                            (
-                                rx,
-                                decoder,
-                                guard,
-                                handle,
-                                loop_id,
-                                req_id,
-                                model,
-                                created,
-                                include_usage,
-                                prompt_tokens,
-                                true,
-                                true,
-                            ),
-                        ))
+                        s.sent_done = true;
+                        return Some((Ok::<_, std::convert::Infallible>(bytes_from(payloads)), s));
                     }
-                    Some(LoopEvent::Failed { message, .. }) => {
-                        guard.armed = false;
+                    Some((Ok::<_, std::convert::Infallible>(bytes_from(payloads)), s))
+                }
+                Some(LoopEvent::Finished { reason, .. }) => {
+                    s.guard.disarm();
+                    if !s.sent_role {
                         payloads.push(format!(
                             "data: {}\n\n",
-                            error_body("server_error", "engine_faulted", &message)
+                            chunk_json(
+                                &s.req_id,
+                                &s.model,
+                                s.created,
+                                json!({"role": "assistant", "content": ""}),
+                                None,
+                                None,
+                            )
                         ));
-                        payloads.push("data: [DONE]\n\n".to_owned());
-                        Some((
-                            Ok::<_, std::convert::Infallible>(bytes_from(payloads)),
-                            (
-                                rx,
-                                decoder,
-                                guard,
-                                handle,
-                                loop_id,
-                                req_id,
-                                model,
-                                created,
-                                include_usage,
-                                prompt_tokens,
-                                sent_role,
-                                true,
-                            ),
-                        ))
                     }
-                    None => {
-                        guard.disarm();
-                        None
+                    let tail = s.decoder.finish(finish_reason_to_tokenizer(reason));
+                    if !tail.text.is_empty() {
+                        let logprobs_chunk = if s.enable_logprobs {
+                            Some(json!({
+                                "content": std::mem::take(&mut s.buffered_logprobs),
+                            }))
+                        } else {
+                            None
+                        };
+                        payloads.push(format!(
+                            "data: {}\n\n",
+                            chunk_json(
+                                &s.req_id,
+                                &s.model,
+                                s.created,
+                                json!({"content": tail.text}),
+                                None,
+                                logprobs_chunk,
+                            )
+                        ));
                     }
+                    let final_reason = if tail.finished == Some(TokenizerFinishReason::StopString) {
+                        "stop"
+                    } else {
+                        finish_reason_text(reason)
+                    };
+                    payloads.push(format!(
+                        "data: {}\n\n",
+                        chunk_json(
+                            &s.req_id,
+                            &s.model,
+                            s.created,
+                            json!({}),
+                            Some(final_reason),
+                            None
+                        )
+                    ));
+                    if s.include_usage {
+                        payloads.push(format!(
+                            "data: {}\n\n",
+                            usage_chunk_json(
+                                &s.req_id,
+                                &s.model,
+                                s.created,
+                                s.prompt_tokens,
+                                s.decoder.token_count(),
+                            )
+                        ));
+                    }
+                    payloads.push("data: [DONE]\n\n".to_owned());
+                    s.sent_done = true;
+                    Some((Ok::<_, std::convert::Infallible>(bytes_from(payloads)), s))
                 }
-            },
-        );
+                Some(LoopEvent::Failed { message, .. }) => {
+                    s.guard.disarm();
+                    payloads.push(format!(
+                        "data: {}\n\n",
+                        error_body("server_error", "engine_faulted", &message)
+                    ));
+                    payloads.push("data: [DONE]\n\n".to_owned());
+                    s.sent_done = true;
+                    Some((Ok::<_, std::convert::Infallible>(bytes_from(payloads)), s))
+                }
+                None => {
+                    s.guard.disarm();
+                    None
+                }
+            }
+        });
         let mut response = Response::new(Body::from_stream(event_stream));
         response.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -1187,13 +1219,24 @@ async fn chat_completions(
         request_id: loop_request_id,
         armed: true,
     };
+    let enable_logprobs = request.logprobs.unwrap_or(false);
+    let top_logprobs_requested = request.top_logprobs.is_some();
+    let mut logprobs_content = Vec::new();
     let mut text = String::new();
     let mut finish_reason_str = "length";
     let mut failure: Option<String> = None;
 
     while let Some(event) = rx.recv().await {
         match event {
-            LoopEvent::Token { token, .. } => {
+            LoopEvent::Token { token, logprob, .. } => {
+                if enable_logprobs {
+                    logprobs_content.push(format_logprob_item(
+                        &state.tokenizer,
+                        token,
+                        logprob.as_ref(),
+                        top_logprobs_requested,
+                    ));
+                }
                 let delta = decoder.push(token);
                 text.push_str(&delta.text);
                 if delta.finished == Some(TokenizerFinishReason::StopString) {
@@ -1236,6 +1279,13 @@ async fn chat_completions(
         );
     }
     let completion_tokens = decoder.token_count();
+    let logprobs_payload = if enable_logprobs {
+        Some(json!({
+            "content": logprobs_content,
+        }))
+    } else {
+        None
+    };
     let body = json!({
         "id": request_id,
         "object": "chat.completion",
@@ -1244,6 +1294,7 @@ async fn chat_completions(
         "choices": [{
             "index": 0,
             "message": {"role": "assistant", "content": text},
+            "logprobs": logprobs_payload,
             "finish_reason": finish_reason_str,
         }],
         "usage": {

@@ -360,3 +360,26 @@ def test_presence_and_frequency_penalties_with_slot_reset_and_ring_wrap() -> Non
         frequency_penalties=torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32),
     )
     assert mix_out2.tolist() == [1, 2, 1]
+
+
+def test_sample_tp8_logits_return_top2() -> None:
+    logits = torch.tensor(
+        [
+            [10.0, 5.0, 1.0, 0.0],
+            [2.0, 8.0, 4.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    tokens, lps, ru_toks, ru_lps = sample_tp8_logits(
+        logits,
+        temperatures=torch.tensor([0.0, 0.0], dtype=torch.float32),
+        top_p=torch.tensor([1.0, 1.0], dtype=torch.float32),
+        top_k=torch.tensor([0, 0], dtype=torch.int32),
+        rng_seeds=torch.tensor([0, 0], dtype=torch.int64),
+        return_top2=True,
+    )
+    assert tokens.tolist() == [0, 1]
+    assert lps.tolist() == [10.0, 8.0]
+    assert ru_toks.tolist() == [1, 2]
+    assert ru_lps.tolist() == [5.0, 4.0]
+

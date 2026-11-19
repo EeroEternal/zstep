@@ -207,6 +207,19 @@ impl Tokenizer {
         self.inner.decode(token_ids, true).unwrap_or_default()
     }
 
+    /// Decode a single token ID with special tokens preserved (for logprobs formatting).
+    pub fn decode_single_token(&self, token_id: u32) -> (String, Vec<u8>) {
+        if let Ok(text) = self.inner.decode(&[token_id], false) {
+            let bytes = text.as_bytes().to_vec();
+            (text, bytes)
+        } else if let Some(token_str) = self.inner.id_to_token(token_id) {
+            let bytes = token_str.as_bytes().to_vec();
+            (token_str, bytes)
+        } else {
+            (String::new(), Vec::new())
+        }
+    }
+
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
         self.inner.token_to_id(token)
     }
@@ -399,5 +412,7 @@ mod tests {
             );
         }
         assert!(tokenizer.is_eos(1), "EOS token id must be 1");
+        let (token_str, token_bytes) = tokenizer.decode_single_token(1);
+        assert_eq!(token_bytes, token_str.as_bytes());
     }
 }

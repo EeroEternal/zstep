@@ -157,6 +157,10 @@ pub struct SamplingParams {
     pub frequency_penalty: f32,
     /// Continue generating past EOS tokens until `max_tokens` or caller stop strings.
     pub ignore_eos: bool,
+    /// Whether to return log probabilities for output tokens.
+    pub logprobs: bool,
+    /// Number of top log probabilities to return per token (0..=5).
+    pub top_logprobs: u32,
 }
 
 impl Default for SamplingParams {
@@ -169,6 +173,8 @@ impl Default for SamplingParams {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             ignore_eos: false,
+            logprobs: false,
+            top_logprobs: 0,
         }
     }
 }
@@ -2726,6 +2732,7 @@ mod tests;
 pub mod serve_loop;
 pub use serve_loop::{
     EngineState, EventSink, LoopEvent, LoopFinishReason, MockScript, OnlineConfig, OnlineMetrics,
-    ServeLoopHandle, SubmitError, SubmitRequest, TPOT_BUCKET_BOUNDS_SECS, TTFT_BUCKET_BOUNDS_SECS,
+    ServeLoopHandle, StepLogprob, StepTopLogprob, SubmitError, SubmitRequest,
+    TPOT_BUCKET_BOUNDS_SECS, TTFT_BUCKET_BOUNDS_SECS, compute_step_logprob,
     spawn as spawn_serve_loop, spawn_mock, spawn_with_state as spawn_serve_loop_with_state,
 };
