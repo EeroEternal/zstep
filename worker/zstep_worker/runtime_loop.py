@@ -45,6 +45,7 @@ from zstep_worker.numa_pin import (
     DeviceNumaTopology,
     pin_process_to_device_numa,
 )
+from zstep_worker.runahead import PrefillRunAheadGuard
 from zstep_worker.shm_bridge import (
     STEP_FLAG_DECODE_ONLY,
     STEP_FLAG_DEVICE_TOKENS,
@@ -387,6 +388,10 @@ class RuntimeLoop:
             free_bytes, total_bytes = torch.cuda.mem_get_info(self.runner.device)
             self._free_vram_mb: int = free_bytes // (1024 * 1024)
             self._total_vram_mb: int = total_bytes // (1024 * 1024)
+            self._prefill_runahead: PrefillRunAheadGuard = PrefillRunAheadGuard(
+                max_depth=self.runtime_config.prefill_runahead_depth,
+                device=self.runner.device,
+            )
             self.current_step: int = 0
             self.last_step: int = 0
             self._pending_plan_signals: int = 0
@@ -566,6 +571,7 @@ class RuntimeLoop:
                                 f"shutdown step {header.step_id} published while step "
                                 f"{pending[0]} was still pending"
                             )
+                        self._prefill_runahead.drain()
                         recompiled_count = sum(spy.call_count for _, spy in spies)
                         if self.args.rank == 0:
                             self.bridge.result(header.step_id).write(
@@ -587,6 +593,7 @@ class RuntimeLoop:
                         if pending is not None:
                             self._finish_pending(pending, watched_count)
                             pending = None
+                        self._prefill_runahead.drain()
                         transfer_fn = getattr(self.runner, "execute_kv_transfer", None)
                         if not callable(transfer_fn):
                             raise RuntimeError(
@@ -601,16 +608,20 @@ class RuntimeLoop:
                     overlap_flags = header.flags & (
                         STEP_FLAG_DEVICE_TOKENS | STEP_FLAG_NEXT_PREPUBLISHED
                     )
+                    is_decode = (header.flags & STEP_FLAG_DECODE_ONLY) != 0
                     if not pipelined:
                         if overlap_flags != 0:
                             raise RuntimeError(
                                 f"step {header.step_id} set overlap flags {overlap_flags:#x} "
                                 f"on non-pipelined runner {type(self.runner).__name__}"
                             )
+                        if not is_decode:
+                            self._prefill_runahead.before_launch()
                         outputs, gpu_exec_us = self.runner.execute(plan, header)
+                        if not is_decode:
+                            self._prefill_runahead.after_launch()
                         self._complete_step(header.step_id, outputs, gpu_exec_us, watched_count)
                         continue
-                    is_decode = (header.flags & STEP_FLAG_DECODE_ONLY) != 0
                     if not is_decode and overlap_flags != 0:
                         raise RuntimeError(
                             f"non-decode step {header.step_id} must not set overlap flags "
@@ -620,7 +631,11 @@ class RuntimeLoop:
                         # Only decode steps double-buffer their host staging.
                         self._finish_pending(pending, watched_count)
                         pending = None
+                    if not is_decode:
+                        self._prefill_runahead.before_launch()
                     launched = self.runner.launch(plan, header)
+                    if not is_decode:
+                        self._prefill_runahead.after_launch()
                     if pending is not None:
                         # The GPU already has this step queued behind the pending one.
                         self._finish_pending(pending, watched_count)
@@ -666,14 +681,34 @@ class RuntimeLoop:
 
     def close(self, *, abort: bool = False) -> None:
         self._stop_watchdog()
-        if self.runner is not None:
-            try:
-                self.runner.close(abort=abort)
-            except TypeError:
-                self.runner.close()
-        self.bridge.close()
-        os.close(self.args.plan_fd)
-        os.close(self.args.done_fd)
+        runahead = getattr(self, "_prefill_runahead", None)
+        try:
+            if abort:
+                # Signal/abort the runner first so stuck SHM collectives unblock before
+                # tearing down driver event handles without blocking on cuEventSynchronize.
+                try:
+                    if self.runner is not None:
+                        try:
+                            self.runner.close(abort=True)
+                        except TypeError:
+                            self.runner.close()
+                finally:
+                    if runahead is not None:
+                        runahead.close(abort=True)
+            else:
+                try:
+                    if runahead is not None:
+                        runahead.close(abort=False)
+                finally:
+                    if self.runner is not None:
+                        try:
+                            self.runner.close(abort=False)
+                        except TypeError:
+                            self.runner.close()
+        finally:
+            self.bridge.close()
+            os.close(self.args.plan_fd)
+            os.close(self.args.done_fd)
 
 
 def _parse_args() -> argparse.Namespace:
