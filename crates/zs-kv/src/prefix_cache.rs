@@ -22,11 +22,11 @@
 //! optional co-owned recurrent checkpoint slots (`aux_lease`), cascading LRU leaf eviction, and
 //! four-group FlatKV request admission (`RequestKvHandle`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use crate::{BlockLease, BlockPool, CacheGroupKind, plan_bounded_replay};
+use crate::{BlockLease, BlockPool, CacheGroupKind, HybridBlockAliasTable, plan_bounded_replay};
 
 /// Errors produced during Automatic Prefix Cache admission or block promotion.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +82,7 @@ struct PrefixTreeInner {
     free_node_slots: Vec<usize>,
     cached_blocks: usize,
     access_clock: u64,
+    alias_table: HybridBlockAliasTable,
 }
 
 impl PrefixTreeInner {
@@ -140,6 +141,11 @@ impl PrefixTreeInner {
             self.nodes[parent_idx].children.remove(&key);
             let lease = self.nodes[victim_idx].lease.take();
             let aux_lease = self.nodes[victim_idx].aux_lease.take();
+            if aux_lease.is_some() {
+                if let Some(&anchor_block_id) = lease.as_ref().and_then(|kv| kv.ids().first()) {
+                    self.alias_table.remove_by_anchor(anchor_block_id);
+                }
+            }
             self.nodes[victim_idx].evicted = true;
             self.free_node_slots.push(victim_idx);
             self.cached_blocks = self.cached_blocks.saturating_sub(1);
@@ -167,6 +173,13 @@ pub struct PrefixVictim {
     pub token_path: Vec<i32>,
     pub lease: BlockLease,
     pub aux_lease: Option<BlockLease>,
+}
+
+impl PrefixVictim {
+    /// Canonical unified Block-ID (the victim node's anchor KV page ID).
+    pub fn anchor_block_id(&self) -> Option<i32> {
+        self.lease.ids().first().copied()
+    }
 }
 
 /// Thread-safe block-aligned prefix cache tree over physical KV pages and optional recurrent
@@ -215,6 +228,7 @@ impl PrefixTree {
                 free_node_slots: Vec::new(),
                 cached_blocks: 0,
                 access_clock: 0,
+                alias_table: HybridBlockAliasTable::new(),
             })),
         })
     }
@@ -324,6 +338,7 @@ impl PrefixTree {
         let mut block_ids = Vec::new();
         let mut matched_nodes = 0usize;
         let mut leaf_aux_id = None;
+        let mut leaf_anchor_block_id = None;
 
         for chunk in tokens.chunks_exact(block_tokens).take(max_nodes) {
             let next_idx = guard.nodes[current].children.get(chunk).copied();
@@ -340,6 +355,7 @@ impl PrefixTree {
                 .expect("live prefix node owns physical KV pages")
                 .ids();
             block_ids.extend_from_slice(ids);
+            leaf_anchor_block_id = ids.first().copied();
             leaf_aux_id = child.aux_lease.as_ref().map(|aux| aux.ids()[0]);
             matched_nodes += 1;
             current = child_idx;
@@ -353,6 +369,7 @@ impl PrefixTree {
             matched_nodes,
             matched_tokens,
             leaf_aux_id,
+            leaf_anchor_block_id,
         }
     }
 
@@ -411,11 +428,24 @@ impl PrefixTree {
                     new_node_blocks.len()
                 )));
             }
-            for aux in aux_vec {
+            let mut seen_anchors = HashSet::with_capacity(new_node_blocks.len());
+            let mut seen_slots = HashSet::with_capacity(aux_vec.len());
+            for (block_lease, aux) in new_node_blocks.iter().zip(aux_vec.iter()) {
                 if aux.ids().len() != 1 {
                     return Err(KvError::MisalignedPromotion(
                         "each promoted aux BlockLease must own exactly 1 slot".to_owned(),
                     ));
+                }
+                let anchor = block_lease.ids()[0];
+                let slot = aux.ids()[0];
+                if !seen_anchors.insert(anchor)
+                    || !seen_slots.insert(slot)
+                    || guard.alias_table.recurrent_slot_for_block(anchor).is_some()
+                    || guard.alias_table.anchor_for_recurrent_slot(slot).is_some()
+                {
+                    return Err(KvError::InvalidGeometry(format!(
+                        "hybrid alias collision for anchor_block_id={anchor} / aux_slot={slot}"
+                    )));
                 }
             }
         }
@@ -424,6 +454,7 @@ impl PrefixTree {
         let mut block_ids = existing_lease.block_ids.clone();
         let mut matched_nodes = existing_lease.matched_nodes;
         let mut leaf_aux_id = existing_lease.leaf_aux_id;
+        let mut leaf_anchor_block_id = existing_lease.leaf_anchor_block_id;
         // Consume `existing_lease` without decrementing the ancestor pins we are extending.
         let mut transferred = existing_lease;
         transferred.leaf_node = 0;
@@ -456,12 +487,20 @@ impl PrefixTree {
                     .expect("live prefix node owns physical KV pages")
                     .ids();
                 block_ids.extend_from_slice(ids);
+                leaf_anchor_block_id = ids.first().copied();
                 leaf_aux_id = child.aux_lease.as_ref().map(|aux| aux.ids()[0]);
                 matched_nodes += 1;
                 current = child_idx;
             } else {
                 block_ids.extend_from_slice(block_lease.ids());
+                leaf_anchor_block_id = block_lease.ids().first().copied();
                 leaf_aux_id = aux_lease.as_ref().map(|aux| aux.ids()[0]);
+                if let Some(aux_slot_id) = leaf_aux_id {
+                    guard
+                        .alias_table
+                        .insert(block_lease.ids(), aux_slot_id)
+                        .expect("pre-flight validated unique hybrid alias");
+                }
                 let tick = guard.next_tick();
                 let key: Box<[i32]> = chunk.into();
                 let node = PrefixNode {
@@ -490,7 +529,40 @@ impl PrefixTree {
             matched_nodes,
             matched_tokens,
             leaf_aux_id,
+            leaf_anchor_block_id,
         })
+    }
+
+    /// Resolve the GDN recurrent checkpoint slot aliased to a node's anchor KV Block-ID.
+    pub fn resolve_aux_for_kv_block(&self, anchor_kv_block_id: i32) -> Option<i32> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .alias_table
+            .recurrent_slot_for_block(anchor_kv_block_id)
+    }
+
+    /// Resolve the physical KV page IDs aliased to a GDN recurrent checkpoint slot.
+    pub fn resolve_kv_pages_for_aux_slot(&self, aux_slot_id: i32) -> Option<Vec<i32>> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .alias_table
+            .kv_pages_for_recurrent_slot(aux_slot_id)
+            .map(|ids| ids.to_vec())
+    }
+
+    /// Number of active KV ↔ recurrent-state unified Block-ID aliases in this tree.
+    pub fn alias_count(&self) -> usize {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.alias_table.len()
     }
 
     /// Evict up to `target_blocks` unpinned leaf nodes in strict LRU order.
@@ -525,6 +597,7 @@ pub struct PrefixLease {
     matched_nodes: usize,
     matched_tokens: u32,
     leaf_aux_id: Option<i32>,
+    leaf_anchor_block_id: Option<i32>,
 }
 
 impl PrefixLease {
@@ -542,6 +615,12 @@ impl PrefixLease {
 
     pub fn leaf_aux_id(&self) -> Option<i32> {
         self.leaf_aux_id
+    }
+
+    /// Canonical unified Block-ID of the matched leaf node (`kv_page_ids[0]` of the leaf),
+    /// directly resolving to `leaf_aux_id()` in [`PrefixTree::resolve_aux_for_kv_block`].
+    pub fn leaf_anchor_block_id(&self) -> Option<i32> {
+        self.leaf_anchor_block_id
     }
 }
 

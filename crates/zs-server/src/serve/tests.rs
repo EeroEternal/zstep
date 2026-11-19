@@ -144,7 +144,11 @@ fn cli_parser_enforces_nebula_contract_flags_and_model_defaults() {
     );
     assert!(
         parse(&["--model-dir", "/tmp/m", "--page-block-tokens", "24"]).is_err(),
-        "hybrid APC requires page_block_tokens dividing 64"
+        "hybrid APC requires page_block_tokens dividing apc_gdn_node_tokens"
+    );
+    assert!(
+        parse(&["--model-dir", "/tmp/m", "--apc-gdn-node-tokens", "96"]).is_err(),
+        "apc_gdn_node_tokens must be 64 or 128"
     );
     assert!(
         parse(&["--model-dir", "/tmp/m", "--world-size", "16"]).is_err(),
@@ -156,7 +160,11 @@ fn cli_parser_enforces_nebula_contract_flags_and_model_defaults() {
     );
     let default_apc = parse(&["--model-dir", "/tmp/qwen35"]).expect("default qwen args");
     assert!(default_apc.enable_prefix_caching);
-    assert_eq!(default_apc.resolved_apc_geometry().expect("apc"), (4, 255));
+    assert_eq!(default_apc.apc_gdn_node_tokens, 128);
+    assert_eq!(default_apc.resolved_apc_geometry().expect("apc"), (8, 255));
+    let apc_64 = parse(&["--model-dir", "/tmp/qwen35", "--apc-gdn-node-tokens", "64"])
+        .expect("64-token hybrid GDN APC");
+    assert_eq!(apc_64.resolved_apc_geometry().expect("apc64"), (4, 255));
     assert_eq!(
         default_apc
             .engine_config(None)
