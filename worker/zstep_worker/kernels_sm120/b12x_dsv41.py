@@ -2001,7 +2001,7 @@ def _prepare_sm120_mhc_overlap(
                     and not getattr(ar, "_closed", True)
                     and getattr(ar, "_use_shm_v5", False)
                     and ar.world_size == 8
-                    and (ar.blocks == 8 or (ar._pxb_enabled and ar.blocks == 32))
+                    and (ar.blocks == 8 or (ar._pxb_enabled and 32 <= ar.blocks <= 56))
                     and (x.data_ptr() & 15) == 0
                 )
                 if reduce_results and not use_c8:
@@ -2014,7 +2014,7 @@ def _prepare_sm120_mhc_overlap(
                     )
                     aux_buf = torch.empty_like(layer_in) if capture_aux else s.empty_aux
                     if use_c8:
-                        flag_base = 32 if (ar._pxb_enabled and ar.blocks == 32) else 0
+                        flag_base = ar.blocks if (ar._pxb_enabled and 32 <= ar.blocks <= 56) else 0
                         s.ext.launch_ar_mhc_cluster8(
                             x,
                             residual,

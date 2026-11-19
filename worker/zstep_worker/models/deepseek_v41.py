@@ -524,7 +524,10 @@ class DeepSeekV41StepRunner:
         self.hidden_size: int = int(self.vllm_config.model_config.get_hidden_size())
 
         # Load cached FlashInfer autotune configs if present in ~/.cache/flashinfer
-        self._autotune_loaded_files: int = self._load_flashinfer_autotune_cache()
+        # (intentionally skips ~/.cache/vllm/.../zstep_dsv41_sm120_autotune.json because
+        # FlashInfer save_configs strips runner_hash from ProfilingCacheKey, which causes
+        # same-named multi-instance runners to mis-match runners[0] on reload).
+        self._load_flashinfer_autotune_cache()
 
         # Serialize CUDA C++ extension build on rank 0 before ranks 1..7 load it
         if rank == 0:
@@ -537,7 +540,8 @@ class DeepSeekV41StepRunner:
         # Initialize NUMA-local shm_v5 AllReduce, AllGather, and lock-free TP=8 Argmax
         ar_max_tokens = max(self.max_step_tokens, 2048)
         use_pxb_ar = self.p2p_report.pxb_shm_enabled
-        pxb_ar_blocks = max(allreduce_blocks, 32) if use_pxb_ar else allreduce_blocks
+        pxb_ar_blocks = max(allreduce_blocks, 56) if use_pxb_ar else allreduce_blocks
+        pxb_ag_blocks = max(allreduce_blocks, 32) if use_pxb_ar else allreduce_blocks
         pxb_ar_threads = max(allreduce_threads, 512) if use_pxb_ar else allreduce_threads
         self.shm_ar: HostMappedShmAllReduce = HostMappedShmAllReduce(
             name=allreduce_name,
@@ -556,7 +560,7 @@ class DeepSeekV41StepRunner:
             rank=rank,
             world_size=self.world_size,
             capacity_input_elements=ar_max_tokens * 4096,
-            blocks=pxb_ar_blocks,
+            blocks=pxb_ag_blocks,
             threads=pxb_ar_threads,
             exchange_group=self.exchange_group,
         )
@@ -874,7 +878,7 @@ class DeepSeekV41StepRunner:
             load_fn = getattr(tuner, "load_configs", None)
             if not callable(load_fn):
                 return 0
-            cache_root = Path.home() / ".cache"
+            cache_root = Path.home() / ".cache" / "flashinfer"
             if cache_root.is_dir():
                 candidates = sorted(
                     cache_root.rglob("*autotune*.json"),
@@ -1411,11 +1415,6 @@ class DeepSeekV41StepRunner:
                 with ExitStack() as stack:
                     if case_idx == 0:
                         stack.enter_context(
-                            fi_utils.autotune(
-                                tune_mode=(self._autotune_loaded_files == 0)
-                            )
-                        )
-                        stack.enter_context(
                             fi_utils.autotune(tuning_buckets=tuning_buckets)
                         )
                     stack.enter_context(
@@ -1441,15 +1440,13 @@ class DeepSeekV41StepRunner:
             # Also warm up + autotune eager decode (`seq_len = 64..2563`) so all
             # FlashInfer SM120 sparse MLA decode tactics & persistent_topk kernels
             # are active before CUDAGraph capture.
-            for warm_idx, (warm_b, warm_sl) in enumerate(
-                (
-                    (16, 2560),
-                    (1, 64),
-                    (1, 2561),
-                    (3, 2563),
-                    (32, 1536),
-                    (128, 1280),
-                )
+            for warm_b, warm_sl in (
+                (16, 2560),
+                (1, 64),
+                (1, 2561),
+                (3, 2563),
+                (32, 1536),
+                (128, 1280),
             ):
                 if warm_b > self.max_graph_bucket:
                     continue
@@ -1478,12 +1475,7 @@ class DeepSeekV41StepRunner:
                     for_capture=True,
                 )
                 with ExitStack() as stack:
-                    if warm_idx == 0:
-                        stack.enter_context(
-                            fi_utils.autotune(
-                                tune_mode=(self._autotune_loaded_files == 0)
-                            )
-                        )
+                    stack.enter_context(fi_utils.autotune(tune_mode=True))
                     stack.enter_context(
                         set_forward_context(
                             attn_meta,

@@ -438,6 +438,19 @@ __device__ __forceinline__ void unpack_to_bf16_pair(uint4 pkt, uint4& out0, uint
     out1 = p1.u4;
 }
 
+__device__ __forceinline__ uint4 pack_bf16_pair(const uint4* __restrict__ vec, int64_t idx0) {
+    Pack128Bf16 a0, a1;
+    a0.u4 = vec[idx0];
+    a1.u4 = vec[idx0 + 1];
+    float v[16];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        v[j] = __bfloat162float(a0.elems[j]);
+        v[8 + j] = __bfloat162float(a1.elems[j]);
+    }
+    return pack_fp12_bfp7(v);
+}
+
 __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
     const uint4* __restrict__ input_vec,
     uint4* __restrict__ output_vec,
@@ -470,7 +483,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
     }
     __syncthreads();
     const uint64_t step = s_step;
-    const bool split_regime = (flag_base > 0 || (my_hbm != nullptr && gridDim.x == 32));
+    const bool split_regime = (flag_base > 0 || (my_hbm != nullptr && gridDim.x >= 32 && gridDim.x <= 56));
     const int slot = split_regime
         ? ((flag_base > 0 ? 2 : 0) + static_cast<int>((step - 1ULL) & 1))
         : static_cast<int>((step - 1ULL) & 3);
@@ -607,15 +620,16 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
 
     // Hybrid CX8-partner P2P + 4-pair Host-SHM 2-Shot (`>= 128 KiB`, up to `pxb_max_vecs`)
     if (can_pxb && num_vecs >= kPxbTwoShotMinVecs) {
-        if (pxb_bfp != 0 && flag_base == 0 && (num_vecs & 15) == 0) {
-            const int bfp_mode = (pxb_bfp == 2 || num_vecs > 655360) ? 2 : 1;
+        if (pxb_bfp != 0 && (num_vecs & 15) == 0 && (flag_base == 0 || num_vecs >= 15360)) {
+            const int bfp_mode = (pxb_bfp == 2) ? 2 : 1;
             const int parity = rank & 1;
             const int pair_id = rank >> 1;
             const int tid = threadIdx.x;
-            const int64_t g16 = num_vecs >> 4;
-            const int64_t fb = ((g16 * b_local) / gridDim.x) << 4;
+            const int sh = ((num_vecs & 127) == 0 && (num_vecs >> 7) >= gridDim.x) ? 7 : 4;
+            const int64_t g16 = num_vecs >> sh;
+            const int64_t fb = ((g16 * b_local) / gridDim.x) << sh;
             const int64_t fe =
-                (b_local + 1 == gridDim.x) ? num_vecs : (((g16 * (b_local + 1)) / gridDim.x) << 4);
+                (b_local + 1 == gridDim.x) ? num_vecs : (((g16 * (b_local + 1)) / gridDim.x) << sh);
             const int64_t fm = fb + (((fe - fb) >> 2) << 1);
             const int64_t my_hb = (parity == 0) ? fb : fm;
             const int64_t my_he = (parity == 0) ? fm : fe;
@@ -629,8 +643,14 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             const int64_t half_pxb = cur_pxb_stride / 2;
 
             uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + pxb_base_off);
-            for (int64_t idx = pt_hb + tid; idx < pt_he; idx += blockDim.x) {
-                st_wt_uint4(pt_in + idx, input_vec[idx]);
+            if (bfp_mode == 1) {
+                for (int64_t p = (pt_hb >> 1) + tid; p < (pt_he >> 1); p += blockDim.x) {
+                    st_wt_uint4(pt_in + p, pack_bf16_pair(input_vec, p << 1));
+                }
+            } else {
+                for (int64_t idx = pt_hb + tid; idx < pt_he; idx += blockDim.x) {
+                    st_wt_uint4(pt_in + idx, input_vec[idx]);
+                }
             }
             __syncthreads();
             if (tid == 0) {
@@ -657,19 +677,28 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                 Pack128Bf16 a0, a1, b0, b1;
                 a0.u4 = input_vec[idx0];
                 a1.u4 = input_vec[idx0 + 1];
-                b0.u4 = ld_cv_uint4(from_pt + idx0);
-                b1.u4 = ld_cv_uint4(from_pt + idx0 + 1);
                 float v[16];
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const float2 fa0 = __bfloat1622float2(a0.pairs[j]);
-                    const float2 fb0 = __bfloat1622float2(b0.pairs[j]);
-                    const float2 fa1 = __bfloat1622float2(a1.pairs[j]);
-                    const float2 fb1 = __bfloat1622float2(b1.pairs[j]);
-                    v[2 * j] = fa0.x + fb0.x;
-                    v[2 * j + 1] = fa0.y + fb0.y;
-                    v[8 + 2 * j] = fa1.x + fb1.x;
-                    v[8 + 2 * j + 1] = fa1.y + fb1.y;
+                if (bfp_mode == 1) {
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        v[j] = __bfloat162float(a0.elems[j]);
+                        v[8 + j] = __bfloat162float(a1.elems[j]);
+                    }
+                    unpack_accum_fp12_bfp7(ld_cv_uint4(from_pt + p), v);
+                } else {
+                    b0.u4 = ld_cv_uint4(from_pt + idx0);
+                    b1.u4 = ld_cv_uint4(from_pt + idx0 + 1);
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float2 fa0 = __bfloat1622float2(a0.pairs[j]);
+                        const float2 fb0 = __bfloat1622float2(b0.pairs[j]);
+                        const float2 fa1 = __bfloat1622float2(a1.pairs[j]);
+                        const float2 fb1 = __bfloat1622float2(b1.pairs[j]);
+                        v[2 * j] = fa0.x + fb0.x;
+                        v[2 * j + 1] = fa0.y + fb0.y;
+                        v[8 + 2 * j] = fa1.x + fb1.x;
+                        v[8 + 2 * j + 1] = fa1.y + fb1.y;
+                    }
                 }
                 if (p >= own_pb && p < own_pe) {
                     Pack128Bf16 s0, s1;
@@ -730,13 +759,9 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                 if (bfp_mode == 1) {
                     const uint4 rq = pack_fp12_bfp7(acc);
                     st_wt_uint4(my_shm_red + p, rq);
-                    uint4 out0, out1;
+                    st_wt_uint4(pt_hbm_red + (my_hb + (p - my_pb)), rq);
                     // Reconstruct owner's output from `rq` for 0-ULP cross-rank bit identity.
-                    unpack_to_bf16_pair(rq, out0, out1);
-                    output_vec[idx0] = out0;
-                    output_vec[idx0 + 1] = out1;
-                    st_wt_uint4(pt_hbm_red + idx0, out0);
-                    st_wt_uint4(pt_hbm_red + idx0 + 1, out1);
+                    unpack_to_bf16_pair(rq, output_vec[idx0], output_vec[idx0 + 1]);
                 } else {
                     Pack128Bf16 out0, out1;
                     #pragma unroll
@@ -796,13 +821,9 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                     const int64_t qb = my_pb + (my_pairs * q) / 4;
                     const int64_t qe = my_pb + (my_pairs * (q + 1)) / 4;
                     for (int64_t p = qb + tid; p < qe; p += blockDim.x) {
-                        const int64_t idx0 = p << 1;
-                        uint4 out0, out1;
-                        unpack_to_bf16_pair(ld_cv_uint4(o_red + p), out0, out1);
-                        output_vec[idx0] = out0;
-                        output_vec[idx0 + 1] = out1;
-                        st_wt_uint4(pt_hbm_red + idx0, out0);
-                        st_wt_uint4(pt_hbm_red + idx0 + 1, out1);
+                        const uint4 rq = ld_cv_uint4(o_red + p);
+                        st_wt_uint4(pt_hbm_red + (my_hb + (p - my_pb)), rq);
+                        unpack_to_bf16_pair(rq, output_vec[p << 1], output_vec[(p << 1) + 1]);
                     }
                 } else {
                     const int64_t qb = (my_pb + (my_pairs * q) / 4) << 1;
@@ -817,8 +838,17 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             const int64_t pt_pb = pt_hb >> 1;
             const int64_t pt_own_b = (pt_pb + (pt_pairs * pair_id) / 4) << 1;
             const int64_t pt_own_e = (pt_pb + (pt_pairs * (pair_id + 1)) / 4) << 1;
-            for (int64_t idx = pt_own_b + tid; idx < pt_own_e; idx += blockDim.x) {
-                output_vec[idx] = ld_cv_uint4(my_hbm_red + idx);
+            if (bfp_mode == 1) {
+                for (int64_t p = (pt_own_b >> 1) + tid; p < (pt_own_e >> 1); p += blockDim.x) {
+                    unpack_to_bf16_pair(
+                        ld_cv_uint4(my_hbm_red + (pt_hb + (p - pt_pb))),
+                        output_vec[p << 1],
+                        output_vec[(p << 1) + 1]);
+                }
+            } else {
+                for (int64_t idx = pt_own_b + tid; idx < pt_own_e; idx += blockDim.x) {
+                    output_vec[idx] = ld_cv_uint4(my_hbm_red + idx);
+                }
             }
             __syncthreads();
             if (tid == 0) {
@@ -841,8 +871,17 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                 if (q == pair_id) continue;
                 const int64_t qb = (pt_pb + (pt_pairs * q) / 4) << 1;
                 const int64_t qe = (pt_pb + (pt_pairs * (q + 1)) / 4) << 1;
-                for (int64_t idx = qb + tid; idx < qe; idx += blockDim.x) {
-                    output_vec[idx] = ld_cv_uint4(my_hbm_red + idx);
+                if (bfp_mode == 1) {
+                    for (int64_t p = (qb >> 1) + tid; p < (qe >> 1); p += blockDim.x) {
+                        unpack_to_bf16_pair(
+                            ld_cv_uint4(my_hbm_red + (pt_hb + (p - pt_pb))),
+                            output_vec[p << 1],
+                            output_vec[(p << 1) + 1]);
+                    }
+                } else {
+                    for (int64_t idx = qb + tid; idx < qe; idx += blockDim.x) {
+                        output_vec[idx] = ld_cv_uint4(my_hbm_red + idx);
+                    }
                 }
             }
             __syncthreads();
@@ -1262,7 +1301,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
     }
     __syncthreads();
     const uint64_t step = s_step;
-    const bool split_regime = (flag_base > 0 || (my_hbm != nullptr && blocks == 32));
+    const bool split_regime = (flag_base > 0 || (my_hbm != nullptr && blocks >= 32 && blocks <= 56));
     const int slot = split_regime
         ? ((flag_base > 0 ? 2 : 0) + static_cast<int>((step - 1ULL) & 1))
         : static_cast<int>((step - 1ULL) & 3);
@@ -2968,9 +3007,9 @@ void launch_shm_v5_allreduce_cuda(
     int pxb_bfp,
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    const bool small_pxb = (my_hbm_ptr != 0 && blocks == 32 && num_vecs <= 40960);
+    const bool small_pxb = (my_hbm_ptr != 0 && blocks >= 32 && blocks <= 56 && num_vecs <= 40960);
     const int launch_blocks = small_pxb ? 8 : blocks;
-    const int flag_base = small_pxb ? 32 : 0;
+    const int flag_base = small_pxb ? blocks : 0;
     const int64_t vecs_per_cta = (num_vecs + launch_blocks - 1) / launch_blocks;
     const int capped_threads = threads > 512 ? 512 : threads;
     const int launch_threads = small_pxb
@@ -3021,9 +3060,9 @@ void launch_shm_v5_allreduce_add_rmsnorm_cuda(
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     const int64_t num_vecs = rows * vecs_per_row;
-    const bool small_pxb = (my_hbm_ptr != 0 && blocks == 32 && num_vecs <= 40960);
+    const bool small_pxb = (my_hbm_ptr != 0 && blocks >= 32 && blocks <= 56 && num_vecs <= 40960);
     const int launch_blocks = small_pxb ? 8 : blocks;
-    const int flag_base = small_pxb ? 32 : 0;
+    const int flag_base = small_pxb ? blocks : 0;
     const int64_t vecs_per_cta = (num_vecs + launch_blocks - 1) / launch_blocks;
 
     if (use_cluster != 0 && rows < launch_blocks && launch_blocks == 8 && (launch_blocks % rows) == 0) {
