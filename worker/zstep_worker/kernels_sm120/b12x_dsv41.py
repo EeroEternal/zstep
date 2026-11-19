@@ -69,6 +69,7 @@ import sys
 import time
 import types
 from typing import Any
+import weakref
 
 import torch
 import torch.distributed as dist
@@ -1695,17 +1696,29 @@ def flush_sm120_mhc_before_ar(device_idx: int | None) -> None:
         s.flush(stream)
 
 
+def attach_sm120_mhc_shm_ar(
+    device_idx: int | None, shm_ar: Any | None, runner: Any | None = None
+) -> None:
+    """Bind weak references to `HostMappedShmAllReduce` and runner for `M in {1, 2, 4}` cluster8 fusion."""
+    s = _MHC_STATE_BY_DEV.get(0 if device_idx is None else int(device_idx))
+    if s is not None:
+        s.shm_ar_ref = weakref.ref(shm_ar) if shm_ar is not None else None
+        s.runner_ref = weakref.ref(runner) if runner is not None else None
+
+
 def _prepare_sm120_mhc_overlap(
     model: torch.nn.Module, *, device: torch.device, max_tokens: int
 ) -> None:
     """Install 1-pass in-place SM120 mHC post+collapse+RMSNorm and side-stream Sinkhorn overlap."""
+    cfg = WorkerRuntimeConfig.from_env()
     if not (
-        WorkerRuntimeConfig.from_env().enable_sm120_mhc_overlap
+        cfg.enable_sm120_mhc_overlap
         and torch.cuda.is_available()
         and torch.cuda.get_device_capability() == (12, 0)
     ):
         return
     try:
+        from vllm.distributed import tensor_model_parallel_all_reduce
         from vllm.forward_context import in_piecewise_cudagraph
         from vllm.model_executor.kernels.mhc.warmup import compute_mhc_pre_num_splits
         from vllm.models.deepseek_v41.nvidia import model as dsv41_model
@@ -1740,6 +1753,8 @@ def _prepare_sm120_mhc_overlap(
             pending=False,
             deferred=None,
             ext=None,
+            shm_ar_ref=None,
+            runner_ref=None,
             owners={id(model)},
         )
 
@@ -1817,6 +1832,29 @@ def _prepare_sm120_mhc_overlap(
     inner_model = getattr(model, "model", None)
     if isinstance(inner_model, torch.nn.Module):
         _wrap_mhc_forward_join(inner_model, dev_idx)
+
+    lang_mod = getattr(model, "language_model", model)
+    dsv4_core = getattr(lang_mod, "model", lang_mod)
+    if (
+        cfg.enable_sm120_fuse_mhc_ar
+        and isinstance(dsv4_core, dsv41_model.DeepseekV4Model)
+        and not getattr(dsv4_core, "use_sequence_parallel", False)
+    ):
+        ok_layers = [
+            lyr
+            for lyr in dsv4_core.layers
+            if isinstance(lyr, dsv41_model.DeepseekV4DecoderLayer)
+            and hasattr(getattr(lyr, "attn", None), "wo_b")
+            and hasattr(getattr(getattr(lyr, "ffn", None), "experts", None), "moe_config")
+            and not getattr(lyr.ffn.experts, "_fused_output_is_reduced", False)
+        ]
+        if ok_layers and len(ok_layers) == len(dsv4_core.layers):
+            dsv4_core.fuse_mhc_all_reduce = True
+            for lyr in ok_layers:
+                lyr.fuse_mhc_all_reduce = True
+                lyr.attn.wo_b.reduce_results = False
+                lyr.ffn.reduce_results = False
+                lyr.ffn.experts.moe_config.skip_final_all_reduce = True
 
     if not getattr(dsv41_model, "_zstep_sm120_mhc_patched", False):
         orig_post = dsv41_model.mhc_post_tilelang
@@ -1900,14 +1938,11 @@ def _prepare_sm120_mhc_overlap(
                 s = _MHC_STATE_BY_DEV.get(r_idx)
             else:
                 s = None
-            if s is not None:
-                _sync_mhc_state_in(s, torch.cuda.current_stream(residual.device))
             n = int(residual.shape[0]) if (isinstance(residual, torch.Tensor) and residual.ndim == 3) else -1
             if (
                 s is not None
                 and isinstance(x, torch.Tensor)
                 and x.is_cuda
-                and not reduce_results
                 and stream is None
                 and pre_mix is not None
                 and norm_weight is not None
@@ -1949,61 +1984,112 @@ def _prepare_sm120_mhc_overlap(
                 and not in_piecewise_cudagraph()
                 and all(
                     t.is_contiguous()
-                    for t in (x, residual, post_layer_mix, comb_res_mix, pre_mix, norm_weight)
+                    for t in (residual, post_layer_mix, comb_res_mix, pre_mix, norm_weight)
                 )
-                and (x.data_ptr() & 15) == 0
                 and (residual.data_ptr() & 15) == 0
                 and (norm_weight.data_ptr() & 15) == 0
             ):
                 s.ext = s.ext or get_host_mapped_allreduce_extension()
                 main_s = torch.cuda.current_stream(residual.device)
-                layer_in = torch.empty(
-                    (n, 5120), dtype=torch.bfloat16, device=residual.device
+                x = x if x.is_contiguous() else x.contiguous()
+                ar_ref = getattr(s, "shm_ar_ref", None)
+                ar = ar_ref() if callable(ar_ref) else None
+                use_c8 = bool(
+                    reduce_results
+                    and n in (1, 2, 4)
+                    and ar is not None
+                    and not getattr(ar, "_closed", True)
+                    and getattr(ar, "_use_shm_v5", False)
+                    and ar.world_size == 8
+                    and (ar.blocks == 8 or (ar._pxb_enabled and ar.blocks == 32))
+                    and (x.data_ptr() & 15) == 0
                 )
-                aux_buf = torch.empty_like(layer_in) if capture_aux else s.empty_aux
-                s.ext.launch_mhc_post_collapse_rmsnorm(
-                    x,
-                    residual,
-                    post_layer_mix,
-                    comb_res_mix,
-                    pre_mix,
-                    norm_weight,
-                    layer_in,
-                    aux_buf,
-                    float(norm_eps),
-                    1 if capture_aux else 0,
-                    0,
-                    main_s.cuda_stream,
-                )
-                p, s.slot = s.slot, s.slot ^ 1
-                next_post = s.post_buf[p][:n]
-                next_comb = s.comb_buf[p][:n]
-                next_pre = s.pre_buf[p][:n]
-                s.deferred = (
-                    n,
-                    residual,
-                    fn,
-                    hc_scale,
-                    hc_base,
-                    next_post,
-                    next_comb,
-                    next_pre,
-                    float(rms_eps),
-                    float(hc_pre_eps),
-                    float(hc_sinkhorn_eps),
-                    float(hc_post_mult_value),
-                    int(sinkhorn_repeat),
-                )
-                if n <= 256:
-                    s.flush(main_s)
-                return (
-                    residual,
-                    next_post,
-                    next_comb,
-                    layer_in,
-                    next_pre,
-                    aux_buf if capture_aux else None,
-                )
+                if reduce_results and not use_c8:
+                    x = tensor_model_parallel_all_reduce(x)
+                    x = x if x.is_contiguous() else x.contiguous()
+                if (x.data_ptr() & 15) == 0:
+                    _sync_mhc_state_in(s, main_s)
+                    layer_in = torch.empty(
+                        (n, 5120), dtype=torch.bfloat16, device=residual.device
+                    )
+                    aux_buf = torch.empty_like(layer_in) if capture_aux else s.empty_aux
+                    if use_c8:
+                        flag_base = 32 if (ar._pxb_enabled and ar.blocks == 32) else 0
+                        s.ext.launch_ar_mhc_cluster8(
+                            x,
+                            residual,
+                            post_layer_mix,
+                            comb_res_mix,
+                            pre_mix,
+                            norm_weight,
+                            layer_in,
+                            aux_buf,
+                            ar.control,
+                            ar._rank_shm_ptrs,
+                            ar._my_hbm_ptr if ar._pxb_enabled else 0,
+                            ar._pt_hbm_ptr if ar._pxb_enabled else 0,
+                            ar.slot_stride_bytes,
+                            ar.pxb_slot_stride_bytes if ar._pxb_enabled else 0,
+                            float(norm_eps),
+                            1 if capture_aux else 0,
+                            ar.rank,
+                            flag_base,
+                            main_s.cuda_stream,
+                        )
+                        runner_ref = getattr(s, "runner_ref", None)
+                        runner_obj = runner_ref() if callable(runner_ref) else None
+                        if runner_obj is not None:
+                            runner_obj.shm_ar_calls += 1
+                    else:
+                        s.ext.launch_mhc_post_collapse_rmsnorm(
+                            x,
+                            residual,
+                            post_layer_mix,
+                            comb_res_mix,
+                            pre_mix,
+                            norm_weight,
+                            layer_in,
+                            aux_buf,
+                            float(norm_eps),
+                            1 if capture_aux else 0,
+                            0,
+                            main_s.cuda_stream,
+                        )
+                    p, s.slot = s.slot, s.slot ^ 1
+                    next_post = s.post_buf[p][:n]
+                    next_comb = s.comb_buf[p][:n]
+                    next_pre = s.pre_buf[p][:n]
+                    s.deferred = (
+                        n,
+                        residual,
+                        fn,
+                        hc_scale,
+                        hc_base,
+                        next_post,
+                        next_comb,
+                        next_pre,
+                        float(rms_eps),
+                        float(hc_pre_eps),
+                        float(hc_sinkhorn_eps),
+                        float(hc_post_mult_value),
+                        int(sinkhorn_repeat),
+                    )
+                    if n <= 256:
+                        s.flush(main_s)
+                    return (
+                        residual,
+                        next_post,
+                        next_comb,
+                        layer_in,
+                        next_pre,
+                        aux_buf if capture_aux else None,
+                    )
+                # If `(x.data_ptr() & 15) != 0` after external AR (`not use_c8`), `x` was
+                # already reduced above; pass `reduce_results=False` to `orig_shifted`.
+                if reduce_results and not use_c8:
+                    reduce_results = False
+            if s is not None:
+                _sync_mhc_state_in(s, torch.cuda.current_stream(residual.device))
             return orig_shifted(
                 x,
                 residual,

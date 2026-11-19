@@ -488,6 +488,259 @@ def _pxb_8gpu_worker(rank: int, init_file: str, shm_name: str) -> None:
                             ar_out = torch.empty_like(ar_x)
                             comm.all_reduce(ar_x, output=ar_out)
                             assert float((ar_out.float().cpu() - ar_ref).abs().max()) < 0.03
+
+                # Verify SM120 Cluster-8 DSMEM fused `AR + mHC + collapse + RMSNorm` (`M in {1, 2, 4}`)
+                # across both non-PXB (`blk=8, flag_base=0`) and dual-grid PXB (`blk=32, flag_base=32`).
+                if torch.cuda.get_device_capability(device) == (12, 0) and (
+                    (not use_pxb and blk == 8) or (use_pxb and blk == 32)
+                ):
+                    from zstep_worker.kernels_sm120.shm_allreduce import (
+                        get_host_mapped_allreduce_extension,
+                    )
+
+                    ext = get_host_mapped_allreduce_extension()
+                    stream = torch.cuda.current_stream(device).cuda_stream
+                    flag_base = 32 if (use_pxb and blk == 32) else 0
+                    torch.cuda.synchronize(device)
+                    base_c8 = comm.control[flag_base : flag_base + 8].cpu().tolist()
+                    assert len(set(base_c8)) == 1
+                    c8_calls = 0
+                    empty_aux = torch.empty((0, 5120), dtype=torch.bfloat16, device=device)
+                    for c8_rows in (1, 2, 4):
+                        for write_aux in (0, 1):
+                            torch.manual_seed(2100 + c8_rows * 19 + write_aux * 7 + rank)
+                            x_c8 = (
+                                torch.randn((c8_rows, 5120), dtype=torch.bfloat16, device=device)
+                                * 0.125
+                            )
+                            torch.manual_seed(2200 + c8_rows * 19 + write_aux * 7)
+                            res0_c8 = (
+                                torch.randn(
+                                    (c8_rows, 4, 5120), dtype=torch.bfloat16, device=device
+                                )
+                                * 0.25
+                            )
+                            post_c8 = (
+                                torch.sigmoid(
+                                    torch.randn((c8_rows, 4), dtype=torch.float32, device=device)
+                                )
+                                * 2.0
+                            )
+                            comb_c8 = torch.softmax(
+                                torch.randn(
+                                    (c8_rows, 4, 4), dtype=torch.float32, device=device
+                                ),
+                                dim=-1,
+                            ).contiguous()
+                            pre_c8 = (
+                                torch.sigmoid(
+                                    torch.randn((c8_rows, 4), dtype=torch.float32, device=device)
+                                )
+                                + 1e-4
+                            )
+                            nw_c8 = (
+                                torch.randn((5120,), dtype=torch.bfloat16, device=device) * 0.5
+                                + 1.0
+                            )
+
+                            ref_ar_c8 = torch.empty_like(x_c8)
+                            comm.all_reduce(x_c8, output=ref_ar_c8)
+                            c8_calls += 1
+                            ref_res_c8 = res0_c8.clone()
+                            ref_in_c8 = torch.empty_like(x_c8)
+                            ref_aux_c8 = torch.empty_like(x_c8) if write_aux else empty_aux
+                            ext.launch_mhc_post_collapse_rmsnorm(
+                                ref_ar_c8,
+                                ref_res_c8,
+                                post_c8,
+                                comb_c8,
+                                pre_c8,
+                                nw_c8,
+                                ref_in_c8,
+                                ref_aux_c8,
+                                1e-6,
+                                write_aux,
+                                0,
+                                stream,
+                            )
+
+                            got_res_c8 = res0_c8.clone()
+                            got_in_c8 = torch.empty_like(x_c8)
+                            got_aux_c8 = torch.empty_like(x_c8) if write_aux else empty_aux
+                            ext.launch_ar_mhc_cluster8(
+                                x_c8,
+                                got_res_c8,
+                                post_c8,
+                                comb_c8,
+                                pre_c8,
+                                nw_c8,
+                                got_in_c8,
+                                got_aux_c8,
+                                comm.control,
+                                comm._rank_shm_ptrs,
+                                comm._my_hbm_ptr if comm._pxb_enabled else 0,
+                                comm._pt_hbm_ptr if comm._pxb_enabled else 0,
+                                comm.slot_stride_bytes,
+                                comm.pxb_slot_stride_bytes if comm._pxb_enabled else 0,
+                                1e-6,
+                                write_aux,
+                                rank,
+                                flag_base,
+                                stream,
+                            )
+                            c8_calls += 1
+
+                            assert (
+                                float((got_res_c8.float() - ref_res_c8.float()).abs().max().item())
+                                == 0.0
+                            )
+                            # `got_in_c8` reduces `sum_sq` via 8-CTA x 8-warp DSMEM tree vs
+                            # 1-CTA x 20-warp SMEM tree (`<= 1 BF16 ULP`), while all 8 ranks
+                            # remain strictly bit-identical (`torch.equal` below).
+                            assert (
+                                float((got_in_c8.float() - ref_in_c8.float()).abs().max().item())
+                                <= 0.016
+                            )
+                            if write_aux:
+                                assert (
+                                    float(
+                                        (got_aux_c8.float() - ref_aux_c8.float()).abs().max().item()
+                                    )
+                                    == 0.0
+                                )
+                            gathered_in = [
+                                torch.empty_like(got_in_c8, device="cpu") for _ in range(8)
+                            ]
+                            dist.all_gather(
+                                gathered_in, got_in_c8.cpu(), group=dist.group.WORLD
+                            )
+                            for peer_r in range(1, 8):
+                                assert torch.equal(gathered_in[0], gathered_in[peer_r])
+
+                    torch.cuda.synchronize(device)
+                    after_c8 = comm.control[flag_base : flag_base + 8].cpu().tolist()
+                    assert after_c8 == [base_c8[0] + c8_calls] * 8
+
+        # Verify `FP12+BFP7` (`pxb_bfp` modes 1 & 2, plus automatic `M > 1024` switch to mode 2)
+        # accuracy, sub-threshold / non-finite edge cases, in-place safety, and 0-ULP cross-rank
+        # bit-identity across all 8 ranks.
+        for bfp_mode in (1, 2):
+            with HostMappedShmAllReduce(
+                name=f"{shm_name}_bfp_{bfp_mode}",
+                rank=rank,
+                world_size=8,
+                capacity_elements=1536 * 5120,
+                blocks=32,
+                threads=512,
+                exchange_group=dist.group.WORLD,
+                enable_pxb_p2p=True,
+                pxb_max_elements=1536 * 5120,
+                enable_pxb_bfp=bfp_mode,
+            ) as comm_bfp:
+                assert comm_bfp._pxb_bfp == bfp_mode
+                for m, h in ((8, 5120), (96, 5120), (256, 5120), (512, 5120), (1280, 5120)):
+                    torch.manual_seed(3100 + bfp_mode * 101 + m * 11 + rank)
+                    x = torch.randn((m, h), dtype=torch.bfloat16, device=device) * 0.125
+                    ref_cpu = x.float().cpu()
+                    dist.all_reduce(ref_cpu, group=dist.group.WORLD)
+
+                    out = torch.empty_like(x)
+                    comm_bfp.all_reduce(x, output=out)
+                    x_ip = x.clone()
+                    comm_bfp.all_reduce(x_ip, output=x_ip)
+                    assert torch.equal(out.cpu(), x_ip.cpu()), (
+                        f"in-place vs out-of-place mismatch (bfp={bfp_mode}) at {(m, h)}"
+                    )
+                    diff = float((out.float().cpu() - ref_cpu).abs().max().item())
+                    assert diff < 0.03, f"bfp={bfp_mode} all_reduce diff at {(m, h)}: {diff}"
+
+                    gathered_out = [torch.empty((m, h), dtype=torch.bfloat16) for _ in range(8)]
+                    dist.all_gather(gathered_out, out.cpu(), group=dist.group.WORLD)
+                    for peer_r in range(1, 8):
+                        assert torch.equal(gathered_out[0], gathered_out[peer_r]), (
+                            f"cross-rank drift (bfp={bfp_mode}) at {(m, h)} rank {peer_r}"
+                        )
+
+                    torch.manual_seed(3200 + bfp_mode * 101 + m * 11)
+                    res_in = torch.randn((m, h), dtype=torch.bfloat16, device=device) * 0.1
+                    w = torch.randn((h,), dtype=torch.bfloat16, device=device) * 0.05
+                    res = res_in.clone()
+                    norm_out = torch.empty_like(x)
+                    comm_bfp.all_reduce_add_rmsnorm(
+                        x, res, w, normed_out=norm_out, eps=1e-6, zero_centered=True
+                    )
+                    res_ref = (
+                        res_in.float().cpu() + ref_cpu.to(torch.bfloat16).float()
+                    ).to(torch.bfloat16)
+                    rf = res_ref.float()
+                    inv = torch.rsqrt(rf.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+                    exp_norm = (rf * inv * (1.0 + w.float().cpu())).to(torch.bfloat16)
+                    assert float((res.float().cpu() - res_ref.float()).abs().max().item()) < 0.03
+                    assert (
+                        float((norm_out.float().cpu() - exp_norm.float()).abs().max().item()) < 0.08
+                    )
+                    gathered_norm = [torch.empty((m, h), dtype=torch.bfloat16) for _ in range(8)]
+                    dist.all_gather(gathered_norm, norm_out.cpu(), group=dist.group.WORLD)
+                    for peer_r in range(1, 8):
+                        assert torch.equal(gathered_norm[0], gathered_norm[peer_r])
+
+                # Sub-block edge cases (`m=16, h=5120` -> `num_vecs=10240 >= 4097` PXB 2-shot):
+                # tile 4 packet archetypes across all 5,120 16-element packets so both owner and
+                # cross-SHM non-owner slices exercise every branch.
+                edge_pkts = torch.zeros((4, 16), dtype=torch.float32)
+                # Packet 0: `big_max = 1e-34` in sub-block 0, exact `0.0` in sub-block 1
+                edge_pkts[0, 0] = 1.0e-34
+                edge_pkts[0, 1] = -1.0e-34
+                # Packet 1: sub-threshold `1e-37` in sub-block 0, `big_max = 1e-34` in sub-block 1
+                edge_pkts[1, :8] = 1.0e-37
+                edge_pkts[1, 8] = 1.0e-34
+                # Packet 2: dual sub-block `±Inf` (`+Inf` in sub-block 0, `-Inf` in sub-block 1)
+                edge_pkts[2, 0] = float("inf")
+                edge_pkts[2, 8] = float("-inf")
+                # Packet 3: `+Inf` on pair 0 vs `-Inf` on pair 2 (`-> NaN`), plus explicit `NaN` on
+                # lane 3 while lane 4 remains `0.0` (must not pollute neighboring lanes).
+                if rank == 0:
+                    edge_pkts[3, 0] = float("inf")
+                elif rank == 4:
+                    edge_pkts[3, 0] = float("-inf")
+                edge_pkts[3, 3] = float("nan")
+
+                x_edge = (
+                    edge_pkts.to(torch.bfloat16)
+                    .repeat(1280, 1)
+                    .reshape(16, 5120)
+                    .to(device=device)
+                    .contiguous()
+                )
+                out_edge = torch.empty_like(x_edge)
+                comm_bfp.all_reduce(x_edge, output=out_edge)
+                pkts_out = out_edge.cpu().reshape(1280, 4, 16).float()
+
+                # Packet 0: sub-block 1 zeros must remain exact 0.0 (never NaN)
+                assert not torch.isnan(pkts_out[:, 0, :]).any()
+                assert float(pkts_out[:, 0, 8:].abs().max().item()) == 0.0
+                assert float((pkts_out[:, 0, 0] - 8.0e-34).abs().max().item()) < 2.0e-35
+                # Packet 1: sub-threshold `<= 1e-36` sub-block flushes to 0 (no `inv_sml` overflow)
+                assert not torch.isnan(pkts_out[:, 1, :]).any()
+                assert float(pkts_out[:, 1, :8].abs().max().item()) <= 2.0e-36
+                assert float((pkts_out[:, 1, 8] - 8.0e-34).abs().max().item()) < 2.0e-35
+                # Packet 2: both `+Inf` and `-Inf` sub-blocks stay infinite
+                assert bool(torch.isposinf(pkts_out[:, 2, 0]).all())
+                assert bool(torch.isneginf(pkts_out[:, 2, 8]).all())
+                assert float(pkts_out[:, 2, 1:8].abs().max().item()) == 0.0
+                # Packet 3: `+Inf + (-Inf)` and `NaN` yield `NaN` without polluting lane 4
+                assert bool(torch.isnan(pkts_out[:, 3, 0]).all())
+                assert bool(torch.isnan(pkts_out[:, 3, 3]).all())
+                assert float(pkts_out[:, 3, 4].abs().max().item()) == 0.0
+
+                gathered_edge = [torch.empty((16, 5120), dtype=torch.uint16) for _ in range(8)]
+                dist.all_gather(
+                    gathered_edge, out_edge.cpu().view(torch.uint16), group=dist.group.WORLD
+                )
+                for peer_r in range(1, 8):
+                    assert torch.equal(gathered_edge[0], gathered_edge[peer_r]), (
+                        f"edge-case bit-identity drift (bfp={bfp_mode}) rank {peer_r}"
+                    )
     finally:
         dist.destroy_process_group()
 

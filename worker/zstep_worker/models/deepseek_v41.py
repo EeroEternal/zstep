@@ -45,6 +45,7 @@ import torch.distributed as dist
 from zstep_worker.kernels_sm120.b12x_dsv41 import (
     SM120_DSA_CANDIDATE_COVER_TOKENS,
     B12xPrepareSummary,
+    attach_sm120_mhc_shm_ar,
     close_b12x_dsv41_model,
     flush_sm120_mhc_before_ar,
     install_b12x_dsv41_quant_patches,
@@ -542,7 +543,8 @@ class DeepSeekV41StepRunner:
             threads=pxb_ar_threads,
             exchange_group=self.exchange_group,
             enable_pxb_p2p=self.p2p_report.pxb_shm_enabled,
-            pxb_max_elements=min(ar_max_tokens, 3072) * 5120,
+            pxb_max_elements=min(ar_max_tokens, 4096) * 5120,
+            enable_pxb_bfp=self.runtime_config.shm_pxb_bfp_mode,
         )
         self.shm_ag: HostMappedShmAllGather = HostMappedShmAllGather(
             name=f"{allreduce_name}_ag",
@@ -586,6 +588,7 @@ class DeepSeekV41StepRunner:
                 decode_buckets=dspark_buckets,
                 exchange_group=self.exchange_group,
             )
+        attach_sm120_mhc_shm_ar(self.device.index, self.shm_ar, self)
 
         # Reclaim transient b12x / weight-conversion blocks before large KV allocation
         gc.collect()
@@ -801,15 +804,15 @@ class DeepSeekV41StepRunner:
         shm_ar = self.shm_ar
         shm_ag = self.shm_ag
         runner = self
-        # Route M <= 3072 when CX8 PXB-SHM hybrid is active (or M <= 384 on non-P2P)
-        # plus 100% of CUDAGraph captures through `shm_ar`; route larger eager AR
-        # payloads to topology-aware NCCL (`PXB` on P2P switches, `LOC` on non-P2P).
-        default_ar_rows = 3072 if shm_ar.pxb_enabled else 384
+        # Route up to `shm_ar`'s allocated PXB capacity (M <= 4096 when max_step_tokens >= 4096,
+        # or M <= 384 on non-P2P) plus 100% of CUDAGraph captures through `shm_ar`; route larger
+        # eager AR payloads to topology-aware NCCL (`PXB` on P2P switches, `LOC` on non-P2P).
+        default_ar_numel = shm_ar.pxb_max_vecs * 8 if shm_ar.pxb_enabled else 384 * 5120
         shm_max_ar_numel = self.runtime_config.effective_shm_max_ar_numel(
-            default_ar_rows * 5120
+            default_ar_numel
         )
         default_ag_elems = (
-            min(self.max_step_tokens, 3072) * 3200 if shm_ar.pxb_enabled else 1024 * 4096
+            min(self.max_step_tokens, 4096) * 3200 if shm_ar.pxb_enabled else 1024 * 4096
         )
         shm_max_ag_numel = self.runtime_config.effective_shm_max_ag_numel(
             default_ag_elems
@@ -830,10 +833,9 @@ class DeepSeekV41StepRunner:
             ):
                 contig = input_ if input_.is_contiguous() else input_.contiguous()
                 if contig.data_ptr() % 16 == 0:
-                    out = torch.empty_like(contig)
-                    shm_ar.all_reduce(contig, output=out)
+                    shm_ar.all_reduce(contig, output=contig)
                     runner.shm_ar_calls += 1
-                    return out
+                    return contig
             if not capturing and numel > shm_max_ar_numel:
                 runner.nccl_eager_large_calls += 1
             else:

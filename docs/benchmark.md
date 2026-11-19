@@ -19,7 +19,7 @@
 | --- | --- | --- | --- | --- |
 | **PCIe AllReduce（小/中 batch）** | `8 × RTX 6000D`（`H=5120`, `M=1..512`） | `NCCL_LOC`：`48.95 µs`（`M=1`）；`shm_v5`：`571.54 µs`（`M=512`） | `shm_v5`：**`12.46–14.48 µs`**（`M=1`）；`shm_v5_pxb`：**`323.95 µs`**（`M=512`） | **`3.38×–3.93×`**（`M=1`）；CX8 P2P 再快 **`1.40×–1.76×`** |
 | **基础引擎对称对标（`Qwen3.5`）** | `Qwen3.5-35B-A3B` TP=8 @ `8 × RTX 5090` / `6000D` | `vLLM 0.33.0`：`192.2–3,259.0 tok/s` | 无 P2P **`261.5–5,115.9 tok/s`**；自适应 P2P 达 **`5,877.1 tok/s`**（总吞吐 **`17,631.4 tok/s`**），在线 `serve` 单流 **`380.0 tok/s`** | 较 `vLLM` **`+11.0%` ~ `+80.3%`**；自适应 P2P 再增 **`+10.30%`**（中位 TTFT 降 **`12.2%–16.9%`**） |
-| **基础引擎对称对标（`DeepSeek-V4.1`）** | `DeepSeek-V4.1-Flash` TP=8 @ `8 × RTX 6000D` | `vLLM 0.31.0` 纯引擎：`83.6–1,126.3 tok/s` | 无 P2P **`124.0–1,807.2 tok/s`**；自适应 P2P + 原地融合 `mHC`/PXB AllGather 达 **`2,294.3 tok/s`**（`in1024_c128` 总吞吐 **`8,041.1 tok/s`**），在线单流 **`133.5 tok/s`** | 较 `vLLM` **`+42.5%` ~ `+103.7%`**（`c>=16` 达 **`+60.3%` ~ `+103.7%`**）；自适应 P2P + 融合 `mHC` 累计增 **`+17.8%`**（中位 TTFT 累计降 **`~28.5%`**） |
+| **基础引擎对称对标（`DeepSeek-V4.1`）** | `DeepSeek-V4.1-Flash` TP=8 @ `8 × RTX 6000D` | `vLLM 0.31.0` 纯引擎：`83.6–1,126.3 tok/s` | 无 P2P **`124.0–1,807.2 tok/s`**；自适应 P2P + `FP12+BFP7` 压缩 / `Cluster-8` 融合 `mHC` 达 **`2,437.3 tok/s`**（`in1024_c128` 总吞吐 **`8,816.9 tok/s`**），在线单流 **`133.5 tok/s`** | 较 `vLLM` **`+42.5%` ~ `+116.4%`**（`c>=16` 达 **`+65.9%` ~ `+116.4%`**）；自适应 P2P + 融合 `mHC` 累计增 **`+24.8%`**（中位 TTFT 累计降 **`~36.2%`**） |
 | **在线自动前缀缓存（APC）** | `Qwen3.5` / `DeepSeek-V4.1` TP=8 @ `8 × RTX 6000D` | Cold TTFT：`599.2 ms` / `1,049.6 ms` | Warm TTFT：**`36.9–44.4 ms`** / **`202.7–204.3 ms`** | **`13.49×–16.22×`** / **`5.14×–5.18×`** |
 | **在线投机解码（`Qwen3.5` `mtp K=3`）** | `Qwen3.5-35B-A3B` TP=8 @ `8 × RTX 6000D` | `zstep` 无投机：`309.3–314.3 tok/s` | **`583.6–762.5 tok/s`**（TPOT **`1.31–1.71 ms`**，$\tau=2.88\text{–}3.90$） | **`1.87×–2.45×`** |
 | **在线投机解码（`DeepSeek-V4.1` `dspark K=5`）** | `DeepSeek-V4.1-Flash` TP=8 @ `8 × RTX 6000D` | `zstep` 无投机：`117.9–118.6 tok/s` | **`168.9–395.1 tok/s`**（TPOT **`2.53–5.92 ms`**，$\tau=2.85\text{–}6.00$） | **`1.42×–3.35×`** |
@@ -258,6 +258,22 @@
 | `in512_c128` | `2,165.45` | **`2,294.32`** | **`+5.95%`** | `0.15%` / `0.03%` | `561.60` / **`528.96`**（**`-5.81%`**） | `51.56` / **`48.71`**（`-5.53%`） | `280.57` / **`264.29`**（**`-5.80%`**） |
 | `in1024_c128` | `1,535.68` | **`1,608.21`** | **`+4.72%`** | `0.10%` / `0.11%` | `569.08` / **`536.29`**（**`-5.76%`**） | `70.20` / **`67.11`**（`-4.40%`） | `285.06` / **`268.65`**（**`-5.76%`**） |
 
+#### （e）`DeepSeek-V4.1-Flash` `FP12+BFP7` 2× 跨-SHM 块浮点压缩 + `M <= 4096` PXB 环 + SM120 `Cluster-8` 融合 `AR + mHC`（3 轮交错中位数，几何平均再增 **`+5.93%`**）
+
+在 `4.4(d)` 基线之上，针对大批量混合/Prefill 步每拍 `123` 次 AllReduce 跨 Xeon Root Complex 的 PCIe/DDR5 内存控制器带宽墙与小批量 `M in {1, 2, 4}` 双内核启动开销，落地四项通信与 SM120 集群融合（[`shm_allreduce.py`](../worker/zstep_worker/kernels_sm120/shm_allreduce.py)、[`b12x_dsv41.py`](../worker/zstep_worker/kernels_sm120/b12x_dsv41.py)、[`deepseek_v41.py`](../worker/zstep_worker/models/deepseek_v41.py)、[`env_config.py`](../worker/zstep_worker/env_config.py)）：
+
+1. **`FP12+BFP7` 跨-SHM 2× 双子块浮点压缩（`ZSTEP_SHM_ENABLE_PXB_BFP=1` 默认开启）**：同 CX8 Switch 伙伴 Stage-1 继续走无损 16-bit P2P（`103 GB/s`），随后将每 **16 个 FP32 局部和**在线打包为 **`128-bit`（`uint4`，16 B）双子块压缩帧**（`1-bit` 大子块标记 `h1_big` + `12-bit FP12` `[8b exp + 4b mant]` 基准缩放因子 + `3-bit` 子块间 `4^sh` 相对移位 + `16 × 7-bit` 二进制补码四舍五入有符号尾数 `[-63..+63]`，幅值有效精度 `6-bit`，与 BF16 输入量化噪声同一量级）写入跨对 Host-SHM；4 个对代表以**完全一致的固定顺序 `(0, 1, 2, 3)` 累加**：在 `64 < M <= 1024`（`bfp_mode=1`）下 Stage-2 同样以 `128-bit FP12+BFP7` 广播并由主从统一经 `unpack_to_bf16_pair` 重建，在 `M > 1024`（`bfp_mode=2`，或显式 `ZSTEP_SHM_ENABLE_PXB_BFP=2`）下 Stage-1 压缩 + Stage-2 直接广播单代表截断后的原生 BF16（`=0` 完全回退无损 BF16）。跨-NUMA/Root-Complex 负载最高腰斩 **`2.0×`**（`M=512`: `320 -> 208 µs`, **`1.54×`**；`M=4096`: `2,672 -> 1,554 µs`, **`1.72×`**），同时严格保证 8 个 TP rank 输出 **0-ULP 逐 bit 完全一致**（无跨卡分叉风险）。
+2. **全步宽 `M <= 4096` 覆盖（`pxb_max_elements` / `shm_ar` / `shm_ag` 统一对齐至 `4096` tokens）**：消除 `M = 3073..4096` 满载混合步跌回慢速 `NCCL_PXB`（`2,672 µs`）的悬崖，仅增加 `+40 MiB/GPU`（总显存仍余 `> 20 GiB` 安全裕度）。
+3. **原地 `_fast_all_reduce`（`shm_ar.all_reduce(contig, output=contig)`）**：利用 Stage-1 全栅栏同步无 WAR 特性消除每拍 `122` 次临时输出张量分配与写分配缓存抖动。
+4. **SM120 `Cluster-8` DSMEM 融合 `shm_v5_ar_mhc_cluster8_kernel`（`M in {1, 2, 4}`，`ZSTEP_ENABLE_SM120_FUSE_MHC_AR=1`）**：启用 `DeepseekV4DecoderLayer` 延迟归约（`wo_b.reduce_results = False`、`ffn.reduce_results = False`、`experts.moe_config.skip_final_all_reduce = True`），对 `M in {1, 2, 4}` 解码桶在单个 `__cluster_dims__(8, 1, 1)` 内核内通过 Hopper/Blackwell 分布式共享内存（DSMEM）一次性完成 8 卡归约 + 4 流 `mHC` 混合 + `pre_mix` 流折叠 + 输入 `RMSNorm`（61 层模型每拍省去 `121` 次独立内核启动；`M >= 8` 保持 `mhc_stream` Sinkhorn 与 `32-CTA` `shm_ar` 并发重叠）。
+
+| 档位 | `4.4(d)` 基线 Output (`tok/s`) | `FP12+BFP7` + `Cluster-8` Output (`tok/s`) | 优化后 Total (`tok/s`) | 吞吐增益 | 轮间 CV（基线 / 优化后） | 基线 / 优化后 Med TTFT (`ms`) | 基线 / 优化后 Mean TPOT (`ms`) | 基线 / 优化后 P99 ITL (`ms`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `in512_c16` | `892.45` | **`922.22`** | **`2,766.67`** | **`+3.34%`** | `1.38%` / `0.69%` | `299.40` / **`234.61`**（**`-21.64%`**） | `16.42` / **`16.12`**（`-1.83%`） | `15.92` / **`15.91`**（`-0.06%`） |
+| `in1024_c32` | `1,018.05` | **`1,061.26`** | **`5,306.30`** | **`+4.24%`** | `0.23%` / `0.75%` | `266.22` / **`238.37`**（**`-10.46%`**） | `28.00` / **`26.98`**（`-3.64%`） | `266.10` / **`238.13`**（**`-10.51%`**） |
+| `in512_c128` | `2,273.91` | **`2,437.25`** | **`7,311.76`** | **`+7.18%`** | `0.75%` / `0.37%` | `527.80` / **`472.44`**（**`-10.49%`**） | `49.21` / **`46.26`**（`-5.99%`） | `263.83` / **`235.95`**（**`-10.57%`**） |
+| `in1024_c128` | `1,616.65` | **`1,763.37`** | **`8,816.85`** | **`+9.08%`** | `0.51%` / `0.14%` | `536.05` / **`479.74`**（**`-10.50%`**） | `66.78` / **`61.14`**（`-8.45%`） | `268.68` / **`240.63`**（**`-10.44%`**） |
+
 ---
 
 ## 5. 在线自动前缀缓存（APC）性能验证
@@ -345,7 +361,7 @@ $$\text{Client} \longrightarrow \text{nebula-gateway} \longrightarrow \text{nebu
 | --- | --- | --- | --- | --- |
 | **交互式 Agent / IDE 代码补全 / JSON 提取** | 低至中并发（`c = 1..8`），追求极致单流 TPOT 与多轮低 TTFT | `--enable-prefix-caching --speculative-method mtp --num-speculative-tokens 3` | `--enable-prefix-caching --speculative-method dspark --num-speculative-tokens 5` | 单流解码 **`584–762 tok/s`**（`Qwen3.5`）/ **`263–395 tok/s`**（`DS-V4.1`），多轮 TTFT 加速 **`5×–16×`** |
 | **RAG 原文引用 / 代码 Diff 重写（显存受限）** | 低并发、输入输出高度重叠、希望将全部剩余显存留给主模型 KV 池 | `--enable-prefix-caching --speculative-method ngram --num-speculative-tokens 3 --prompt-lookup-max 5 --prompt-lookup-min 2` | `--enable-prefix-caching --speculative-method ngram --num-speculative-tokens 5 --prompt-lookup-max 5 --prompt-lookup-min 2` | **零草稿权重/草稿 KV 显存开销**，重复片段最高 **`2.16×–2.92×`** 提速，不匹配负载零退化 |
-| **高并发离线批处理 / 高吞吐在线池** | 高并发（`c = 16..128`），GPU 算力已由 batch 填满 | `--enable-prefix-caching --speculative-method none`（若追求更低 `P99 ITL` 可加 `--max-prefill-chunk 512`） | `--enable-prefix-caching --speculative-method none` | 无 P2P 峰值 **`5,039–5,116 tok/s`**（`Qwen3.5`）/ **`1,796–1,807 tok/s`**（`DS-V4.1`）；开启 PCIe Switch P2P + 融合 `mHC` 后达 **`5,877 tok/s`** / **`2,294 tok/s`**（比 `vLLM` 高 **`+60%` ~ `+104%`**） |
+| **高并发离线批处理 / 高吞吐在线池** | 高并发（`c = 16..128`），GPU 算力已由 batch 填满 | `--enable-prefix-caching --speculative-method none`（若追求更低 `P99 ITL` 可加 `--max-prefill-chunk 512`） | `--enable-prefix-caching --speculative-method none` | 无 P2P 峰值 **`5,039–5,116 tok/s`**（`Qwen3.5`）/ **`1,796–1,807 tok/s`**（`DS-V4.1`）；开启 PCIe Switch P2P + `FP12+BFP7` + 融合 `mHC` 后达 **`5,877 tok/s`** / **`2,437 tok/s`**（比 `vLLM` 高 **`+66%` ~ `+116%`**） |
 
 ### Nebula 声明式部署配置示例（`ModelConfig.speculative_config`）
 

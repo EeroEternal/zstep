@@ -8,6 +8,7 @@ import pytest
 from zstep_worker.env_config import (
     DEFAULT_MIN_PXB_BI_GBPS,
     WorkerRuntimeConfig,
+    parse_pxb_bfp_mode,
     parse_qwen_fused_gdn_enabled,
     parse_qwen_gdn_decode_mode,
 )
@@ -24,6 +25,7 @@ def test_worker_runtime_config_defaults_and_summary() -> None:
     assert cfg.p2p_mode == "auto"
     assert cfg.p2p_min_pxb_bi_gbps == DEFAULT_MIN_PXB_BI_GBPS
     assert cfg.shm_enable_pxb_p2p is True
+    assert cfg.shm_pxb_bfp_mode == 1
     assert cfg.effective_shm_max_ar_numel(1234) == 1234
     assert cfg.effective_shm_max_ag_numel(5678) == 5678
     assert cfg.enable_b12x is True
@@ -35,6 +37,7 @@ def test_worker_runtime_config_defaults_and_summary() -> None:
     assert cfg.mega_gate_min_tokens == 1
     assert cfg.mega_gate_enable_pdl is False
     assert cfg.enable_sm120_mhc_overlap is True
+    assert cfg.enable_sm120_fuse_mhc_ar is True
     assert cfg.b12x_compat_dir == ""
     assert cfg.b12x_cache_dir is None
     assert cfg.b12x_autotune is True
@@ -44,6 +47,8 @@ def test_worker_runtime_config_defaults_and_summary() -> None:
     line = cfg.format_log_line()
     assert line.startswith("zstep_worker_config ")
     assert "spec=none:0" in line
+    assert "pxb_bfp=1" in line
+    assert "mhc_overlap=1(fuse_ar=1)" in line
     assert "shm_max_ar=auto" in line
 
 
@@ -58,6 +63,7 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
         "ZSTEP_P2P_MODE": "OFF",
         "ZSTEP_P2P_MIN_PXB_BI_GBPS": "55.5",
         "ZSTEP_SHM_ENABLE_PXB_P2P": "0",
+        "ZSTEP_SHM_ENABLE_PXB_BFP": "2",
         "ZSTEP_SHM_MAX_AR_NUMEL": "65536",
         "ZSTEP_SHM_MAX_AG_NUMEL": "131072",
         "ZSTEP_ENABLE_B12X": "off",
@@ -68,6 +74,7 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
         "ZSTEP_MEGA_GATE_MIN_TOKENS": "8",
         "ZSTEP_MEGA_GATE_ENABLE_PDL": "1",
         "ZSTEP_ENABLE_SM120_MHC_OVERLAP": "0",
+        "ZSTEP_ENABLE_SM120_FUSE_MHC_AR": "0",
         "ZSTEP_B12X_COMPAT_DIR": " /opt/b12x ",
         "ZSTEP_B12X_CACHE_DIR": " /tmp/b12x_cache ",
         "ZSTEP_B12X_AUTOTUNE": "0",
@@ -84,6 +91,9 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
     assert cfg.p2p_mode == "off"
     assert cfg.p2p_min_pxb_bi_gbps == 55.5
     assert cfg.shm_enable_pxb_p2p is False
+    assert cfg.shm_pxb_bfp_mode == 2
+    assert parse_pxb_bfp_mode({"ZSTEP_SHM_ENABLE_PXB_BFP": "false"}) == 0
+    assert parse_pxb_bfp_mode({"ZSTEP_SHM_ENABLE_PXB_BFP": "true"}) == 1
     assert cfg.effective_shm_max_ar_numel(1234) == 65536
     assert cfg.effective_shm_max_ag_numel(5678) == 131072
     assert cfg.enable_b12x is False
@@ -95,6 +105,7 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
     assert cfg.mega_gate_min_tokens == 8
     assert cfg.mega_gate_enable_pdl is True
     assert cfg.enable_sm120_mhc_overlap is False
+    assert cfg.enable_sm120_fuse_mhc_ar is False
     assert cfg.b12x_compat_dir == "/opt/b12x"
     assert cfg.b12x_cache_dir == "/tmp/b12x_cache"
     assert cfg.b12x_autotune is False
@@ -112,6 +123,8 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
         ({"ZSTEP_NUM_RECURRENT_CHECKPOINTS": "256"}, "ZSTEP_NUM_RECURRENT_CHECKPOINTS"),
         ({"ZSTEP_P2P_MODE": "bogus"}, "ZSTEP_P2P_MODE"),
         ({"ZSTEP_P2P_MIN_PXB_BI_GBPS": "-1.0"}, "ZSTEP_P2P_MIN_PXB_BI_GBPS"),
+        ({"ZSTEP_SHM_ENABLE_PXB_BFP": "3"}, "ZSTEP_SHM_ENABLE_PXB_BFP"),
+        ({"ZSTEP_SHM_ENABLE_PXB_BFP": "bogus"}, "ZSTEP_SHM_ENABLE_PXB_BFP"),
         ({"ZSTEP_SHM_MAX_AR_NUMEL": "-4"}, "ZSTEP_SHM_MAX_AR_NUMEL"),
         ({"ZSTEP_QWEN_GDN_DECODE_MODE": "invalid_mode"}, "ZSTEP_QWEN_GDN_DECODE_MODE"),
     ],
