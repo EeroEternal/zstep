@@ -70,7 +70,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v22_ext",
+            name="zstep_shm_allreduce_sm120_v28_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -464,6 +464,7 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
                 self.one_shot_max_vecs,
                 self.pxb_max_vecs if self._pxb_enabled else 0,
                 self._pxb_bfp if self._pxb_enabled else 0,
+                0,
                 stream_handle,
             )
         else:

@@ -42,6 +42,7 @@ void launch_shm_v5_allreduce_cuda(
     int one_shot_max_vecs,
     int64_t pxb_max_vecs,
     int pxb_bfp,
+    std::uintptr_t ar_cta_done_ptr,
     std::uintptr_t stream_handle);
 
 void launch_shm_v5_allreduce_add_rmsnorm_cuda(
@@ -97,6 +98,9 @@ void launch_mhc_post_collapse_rmsnorm_cuda(
     float norm_eps,
     int write_aux,
     int post_only,
+    int ar_blocks,
+    std::uintptr_t ar_cta_done_ptr,
+    std::uintptr_t ar_cta_wait_ptr,
     std::uintptr_t stream_handle);
 void launch_mhc_sinkhorn_stats_cuda(
     const float* gemm_mul_ptr,
@@ -247,6 +251,7 @@ void launch_shm_v5_pxb_allreduce(
     int64_t one_shot_max_vecs,
     int64_t pxb_max_vecs,
     int64_t pxb_bfp,
+    std::uintptr_t ar_cta_done_ptr,
     std::uintptr_t stream_handle) {
     TORCH_CHECK(input.is_cuda() && output.is_cuda(), "input/output must be CUDA tensors");
     TORCH_CHECK(input.scalar_type() == at::kBFloat16 && output.scalar_type() == at::kBFloat16, "BF16 required");
@@ -277,6 +282,7 @@ void launch_shm_v5_pxb_allreduce(
         static_cast<int>(one_shot_max_vecs),
         pxb_max_vecs,
         static_cast<int>(pxb_bfp),
+        ar_cta_done_ptr,
         stream_handle);
 }
 
@@ -306,6 +312,7 @@ void launch_shm_v5_allreduce(
         blocks,
         threads,
         one_shot_max_vecs,
+        0,
         0,
         0,
         stream_handle);
@@ -488,6 +495,9 @@ void launch_mhc_post_collapse_rmsnorm(
     double norm_eps,
     int64_t write_aux,
     int64_t post_only,
+    int64_t ar_blocks,
+    std::uintptr_t ar_cta_done_ptr,
+    std::uintptr_t ar_cta_wait_ptr,
     std::uintptr_t stream_handle) {
     TORCH_CHECK(x.is_cuda() && residual.is_cuda(), "x/residual must be CUDA tensors");
     TORCH_CHECK(
@@ -550,6 +560,9 @@ void launch_mhc_post_collapse_rmsnorm(
         static_cast<float>(norm_eps),
         static_cast<int>(write_aux),
         static_cast<int>(post_only),
+        static_cast<int>(ar_blocks),
+        ar_cta_done_ptr,
+        ar_cta_wait_ptr,
         stream_handle);
 }
 
