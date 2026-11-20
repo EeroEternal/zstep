@@ -26,7 +26,21 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use crate::{BlockLease, BlockPool, CacheGroupKind, HybridBlockAliasTable, plan_bounded_replay};
+use crate::{
+    BlockLease, BlockPool, CacheGroupKind, HybridBlockAliasTable, kv_hash, plan_bounded_replay,
+};
+
+/// External KV cache event emitted by [`PrefixTree`] for cross-replica prefix affinity
+/// (`NEBULA_KV_HASH_SEED` / `nebula-indexd`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KvCacheEvent {
+    Stored { block_hashes: Vec<[u8; 8]> },
+    Removed { block_hashes: Vec<[u8; 8]> },
+    Cleared,
+}
+
+/// Non-blocking callback receiving [`KvCacheEvent`] batches outside the [`PrefixTree`] lock.
+pub type KvCacheEventSink = Arc<dyn Fn(KvCacheEvent) + Send + Sync>;
 
 /// Errors produced during Automatic Prefix Cache admission or block promotion.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +81,7 @@ impl std::error::Error for KvError {}
 struct PrefixNode {
     parent: usize,
     token_key: Box<[i32]>,
+    block_hash: [u8; 32],
     children: HashMap<Box<[i32]>, usize>,
     lease: Option<BlockLease>,
     aux_lease: Option<BlockLease>,
@@ -83,6 +98,7 @@ struct PrefixTreeInner {
     cached_blocks: usize,
     access_clock: u64,
     alias_table: HybridBlockAliasTable,
+    event_sink: Option<KvCacheEventSink>,
 }
 
 impl PrefixTreeInner {
@@ -117,8 +133,13 @@ impl PrefixTreeInner {
         path
     }
 
-    fn evict_lru_victims_inner(&mut self, target_blocks: usize) -> Vec<PrefixVictim> {
+    fn evict_lru_victims_inner(
+        &mut self,
+        target_blocks: usize,
+    ) -> (Vec<PrefixVictim>, Vec<[u8; 8]>) {
         let mut victims = Vec::with_capacity(target_blocks);
+        let mut removed_hashes = Vec::new();
+        let emit_hashes = self.event_sink.is_some();
         while victims.len() < target_blocks {
             let candidate = self
                 .nodes
@@ -138,6 +159,7 @@ impl PrefixTreeInner {
             let token_path = self.reconstruct_token_path(victim_idx);
             let parent_idx = self.nodes[victim_idx].parent;
             let key = self.nodes[victim_idx].token_key.clone();
+            let victim_hash = self.nodes[victim_idx].block_hash;
             self.nodes[parent_idx].children.remove(&key);
             let lease = self.nodes[victim_idx].lease.take();
             let aux_lease = self.nodes[victim_idx].aux_lease.take();
@@ -150,6 +172,9 @@ impl PrefixTreeInner {
             self.free_node_slots.push(victim_idx);
             self.cached_blocks = self.cached_blocks.saturating_sub(1);
             if let Some(lease) = lease {
+                if emit_hashes {
+                    removed_hashes.push(kv_hash::external_hash(&victim_hash));
+                }
                 victims.push(PrefixVictim {
                     token_path,
                     lease,
@@ -159,11 +184,7 @@ impl PrefixTreeInner {
                 drop(aux_lease);
             }
         }
-        victims
-    }
-
-    fn evict_lru_leaves(&mut self, target_blocks: usize) -> usize {
-        self.evict_lru_victims_inner(target_blocks).len()
+        (victims, removed_hashes)
     }
 }
 
@@ -195,6 +216,18 @@ impl PrefixTree {
     }
 
     pub fn with_pages_per_node(block_tokens: u32, pages_per_node: usize) -> Result<Self, KvError> {
+        Self::with_pages_per_node_and_seed(
+            block_tokens,
+            pages_per_node,
+            &kv_hash::env_kv_hash_seed(),
+        )
+    }
+
+    pub fn with_pages_per_node_and_seed(
+        block_tokens: u32,
+        pages_per_node: usize,
+        hash_seed: &str,
+    ) -> Result<Self, KvError> {
         if block_tokens == 0 {
             return Err(KvError::InvalidGeometry(
                 "block_tokens must be positive".to_owned(),
@@ -213,6 +246,7 @@ impl PrefixTree {
         let root = PrefixNode {
             parent: 0,
             token_key: Box::new([]),
+            block_hash: kv_hash::none_hash_for_seed(hash_seed),
             children: HashMap::new(),
             lease: None,
             aux_lease: None,
@@ -229,8 +263,18 @@ impl PrefixTree {
                 cached_blocks: 0,
                 access_clock: 0,
                 alias_table: HybridBlockAliasTable::new(),
+                event_sink: None,
             })),
         })
+    }
+
+    /// Attach a non-blocking [`KvCacheEventSink`] for `BlockStored` / `BlockRemoved` notifications.
+    pub fn set_event_sink(&self, sink: Option<KvCacheEventSink>) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.event_sink = sink;
     }
 
     pub fn block_tokens(&self) -> u32 {
@@ -466,6 +510,9 @@ impl PrefixTree {
             None => (0..new_node_blocks.len()).map(|_| None).collect(),
         };
 
+        let mut stored_hashes = Vec::new();
+        let emit_hashes = guard.event_sink.is_some();
+
         for ((chunk, block_lease), aux_lease) in extension_tokens
             .chunks_exact(block_tokens)
             .zip(new_node_blocks)
@@ -501,11 +548,19 @@ impl PrefixTree {
                         .insert(block_lease.ids(), aux_slot_id)
                         .expect("pre-flight validated unique hybrid alias");
                 }
+                let node_hash = if emit_hashes {
+                    let h = kv_hash::block_hash(&guard.nodes[current].block_hash, chunk);
+                    stored_hashes.push(kv_hash::external_hash(&h));
+                    h
+                } else {
+                    [0u8; 32]
+                };
                 let tick = guard.next_tick();
                 let key: Box<[i32]> = chunk.into();
                 let node = PrefixNode {
                     parent: current,
                     token_key: key.clone(),
+                    block_hash: node_hash,
                     children: HashMap::new(),
                     lease: Some(block_lease),
                     aux_lease,
@@ -518,6 +573,16 @@ impl PrefixTree {
                 guard.cached_blocks += 1;
                 matched_nodes += 1;
                 current = child_idx;
+            }
+        }
+
+        let sink = guard.event_sink.clone();
+        drop(guard);
+        if !stored_hashes.is_empty() {
+            if let Some(sink) = sink {
+                sink(KvCacheEvent::Stored {
+                    block_hashes: stored_hashes,
+                });
             }
         }
 
@@ -567,11 +632,7 @@ impl PrefixTree {
 
     /// Evict up to `target_blocks` unpinned leaf nodes in strict LRU order.
     pub fn evict_lru(&self, target_blocks: usize) -> usize {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.evict_lru_leaves(target_blocks)
+        self.evict_lru_victims(target_blocks).len()
     }
 
     /// Evict up to `target_blocks` unpinned leaf nodes in strict LRU order, returning each
@@ -582,7 +643,17 @@ impl PrefixTree {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.evict_lru_victims_inner(target_blocks)
+        let (victims, removed_hashes) = guard.evict_lru_victims_inner(target_blocks);
+        let sink = guard.event_sink.clone();
+        drop(guard);
+        if !removed_hashes.is_empty() {
+            if let Some(sink) = sink {
+                sink(KvCacheEvent::Removed {
+                    block_hashes: removed_hashes,
+                });
+            }
+        }
+        victims
     }
 }
 

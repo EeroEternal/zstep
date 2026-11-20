@@ -165,6 +165,20 @@ fn cli_parser_enforces_nebula_contract_flags_and_model_defaults() {
     let apc_64 = parse(&["--model-dir", "/tmp/qwen35", "--apc-gdn-node-tokens", "64"])
         .expect("64-token hybrid GDN APC");
     assert_eq!(apc_64.resolved_apc_geometry().expect("apc64"), (4, 255));
+    let with_kv_events = parse(&[
+        "--model-dir",
+        "/tmp/qwen35",
+        "--kv-events-endpoint",
+        "tcp://127.0.0.1:5557",
+        "--kv-events-topic",
+        "qwen35/0",
+    ])
+    .expect("kv events flags");
+    assert_eq!(
+        with_kv_events.kv_events_endpoint.as_deref(),
+        Some("tcp://127.0.0.1:5557")
+    );
+    assert_eq!(with_kv_events.kv_events_topic.as_deref(), Some("qwen35/0"));
     assert_eq!(
         default_apc
             .engine_config(None)

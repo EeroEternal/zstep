@@ -26,6 +26,8 @@ Usage: zstep serve --model-dir <PATH> [OPTIONS]\n\
   --enable-prefix-caching        Enable Automatic Prefix Caching (APC, default: enabled)\n\
   --no-enable-prefix-caching     Disable Automatic Prefix Caching (APC)\n\
   --apc-gdn-node-tokens N        GDN hybrid APC node granularity: 64 | 128 (default: 128)\n\
+  --kv-events-endpoint ADDR      Optional ZeroMQ PUB endpoint for BlockStored/BlockRemoved events\n\
+  --kv-events-topic TOPIC        ZeroMQ topic (default: <served-model-name>/0)\n\
   --dram-kv-blocks N             Host DRAM KV blocks per GPU (default: 0 = disabled; enables Exclusive DRAM + sm_h2d)\n\
   --kv-loading-area-ratio F      HBM fraction reserved for DRAM->HBM reloads in (0.0, 0.5] (default: 0.10)\n\
   --max-waiting-requests N       Bounded HTTP waiting queue depth (default: 1024)\n\
@@ -92,6 +94,8 @@ pub struct ServeArgs {
     pub tokenizer_mode: String,
     pub enable_prefix_caching: bool,
     pub apc_gdn_node_tokens: u32,
+    pub kv_events_endpoint: Option<String>,
+    pub kv_events_topic: Option<String>,
     pub max_waiting_requests: usize,
     pub drain_timeout: Duration,
     pub python: String,
@@ -152,6 +156,8 @@ pub fn validate_known_flags(argv: &[String]) -> Result<BTreeMap<String, String>,
         "--max-prefill-chunk",
         "--page-block-tokens",
         "--apc-gdn-node-tokens",
+        "--kv-events-endpoint",
+        "--kv-events-topic",
         "--num-kv-pages",
         "--kv-cache-dtype",
         "--tokenizer-mode",
@@ -367,6 +373,14 @@ impl ServeArgs {
                 "--apc-gdn-node-tokens must be 64 or 128 (got {apc_gdn_node_tokens})"
             ));
         }
+        let kv_events_endpoint = values
+            .get("--kv-events-endpoint")
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let kv_events_topic = values
+            .get("--kv-events-topic")
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
         let max_waiting_requests: usize =
             parse_map_number(&values, "--max-waiting-requests", 1024)?;
         if max_waiting_requests == 0 {
@@ -527,6 +541,8 @@ impl ServeArgs {
             tokenizer_mode,
             enable_prefix_caching,
             apc_gdn_node_tokens,
+            kv_events_endpoint,
+            kv_events_topic,
             max_waiting_requests,
             drain_timeout: Duration::from_secs(drain_timeout_secs),
             python: values

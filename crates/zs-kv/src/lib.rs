@@ -24,6 +24,7 @@
 
 mod dram_tier;
 mod hybrid_alias;
+pub mod kv_hash;
 mod prefix_cache;
 
 use std::sync::{Arc, Mutex};
@@ -36,8 +37,8 @@ pub use hybrid_alias::{
     SubPageLease,
 };
 pub use prefix_cache::{
-    KvCacheManager, KvError, PrefillSchedule, PrefixLease, PrefixTree, PrefixVictim,
-    RequestKvHandle,
+    KvCacheEvent, KvCacheEventSink, KvCacheManager, KvError, PrefillSchedule, PrefixLease,
+    PrefixTree, PrefixVictim, RequestKvHandle,
 };
 
 /// Physical cache groups managed by `zs-kv`.

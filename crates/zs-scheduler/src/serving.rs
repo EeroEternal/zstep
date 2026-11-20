@@ -1575,6 +1575,13 @@ impl ServingEngine {
         self.prefill_chunk_align = align.max(1);
     }
 
+    /// Attach a non-blocking [`zs_kv::KvCacheEventSink`] to the active `PrefixTree` (if APC is enabled).
+    pub fn set_prefix_event_sink(&mut self, sink: Option<zs_kv::KvCacheEventSink>) {
+        if let Some(tree) = self.prefix_tree.as_ref() {
+            tree.set_event_sink(sink);
+        }
+    }
+
     /// Publish decode steps before the previous step's result is read.
     ///
     /// Workers must implement `launch`/`finish`, `STEP_FLAG_DEVICE_TOKENS`, and

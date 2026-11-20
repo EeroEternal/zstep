@@ -46,11 +46,13 @@ const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 mod auth;
 mod cli;
+mod kv_events;
 mod metrics;
 
 use self::auth::{authorize_bearer, authorize_ops_request};
 use self::cli::is_deepseek_v41_dir;
 pub use self::cli::{SERVE_USAGE, SecretToken, ServeArgs};
+use self::kv_events::KvEventPublisher;
 use self::metrics::render_metrics;
 
 // ---------------------------------------------------------------------------
@@ -1538,6 +1540,7 @@ fn launch_engine(
     let eos_token_ids = state.tokenizer.eos_token_ids().to_vec();
     let (apc_pages_per_node, apc_recurrent_checkpoints) =
         args.resolved_apc_geometry().unwrap_or((0, 0));
+    let tokio_handle = tokio::runtime::Handle::current();
     match ServingEngine::launch(config) {
         Ok(mut engine) => {
             if state.shutdown_requested.load(Ordering::Acquire) {
@@ -1545,17 +1548,26 @@ fn launch_engine(
                 let _ = launch_done_tx.send(());
                 return;
             }
-            if apc_pages_per_node > 0
-                && let Err(error) = engine
+            if apc_pages_per_node > 0 {
+                if let Err(error) = engine
                     .enable_prefix_caching(apc_pages_per_node, apc_recurrent_checkpoints as usize)
-            {
-                let _ = engine.shutdown();
-                if !state.shutdown_requested.load(Ordering::Acquire) {
-                    eprintln!("zstep_serve prefix caching initialization failed: {error}");
-                    state.set_phase(EngineState::Faulted);
+                {
+                    let _ = engine.shutdown();
+                    if !state.shutdown_requested.load(Ordering::Acquire) {
+                        eprintln!("zstep_serve prefix caching initialization failed: {error}");
+                        state.set_phase(EngineState::Faulted);
+                    }
+                    let _ = launch_done_tx.send(());
+                    return;
                 }
-                let _ = launch_done_tx.send(());
-                return;
+                if let Some(ref endpoint) = args.kv_events_endpoint {
+                    let topic = args
+                        .kv_events_topic
+                        .clone()
+                        .unwrap_or_else(|| format!("{}/0", args.served_model_name));
+                    let publisher = KvEventPublisher::spawn(endpoint.clone(), topic, &tokio_handle);
+                    engine.set_prefix_event_sink(Some(publisher.sink()));
+                }
             }
             if args.dram_tier.is_enabled()
                 && let Err(error) = engine.enable_dram_kv_cache(args.dram_tier)
