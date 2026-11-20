@@ -2134,7 +2134,6 @@ def _prepare_sm120_mhc_overlap(
                 and hc_base.is_contiguous()
                 and hc_base.numel() >= 24
                 and int(sinkhorn_repeat) >= 1
-                and not in_piecewise_cudagraph()
                 and all(
                     t.is_contiguous()
                     for t in (residual, post_layer_mix, comb_res_mix, pre_mix, norm_weight)
@@ -2212,23 +2211,26 @@ def _prepare_sm120_mhc_overlap(
                     next_post = s.post_buf[p][:n]
                     next_comb = s.comb_buf[p][:n]
                     next_pre = s.pre_buf[p][:n]
-                    s.deferred = (
-                        n,
-                        residual,
-                        fn,
-                        hc_scale,
-                        hc_base,
-                        next_post,
-                        next_comb,
-                        next_pre,
-                        float(rms_eps),
-                        float(hc_pre_eps),
-                        float(hc_sinkhorn_eps),
-                        float(hc_post_mult_value),
-                        int(sinkhorn_repeat),
-                    )
-                    if n <= 256:
-                        s.flush(main_s)
+                    if in_piecewise_cudagraph():
+                        splits = int(compute_mhc_pre_num_splits(20480, n))
+                        needed = splits * n
+                        mix_v = s.mix_flat[: needed * 24].view(splits, n, 24)
+                        sqr_v = s.sqr_flat[: needed].view(splits, n)
+                        tf32_hc_prenorm_gemm(residual.view(n, 20480), fn, mix_v, sqr_v, splits)
+                        s.ext.launch_mhc_sinkhorn_stats(
+                            mix_v, sqr_v, hc_scale, hc_base, next_post.view(n, 4),
+                            next_comb.view(n, 16), next_pre, 20480, float(rms_eps),
+                            float(hc_pre_eps), float(hc_sinkhorn_eps),
+                            float(hc_post_mult_value), int(sinkhorn_repeat), 1, main_s.cuda_stream,
+                        )
+                    else:
+                        s.deferred = (
+                            n, residual, fn, hc_scale, hc_base, next_post, next_comb, next_pre,
+                            float(rms_eps), float(hc_pre_eps), float(hc_sinkhorn_eps),
+                            float(hc_post_mult_value), int(sinkhorn_repeat),
+                        )
+                        if n <= 256:
+                            s.flush(main_s)
                     return (
                         residual,
                         next_post,
