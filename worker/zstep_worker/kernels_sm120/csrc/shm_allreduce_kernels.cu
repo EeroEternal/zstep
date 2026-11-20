@@ -1565,7 +1565,6 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
         }
         __syncthreads();
         if (s_aborted) {
-            signal_ar_cta_done();
             return;
         }
 
@@ -1602,7 +1601,6 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
         }
         __syncthreads();
         if (s_aborted) {
-            signal_ar_cta_done();
             return;
         }
 
@@ -1686,7 +1684,6 @@ __global__ __launch_bounds__(512, 1) void shm_v5_ar_add_rmsnorm_kernel(
         }
         __syncthreads();
         if (s_aborted) {
-            signal_ar_cta_done();
             return;
         }
 
@@ -2322,7 +2319,8 @@ __global__ __launch_bounds__(512, 2) void shm_v5_allgather_kernel(
     int64_t outer_rows,
     int64_t vecs_per_row,
     int rank,
-    int world_size) {
+    int world_size,
+    int pxb_bfp = 0) {
     const int b = blockIdx.x;
     __shared__ uint64_t s_step;
     __shared__ int s_aborted;
@@ -2377,7 +2375,7 @@ __global__ __launch_bounds__(512, 2) void shm_v5_allgather_kernel(
         const int parity = rank & 1, pair_id = rank >> 1, pt_r = rank ^ 1;
         uint4* pt_buf = reinterpret_cast<uint4*>(pt_hbm + 131072);
         const uint4* my_buf = reinterpret_cast<const uint4*>(my_hbm + 131072);
-        if ((num_in_vecs & 1) == 0 && (vecs_per_row & 1) == 0 && num_in_vecs >= 4096) {
+        if (pxb_bfp == 1 && (num_in_vecs & 1) == 0 && (vecs_per_row & 1) == 0 && num_in_vecs >= 4096) {
             const int64_t np = num_in_vecs >> 1, pb = (np * b) / gridDim.x, pe = (np * (b + 1)) / gridDim.x;
             auto wr = [&](int r, int64_t p, uint4 rq) {
                 uint4 o0, o1; unpack_to_bf16_pair(rq, o0, o1);
@@ -3350,6 +3348,7 @@ void launch_shm_v5_allgather_cuda(
     int world_size,
     int blocks,
     int threads,
+    int pxb_bfp,
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     const int64_t num_in_vecs = outer_rows * vecs_per_row;
@@ -3367,7 +3366,8 @@ void launch_shm_v5_allgather_cuda(
         outer_rows,
         vecs_per_row,
         rank,
-        world_size);
+        world_size,
+        pxb_bfp);
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 

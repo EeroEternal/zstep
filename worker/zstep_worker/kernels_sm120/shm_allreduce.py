@@ -669,6 +669,7 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
         self._closed: bool = False
         self._registered: bool = False
         self._pxb_ar_ref: weakref.ReferenceType[HostMappedShmAllReduce] | None = None
+        self._pxb_bfp: int = 0
         self._extension = get_host_mapped_allreduce_extension()
         try:
             self._init_per_rank_shm(
@@ -723,6 +724,7 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
             )
         if shm_ar.pxb_enabled and not shm_ar._closed and self.world_size == 8:
             self._pxb_ar_ref = weakref.ref(shm_ar)
+            self._pxb_bfp = int(getattr(shm_ar, "_pxb_bfp", 0) or 0)
         else:
             self._pxb_ar_ref = None
 
@@ -776,6 +778,7 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
             self.world_size,
             self.blocks,
             self.threads,
+            int(getattr(self, "_pxb_bfp", 0)) if use_pxb else 0,
             stream_handle,
         )
         return output

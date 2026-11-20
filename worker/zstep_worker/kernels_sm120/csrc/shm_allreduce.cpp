@@ -84,6 +84,7 @@ void launch_shm_v5_allgather_cuda(
     int world_size,
     int blocks,
     int threads,
+    int pxb_bfp,
     std::uintptr_t stream_handle);
 void launch_mhc_post_collapse_rmsnorm_cuda(
     const void* x_ptr,
@@ -458,6 +459,7 @@ void launch_shm_v5_allgather(
     int64_t world_size,
     int64_t blocks,
     int64_t threads,
+    int64_t pxb_bfp,
     std::uintptr_t stream_handle) {
     TORCH_CHECK(input.is_cuda() && output.is_cuda(), "input/output must be CUDA tensors");
     TORCH_CHECK(input.scalar_type() == at::kBFloat16 && output.scalar_type() == at::kBFloat16, "BF16 required");
@@ -481,6 +483,7 @@ void launch_shm_v5_allgather(
         static_cast<int>(world_size),
         static_cast<int>(blocks),
         static_cast<int>(threads),
+        static_cast<int>(pxb_bfp),
         stream_handle);
 }
 void launch_mhc_post_collapse_rmsnorm(
