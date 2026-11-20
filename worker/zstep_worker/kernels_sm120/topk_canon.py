@@ -51,7 +51,7 @@ if _HAS_TRITON:
 
         k_offs = tl.arange(0, BLOCK_K)
         k_mask = k_offs < TOP_K
-        out_row_ptr = topk_ptr + row * topk_stride_row.to(tl.int64)
+        out_row_ptr = topk_ptr + row * topk_stride_row
 
         if row_len <= 0:
             tl.store(out_row_ptr + k_offs, -1, mask=k_mask)
@@ -62,11 +62,11 @@ if _HAS_TRITON:
             tl.store(out_row_ptr + k_offs, canon, mask=k_mask)
             return
 
-        row_logits_ptr = logits_ptr + row * logits_stride_row.to(tl.int64)
+        row_logits_ptr = logits_ptr + row * logits_stride_row
         sel_idx = tl.load(out_row_ptr + k_offs, mask=k_mask, other=-1).to(tl.int64)
         sel_valid = k_mask & (sel_idx >= 0) & (sel_idx < row_len)
         sel_scores = tl.load(
-            row_logits_ptr + (ks + sel_idx) * logits_stride_col.to(tl.int64),
+            row_logits_ptr + (ks + sel_idx) * logits_stride_col,
             mask=sel_valid,
             other=float("inf"),
         ).to(tl.float32)
@@ -82,7 +82,7 @@ if _HAS_TRITON:
             cols = base + n_offs
             c_mask = cols < row_len
             vals = tl.load(
-                row_logits_ptr + (ks + cols) * logits_stride_col.to(tl.int64),
+                row_logits_ptr + (ks + cols) * logits_stride_col,
                 mask=c_mask,
                 other=-float("inf"),
             ).to(tl.float32)
@@ -98,7 +98,7 @@ if _HAS_TRITON:
             cols = base + n_offs
             c_mask = cols < row_len
             vals = tl.load(
-                row_logits_ptr + (ks + cols) * logits_stride_col.to(tl.int64),
+                row_logits_ptr + (ks + cols) * logits_stride_col,
                 mask=c_mask,
                 other=-float("inf"),
             ).to(tl.float32)
