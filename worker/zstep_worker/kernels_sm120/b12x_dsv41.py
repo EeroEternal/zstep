@@ -59,6 +59,7 @@ MLA+SWA untouched:
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
 import hashlib
 import logging
@@ -309,6 +310,63 @@ def _slice_arena_for_specs(
     return views
 
 
+_get_raw_cuda_stream = getattr(torch._C, "_cuda_getCurrentRawStream", lambda d: torch.cuda.current_stream(d).cuda_stream)
+
+
+def _build_moe_capi_launcher(prog: Any, ca: Any, oidx: int) -> tuple[Any, ...] | None:
+    try:
+        import cuda.bindings.driver as cuda
+        from b12x._lib.utils import make_ptr
+        res = prog._load() if hasattr(prog, "_load") else prog
+        jf = getattr(res, "_executable", res)
+        ea, nca = getattr(jf, "execution_args", None), len(ca)
+        if ea is None or not hasattr(jf, "capi_func"):
+            return None
+        if getattr(jf, "_default_executor", None) is None:
+            with jf._executor_lock:
+                if jf._default_executor is None:
+                    jf._default_executor = weakref.proxy(jf).to(None)
+        ex = jf._default_executor
+        if ex is None or getattr(ex, "_has_profiler", False):
+            return None
+        meta = ea._meta
+        rect = list(ca if nca == meta.arg_count else ea.get_rectified_args(tuple(ca), {}))
+        p_idx, i_idx = (0, 1, 2, oidx), (nca - 8, nca - 6, nca - 5, nca - 2)
+        dyn_s = {*p_idx, *i_idx, nca - 1}
+        for idx in range(meta.arg_count):
+            if idx not in dyn_s and meta.numeric_flags[idx] and not hasattr(rect[idx], "__c_pointers__"):
+                rect[idx] = meta.annotated_types[idx](rect[idx])
+        aa, ab, u64_p, i32_p = list(rect), list(rect), [], []
+        for k, ai in enumerate(p_idx):
+            va, vb, p = 0x11000000 + (k + 1) * 0x10000, 0x55000000 + (k + 1) * 0x10000, ca[ai]
+            aa[ai] = make_ptr(p._dtype, va, p._addr_space, assumed_align=p._assumed_align)
+            ab[ai] = make_ptr(p._dtype, vb, p._addr_space, assumed_align=p._assumed_align)
+            u64_p.append((va, vb))
+        aa[nca - 1], ab[nca - 1] = cuda.CUstream(0x33001000), cuda.CUstream(0x77002000)
+        u64_p.append((0x33001000, 0x77002000))
+        for k, ai in enumerate(i_idx):
+            va, vb, ann = 0x135700 + k + 1, 0x246800 + k + 1, meta.annotated_types[ai]
+            aa[ai], ab[ai] = ann(va), ann(vb)
+            i32_p.append((va, vb))
+        (exe_a, ad_a), (exe_b, _) = ea.generate_execution_args(tuple(aa), {}), ea.generate_execution_args(tuple(ab), {})
+        pk_a, pk_b = list(ex._get_invoke_packed_args(exe_a)), list(ex._get_invoke_packed_args(exe_b))
+        if len(exe_a) != len(exe_b) or len(pk_a) != len(pk_b):
+            return None
+        packed = (ctypes.c_void_p * len(pk_a))(*[0 if x is None else x for x in pk_a])
+        u64_buf, i32_buf, used, nb = (ctypes.c_uint64 * 5)(), (ctypes.c_int32 * 4)(), set(), len(pk_a)
+        for pairs, ctp, base, stride in ((u64_p, ctypes.c_uint64, ctypes.addressof(u64_buf), 8), (i32_p, ctypes.c_int32, ctypes.addressof(i32_buf), 4)):
+            for k, (va, vb) in enumerate(pairs):
+                h = [s for s in range(nb) if s not in used and pk_a[s] and pk_b[s] and ctp.from_address(pk_a[s]).value == va and ctp.from_address(pk_b[s]).value == vb]
+                if len(h) != 1:
+                    return None
+                used.add(h[0])
+                packed[h[0]] = base + k * stride
+        err = ex.cuda_result if getattr(ex, "_has_cuda_result", False) else None
+        return u64_buf, i32_buf, packed, ex.capi_func, err, (res, jf, ex, tuple(aa), tuple(ad_a), tuple(exe_a))
+    except Exception:
+        return None
+
+
 def install_b12x_dsv41_quant_patches() -> bool:
     """Patch `DeepseekV4FP8Config.get_quant_method` to dispatch MoE & Block32 FP8 to `b12x`."""
     if not maybe_enable_b12x_for_dsv41():
@@ -358,6 +416,10 @@ def install_b12x_dsv41_quant_patches() -> bool:
             self._b12x_eplan: Any = None
             self._b12x_moe_state: Any = None
             self._b12x_scratch: tuple[torch.Tensor, ...] | None = None
+            self._b12x_moe_arena: torch.Tensor | None = None
+            self._b12x_moe_by_m: list[Any] = []
+            self._b12x_moe_capi_by_kern: dict[tuple[int, int], Any] = {}
+            self._b12x_dev_idx: int = 0
 
         @property
         def is_monolithic(self) -> bool:
@@ -433,6 +495,21 @@ def install_b12x_dsv41_quant_patches() -> bool:
 
             device = layer.w13_weight.device
             swiglu_limit = getattr(layer, "swiglu_limit", None)
+            i0 = self.intermediate_size
+            eff_i = (i0 & ~127) + 64 if 0 < (i0 & 127) < 64 else i0
+            w13, w2 = layer.w13_weight.data.contiguous(), layer.w2_weight.data.contiguous()
+            s13, s2 = layer.w13_weight_scale.data.contiguous(), layer.w2_weight_scale.data.contiguous()
+            if eff_i != i0:
+                def _pad_w13(t: torch.Tensor, cols: int) -> torch.Tensor:
+                    u, o = t.view(torch.uint8), torch.zeros((self.num_experts, 2 * eff_i, cols), dtype=torch.uint8, device=device)
+                    o[:, :i0, :], o[:, eff_i : eff_i + i0, :] = u[:, :i0, :], u[:, i0:, :]
+                    return o.view(t.dtype)
+                def _pad_w2(t: torch.Tensor, c0: int, c1: int) -> torch.Tensor:
+                    u, o = t.view(torch.uint8), torch.zeros((self.num_experts, self.hidden_size, c1), dtype=torch.uint8, device=device)
+                    o[:, :, :c0] = u
+                    return o.view(t.dtype)
+                w13, s13 = _pad_w13(w13, self.hidden_size // 2), _pad_w13(s13, self.hidden_size // 32)
+                w2, s2 = _pad_w2(w2, i0 // 2, eff_i // 2), _pad_w2(s2, i0 // 32, eff_i // 32)
             wplan = fused_moe.plan_weights(
                 source=fused_moe.PackedSource(
                     format=fused_moe.PackedSourceFormat("fp4_e8m0_k32"),
@@ -449,7 +526,7 @@ def install_b12x_dsv41_quant_patches() -> bool:
                 geometry=fused_moe.MoEGeometry(
                     num_experts=self.num_experts,
                     hidden_size=self.hidden_size,
-                    intermediate_size=self.intermediate_size,
+                    intermediate_size=eff_i,
                 ),
             )
             unit_scale = torch.ones(
@@ -458,10 +535,10 @@ def install_b12x_dsv41_quant_patches() -> bool:
             prepared = fused_moe.prepare_weights(
                 plan=wplan,
                 weights=fused_moe.PackedWeights(
-                    w13=layer.w13_weight.data.contiguous(),
-                    w2=layer.w2_weight.data.contiguous(),
-                    w13_block_scales=layer.w13_weight_scale.data.contiguous(),
-                    w2_block_scales=layer.w2_weight_scale.data.contiguous(),
+                    w13=w13,
+                    w2=w2,
+                    w13_block_scales=s13,
+                    w2_block_scales=s2,
                     w13_global_scales=unit_scale,
                     w2_global_scales=unit_scale,
                     input_scale=unit_scale,
@@ -469,6 +546,7 @@ def install_b12x_dsv41_quant_patches() -> bool:
                     immutable_input_scales=True,
                 ),
             )
+            del w13, w2, s13, s2
             layer._b12x_prepared_experts = prepared
             self._b12x_enabled = True
             self.moe_kernel = None
@@ -527,6 +605,22 @@ def install_b12x_dsv41_quant_patches() -> bool:
                 else topk_ids.to(dtype=torch.int32).contiguous()
             )
             out_2d = torch.empty_like(x_2d)
+            m, by_m = int(x_2d.shape[0]), self._b12x_moe_by_m
+            entry = by_m[m] if m < len(by_m) else False
+            if entry is None and not torch.cuda.is_current_stream_capturing():
+                self._capture_fast_moe_m(layer, x_2d, wts, ids, out_2d, m)
+                return out_2d.view(orig_shape)
+            if entry:
+                b_span, b_ep, pad_rows, mac, dev_i, m_u64, m_i32, m_pk, m_capi, m_err, _kp = entry
+                b_span.zero_()
+                if b_ep is not None:
+                    b_ep.zero_()
+                m_u64[0], m_u64[1], m_u64[2], m_u64[3], m_u64[4] = x_2d.data_ptr(), ids.data_ptr(), wts.data_ptr(), out_2d.data_ptr(), _get_raw_cuda_stream(dev_i)
+                m_i32[0], m_i32[1], m_i32[2], m_i32[3] = m, m, pad_rows, mac
+                m_capi(m_pk)
+                if m_err is not None and m_err.value != 0:
+                    raise RuntimeError(f"b12x dynamic MoE CUDA error {m_err.value}")
+                return out_2d.view(orig_shape)
             if self._b12x_moe_state is not None:
                 binding = self._b12x_moe_state.bind(
                     scratch=self._b12x_scratch,
@@ -550,6 +644,41 @@ def install_b12x_dsv41_quant_patches() -> bool:
                 )
             binding.run()
             return out_2d.view(orig_shape)
+
+        def _capture_fast_moe_m(self, layer: RoutedExperts, x_2d: torch.Tensor, wts: torch.Tensor, ids: torch.Tensor, out_2d: torch.Tensor, m: int) -> Any:
+            import b12x.moe.fused_moe._impl as moe_impl
+            st, rec, orig_gdk = self._b12x_moe_state, [], moe_impl._get_dynamic_kernel
+            vm, a16 = st.variants, st.a16_max_tokens
+            vcap = a16 if (0 < m <= a16 and m not in vm) else (m if m in vm else max(vm))
+            binding = vm[vcap].bind(scratch=self._b12x_scratch, a=x_2d, experts=layer._b12x_prepared_experts, topk_weights=wts, topk_ids=ids, output=out_2d, input_scales_static=True)
+            def _spy_gdk(*a: Any, **kw: Any) -> Any:
+                comp, mac_v = orig_gdk(*a, **kw)
+                ext_r = bool(kw.get("external_route_plan", False) or kw.get("deterministic_output", False))
+                return (lambda *ca: (rec.append((comp, mac_v, ca, ext_r)), comp(*ca))[1]), mac_v
+            moe_impl._get_dynamic_kernel = _spy_gdk
+            try:
+                binding.run()
+            finally:
+                moe_impl._get_dynamic_kernel = orig_gdk
+            entry, ei = False, layer._b12x_prepared_experts._impl
+            if len(rec) == 1 and binding.implementation == "dynamic" and ei.mxfp4_csf is None and ei.nvfp4_csf is None and not (ei.mxfp4_csf_inline is not None and not binding.w4a8_csf_inline):
+                comp, mac_v, ca, ext_r = rec[0]
+                nca, oidx = len(ca), len(ca) - 11
+                if not ext_r and nca >= 20 and [getattr(ca[i], "_pointer", None) for i in (0, 1, 2, oidx)] == [x_2d.data_ptr(), ids.data_ptr(), wts.data_ptr(), out_2d.data_ptr()] and ca[nca - 8] == m and ca[nca - 6] == m:
+                    ckey = (vcap, id(comp))
+                    if ckey not in self._b12x_moe_capi_by_kern:
+                        self._b12x_moe_capi_by_kern[ckey] = _build_moe_capi_launcher(comp, ca, oidx)
+                    capi = self._b12x_moe_capi_by_kern[ckey]
+                    if capi is not None:
+                        bc, be, ar = binding.barrier_count, binding.barrier_epoch, self._b12x_moe_arena
+                        b_span, b_ep = bc, be
+                        if ar is not None and bc is not None and be is not None:
+                            off0, end1 = bc.data_ptr() - ar.data_ptr(), (be.data_ptr() - ar.data_ptr()) + be.numel() * 4
+                            if 0 <= off0 < end1 <= ar.numel() and 0 <= be.data_ptr() - (bc.data_ptr() + bc.numel() * 4) <= 16:
+                                b_span, b_ep = ar.narrow(0, off0, end1 - off0), None
+                        entry = (b_span, b_ep, int(ca[nca - 5]), int(mac_v), self._b12x_dev_idx, *capi)
+            self._b12x_moe_by_m[m] = entry
+            return entry
 
     class ZstepB12xBlock32LinearMethod(ModelOptLinearMethod):
         """SM120 `b12x` `[32, 32] UE8M0` 2D FP8 linear method."""
@@ -2260,6 +2389,7 @@ def prepare_b12x_dsv41_model(
     moe_warmup_counts = tuple(
         sorted(
             {
+                *(int(b) for b in decode_buckets if int(b) > 0),
                 1,
                 2,
                 4,
@@ -2456,6 +2586,7 @@ def prepare_b12x_dsv41_model(
 
         # 4. Pre-allocate static 1024B-aligned scratch arenas (zero-alloc CUDAGraph capture & replay).
         moe_scratch_bytes = 0
+        dev_idx = 0 if device.index is None else int(device.index)
         if moe_layers:
             for _mname, _layer, qm in moe_layers:
                 moe_scratch_bytes = max(
@@ -2469,6 +2600,10 @@ def prepare_b12x_dsv41_model(
                 qm._b12x_scratch = tuple(
                     _slice_arena_for_specs(moe_arena, qm._b12x_eplan.scratch_specs())
                 )
+                qm._b12x_moe_arena = moe_arena
+                qm._b12x_moe_by_m = [None] * (int(max_tokens) + 1)
+                qm._b12x_moe_capi_by_kern = {}
+                qm._b12x_dev_idx = dev_idx
 
         # Separate linear scratch arenas for main stream (slot 0) vs `SharedExperts` aux stream (slot 1).
         slot_max_bytes: dict[int, int] = {0: 0, 1: 0}
