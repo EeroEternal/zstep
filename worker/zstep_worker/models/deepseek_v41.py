@@ -79,6 +79,17 @@ from zstep_worker.shm_bridge import (
 )
 
 _LOG = logging.getLogger(__name__)
+PREFILL_PIECEWISE_BUCKETS: tuple[int, ...] = (64, 128, 256, 512, 640, 1024, 1152)
+
+
+def _slice_piecewise_arg(x: Any, n: int) -> Any:
+    if x is None:
+        return None
+    if hasattr(x, "data") and hasattr(x, "scale") and hasattr(x, "orig_shape"):
+        return dataclasses.replace(
+            x, data=x.data[:n], orig_shape=(n,) + tuple(x.orig_shape[1:])
+        )
+    return x[:n]
 
 
 @dataclass(frozen=True)
@@ -328,6 +339,7 @@ class DeepSeekV41StepRunner:
         num_kv_pages: int,
     ) -> None:
         os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+        os.environ.setdefault("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
         torch.set_num_threads(2)
 
         self._closed: bool = False
@@ -336,6 +348,10 @@ class DeepSeekV41StepRunner:
         self.shm_ag: HostMappedShmAllGather | None = None
         self.argmax_channel: HostMappedShmArgmax | None = None
         self.decode_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.piecewise_graphs: dict[int, Any] = {}
+        self.piecewise_outputs: dict[int, torch.Tensor] = {}
+        self._pw_live_lookback: torch.Tensor | None = None
+        self._pw_live_num_tokens: int = 0
         self.verify_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.verify_graph_aux: dict[int, list[torch.Tensor] | None] = {}
         self.dspark_drafter: Any | None = None
@@ -1647,6 +1663,8 @@ class DeepSeekV41StepRunner:
             self._capture_spec_verify_graphs(graph_pool, capture_stream)
         if self.dspark_drafter is not None:
             self.dspark_drafter.capture_graphs(graph_pool, capture_stream)
+        if self.spec_method == "none":
+            self._capture_piecewise_prefill_graphs(graph_pool, capture_stream)
         lock_workspace()
         gc.collect()
         torch.cuda.empty_cache()
@@ -1685,6 +1703,143 @@ class DeepSeekV41StepRunner:
                 f"nccl_fallback_warm={self.nccl_fallback_calls}",
                 flush=True,
             )
+
+    def _select_piecewise_bucket(self, total_tokens: int) -> int | None:
+        for b in PREFILL_PIECEWISE_BUCKETS:
+            if b in self.piecewise_graphs and total_tokens <= b:
+                return b if (b <= 128 or (b - total_tokens) <= 128) else None
+        return None
+
+    def _install_piecewise_hooks(self) -> None:
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+        from vllm.forward_context import get_forward_context, in_piecewise_cudagraph
+        from vllm.models.deepseek_v41.common.engram import DEAD_ID
+        from vllm.models.deepseek_v41.nvidia.model import image_sentinel_mask
+        from vllm.utils.torch_utils import weak_ref_tensor
+
+        lang_model = getattr(self.model, "language_model", self.model)
+        inner_model = getattr(lang_model, "model", lang_model)
+        eh = getattr(inner_model, "engram_hash", None)
+        eh_prefix = getattr(inner_model, "engram_swa_prefix", None)
+        if eh is not None and eh_prefix is not None:
+            orig_eh = eh.forward
+            n_lyr, max_ng = eh.multipliers.shape
+            h_cols = (max_ng - 1) * eh.primes.shape[-1]
+
+            def _pw_eh(ids, pos, qsl, dead, lb, lb_dead, sm, bt):
+                cap = BreakableCUDAGraphCapture.current()
+                if cap is None or not cap._capturing or not in_piecewise_cudagraph():
+                    return orig_eh(ids, pos, qsl, dead, lb, lb_dead, sm, bt)
+                b_toks = int(ids.shape[0])
+                out = ids.new_full((b_toks, n_lyr, h_cols), DEAD_ID, dtype=torch.int32)
+                w_ids, w_pos, w_dead, w_out = (
+                    weak_ref_tensor(ids), weak_ref_tensor(pos),
+                    weak_ref_tensor(dead), weak_ref_tensor(out),
+                )
+
+                def _run_eh() -> None:
+                    if BreakableCUDAGraphCapture.is_active():
+                        w_out.fill_(DEAD_ID)
+                        return
+                    swa = get_forward_context().attn_metadata[eh_prefix]
+                    n = self._pw_live_num_tokens or int(swa.num_decode_tokens + swa.num_prefill_tokens)
+                    live_lb = self._pw_live_lookback if self._pw_live_lookback is not None else lb
+                    res = orig_eh(
+                        w_ids[:n], w_pos[:n], swa.query_start_loc, w_dead[:n],
+                        live_lb, image_sentinel_mask(live_lb), swa.slot_mapping, swa.block_table,
+                    )
+                    w_out[:n].copy_(res)
+                    if n < b_toks:
+                        w_out[n:].fill_(DEAD_ID)
+
+                cap.add_eager(_run_eh)
+                return out
+
+            eh.forward = _pw_eh  # type: ignore[method-assign]
+
+        for lyr in inner_model.layers:
+            attn = getattr(lyr, "attn", None)
+            if attn is None or not hasattr(attn, "_prepare_and_attn"):
+                continue
+            orig_paa = attn._prepare_and_attn
+
+            def _make_paa(_orig: Any) -> Any:
+                def _pw_paa(h, qr, kv, qr_s, kv_s, idx_w, pos, out):
+                    if in_piecewise_cudagraph():
+                        if BreakableCUDAGraphCapture.is_active():
+                            out.zero_()
+                            return None
+                        n = self._pw_live_num_tokens
+                        if 0 < n < int(h.shape[0]):
+                            return _orig(
+                                h[:n], _slice_piecewise_arg(qr, n), kv[:n],
+                                _slice_piecewise_arg(qr_s, n), _slice_piecewise_arg(kv_s, n),
+                                _slice_piecewise_arg(idx_w, n), pos[:n], out[:n],
+                            )
+                    return _orig(h, qr, kv, qr_s, kv_s, idx_w, pos, out)
+                return _pw_paa
+
+            attn._prepare_and_attn = _make_paa(orig_paa)
+            attn._prepare_and_attn_fn = attn._prepare_and_attn_eager
+
+    @torch.inference_mode()
+    def _capture_piecewise_prefill_graphs(
+        self, graph_pool: Any, capture_stream: torch.cuda.Stream
+    ) -> None:
+        from vllm.compilation.breakable_cudagraph import (
+            BreakableCUDAGraphCapture, is_breakable_cudagraph_enabled,
+        )
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import set_forward_context
+
+        if not is_breakable_cudagraph_enabled():
+            return
+        self._install_piecewise_hooks()
+        for b in PREFILL_PIECEWISE_BUCKETS:
+            n_pages = (b + 127) // 128
+            if b > self.max_step_tokens or n_pages > self.num_kv_pages:
+                continue
+            self.token_ids_gpu[:b].zero_()
+            self.positions_gpu[:b].copy_(torch.arange(b, dtype=torch.int64, device=self.device))
+            self.mla_bt_cpu[0].zero_()
+            self.swa_bt_cpu[0].zero_()
+            for p in range(n_pages):
+                pg = 1 + p
+                self.mla_bt_cpu[0, p] = pg
+                self.swa_bt_cpu[0, 2 * p], self.swa_bt_cpu[0, 2 * p + 1] = pg * 2, pg * 2 + 1
+            self.comp_bt_cpu[0, 0] = 1
+            self.mla_bt_gpu[:1].copy_(self.mla_bt_cpu[:1])
+            self.swa_bt_gpu[:1].copy_(self.swa_bt_cpu[:1])
+            self.comp_bt_gpu[:1].copy_(self.comp_bt_cpu[:1])
+            self.lookback_gpu[:1].fill_(-1)
+            self.slot_mapping_gpu[:b].fill_(-1)
+            self.seq_lens_cpu[0], self.query_start_loc_cpu[0], self.query_start_loc_cpu[1] = b, 0, b
+            self.seq_lens_gpu[:1].fill_(b)
+            self.query_start_loc_gpu[:2].copy_(self.query_start_loc_cpu[:2])
+            self.mixed_is_prefilling_cpu[0] = True
+            attn_meta = self._build_step_attn_metadata(
+                num_reqs=1, num_tokens=b, max_query_len=b, max_seq_len=b,
+                qsl_gpu=self.query_start_loc_gpu[:2], qsl_cpu=self.query_start_loc_cpu[:2],
+                seq_lens_gpu=self.seq_lens_gpu[:1], seq_lens_cpu=self.seq_lens_cpu[:1],
+                positions_gpu=self.positions_gpu[:b], slot_mapping_gpu=self.slot_mapping_gpu[:b],
+                is_prefilling_cpu=self.mixed_is_prefilling_cpu[:1], for_capture=False,
+            )
+            self._pw_live_lookback, self._pw_live_num_tokens = self.lookback_gpu[:1], b
+            with torch.cuda.stream(capture_stream):
+                for _ in range(2):
+                    with set_forward_context(attn_meta, self.vllm_config, num_tokens=b, cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE):
+                        self.model(input_ids=self.token_ids_gpu[:b], positions=self.positions_gpu[:b], lookback_token_ids=self.lookback_gpu[:1])
+            capture_stream.synchronize()
+            dist.barrier(group=self.exchange_group)
+            cap = BreakableCUDAGraphCapture(pool=graph_pool)
+            with torch.cuda.stream(capture_stream):
+                with set_forward_context(attn_meta, self.vllm_config, num_tokens=b, cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE):
+                    with cap:
+                        out = self.model(input_ids=self.token_ids_gpu[:b], positions=self.positions_gpu[:b], lookback_token_ids=self.lookback_gpu[:1])
+            capture_stream.synchronize()
+            dist.barrier(group=self.exchange_group)
+            self.piecewise_graphs[b], self.piecewise_outputs[b] = cap, out
+        self._pw_live_lookback, self._pw_live_num_tokens = None, 0
 
     @torch.inference_mode()
     def _capture_spec_verify_graphs(
@@ -2303,21 +2458,35 @@ class DeepSeekV41StepRunner:
                         out=self.lookback_gpu[:num_seqs],
                     )
             self._h2d_done_event.record()
+            pw_b = None if is_spec_step else self._select_piecewise_bucket(total_tokens)
+            if pw_b is not None:
+                if total_tokens < pw_b:
+                    self.token_ids_gpu[total_tokens:pw_b].zero_()
+                    self.positions_gpu[total_tokens:pw_b].zero_()
+                self._pw_live_lookback = self.lookback_gpu[:num_seqs]
+                self._pw_live_num_tokens = total_tokens
             with set_forward_context(
                 attn_meta,
                 self.vllm_config,
-                num_tokens=total_tokens,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                num_tokens=pw_b if pw_b is not None else total_tokens,
+                cudagraph_runtime_mode=(
+                    CUDAGraphMode.PIECEWISE if pw_b is not None else CUDAGraphMode.NONE
+                ),
             ):
-                model_output = self.model(
-                    input_ids=self.token_ids_gpu[:total_tokens],
-                    positions=self.positions_gpu[:total_tokens],
-                    lookback_token_ids=self.lookback_gpu[:num_seqs],
-                )
-                if isinstance(model_output, tuple):
-                    hidden, aux_hidden_states = model_output
+                if pw_b is not None:
+                    self.piecewise_graphs[pw_b].replay()
+                    hidden = self.piecewise_outputs[pw_b][:total_tokens]
+                    aux_hidden_states = None
                 else:
-                    hidden = model_output
+                    model_output = self.model(
+                        input_ids=self.token_ids_gpu[:total_tokens],
+                        positions=self.positions_gpu[:total_tokens],
+                        lookback_token_ids=self.lookback_gpu[:num_seqs],
+                    )
+                    if isinstance(model_output, tuple):
+                        hidden, aux_hidden_states = model_output
+                    else:
+                        hidden = model_output
                 if num_sample > 0:
                     local_logits = self._sample_rows_into_argmax(
                         hidden,
@@ -2444,6 +2613,8 @@ class DeepSeekV41StepRunner:
         self._closed = True
         self.signal_abort()
         self.decode_graphs.clear()
+        self.piecewise_graphs.clear()
+        self.piecewise_outputs.clear()
         self.verify_graphs.clear()
         self.verify_graph_aux.clear()
         if self.dspark_drafter is not None:
@@ -2481,6 +2652,8 @@ class DeepSeekV41StepRunner:
 
         torch.cuda.synchronize(self.device)
         self.decode_graphs.clear()
+        self.piecewise_graphs.clear()
+        self.piecewise_outputs.clear()
         self.verify_graphs.clear()
         self.verify_graph_aux.clear()
         if self.dspark_drafter is not None:
