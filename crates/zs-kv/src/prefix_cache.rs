@@ -137,7 +137,7 @@ impl PrefixTreeInner {
         &mut self,
         target_blocks: usize,
     ) -> (Vec<PrefixVictim>, Vec<[u8; 8]>) {
-        let mut victims = Vec::with_capacity(target_blocks);
+        let mut victims = Vec::with_capacity(target_blocks.min(self.cached_blocks));
         let mut removed_hashes = Vec::new();
         let emit_hashes = self.event_sink.is_some();
         while victims.len() < target_blocks {
