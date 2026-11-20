@@ -70,7 +70,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v22_ext",
+            name="zstep_shm_allreduce_sm120_v28_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -464,6 +464,7 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
                 self.one_shot_max_vecs,
                 self.pxb_max_vecs if self._pxb_enabled else 0,
                 self._pxb_bfp if self._pxb_enabled else 0,
+                0,
                 stream_handle,
             )
         else:
@@ -668,6 +669,7 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
         self._closed: bool = False
         self._registered: bool = False
         self._pxb_ar_ref: weakref.ReferenceType[HostMappedShmAllReduce] | None = None
+        self._pxb_bfp: int = 0
         self._extension = get_host_mapped_allreduce_extension()
         try:
             self._init_per_rank_shm(
@@ -722,6 +724,7 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
             )
         if shm_ar.pxb_enabled and not shm_ar._closed and self.world_size == 8:
             self._pxb_ar_ref = weakref.ref(shm_ar)
+            self._pxb_bfp = int(getattr(shm_ar, "_pxb_bfp", 0) or 0)
         else:
             self._pxb_ar_ref = None
 
@@ -775,6 +778,7 @@ class HostMappedShmAllGather(_PerRankShmRingBase):
             self.world_size,
             self.blocks,
             self.threads,
+            int(getattr(self, "_pxb_bfp", 0)) if use_pxb else 0,
             stream_handle,
         )
         return output

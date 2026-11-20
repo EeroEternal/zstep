@@ -484,9 +484,16 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
     int one_shot_max_vecs,
     int64_t pxb_max_vecs,
     int flag_base,
-    int pxb_bfp) {
+    int pxb_bfp,
+    uint64_t* __restrict__ ar_cta_done = nullptr) {
     const int b_local = blockIdx.x;
     const int b = flag_base + b_local;
+    auto signal_ar_cta_done = [&]() {
+        if (threadIdx.x == 0 && ar_cta_done != nullptr) {
+            __threadfence();
+            gpu_store_release_u64(ar_cta_done + b_local, ar_cta_done[b_local] + 1ULL);
+        }
+    };
     __shared__ uint64_t s_step;
     __shared__ int s_aborted;
     __shared__ char* s_peer_shm[kMaxRanks];
@@ -525,6 +532,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         }
         __syncthreads();
         if (s_aborted) {
+            signal_ar_cta_done();
             return;
         }
     }
@@ -554,7 +562,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + b * 64), step, abort_flag)) s_aborted = 1;
         }
         __syncthreads();
-        if (s_aborted) return;
+        if (s_aborted) { signal_ar_cta_done(); return; }
         const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + pxb_base_off);
         uint4* my_hbm_sum = reinterpret_cast<uint4*>(my_hbm + pxb_base_off + cur_pxb_stride / 2);
         for (int64_t p = my_pb + tid; p < my_pe; p += blockDim.x) {
@@ -576,7 +584,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_shm + (b * 8 + dst) * 64), step, abort_flag)) s_aborted = 1;
         }
         __syncthreads();
-        if (s_aborted) return;
+        if (s_aborted) { signal_ar_cta_done(); return; }
         for (int64_t p = p_fb + tid; p < p_fe; p += blockDim.x) {
             const int h_par = (p < p_fm) ? 0 : 1;
             uint4 pkts[4];
@@ -623,6 +631,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         }
         __syncthreads();
         if (s_aborted) {
+            signal_ar_cta_done();
             return;
         }
 
@@ -656,6 +665,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         }
         __syncthreads();
         if (s_aborted) {
+            signal_ar_cta_done();
             return;
         }
 
@@ -704,9 +714,12 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             const int tid = threadIdx.x;
             const int sh = ((num_vecs & 127) == 0 && (num_vecs >> 7) >= gridDim.x) ? 7 : 4;
             const int64_t g16 = num_vecs >> sh;
-            const int64_t fb = ((g16 * b_local) / gridDim.x) << sh;
-            const int64_t fe =
-                (b_local + 1 == gridDim.x) ? num_vecs : (((g16 * (b_local + 1)) / gridDim.x) << sh);
+            const int64_t n_toks = num_vecs / 640;
+            const bool tok_align = (ar_cta_done != nullptr && (num_vecs % 640) == 0 && n_toks >= gridDim.x);
+            const int64_t fb = tok_align ? (((n_toks * b_local) / gridDim.x) * 640) : (((g16 * b_local) / gridDim.x) << sh);
+            const int64_t fe = tok_align
+                ? (((n_toks * (b_local + 1)) / gridDim.x) * 640)
+                : ((b_local + 1 == gridDim.x) ? num_vecs : (((g16 * (b_local + 1)) / gridDim.x) << sh));
             const int64_t fm = fb + (((fe - fb) >> 2) << 1);
             const int64_t my_hb = (parity == 0) ? fb : fm;
             const int64_t my_he = (parity == 0) ? fm : fe;
@@ -726,6 +739,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                 __syncthreads();
                 if (s_aborted) {
                     if (tid == 0 && b_local + wave_stride < gridDim.x) { gpu_store_release_u64(g1_self, step); gpu_store_release_u64(g2_self, step); }
+                    signal_ar_cta_done();
                     return;
                 }
             }
@@ -755,6 +769,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             __syncthreads();
             if (s_aborted) {
                 if (do_pipe && tid == 0 && b_local + wave_stride < gridDim.x) { gpu_store_release_u64(g1_self, step); gpu_store_release_u64(g2_self, step); }
+                signal_ar_cta_done();
                 return;
             }
 
@@ -824,6 +839,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             }
             __syncthreads();
             if (s_aborted) {
+                signal_ar_cta_done();
                 return;
             }
 
@@ -903,6 +919,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             }
             __syncthreads();
             if (s_aborted) {
+                signal_ar_cta_done();
                 return;
             }
 
@@ -957,6 +974,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             }
             __syncthreads();
             if (s_aborted) {
+                signal_ar_cta_done();
                 return;
             }
 
@@ -984,6 +1002,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                         s_peer_shm[tid] + 65536 + (b * 8 + rank) * 64),
                     step);
             }
+            signal_ar_cta_done();
             return;
         }
         const int parity = rank & 1;
@@ -1011,6 +1030,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         }
         __syncthreads();
         if (s_aborted) {
+            signal_ar_cta_done();
             return;
         }
 
@@ -2299,7 +2319,8 @@ __global__ __launch_bounds__(512, 2) void shm_v5_allgather_kernel(
     int64_t outer_rows,
     int64_t vecs_per_row,
     int rank,
-    int world_size) {
+    int world_size,
+    int pxb_bfp = 0) {
     const int b = blockIdx.x;
     __shared__ uint64_t s_step;
     __shared__ int s_aborted;
@@ -2354,6 +2375,61 @@ __global__ __launch_bounds__(512, 2) void shm_v5_allgather_kernel(
         const int parity = rank & 1, pair_id = rank >> 1, pt_r = rank ^ 1;
         uint4* pt_buf = reinterpret_cast<uint4*>(pt_hbm + 131072);
         const uint4* my_buf = reinterpret_cast<const uint4*>(my_hbm + 131072);
+        if (pxb_bfp == 1 && (num_in_vecs & 1) == 0 && (vecs_per_row & 1) == 0 && num_in_vecs >= 4096) {
+            const int64_t np = num_in_vecs >> 1, pb = (np * b) / gridDim.x, pe = (np * (b + 1)) / gridDim.x;
+            auto wr = [&](int r, int64_t p, uint4 rq) {
+                uint4 o0, o1; unpack_to_bf16_pair(rq, o0, o1);
+                write_ag_out(output_vec, outer_rows, vecs_per_row, r, p << 1, o0);
+                write_ag_out(output_vec, outer_rows, vecs_per_row, r, (p << 1) + 1, o1);
+            };
+            for (int64_t p = pb + threadIdx.x; p < pe; p += blockDim.x) {
+                const uint4 rq = pack_bf16_pair(input_vec, p << 1);
+                st_wt_uint4(my_in + p, rq); st_wt_uint4(pt_buf + p, rq); wr(rank, p, rq);
+            }
+            __syncthreads(); if (threadIdx.x == 0) __threadfence_system(); __syncthreads();
+            if (threadIdx.x == 0) {
+                sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 102464 + b * 64), step);
+                if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + 102464 + b * 64), step, abort_flag)) s_aborted = 1;
+            } else if (threadIdx.x <= 3) {
+                sys_store_release_u64(reinterpret_cast<uint64_t*>(s_peer_shm[((pair_id + threadIdx.x) & 3) * 2 + parity] + (b * 8 + rank) * 64), step);
+            }
+            __syncthreads(); if (s_aborted) return;
+            for (int64_t p = pb + threadIdx.x; p < pe; p += blockDim.x) wr(pt_r, p, ld_cv_uint4(my_buf + p));
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 106560 + b * 64), step);
+                if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + 106560 + b * 64), step, abort_flag)) s_aborted = 1;
+            } else if (threadIdx.x <= 3) {
+                if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_shm + (b * 8 + ((pair_id + threadIdx.x) & 3) * 2 + parity) * 64), step, abort_flag)) s_aborted = 1;
+            }
+            __syncthreads(); if (s_aborted) return;
+            const int r1 = ((pair_id + 1) & 3) * 2 + parity, r2 = ((pair_id + 2) & 3) * 2 + parity, r3 = ((pair_id + 3) & 3) * 2 + parity;
+            const uint4 *s1 = reinterpret_cast<const uint4*>(s_peer_shm[r1] + 131072 + slot * slot_stride_bytes),
+                        *s2 = reinterpret_cast<const uint4*>(s_peer_shm[r2] + 131072 + slot * slot_stride_bytes),
+                        *s3 = reinterpret_cast<const uint4*>(s_peer_shm[r3] + 131072 + slot * slot_stride_bytes);
+            for (int64_t p = pb + threadIdx.x; p < pe; p += blockDim.x) {
+                const uint4 q1 = ld_cv_uint4(s1 + p), q2 = ld_cv_uint4(s2 + p), q3 = ld_cv_uint4(s3 + p);
+                st_wt_uint4(pt_buf + p, q1); st_wt_uint4(pt_buf + np + p, q2); st_wt_uint4(pt_buf + 2 * np + p, q3);
+                wr(r1, p, q1); wr(r2, p, q2); wr(r3, p, q3);
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                __threadfence_system();
+                sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 110656 + b * 64), step);
+                if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + 110656 + b * 64), step, abort_flag)) s_aborted = 1;
+            }
+            __syncthreads(); if (s_aborted) return;
+            for (int64_t p = pb + threadIdx.x; p < pe; p += blockDim.x) {
+                wr(r1 ^ 1, p, ld_cv_uint4(my_buf + p)); wr(r2 ^ 1, p, ld_cv_uint4(my_buf + np + p)); wr(r3 ^ 1, p, ld_cv_uint4(my_buf + 2 * np + p));
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 114752 + b * 64), step);
+                if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + 114752 + b * 64), step, abort_flag)) s_aborted = 1;
+            }
+            if (threadIdx.x < 8) sys_store_release_u64(reinterpret_cast<uint64_t*>(s_peer_shm[threadIdx.x] + 65536 + (b * 8 + rank) * 64), step);
+            return;
+        }
         for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
             const uint4 v = input_vec[idx];
             st_wt_uint4(my_in + idx, v);
@@ -2494,7 +2570,7 @@ __global__ __launch_bounds__(512, 2) void shm_v5_allgather_kernel(
 
 // 1-pass register-fused SM120 mHC post + stream collapse + RMSNorm (`640` threads = `5120` cols,
 // updating `residual` in-place to save a 2nd 4*5120 HBM pass and 160 MiB peak HBM at M=4096).
-__global__ __launch_bounds__(640, 2) void sm120_mhc_post_collapse_rmsnorm_kernel(
+__global__ __launch_bounds__(640, 1) void sm120_mhc_post_collapse_rmsnorm_kernel(
     const uint4* __restrict__ x_vec,
     uint4* __restrict__ res_vec,
     const float* __restrict__ post_mix,
@@ -2505,9 +2581,38 @@ __global__ __launch_bounds__(640, 2) void sm120_mhc_post_collapse_rmsnorm_kernel
     uint4* __restrict__ aux_out_vec,
     float norm_eps,
     int write_aux,
-    int post_only) {
-    const int tok = blockIdx.x, tid = threadIdx.x;
+    int post_only,
+    int num_tokens = 0,
+    int ar_blocks = 0,
+    const uint64_t* __restrict__ ar_cta_done = nullptr,
+    uint64_t* __restrict__ ar_cta_wait = nullptr) {
+    const int tid = threadIdx.x;
+    const int total_toks = (num_tokens > 0) ? num_tokens : gridDim.x;
     __shared__ float s_post[4], s_comb[16], s_pre[4], s_warp_sq[20], s_inv_rms;
+    __shared__ uint64_t s_tgt;
+    int last_ob = -1;
+    if (ar_cta_done != nullptr && tid == 0) {
+        const uint64_t t = ar_cta_wait[blockIdx.x] + 1ULL;
+        ar_cta_wait[blockIdx.x] = t;
+        s_tgt = t;
+    }
+    if (ar_cta_done != nullptr) __syncthreads();
+    for (int tok = blockIdx.x; tok < total_toks; tok += gridDim.x) {
+    if (ar_cta_done != nullptr) {
+        const int ob = static_cast<int>((static_cast<int64_t>(tok + 1) * ar_blocks - 1) / total_toks);
+        if (ob != last_ob) {
+            if (tid == 0) {
+                uint64_t cur = 0ULL;
+                for (;;) {
+                    asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(cur) : "l"(ar_cta_done + ob) : "memory");
+                    if (cur >= s_tgt) break;
+                    __nanosleep(64);
+                }
+            }
+            __syncthreads();
+            last_ob = ob;
+        }
+    }
     if (tid < 4) {
         s_post[tid] = post_mix[tok * 4 + tid];
         if (!post_only) s_pre[tid] = pre_mix[tok * 4 + tid];
@@ -2554,25 +2659,28 @@ __global__ __launch_bounds__(640, 2) void sm120_mhc_post_collapse_rmsnorm_kernel
     res_vec[base_r + 640] = nr1.u4;
     res_vec[base_r + 1280] = nr2.u4;
     res_vec[base_r + 1920] = nr3.u4;
-    if (post_only) return;
-    if (write_aux) aux_out_vec[base_x] = aux_pack.u4;
+    if (!post_only) {
+        if (write_aux) aux_out_vec[base_x] = aux_pack.u4;
 
-    const float w_sq = warp_reduce_sum(thread_sq);
-    const int warp_id = tid >> 5, lane = tid & 31;
-    if (lane == 0) s_warp_sq[warp_id] = w_sq;
-    __syncthreads();
-    if (warp_id == 0) {
-        float acc = warp_reduce_sum((lane < 20) ? s_warp_sq[lane] : 0.0f);
-        if (lane == 0) s_inv_rms = rsqrtf(acc * (1.0f / 5120.0f) + norm_eps);
-    }
-    __syncthreads();
+        const float w_sq = warp_reduce_sum(thread_sq);
+        const int warp_id = tid >> 5, lane = tid & 31;
+        if (lane == 0) s_warp_sq[warp_id] = w_sq;
+        __syncthreads();
+        if (warp_id == 0) {
+            float acc = warp_reduce_sum((lane < 20) ? s_warp_sq[lane] : 0.0f);
+            if (lane == 0) s_inv_rms = rsqrtf(acc * (1.0f / 5120.0f) + norm_eps);
+        }
+        __syncthreads();
 
-    w_pack.u4 = norm_weight_vec[tid];
-    #pragma unroll
-    for (int e = 0; e < 8; ++e) {
-        out_pack.elems[e] = __float2bfloat16_rn(collapsed[e] * s_inv_rms * __bfloat162float(w_pack.elems[e]));
+        w_pack.u4 = norm_weight_vec[tid];
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            out_pack.elems[e] = __float2bfloat16_rn(collapsed[e] * s_inv_rms * __bfloat162float(w_pack.elems[e]));
+        }
+        layer_input_vec[base_x] = out_pack.u4;
     }
-    layer_input_vec[base_x] = out_pack.u4;
+    if (ar_cta_done != nullptr) __syncthreads();
+    }
 }
 
 // 4-token-per-CTA 16-lane warp-shuffle 4x4 Sinkhorn coefficient generator for SM120 mHC overlap.
@@ -3098,10 +3206,11 @@ void launch_shm_v5_allreduce_cuda(
     int one_shot_max_vecs,
     int64_t pxb_max_vecs,
     int pxb_bfp,
+    std::uintptr_t ar_cta_done_ptr,
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     const int64_t small_lim = (pxb_bfp == 1) ? 20480 : 40960;
-    const bool small_pxb = (my_hbm_ptr != 0 && blocks >= 32 && blocks <= 56 && num_vecs <= small_lim);
+    const bool small_pxb = (ar_cta_done_ptr == 0 && my_hbm_ptr != 0 && blocks >= 32 && blocks <= 56 && num_vecs <= small_lim);
     const int launch_blocks = small_pxb ? 8 : blocks;
     const int flag_base = small_pxb ? blocks : 0;
     const int64_t vecs_per_cta = (num_vecs + launch_blocks - 1) / launch_blocks;
@@ -3124,7 +3233,8 @@ void launch_shm_v5_allreduce_cuda(
         one_shot_max_vecs,
         pxb_max_vecs,
         flag_base,
-        pxb_bfp);
+        pxb_bfp,
+        reinterpret_cast<uint64_t*>(ar_cta_done_ptr));
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -3238,6 +3348,7 @@ void launch_shm_v5_allgather_cuda(
     int world_size,
     int blocks,
     int threads,
+    int pxb_bfp,
     std::uintptr_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     const int64_t num_in_vecs = outer_rows * vecs_per_row;
@@ -3255,7 +3366,8 @@ void launch_shm_v5_allgather_cuda(
         outer_rows,
         vecs_per_row,
         rank,
-        world_size);
+        world_size,
+        pxb_bfp);
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -3272,10 +3384,14 @@ void launch_mhc_post_collapse_rmsnorm_cuda(
     float norm_eps,
     int write_aux,
     int post_only,
+    int ar_blocks,
+    std::uintptr_t ar_cta_done_ptr,
+    std::uintptr_t ar_cta_wait_ptr,
     std::uintptr_t stream_handle) {
     if (num_tokens <= 0) return;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    sm120_mhc_post_collapse_rmsnorm_kernel<<<num_tokens, 640, 0, stream>>>(
+    const int grid = (ar_cta_done_ptr != 0) ? 120 : num_tokens;
+    sm120_mhc_post_collapse_rmsnorm_kernel<<<grid, 640, 0, stream>>>(
         reinterpret_cast<const uint4*>(x_ptr),
         reinterpret_cast<uint4*>(residual_ptr),
         post_mix_ptr,
@@ -3286,7 +3402,11 @@ void launch_mhc_post_collapse_rmsnorm_cuda(
         reinterpret_cast<uint4*>(aux_out_ptr),
         norm_eps,
         write_aux,
-        post_only);
+        post_only,
+        num_tokens,
+        ar_blocks,
+        reinterpret_cast<const uint64_t*>(ar_cta_done_ptr),
+        reinterpret_cast<uint64_t*>(ar_cta_wait_ptr));
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 

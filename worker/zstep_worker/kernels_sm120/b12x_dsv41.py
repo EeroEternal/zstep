@@ -1901,6 +1901,8 @@ def _prepare_sm120_mhc_overlap(
             post_buf=(torch.empty((cap, 4, 1), **f32), torch.empty((cap, 4, 1), **f32)),
             comb_buf=(torch.empty((cap, 4, 4), **f32), torch.empty((cap, 4, 4), **f32)),
             pre_buf=(torch.empty((cap, 4), **f32), torch.empty((cap, 4), **f32)),
+            ar_cta_done=torch.zeros((64,), dtype=torch.int64, device=device),
+            ar_cta_wait=torch.zeros((128,), dtype=torch.int64, device=device),
             cap=cap,
             slot=0,
             pending=False,
@@ -2060,6 +2062,9 @@ def _prepare_sm120_mhc_overlap(
                             1e-6,
                             0,
                             1,
+                            0,
+                            0,
+                            0,
                             main_s.cuda_stream,
                         )
                     return residual
@@ -2156,16 +2161,54 @@ def _prepare_sm120_mhc_overlap(
                     and (ar.blocks == 8 or (ar._pxb_enabled and 32 <= ar.blocks <= 56))
                     and (x.data_ptr() & 15) == 0
                 )
-                if reduce_results and not use_c8:
+                use_wave_mhc = bool(
+                    reduce_results
+                    and not use_c8
+                    and ar is not None
+                    and not getattr(ar, "_closed", True)
+                    and getattr(ar, "_use_shm_v5", False)
+                    and ar.world_size == 8
+                    and ar._pxb_enabled
+                    and ar._pxb_bfp == 1
+                    and n >= 256
+                    and n * 640 <= ar.pxb_max_vecs
+                    and (x.data_ptr() & 15) == 0
+                )
+                if reduce_results and not use_c8 and not use_wave_mhc:
                     x = tensor_model_parallel_all_reduce(x)
                     x = x if x.is_contiguous() else x.contiguous()
                 if (x.data_ptr() & 15) == 0:
-                    _sync_mhc_state_in(s, main_s)
                     layer_in = torch.empty(
                         (n, 5120), dtype=torch.bfloat16, device=residual.device
                     )
                     aux_buf = torch.empty_like(layer_in) if capture_aux else s.empty_aux
-                    if use_c8:
+                    if use_wave_mhc:
+                        if getattr(s, "deferred", None) is not None:
+                            s.flush(main_s)
+                        s.mhc_stream.wait_stream(main_s)
+                        s.ext.launch_shm_v5_pxb_allreduce(
+                            x, x, ar.control, ar._rank_shm_ptrs,
+                            ar._my_hbm_ptr, ar._pt_hbm_ptr, ar.slot_stride_bytes,
+                            ar.pxb_slot_stride_bytes, ar.rank, ar.world_size,
+                            ar.blocks, ar.threads, ar.one_shot_max_vecs,
+                            ar.pxb_max_vecs, ar._pxb_bfp,
+                            s.ar_cta_done.data_ptr(), main_s.cuda_stream,
+                        )
+                        s.ext.launch_mhc_post_collapse_rmsnorm(
+                            x, residual, post_layer_mix, comb_res_mix, pre_mix,
+                            norm_weight, layer_in, aux_buf, float(norm_eps),
+                            1 if capture_aux else 0, 0, ar.blocks,
+                            s.ar_cta_done.data_ptr(), s.ar_cta_wait.data_ptr(),
+                            s.mhc_stream.cuda_stream,
+                        )
+                        main_s.wait_stream(s.mhc_stream)
+                        s.pending = False
+                        runner_ref = getattr(s, "runner_ref", None)
+                        runner_obj = runner_ref() if callable(runner_ref) else None
+                        if runner_obj is not None:
+                            runner_obj.shm_ar_calls += 1
+                    elif use_c8:
+                        _sync_mhc_state_in(s, main_s)
                         flag_base = ar.blocks if (ar._pxb_enabled and 32 <= ar.blocks <= 56) else 0
                         s.ext.launch_ar_mhc_cluster8(
                             x,
@@ -2193,6 +2236,7 @@ def _prepare_sm120_mhc_overlap(
                         if runner_obj is not None:
                             runner_obj.shm_ar_calls += 1
                     else:
+                        _sync_mhc_state_in(s, main_s)
                         s.ext.launch_mhc_post_collapse_rmsnorm(
                             x,
                             residual,
@@ -2204,6 +2248,9 @@ def _prepare_sm120_mhc_overlap(
                             aux_buf,
                             float(norm_eps),
                             1 if capture_aux else 0,
+                            0,
+                            0,
+                            0,
                             0,
                             main_s.cuda_stream,
                         )
@@ -2241,7 +2288,7 @@ def _prepare_sm120_mhc_overlap(
                     )
                 # If `(x.data_ptr() & 15) != 0` after external AR (`not use_c8`), `x` was
                 # already reduced above; pass `reduce_results=False` to `orig_shifted`.
-                if reduce_results and not use_c8:
+                if reduce_results and not use_c8 and not use_wave_mhc:
                     reduce_results = False
             if s is not None:
                 _sync_mhc_state_in(s, torch.cuda.current_stream(residual.device))

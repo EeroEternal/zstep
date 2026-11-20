@@ -561,6 +561,9 @@ def _pxb_8gpu_worker(rank: int, init_file: str, shm_name: str) -> None:
                                 1e-6,
                                 write_aux,
                                 0,
+                                0,
+                                0,
+                                0,
                                 stream,
                             )
 
@@ -807,6 +810,9 @@ def test_sm120_mhc_fused_kernels_parity() -> None:
                 eps,
                 write_aux,
                 0,
+                0,
+                0,
+                0,
                 stream,
             )
             assert float((res_cur.float() - ref_res.float()).abs().max().item()) <= 0.008
@@ -830,6 +836,9 @@ def test_sm120_mhc_fused_kernels_parity() -> None:
             eps,
             0,
             1,
+            0,
+            0,
+            0,
             stream,
         )
         assert float((res_post.float() - res_cur.float()).abs().max().item()) == 0.0
