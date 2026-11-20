@@ -1421,10 +1421,17 @@ pub fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let launch_exit_pair = Arc::clone(&exit_thread_pair);
         let launch_state = Arc::clone(&state);
         let launch_args = args.clone();
+        let tokio_handle = tokio::runtime::Handle::current();
         let launch_join_handle = std::thread::Builder::new()
             .name("zstep-engine-launch".to_owned())
             .spawn(move || {
-                launch_engine(launch_state, launch_args, launch_done_tx, launch_exit_pair)
+                launch_engine(
+                    launch_state,
+                    launch_args,
+                    launch_done_tx,
+                    launch_exit_pair,
+                    tokio_handle,
+                )
             })?;
 
         let (admin_stop_tx, mut admin_stop_rx) = watch::channel(false);
@@ -1528,6 +1535,7 @@ fn launch_engine(
     args: ServeArgs,
     launch_done_tx: oneshot::Sender<()>,
     exit_thread_pair: Arc<(Mutex<bool>, Condvar)>,
+    tokio_handle: tokio::runtime::Handle,
 ) {
     let config = args.engine_config(Some(Arc::clone(&state.shutdown_requested)));
     let is_dsv41 = is_deepseek_v41_dir(&args.model_dir);
@@ -1540,7 +1548,6 @@ fn launch_engine(
     let eos_token_ids = state.tokenizer.eos_token_ids().to_vec();
     let (apc_pages_per_node, apc_recurrent_checkpoints) =
         args.resolved_apc_geometry().unwrap_or((0, 0));
-    let tokio_handle = tokio::runtime::Handle::current();
     match ServingEngine::launch(config) {
         Ok(mut engine) => {
             if state.shutdown_requested.load(Ordering::Acquire) {
