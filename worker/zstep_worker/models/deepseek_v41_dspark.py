@@ -342,7 +342,7 @@ class DeepSeekV41DSparkDrafter:
         actual_rows = n * k
 
         active_pt = page_table[req_slots, :] + 1
-        bt_cached = runner._last_verify_bt_sig == (
+        bt_cached = getattr(runner, "_last_verify_bt_sig", None) == (
             eff_b,
             tuple(int(s) for s in req_slots),
         )
@@ -539,6 +539,8 @@ class DeepSeekV41DSparkDrafter:
                     page_table=page_table,
                 )
                 for seq in ovf_seqs[1:]:
+                    if self.runner.rank != 0 and self.runner.device.type == "cuda":
+                        torch.cuda.current_stream(self.runner.device).synchronize()
                     merged.update(
                         self._draft_batch([seq], positions=positions, page_table=page_table)
                     )
