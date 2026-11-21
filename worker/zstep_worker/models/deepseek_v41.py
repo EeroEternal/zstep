@@ -90,7 +90,6 @@ PREFILL_PIECEWISE_BUCKETS: tuple[int, ...] = (
     896,
     1024,
     1152,
-    1280,
 )
 
 
@@ -1819,7 +1818,8 @@ class DeepSeekV41StepRunner:
         if not is_breakable_cudagraph_enabled():
             return
         self._install_piecewise_hooks()
-        for b in PREFILL_PIECEWISE_BUCKETS:
+        torch.cuda.empty_cache()
+        for b in reversed(PREFILL_PIECEWISE_BUCKETS):
             n_pages = (b + 127) // 128
             if b > self.max_step_tokens or n_pages > self.num_kv_pages:
                 continue
