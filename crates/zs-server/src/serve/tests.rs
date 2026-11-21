@@ -238,7 +238,7 @@ fn cli_parser_enforces_nebula_contract_flags_and_model_defaults() {
     assert!(dsv41_ok.enable_prefix_caching);
     assert_eq!(dsv41_ok.page_block_tokens, 128);
     assert_eq!(dsv41_ok.resolved_apc_geometry().expect("dsv41 apc"), (1, 0));
-    assert_eq!(dsv41_ok.resolved_num_kv_pages(), 2_560);
+    assert_eq!(dsv41_ok.resolved_num_kv_pages(), 4_096);
     let dsv41_dspark = parse(&[
         "--model-dir",
         dsv41_path,
@@ -248,7 +248,7 @@ fn cli_parser_enforces_nebula_contract_flags_and_model_defaults() {
         "5",
     ])
     .expect("dsv41 dspark ok");
-    assert_eq!(dsv41_dspark.resolved_num_kv_pages(), 1_536);
+    assert_eq!(dsv41_dspark.resolved_num_kv_pages(), 2_560);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

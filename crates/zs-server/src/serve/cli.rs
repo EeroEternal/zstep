@@ -601,9 +601,9 @@ impl ServeArgs {
         self.num_kv_pages.unwrap_or_else(|| {
             let base = if is_deepseek_v41_dir(&self.model_dir) {
                 if self.speculative.method == SpeculativeMethod::Dspark {
-                    1_536.0
-                } else {
                     2_560.0
+                } else {
+                    4_096.0
                 }
             } else {
                 49_152.0

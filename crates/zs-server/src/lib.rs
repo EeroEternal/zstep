@@ -721,7 +721,7 @@ fn run_engine(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     });
     let num_kv_pages = args
         .num_kv_pages
-        .unwrap_or(if is_dsv41 { 2_560 } else { 49_152 });
+        .unwrap_or(if is_dsv41 { 4_096 } else { 49_152 });
 
     let shm_name = args.shm_name.unwrap_or_else(unique_shm_name);
     let config = EngineConfig {
