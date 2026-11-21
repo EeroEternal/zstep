@@ -1575,6 +1575,17 @@ fn launch_engine(
                     let publisher = KvEventPublisher::spawn(endpoint.clone(), topic, &tokio_handle);
                     engine.set_prefix_event_sink(Some(publisher.sink()));
                 }
+                if is_dsv41
+                    && let Ok(raw) = std::env::var("ZSTEP_SWA_KV_PAGES")
+                    && let Ok(swa_pages) = raw.trim().parse::<usize>()
+                    && swa_pages > 0
+                    && swa_pages < args.resolved_num_kv_pages() as usize
+                {
+                    let safe_cap = swa_pages
+                        .saturating_sub(2 * args.max_seqs as usize)
+                        .max(1);
+                    engine.set_swa_safe_capacity(Some(safe_cap));
+                }
             }
             if args.dram_tier.is_enabled()
                 && let Err(error) = engine.enable_dram_kv_cache(args.dram_tier)

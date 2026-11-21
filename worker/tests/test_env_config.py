@@ -45,6 +45,7 @@ def test_worker_runtime_config_defaults_and_summary() -> None:
     assert cfg.qwen_gdn_decode_mode == "auto"
     assert cfg.enable_driver_batch_memcpy is True
     assert cfg.prefill_runahead_depth == 2
+    assert cfg.swa_kv_pages == 0
 
     line = cfg.format_log_line()
     assert line.startswith("zstep_worker_config ")
@@ -86,6 +87,7 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
         "ZSTEP_QWEN_GDN_DECODE_MODE": "cluster2",
         "ZSTEP_ENABLE_DRIVER_BATCH_MEMCPY": "0",
         "ZSTEP_PREFILL_RUNAHEAD_DEPTH": "4",
+        "ZSTEP_SWA_KV_PAGES": "2048",
     }
     cfg = WorkerRuntimeConfig.from_env(env)
     assert cfg.spec_method == "dspark"
@@ -119,6 +121,7 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
     assert parse_qwen_gdn_decode_mode(env) == "cluster2"
     assert cfg.enable_driver_batch_memcpy is False
     assert cfg.prefill_runahead_depth == 4
+    assert cfg.swa_kv_pages == 2048
 
 
 @pytest.mark.parametrize(
@@ -136,6 +139,7 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
         ({"ZSTEP_SHM_ENABLE_PXB_BFP": "bogus"}, "ZSTEP_SHM_ENABLE_PXB_BFP"),
         ({"ZSTEP_SHM_MAX_AR_NUMEL": "-4"}, "ZSTEP_SHM_MAX_AR_NUMEL"),
         ({"ZSTEP_QWEN_GDN_DECODE_MODE": "invalid_mode"}, "ZSTEP_QWEN_GDN_DECODE_MODE"),
+        ({"ZSTEP_SWA_KV_PAGES": "-1"}, "ZSTEP_SWA_KV_PAGES"),
     ],
 )
 def test_worker_runtime_config_rejects_invalid_values(

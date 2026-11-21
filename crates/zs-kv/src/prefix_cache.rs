@@ -22,7 +22,7 @@
 //! optional co-owned recurrent checkpoint slots (`aux_lease`), cascading LRU leaf eviction, and
 //! four-group FlatKV request admission (`RequestKvHandle`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -90,6 +90,52 @@ struct PrefixNode {
     evicted: bool,
 }
 
+struct SwaSafeLru {
+    capacity: usize,
+    clock: u64,
+    order: VecDeque<(i32, u64)>,
+    latest_clock: HashMap<i32, u64>,
+}
+
+impl SwaSafeLru {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            clock: 0,
+            order: VecDeque::with_capacity(capacity.min(4096)),
+            latest_clock: HashMap::with_capacity(capacity.min(4096)),
+        }
+    }
+
+    fn touch(&mut self, page_id: i32) {
+        if self.capacity == 0 || page_id < 0 {
+            return;
+        }
+        self.clock = self.clock.wrapping_add(1);
+        let g = self.clock;
+        self.latest_clock.insert(page_id, g);
+        self.order.push_back((page_id, g));
+        while self.latest_clock.len() > self.capacity {
+            if let Some((old_id, old_clock)) = self.order.pop_front() {
+                if self.latest_clock.get(&old_id) == Some(&old_clock) {
+                    self.latest_clock.remove(&old_id);
+                }
+            } else {
+                break;
+            }
+        }
+        // Periodically compact stale duplicate entries from `order`.
+        if self.order.len() > self.capacity.saturating_mul(4).max(1024) {
+            let latest = &self.latest_clock;
+            self.order.retain(|(id, g)| latest.get(id) == Some(g));
+        }
+    }
+
+    fn contains(&self, page_id: i32) -> bool {
+        self.latest_clock.contains_key(&page_id)
+    }
+}
+
 struct PrefixTreeInner {
     block_tokens: usize,
     pages_per_node: usize,
@@ -99,6 +145,7 @@ struct PrefixTreeInner {
     access_clock: u64,
     alias_table: HybridBlockAliasTable,
     event_sink: Option<KvCacheEventSink>,
+    swa_safe_lru: Option<SwaSafeLru>,
 }
 
 impl PrefixTreeInner {
@@ -264,8 +311,36 @@ impl PrefixTree {
                 access_clock: 0,
                 alias_table: HybridBlockAliasTable::new(),
                 event_sink: None,
+                swa_safe_lru: None,
             })),
         })
+    }
+
+    /// Configure a conservative SWA-resident LRU capacity. When set, prefix matches are
+    /// automatically trimmed so the terminal matched page is guaranteed to be resident in
+    /// the worker's decoupled SWA page pool.
+    pub fn set_swa_safe_capacity(&self, capacity: Option<usize>) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.swa_safe_lru = capacity.filter(|&c| c > 0).map(SwaSafeLru::new);
+    }
+
+    /// Record physical MLA page IDs (0-based) whose SWA windows were touched on the latest step.
+    pub fn touch_swa_pages(&self, page_ids: &[i32]) {
+        if page_ids.is_empty() {
+            return;
+        }
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(lru) = guard.swa_safe_lru.as_mut() {
+            for &pid in page_ids {
+                lru.touch(pid);
+            }
+        }
     }
 
     /// Attach a non-blocking [`KvCacheEventSink`] for `BlockStored` / `BlockRemoved` notifications.
@@ -351,15 +426,38 @@ impl PrefixTree {
         let mut current = 0usize;
         let mut matched_nodes = 0usize;
         let mut unpinned_matched_nodes = 0usize;
+        let mut chain: Vec<(i32, bool)> = Vec::new();
         for chunk in tokens.chunks_exact(block_tokens).take(max_nodes) {
             let Some(&child_idx) = guard.nodes[current].children.get(chunk) else {
                 break;
             };
+            let child = &guard.nodes[child_idx];
+            let was_unpinned = child.pin_count == 0;
             matched_nodes += 1;
-            if guard.nodes[child_idx].pin_count == 0 {
+            if was_unpinned {
                 unpinned_matched_nodes += 1;
             }
+            if guard.swa_safe_lru.is_some() {
+                let last_pid = child
+                    .lease
+                    .as_ref()
+                    .and_then(|l| l.ids().last().copied())
+                    .unwrap_or(-1);
+                chain.push((last_pid, was_unpinned));
+            }
             current = child_idx;
+        }
+        if let Some(lru) = guard.swa_safe_lru.as_ref() {
+            while let Some(&(last_pid, was_unpinned)) = chain.last() {
+                if lru.contains(last_pid) {
+                    break;
+                }
+                chain.pop();
+                matched_nodes -= 1;
+                if was_unpinned {
+                    unpinned_matched_nodes -= 1;
+                }
+            }
         }
         (matched_nodes, unpinned_matched_nodes)
     }
@@ -383,6 +481,7 @@ impl PrefixTree {
         let mut matched_nodes = 0usize;
         let mut leaf_aux_id = None;
         let mut leaf_anchor_block_id = None;
+        let mut matched_chain: Vec<(usize, usize)> = Vec::new();
 
         for chunk in tokens.chunks_exact(block_tokens).take(max_nodes) {
             let next_idx = guard.nodes[current].children.get(chunk).copied();
@@ -398,11 +497,45 @@ impl PrefixTree {
                 .as_ref()
                 .expect("live prefix node owns physical KV pages")
                 .ids();
+            let n_ids = ids.len();
             block_ids.extend_from_slice(ids);
             leaf_anchor_block_id = ids.first().copied();
             leaf_aux_id = child.aux_lease.as_ref().map(|aux| aux.ids()[0]);
             matched_nodes += 1;
+            if guard.swa_safe_lru.is_some() {
+                matched_chain.push((child_idx, n_ids));
+            }
             current = child_idx;
+        }
+
+        if guard.swa_safe_lru.is_some() {
+            while let Some(&(leaf_idx, n_ids)) = matched_chain.last() {
+                let last_pid = block_ids.last().copied().unwrap_or(-1);
+                let resident = guard
+                    .swa_safe_lru
+                    .as_ref()
+                    .is_some_and(|lru| lru.contains(last_pid));
+                if resident {
+                    break;
+                }
+                guard.nodes[leaf_idx].pin_count -= 1;
+                matched_chain.pop();
+                block_ids.truncate(block_ids.len() - n_ids);
+                matched_nodes -= 1;
+            }
+            if let Some(&(new_leaf, _)) = matched_chain.last() {
+                current = new_leaf;
+                let node = &guard.nodes[new_leaf];
+                leaf_anchor_block_id = node
+                    .lease
+                    .as_ref()
+                    .and_then(|lease| lease.ids().first().copied());
+                leaf_aux_id = node.aux_lease.as_ref().map(|aux| aux.ids()[0]);
+            } else {
+                current = 0;
+                leaf_anchor_block_id = None;
+                leaf_aux_id = None;
+            }
         }
 
         let matched_tokens = (matched_nodes * block_tokens) as u32;
@@ -520,9 +653,24 @@ impl PrefixTree {
         {
             let existing_child = guard.nodes[current].children.get(chunk).copied();
             if let Some(child_idx) = existing_child {
-                // Another request already cached this exact node: drop redundant KV and aux
-                // leases so their physical IDs return immediately to their `BlockPool`s.
-                drop(block_lease);
+                let swa_stale = guard.swa_safe_lru.as_ref().is_some_and(|lru| {
+                    let existing_node = &guard.nodes[child_idx];
+                    existing_node.pin_count == 0
+                        && existing_node
+                            .lease
+                            .as_ref()
+                            .and_then(|l| l.ids().last().copied())
+                            .is_some_and(|pid| !lru.contains(pid))
+                });
+                if swa_stale && aux_lease.is_none() && guard.nodes[child_idx].aux_lease.is_none() {
+                    // Refresh the unpinned SWA-evicted node with the newly written SWA-resident
+                    // block lease so chunked prefill continuations keep valid SWA KV.
+                    guard.nodes[child_idx].lease = Some(block_lease);
+                } else {
+                    // Another request already cached this exact node: drop redundant KV and aux
+                    // leases so their physical IDs return immediately to their `BlockPool`s.
+                    drop(block_lease);
+                }
                 drop(aux_lease);
                 let tick = guard.next_tick();
                 let child = &mut guard.nodes[child_idx];
@@ -1012,5 +1160,103 @@ impl KvCacheManager {
             block_tokens: self.block_tokens,
             schedule,
         })
+    }
+}
+
+#[cfg(test)]
+mod swa_safe_lru_tests {
+    use super::*;
+
+    #[test]
+    fn swa_safe_lru_trims_evicted_terminal_pages_and_restores_pins() {
+        let pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 16);
+        let tree = PrefixTree::new(4).expect("tree");
+        tree.set_swa_safe_capacity(Some(2));
+
+        let prompt: Vec<i32> = (1..=12).collect(); // 3 blocks of 4 tokens
+        let empty = tree.match_prefix(&prompt);
+        let blocks: Vec<BlockLease> = (0..3)
+            .map(|_| pool.allocate(1).expect("block"))
+            .collect();
+        let pids: Vec<i32> = blocks.iter().map(|b| b.ids()[0]).collect();
+        let lease = tree
+            .extend_prefix(empty, &prompt, blocks)
+            .expect("extend");
+        assert_eq!(lease.matched_nodes(), 3);
+        drop(lease);
+
+        // Touch all 3 pages in order: LRU cap=2 retains [pids[1], pids[2]], evicting pids[0].
+        tree.touch_swa_pages(&pids);
+        assert_eq!(tree.peek_prefix_bounded(&prompt, 3), (3, 3));
+        let full = tree.match_prefix(&prompt);
+        assert_eq!(full.matched_nodes(), 3);
+        drop(full);
+
+        // Touch 2 unrelated pages: evicts pids[1] and pids[2] from SWA safe LRU.
+        tree.touch_swa_pages(&[100, 101]);
+        assert_eq!(tree.peek_prefix_bounded(&prompt, 3), (0, 0));
+        let trimmed = tree.match_prefix(&prompt);
+        assert_eq!(trimmed.matched_nodes(), 0);
+        drop(trimmed);
+        // Trimmed nodes must not leak pin_count (all 3 remain evictable).
+        assert_eq!(tree.evictable_blocks(), 3);
+
+        // Re-touch only pids[1] (middle block): match trims node 2 and stops at node 1.
+        tree.touch_swa_pages(&[pids[1]]);
+        assert_eq!(tree.peek_prefix_bounded(&prompt, 3), (2, 2));
+        let partial = tree.match_prefix(&prompt);
+        assert_eq!(partial.matched_nodes(), 2);
+        assert_eq!(partial.block_ids(), &pids[..2]);
+        assert_eq!(tree.evictable_blocks(), 1); // only node 2 is unpinned
+        drop(partial);
+        assert_eq!(tree.evictable_blocks(), 3);
+    }
+
+    #[test]
+    fn swa_safe_lru_refreshes_stale_unpinned_node_on_extend() {
+        let pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 16);
+        let tree = PrefixTree::new(4).expect("tree");
+        tree.set_swa_safe_capacity(Some(2));
+
+        let prompt: Vec<i32> = (1..=12).collect(); // 3 blocks of 4 tokens
+        let empty = tree.match_prefix(&prompt);
+        let blocks: Vec<BlockLease> = (0..3)
+            .map(|_| pool.allocate(1).expect("block"))
+            .collect();
+        let old_pids: Vec<i32> = blocks.iter().map(|b| b.ids()[0]).collect();
+        let lease = tree
+            .extend_prefix(empty, &prompt, blocks)
+            .expect("extend");
+        drop(lease);
+
+        // Evict all 3 pages from SWA safe LRU while leaving them in the prefix tree.
+        tree.touch_swa_pages(&[100, 101]);
+        let trimmed = tree.match_prefix(&prompt);
+        assert_eq!(trimmed.matched_nodes(), 0);
+
+        // Re-prefill chunk 1 (first 2 blocks) into fresh physical pages.
+        let new_blocks: Vec<BlockLease> = (0..2)
+            .map(|_| pool.allocate(1).expect("new block"))
+            .collect();
+        let new_pids: Vec<i32> = new_blocks.iter().map(|b| b.ids()[0]).collect();
+        assert_ne!(new_pids, old_pids[..2]);
+        tree.touch_swa_pages(&new_pids);
+
+        let refreshed = tree
+            .extend_prefix(trimmed, &prompt[..8], new_blocks)
+            .expect("refresh extend");
+        assert_eq!(refreshed.matched_nodes(), 2);
+        // Must keep the newly written SWA-resident pages, not swap back to old SWA-evicted pages.
+        assert_eq!(refreshed.block_ids(), &new_pids);
+        // Old 2 pages were dropped back to the pool; tree still holds 3 nodes total (new0, new1, old2).
+        assert_eq!(pool.available(), 16 - 3);
+        drop(refreshed);
+
+        // Subsequent match sees the refreshed SWA-resident prefix up to node 2 (node 3 still stale).
+        let after = tree.match_prefix(&prompt);
+        assert_eq!(after.matched_nodes(), 2);
+        assert_eq!(after.block_ids(), &new_pids);
+        drop(after);
+        assert_eq!(tree.evictable_blocks(), 3);
     }
 }

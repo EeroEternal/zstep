@@ -1219,6 +1219,14 @@ impl ServingEngine {
         Ok(())
     }
 
+    /// Configure conservative SWA-resident LRU capacity on the prefix tree so matches
+    /// never stop on a page evicted from the worker's decoupled SWA page pool.
+    pub fn set_swa_safe_capacity(&mut self, capacity: Option<usize>) {
+        if let Some(tree) = self.prefix_tree.as_ref() {
+            tree.set_swa_safe_capacity(capacity);
+        }
+    }
+
     pub fn has_prefix_cache(&self) -> bool {
         self.prefix_tree.is_some()
     }
@@ -2572,6 +2580,13 @@ impl ServingEngine {
                 .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
             {
                 let start_pos = seq.current_seq_len;
+                touch_seq_swa_window(
+                    self.prefix_tree.as_ref(),
+                    &seq.page_ids,
+                    start_pos,
+                    start_pos,
+                    page_block_tokens,
+                );
                 let lookback = seq.lookback_window(start_pos);
                 let pos = start_pos as i32;
                 let next_len = pos + 1;
@@ -2852,6 +2867,13 @@ impl ServingEngine {
             &mut self.shadow_page_table,
             &mut self.dirty_pt_slots,
         )?;
+        touch_seq_swa_window(
+            self.prefix_tree.as_ref(),
+            &seq.page_ids,
+            chunk_start,
+            chunk_end.saturating_sub(1),
+            page_block_tokens,
+        );
         let chunk_len = chunk_end - chunk_start;
         let slot_i32 = seq.slot_lease.id() as i32;
         let lookback = seq.lookback_window(chunk_start);
@@ -2985,6 +3007,13 @@ impl ServingEngine {
                 &mut self.shadow_page_table,
                 &mut self.dirty_pt_slots,
             )?;
+            touch_seq_swa_window(
+                self.prefix_tree.as_ref(),
+                &seq.page_ids,
+                start_pos,
+                target_len.saturating_sub(1),
+                page_block_tokens,
+            );
 
             for (row, &token) in rows.iter().enumerate() {
                 staged_tokens.push(token);
@@ -3135,6 +3164,13 @@ impl ServingEngine {
             .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
         {
             let start_pos = seq.current_seq_len;
+            touch_seq_swa_window(
+                self.prefix_tree.as_ref(),
+                &seq.page_ids,
+                start_pos,
+                start_pos,
+                page_block_tokens,
+            );
             let lookback = seq.lookback_window(start_pos);
             let pos = start_pos as i32;
             let next_len = pos + 1;
@@ -3243,6 +3279,26 @@ impl ServingEngine {
         self.step_cursor += 1;
         let stop_step = self.step_cursor;
         self.coordinator.shutdown_and_wait_with_stats(stop_step)
+    }
+}
+
+fn touch_seq_swa_window(
+    tree: Option<&PrefixTree>,
+    page_ids: &[i32],
+    pos_min: usize,
+    pos_max: usize,
+    page_block_tokens: usize,
+) {
+    let Some(tree) = tree else {
+        return;
+    };
+    if page_ids.is_empty() || page_block_tokens == 0 {
+        return;
+    }
+    let p_lo = pos_min.saturating_sub(127) / page_block_tokens;
+    let p_hi = (pos_max / page_block_tokens).min(page_ids.len() - 1);
+    if p_lo <= p_hi {
+        tree.touch_swa_pages(&page_ids[p_lo..=p_hi]);
     }
 }
 

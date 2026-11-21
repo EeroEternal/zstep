@@ -266,6 +266,8 @@ class DeepSeekV41DSparkDrafter:
             if n_ctx == 0:
                 return
         physical = page_table[ctx_slots, ctx_pos_i64 // 128].astype(np.int64) + 1
+        if self.runner._swa_pool is not None:
+            physical = self.runner._swa_pool.lookup(physical).astype(np.int64)
         slots_i64 = physical * 128 + (ctx_pos_i64 % 128)
 
         np.copyto(self.ctx_positions_cpu[:n_ctx].numpy(), ctx_pos_i64)
@@ -342,9 +344,19 @@ class DeepSeekV41DSparkDrafter:
         actual_rows = n * k
 
         active_pt = page_table[req_slots, :] + 1
-        bt_cached = getattr(runner, "_last_verify_bt_sig", None) == (
-            eff_b,
-            tuple(int(s) for s in req_slots),
+        swa_allocated = False
+        if getattr(runner, "_swa_pool", None) is not None:
+            swa_pt, swa_allocated = runner._swa_pool.map_active_windows(
+                active_pt,
+                pos_next,
+                np.minimum(pos_next + k - 1, max_ctx - 1),
+                pos_next,
+            )
+        else:
+            swa_pt = active_pt
+        bt_cached = (not swa_allocated) and (
+            getattr(runner, "_last_verify_bt_sig", None)
+            == (eff_b, tuple(int(s) for s in req_slots))
         )
         if not bt_cached:
             mla_bt_np = runner.mla_bt_cpu[:eff_b].numpy()
@@ -353,8 +365,8 @@ class DeepSeekV41DSparkDrafter:
                 mla_bt_np[n:eff_b] = 0
 
             swa_bt_np = runner.swa_bt_cpu[:eff_b].numpy()
-            swa_bt_np[:n, 0::2] = active_pt * 2
-            swa_bt_np[:n, 1::2] = active_pt * 2 + 1
+            swa_bt_np[:n, 0::2] = swa_pt * 2
+            swa_bt_np[:n, 1::2] = swa_pt * 2 + 1
             if eff_b > n:
                 swa_bt_np[n:eff_b] = 0
 
@@ -385,7 +397,7 @@ class DeepSeekV41DSparkDrafter:
             )
 
         safe_cols = np.where(in_bounds, q_pos_2d // 128, 0)
-        phys_2d = active_pt[np.arange(n)[:, None], safe_cols].astype(np.int64)
+        phys_2d = swa_pt[np.arange(n)[:, None], safe_cols].astype(np.int64)
         slots_2d = np.where(in_bounds, phys_2d * 128 + (q_pos_2d % 128), -1)
         sm_cpu_np = self.draft_slot_mapping_cpu[:rows].numpy()
         sm_cpu_np[:actual_rows] = slots_2d.reshape(-1)
