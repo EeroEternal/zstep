@@ -148,6 +148,7 @@ class WorkerRuntimeConfig:
     require_b12x: bool = False
     require_sm120_exp: bool = False
     enable_sm120_dsa_decode: bool = True
+    enable_sm120_candidate_mqa: bool = True
     enable_topk_canon: bool = True
     enable_sm12x_mega_gate: bool = True
     mega_gate_min_tokens: int = 1
@@ -272,6 +273,9 @@ class WorkerRuntimeConfig:
             ),
             enable_sm120_dsa_decode=env_flag(
                 "ZSTEP_ENABLE_SM120_DSA_DECODE", default=True, environ=env
+            ),
+            enable_sm120_candidate_mqa=env_flag(
+                "ZSTEP_ENABLE_SM120_CANDIDATE_MQA", default=True, environ=env
             ),
             enable_topk_canon=env_flag(
                 "ZSTEP_ENABLE_TOPK_CANON", default=True, environ=env
