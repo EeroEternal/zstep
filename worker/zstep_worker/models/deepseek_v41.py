@@ -29,6 +29,7 @@ sparse MLA/SWA kernels and full-40-layer `CUDAGraph` decode buckets.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import dataclasses
 import gc
@@ -334,6 +335,76 @@ class _AttnBuilderGroup:
     builder: Any
 
 
+class _SwaPagePool:
+    """Deterministic LRU pool mapping global 128-token MLA page IDs (1..N)
+    to a smaller physical SWA 128-token page pool (1..M, 0=null, M+1=dummy)."""
+
+    def __init__(self, num_swa_pages: int, mla_dummy_vb: int) -> None:
+        self.num_swa_pages: int = int(num_swa_pages)
+        self.swa_dummy_vb: int = self.num_swa_pages + 1
+        self.mla_dummy_vb: int = int(mla_dummy_vb)
+        self._mla_to_swa: OrderedDict[int, int] = OrderedDict()
+        self._free: list[int] = list(range(self.num_swa_pages, 0, -1))
+        self._lut: np.ndarray = np.zeros(self.mla_dummy_vb + 2, dtype=np.int32)
+        self._lut[self.mla_dummy_vb] = self.swa_dummy_vb
+
+    def lookup(self, mla_pages: np.ndarray) -> np.ndarray:
+        return self._lut[mla_pages]
+
+    def map_active_windows(
+        self,
+        active_pt: np.ndarray,
+        seq_pos_min: np.ndarray,
+        seq_pos_max: np.ndarray,
+        allow_alloc_from: np.ndarray,
+    ) -> tuple[np.ndarray, bool]:
+        pinned: set[int] = set()
+        to_alloc: list[int] = []
+        bt_w = int(active_pt.shape[1])
+        for i in range(int(active_pt.shape[0])):
+            p_lo = max(0, (int(seq_pos_min[i]) - 127) // 128)
+            p_hi = min(bt_w - 1, int(seq_pos_max[i]) // 128)
+            w_lo = int(allow_alloc_from[i]) // 128
+            for col in range(p_lo, p_hi + 1):
+                mp = int(active_pt[i, col])
+                if mp <= 0 or mp >= self.mla_dummy_vb:
+                    continue
+                pinned.add(mp)
+                if mp in self._mla_to_swa:
+                    self._mla_to_swa.move_to_end(mp)
+                else:
+                    if col < w_lo:
+                        raise RuntimeError(
+                            f"SWA pool miss on read-only prefix page mla_page={mp} "
+                            f"(col={col} < w_lo={w_lo}); increase ZSTEP_SWA_KV_PAGES "
+                            f"(currently {self.num_swa_pages})"
+                        )
+                    to_alloc.append(mp)
+        allocated_any = False
+        for mp in to_alloc:
+            if mp in self._mla_to_swa:
+                continue
+            allocated_any = True
+            if self._free:
+                sp = self._free.pop()
+            else:
+                evicted_mp: int | None = None
+                for cand_mp in self._mla_to_swa:
+                    if cand_mp not in pinned:
+                        evicted_mp = cand_mp
+                        break
+                if evicted_mp is None:
+                    raise RuntimeError(
+                        f"SWA pool exhausted: all {self.num_swa_pages} pages are "
+                        "pinned by active SWA windows"
+                    )
+                sp = self._mla_to_swa.pop(evicted_mp)
+                self._lut[evicted_mp] = 0
+            self._mla_to_swa[mp] = sp
+            self._lut[mp] = sp
+        return self._lut[active_pt], allocated_any
+
+
 class DeepSeekV41StepRunner:
     """Explicit GPU step runner for DeepSeek-V4.1-Flash (`TP=8`, `sm_120`)."""
 
@@ -459,6 +530,15 @@ class DeepSeekV41StepRunner:
         # Block 0 = permanent all-zero null_block; 1..num_kv_pages = real pages;
         # num_kv_pages + 1 = dummy overflow page.
         self.total_128_blocks: int = num_kv_pages + 2
+        swa_env_pages = self.runtime_config.swa_kv_pages
+        if 0 < swa_env_pages < num_kv_pages:
+            self.swa_total_128_blocks: int = swa_env_pages + 2
+            self._swa_pool: _SwaPagePool | None = _SwaPagePool(
+                swa_env_pages, num_kv_pages + 1
+            )
+        else:
+            self.swa_total_128_blocks = self.total_128_blocks
+            self._swa_pool = None
         self.dummy_comp_block: int = self.max_seqs + 1
 
         engine_args = EngineArgs(
@@ -664,6 +744,11 @@ class DeepSeekV41StepRunner:
         self.slot_mapping_gpu: torch.Tensor = torch.full(
             (mt,), -1, dtype=torch.int64, device=self.device
         )
+        self.swa_slot_mapping_gpu: torch.Tensor = (
+            torch.full((mt,), -1, dtype=torch.int64, device=self.device)
+            if self._swa_pool is not None
+            else self.slot_mapping_gpu
+        )
         self.mla_bt_gpu: torch.Tensor = torch.zeros(
             (ms, self.bt_width), dtype=torch.int32, device=self.device
         )
@@ -721,6 +806,11 @@ class DeepSeekV41StepRunner:
         )
         self.slot_mapping_cpu: torch.Tensor = torch.full(
             (mt,), -1, dtype=torch.int64, pin_memory=True
+        )
+        self.swa_slot_mapping_cpu: torch.Tensor = (
+            torch.full((mt,), -1, dtype=torch.int64, pin_memory=True)
+            if self._swa_pool is not None
+            else self.slot_mapping_cpu
         )
         self.mla_bt_cpu: torch.Tensor = torch.zeros(
             (ms, self.bt_width), dtype=torch.int32, pin_memory=True
@@ -904,6 +994,10 @@ class DeepSeekV41StepRunner:
 
         self.dram_kv_tier: HostDramKvTier | None = None
         if self.runtime_config.dram_kv_blocks > 0:
+            if self.runtime_config.swa_kv_pages > 0:
+                raise ValueError(
+                    "ZSTEP_SWA_KV_PAGES cannot be combined with dram_kv_blocks > 0"
+                )
             try:
                 numa_node = pin_process_to_device_numa(int(self.device.index)).numa_node
             except Exception:
@@ -1047,7 +1141,7 @@ class DeepSeekV41StepRunner:
                 kind = "swa_draft" if is_draft_layer else "swa"
                 # 64-token pages, 584B row (64 * 584 = 37376 == 73 * 512)
                 raw = torch.zeros(
-                    (self.total_128_blocks * 2, 1, 64, 584),
+                    (self.swa_total_128_blocks * 2, 1, 64, 584),
                     dtype=torch.uint8,
                     device=self.device,
                 )
@@ -1164,6 +1258,7 @@ class DeepSeekV41StepRunner:
         seq_lens_cpu: torch.Tensor,
         positions_gpu: torch.Tensor,
         slot_mapping_gpu: torch.Tensor,
+        swa_slot_mapping_gpu: torch.Tensor | None = None,
         is_prefilling_cpu: torch.Tensor,
         for_capture: bool,
         causal: bool = True,
@@ -1177,7 +1272,9 @@ class DeepSeekV41StepRunner:
         req_idx = self.req_idx_arange_np[:num_reqs]
         token_to_req_cache: dict[str, torch.Tensor | None] = {"val": None}
 
-        def _make_cam(bt: torch.Tensor) -> CommonAttentionMetadata:
+        def _make_cam(
+            bt: torch.Tensor, sm: torch.Tensor = slot_mapping_gpu
+        ) -> CommonAttentionMetadata:
             cam = CommonAttentionMetadata(
                 query_start_loc=qsl_gpu,
                 query_start_loc_cpu=qsl_cpu,
@@ -1188,7 +1285,7 @@ class DeepSeekV41StepRunner:
                 num_actual_tokens=num_tokens,
                 max_query_len=max_query_len,
                 block_table_tensor=bt,
-                slot_mapping=slot_mapping_gpu,
+                slot_mapping=sm,
                 causal=causal,
                 positions=positions_gpu,
                 is_prefilling=is_prefilling_cpu,
@@ -1198,7 +1295,10 @@ class DeepSeekV41StepRunner:
             return cam
 
         cam_mla = _make_cam(mla_bt)
-        cam_swa = _make_cam(swa_bt)
+        cam_swa = _make_cam(
+            swa_bt,
+            slot_mapping_gpu if swa_slot_mapping_gpu is None else swa_slot_mapping_gpu,
+        )
         cam_comp = _make_cam(comp_bt)
 
         attn_metadata: dict[str, Any] = {}
@@ -1372,9 +1472,10 @@ class DeepSeekV41StepRunner:
         # JIT compilations ever occur during `RuntimeLoop.run()`, while activating
         # FlashInfer SM120 CutlassMxfp8GemmRunner + Sparse MLA autotuned tactics.
         dummy_vb = self.num_kv_pages + 1  # scratch overflow block
+        swa_dummy_vb = self.swa_total_128_blocks - 1
         self.mla_bt_gpu.fill_(dummy_vb)
-        self.swa_bt_gpu[:, 0::2] = dummy_vb * 2
-        self.swa_bt_gpu[:, 1::2] = dummy_vb * 2 + 1
+        self.swa_bt_gpu[:, 0::2] = swa_dummy_vb * 2
+        self.swa_bt_gpu[:, 1::2] = swa_dummy_vb * 2 + 1
         self.comp_bt_gpu.fill_(self.dummy_comp_block)
         self.lookback_gpu.fill_(-1)
 
@@ -1451,6 +1552,10 @@ class DeepSeekV41StepRunner:
                 self.slot_mapping_gpu[:n_toks].copy_(
                     dummy_vb * 128 + (pos_t % 128)
                 )
+                if self._swa_pool is not None:
+                    self.swa_slot_mapping_gpu[:n_toks].copy_(
+                        swa_dummy_vb * 128 + (pos_t % 128)
+                    )
                 self.sample_rows_gpu[0] = n_toks - 1
 
                 attn_meta = self._build_step_attn_metadata(
@@ -1464,6 +1569,7 @@ class DeepSeekV41StepRunner:
                     seq_lens_cpu=sl_cpu,
                     positions_gpu=self.positions_gpu[:n_toks],
                     slot_mapping_gpu=self.slot_mapping_gpu[:n_toks],
+                    swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:n_toks],
                     is_prefilling_cpu=self.mixed_is_prefilling_cpu[:n_reqs],
                     for_capture=False,
                 )
@@ -1514,6 +1620,10 @@ class DeepSeekV41StepRunner:
                 self.slot_mapping_gpu[:warm_b].fill_(
                     dummy_vb * 128 + ((warm_sl - 1) % 128)
                 )
+                if self._swa_pool is not None:
+                    self.swa_slot_mapping_gpu[:warm_b].fill_(
+                        swa_dummy_vb * 128 + ((warm_sl - 1) % 128)
+                    )
                 self.lookback_gpu[:warm_b].fill_(1)
                 attn_meta = self._build_step_attn_metadata(
                     num_reqs=warm_b,
@@ -1526,6 +1636,7 @@ class DeepSeekV41StepRunner:
                     seq_lens_cpu=sl_cpu,
                     positions_gpu=self.positions_gpu[:warm_b],
                     slot_mapping_gpu=self.slot_mapping_gpu[:warm_b],
+                    swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:warm_b],
                     is_prefilling_cpu=self.decode_is_prefilling_cpu[:warm_b],
                     for_capture=True,
                 )
@@ -1587,6 +1698,8 @@ class DeepSeekV41StepRunner:
         self.comp_bt_gpu.fill_(self.dummy_comp_block)
         self.lookback_gpu.fill_(-1)
         self.slot_mapping_gpu.fill_(-1)
+        if self._swa_pool is not None:
+            self.swa_slot_mapping_gpu.fill_(-1)
         self.seq_lens_gpu.zero_()
 
         graph_pool = torch.cuda.graph_pool_handle()
@@ -1645,6 +1758,7 @@ class DeepSeekV41StepRunner:
                     seq_lens_cpu=sl_cpu,
                     positions_gpu=self.positions_gpu[:b],
                     slot_mapping_gpu=self.slot_mapping_gpu[:b],
+                    swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:b],
                     is_prefilling_cpu=self.decode_is_prefilling_cpu[:b],
                     for_capture=True,
                 )
@@ -1822,7 +1936,11 @@ class DeepSeekV41StepRunner:
         torch.cuda.empty_cache()
         for b in reversed(PREFILL_PIECEWISE_BUCKETS):
             n_pages = (b + 127) // 128
-            if b > self.max_step_tokens or n_pages > self.num_kv_pages:
+            if (
+                b > self.max_step_tokens
+                or n_pages > self.num_kv_pages
+                or n_pages > self.swa_total_128_blocks - 2
+            ):
                 continue
             self.token_ids_gpu[:b].zero_()
             self.positions_gpu[:b].copy_(torch.arange(b, dtype=torch.int64, device=self.device))
@@ -1838,6 +1956,7 @@ class DeepSeekV41StepRunner:
             self.comp_bt_gpu[:1].copy_(self.comp_bt_cpu[:1])
             self.lookback_gpu[:1].fill_(-1)
             self.slot_mapping_gpu[:b].fill_(-1)
+            self.swa_slot_mapping_gpu[:b].fill_(-1)
             self.seq_lens_cpu[0], self.query_start_loc_cpu[0], self.query_start_loc_cpu[1] = b, 0, b
             self.seq_lens_gpu[:1].fill_(b)
             self.query_start_loc_gpu[:2].copy_(self.query_start_loc_cpu[:2])
@@ -1847,6 +1966,7 @@ class DeepSeekV41StepRunner:
                 qsl_gpu=self.query_start_loc_gpu[:2], qsl_cpu=self.query_start_loc_cpu[:2],
                 seq_lens_gpu=self.seq_lens_gpu[:1], seq_lens_cpu=self.seq_lens_cpu[:1],
                 positions_gpu=self.positions_gpu[:b], slot_mapping_gpu=self.slot_mapping_gpu[:b],
+                swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:b],
                 is_prefilling_cpu=self.mixed_is_prefilling_cpu[:1], for_capture=False,
             )
             self._pw_live_lookback, self._pw_live_num_tokens = self.lookback_gpu[:1], b
@@ -1888,6 +2008,8 @@ class DeepSeekV41StepRunner:
         self.comp_bt_gpu.fill_(self.dummy_comp_block)
         self.lookback_gpu.fill_(-1)
         self.slot_mapping_gpu.fill_(-1)
+        if self._swa_pool is not None:
+            self.swa_slot_mapping_gpu.fill_(-1)
         self.seq_lens_gpu.zero_()
 
         for bucket in self.verify_buckets:
@@ -1948,6 +2070,7 @@ class DeepSeekV41StepRunner:
                     seq_lens_cpu=sl_cpu,
                     positions_gpu=self.positions_gpu[:rows],
                     slot_mapping_gpu=self.slot_mapping_gpu[:rows],
+                    swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:rows],
                     is_prefilling_cpu=self.decode_is_prefilling_cpu[:bucket],
                     for_capture=True,
                 )
@@ -2109,9 +2232,17 @@ class DeepSeekV41StepRunner:
             if bucket > num_seqs:
                 mla_bt_np[num_seqs:bucket] = 0
 
+            pos_i64 = pos_np.astype(np.int64)
+            if self._swa_pool is not None:
+                swa_pt, _ = self._swa_pool.map_active_windows(
+                    active_pt, pos_i64, pos_i64, pos_i64
+                )
+            else:
+                swa_pt = active_pt
+
             swa_bt_np = self.swa_bt_cpu[:bucket].numpy()
-            swa_bt_np[:num_seqs, 0::2] = active_pt * 2
-            swa_bt_np[:num_seqs, 1::2] = active_pt * 2 + 1
+            swa_bt_np[:num_seqs, 0::2] = swa_pt * 2
+            swa_bt_np[:num_seqs, 1::2] = swa_pt * 2 + 1
             if bucket > num_seqs:
                 swa_bt_np[num_seqs:bucket] = 0
 
@@ -2134,7 +2265,6 @@ class DeepSeekV41StepRunner:
                     tok_cpu_np[num_seqs:bucket] = 0
 
             pos_cpu_np = self.positions_cpu[:bucket].numpy()
-            pos_i64 = pos_np.astype(np.int64)
             pos_cpu_np[:num_seqs] = pos_i64
             if bucket > num_seqs:
                 pos_cpu_np[num_seqs:bucket] = 0
@@ -2149,6 +2279,12 @@ class DeepSeekV41StepRunner:
             sm_cpu_np[:num_seqs] = vb * 128 + (pos_i64 % 128)
             if bucket > num_seqs:
                 sm_cpu_np[num_seqs:bucket] = -1
+            if self._swa_pool is not None:
+                swa_sm_np = self.swa_slot_mapping_cpu[:bucket].numpy()
+                swa_vb = self._swa_pool.lookup(vb).astype(np.int64)
+                swa_sm_np[:num_seqs] = swa_vb * 128 + (pos_i64 % 128)
+                if bucket > num_seqs:
+                    swa_sm_np[num_seqs:bucket] = -1
 
             self.mla_bt_gpu[:bucket].copy_(self.mla_bt_cpu[:bucket], non_blocking=True)
             self.swa_bt_gpu[:bucket].copy_(self.swa_bt_cpu[:bucket], non_blocking=True)
@@ -2200,6 +2336,10 @@ class DeepSeekV41StepRunner:
                 self.slot_mapping_gpu[:bucket].copy_(
                     self.slot_mapping_cpu[:bucket], non_blocking=True
                 )
+            if self._swa_pool is not None:
+                self.swa_slot_mapping_gpu[:bucket].copy_(
+                    self.swa_slot_mapping_cpu[:bucket], non_blocking=True
+                )
 
             self._build_step_attn_metadata(
                 num_reqs=bucket,
@@ -2212,6 +2352,7 @@ class DeepSeekV41StepRunner:
                 seq_lens_cpu=self.seq_lens_cpu[:bucket],
                 positions_gpu=self.positions_gpu[:bucket],
                 slot_mapping_gpu=self.slot_mapping_gpu[:bucket],
+                swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:bucket],
                 is_prefilling_cpu=self.decode_is_prefilling_cpu[:bucket],
                 for_capture=False,
             )
@@ -2250,9 +2391,19 @@ class DeepSeekV41StepRunner:
             if v_bucket > num_seqs:
                 mla_bt_np[num_seqs:v_bucket] = 0
 
+            pos_i64 = pos_np.astype(np.int64)
+            if self._swa_pool is not None:
+                p_min = pos_i64[0:total_tokens:width]
+                p_max = pos_i64[width - 1 : total_tokens : width]
+                swa_pt, _ = self._swa_pool.map_active_windows(
+                    active_pt, p_min, p_max, p_min
+                )
+            else:
+                swa_pt = active_pt
+
             swa_bt_np = self.swa_bt_cpu[:v_bucket].numpy()
-            swa_bt_np[:num_seqs, 0::2] = active_pt * 2
-            swa_bt_np[:num_seqs, 1::2] = active_pt * 2 + 1
+            swa_bt_np[:num_seqs, 0::2] = swa_pt * 2
+            swa_bt_np[:num_seqs, 1::2] = swa_pt * 2 + 1
             if v_bucket > num_seqs:
                 swa_bt_np[num_seqs:v_bucket] = 0
 
@@ -2273,7 +2424,6 @@ class DeepSeekV41StepRunner:
             if rows > total_tokens:
                 tok_cpu_np[total_tokens:rows] = 0
 
-            pos_i64 = pos_np.astype(np.int64)
             pos_cpu_np = self.positions_cpu[:rows].numpy()
             pos_cpu_np[:total_tokens] = pos_i64
             if rows > total_tokens:
@@ -2291,6 +2441,12 @@ class DeepSeekV41StepRunner:
             sm_cpu_np[:total_tokens] = vb_tok * 128 + (pos_i64 % 128)
             if rows > total_tokens:
                 sm_cpu_np[total_tokens:rows] = -1
+            if self._swa_pool is not None:
+                swa_sm_np = self.swa_slot_mapping_cpu[:rows].numpy()
+                swa_vb_tok = self._swa_pool.lookup(vb_tok).astype(np.int64)
+                swa_sm_np[:total_tokens] = swa_vb_tok * 128 + (pos_i64 % 128)
+                if rows > total_tokens:
+                    swa_sm_np[total_tokens:rows] = -1
 
             self.mla_bt_gpu[:v_bucket].copy_(
                 self.mla_bt_cpu[:v_bucket], non_blocking=True
@@ -2317,6 +2473,10 @@ class DeepSeekV41StepRunner:
             self.slot_mapping_gpu[:rows].copy_(
                 self.slot_mapping_cpu[:rows], non_blocking=True
             )
+            if self._swa_pool is not None:
+                self.swa_slot_mapping_gpu[:rows].copy_(
+                    self.swa_slot_mapping_cpu[:rows], non_blocking=True
+                )
 
             self._build_step_attn_metadata(
                 num_reqs=v_bucket,
@@ -2329,6 +2489,7 @@ class DeepSeekV41StepRunner:
                 seq_lens_cpu=self.seq_lens_cpu[:v_bucket],
                 positions_gpu=self.positions_gpu[:rows],
                 slot_mapping_gpu=self.slot_mapping_gpu[:rows],
+                swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:rows],
                 is_prefilling_cpu=self.decode_is_prefilling_cpu[:v_bucket],
                 for_capture=False,
             )
@@ -2396,10 +2557,20 @@ class DeepSeekV41StepRunner:
             seq_slots_np = slot_np[q_start_np[:num_seqs]]
             active_pt = pt_np[seq_slots_np, :] + 1
 
+            pos_i64 = pos_np.astype(np.int64)
+            if self._swa_pool is not None:
+                p_min = pos_i64[q_start_np[:num_seqs]]
+                p_max = pos_i64[q_start_np[1 : num_seqs + 1] - 1]
+                swa_pt, _ = self._swa_pool.map_active_windows(
+                    active_pt, p_min, p_max, p_min
+                )
+            else:
+                swa_pt = active_pt
+
             self.mla_bt_cpu[:num_seqs].numpy()[:] = active_pt
             swa_bt_np = self.swa_bt_cpu[:num_seqs].numpy()
-            swa_bt_np[:, 0::2] = active_pt * 2
-            swa_bt_np[:, 1::2] = active_pt * 2 + 1
+            swa_bt_np[:, 0::2] = swa_pt * 2
+            swa_bt_np[:, 1::2] = swa_pt * 2 + 1
             self.comp_bt_cpu[:num_seqs, 0].numpy()[:] = seq_slots_np + 1
 
             if not use_dev_tok:
@@ -2409,7 +2580,6 @@ class DeepSeekV41StepRunner:
                 lb_np[:, 2] = prev_win_np[:, 0]
                 np.copyto(self.token_ids_cpu[:total_tokens].numpy(), tok_np)
 
-            pos_i64 = pos_np.astype(np.int64)
             np.copyto(self.positions_cpu[:total_tokens].numpy(), pos_i64)
             np.copyto(self.seq_lens_cpu[:num_seqs].numpy(), seq_lens_np)
             np.copyto(self.query_start_loc_cpu[: num_seqs + 1].numpy(), q_start_np)
@@ -2418,6 +2588,11 @@ class DeepSeekV41StepRunner:
             self.slot_mapping_cpu[:total_tokens].numpy()[:] = vb_tok * 128 + (
                 pos_i64 % 128
             )
+            if self._swa_pool is not None:
+                swa_vb_tok = self._swa_pool.lookup(vb_tok).astype(np.int64)
+                self.swa_slot_mapping_cpu[:total_tokens].numpy()[:] = (
+                    swa_vb_tok * 128 + (pos_i64 % 128)
+                )
 
             if num_sample > 0:
                 self.sample_rows_cpu[:num_sample].numpy()[:] = sample_rows_np.astype(
@@ -2455,6 +2630,10 @@ class DeepSeekV41StepRunner:
             self.slot_mapping_gpu[:total_tokens].copy_(
                 self.slot_mapping_cpu[:total_tokens], non_blocking=True
             )
+            if self._swa_pool is not None:
+                self.swa_slot_mapping_gpu[:total_tokens].copy_(
+                    self.swa_slot_mapping_cpu[:total_tokens], non_blocking=True
+                )
 
             max_q_len = int(q_lens.max())
             max_s_len = int(seq_lens_np.max())
@@ -2469,6 +2648,7 @@ class DeepSeekV41StepRunner:
                 seq_lens_cpu=self.seq_lens_cpu[:num_seqs],
                 positions_gpu=self.positions_gpu[:total_tokens],
                 slot_mapping_gpu=self.slot_mapping_gpu[:total_tokens],
+                swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:total_tokens],
                 is_prefilling_cpu=self.mixed_is_prefilling_cpu[:num_seqs],
                 for_capture=False,
             )

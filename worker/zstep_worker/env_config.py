@@ -127,6 +127,7 @@ class WorkerRuntimeConfig:
     max_model_len: int = 32768
     num_recurrent_checkpoints: int = 0
     dram_kv_blocks: int = 0
+    swa_kv_pages: int = 0
     enable_sm_h2d: bool = True
     enable_driver_batch_memcpy: bool = True
     prefill_runahead_depth: int = 2
@@ -193,6 +194,9 @@ class WorkerRuntimeConfig:
         dram_kv_blocks = env_int("ZSTEP_DRAM_KV_BLOCKS", 0, environ=env)
         if dram_kv_blocks < 0:
             raise ValueError(f"ZSTEP_DRAM_KV_BLOCKS must be >= 0 (got {dram_kv_blocks})")
+        swa_kv_pages = env_int("ZSTEP_SWA_KV_PAGES", 0, environ=env)
+        if swa_kv_pages < 0:
+            raise ValueError(f"ZSTEP_SWA_KV_PAGES must be >= 0 (got {swa_kv_pages})")
         enable_sm_h2d = env_flag("ZSTEP_ENABLE_SM_H2D", default=True, environ=env)
         enable_driver_batch_memcpy = env_flag(
             "ZSTEP_ENABLE_DRIVER_BATCH_MEMCPY", default=True, environ=env
@@ -242,6 +246,7 @@ class WorkerRuntimeConfig:
             max_model_len=max_model_len,
             num_recurrent_checkpoints=num_recurrent_checkpoints,
             dram_kv_blocks=dram_kv_blocks,
+            swa_kv_pages=swa_kv_pages,
             enable_sm_h2d=enable_sm_h2d,
             enable_driver_batch_memcpy=enable_driver_batch_memcpy,
             prefill_runahead_depth=prefill_runahead_depth,
