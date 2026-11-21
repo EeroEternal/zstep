@@ -2466,7 +2466,9 @@ def prepare_b12x_dsv41_model(
                 8,
                 16,
                 32,
+                40,
                 64,
+                80,
                 128,
                 512,
                 min(3072, int(max_tokens)),
@@ -2613,7 +2615,7 @@ def prepare_b12x_dsv41_model(
     csmla_caps: tuple[int, ...] = tuple(sorted(int(b) for b in decode_buckets if int(b) > 0))
     csmla_plans: dict[tuple[int, int, int, bool, str], tuple[Any, ...]] = {}
     csmla_requests: list[Any] = []
-    ext_cap = min(3072, int(max_tokens))
+    ext_cap = min(4096, int(max_tokens))
     try:
         from b12x.attention import compressed_sparse_mla as _csmla
 

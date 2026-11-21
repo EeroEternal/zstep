@@ -548,7 +548,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             : (pxb_slot * pxb_slot_stride_bytes)
     );
 
-    if (can_pxb && pxb_bfp == 1 && num_vecs > kPxbOneShotMinVecs && num_vecs <= 10240 && (num_vecs & 15) == 0 && (num_vecs >> 4) >= gridDim.x) {
+    if (can_pxb && pxb_bfp == 1 && num_vecs > kPxbOneShotMinVecs && num_vecs <= 15360 && (num_vecs & 15) == 0 && (num_vecs >> 4) >= gridDim.x) {
         const int parity = rank & 1, pair_id = rank >> 1, tid = threadIdx.x, sh = ((num_vecs & 127) == 0 && (num_vecs >> 7) >= gridDim.x) ? 7 : 4;
         const int64_t g16 = num_vecs >> sh, fb = ((g16 * b_local) / gridDim.x) << sh, fe = (b_local + 1 == gridDim.x) ? num_vecs : (((g16 * (b_local + 1)) / gridDim.x) << sh);
         const int64_t fm = fb + (((fe - fb) >> 2) << 1), p_fb = fb >> 1, p_fm = fm >> 1, p_fe = fe >> 1;
@@ -3216,7 +3216,7 @@ void launch_shm_v5_allreduce_cuda(
     const int64_t vecs_per_cta = (num_vecs + launch_blocks - 1) / launch_blocks;
     const int capped_threads = threads > 512 ? 512 : threads;
     const int launch_threads = small_pxb
-        ? ((pxb_bfp == 1 && num_vecs > 2560 && num_vecs <= 10240) ? 512 : 256)
+        ? ((pxb_bfp == 1 && num_vecs > 2560 && num_vecs <= 15360) ? 512 : 256)
         : ((capped_threads == 256 && vecs_per_cta > 256) ? 512 : capped_threads);
     shm_v5_allreduce_kernel<<<launch_blocks, launch_threads, 0, stream>>>(
         reinterpret_cast<const uint4*>(input_ptr),
