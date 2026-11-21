@@ -1772,6 +1772,7 @@ def _prepare_sm12x_mega_gate(
 
 
 _MHC_STATE_BY_DEV: dict[int, Any] = {}
+_CSMLA_STATE_BY_DEV: dict[int, dict[tuple[int, int, int, bool], tuple[tuple[int, Any, Any, list[torch.Tensor]], ...]]] = {}
 
 
 def _compute_mhc_split_cap(compute_splits_fn: Any, cap: int) -> int:
@@ -2588,6 +2589,56 @@ def prepare_b12x_dsv41_model(
             )
         shape_plans[(out_f, in_f)] = tuple(plans_for_shape)
 
+    # 2b. Build shared `b12x.attention.compressed_sparse_mla` plans (decode CG + long-prefill extend).
+    csmla_caps: tuple[int, ...] = tuple(sorted(int(b) for b in decode_buckets if int(b) > 0))
+    csmla_plans: dict[tuple[int, int, int, bool, str], tuple[Any, ...]] = {}
+    ext_cap = min(3072, int(max_tokens))
+    try:
+        from b12x.attention import compressed_sparse_mla as _csmla
+
+        csmla_sigs: set[tuple[int, int, int, bool]] = set()
+        for _mod in model.modules():
+            if hasattr(_mod, "swa_cache_layer") and getattr(_mod, "swa_bytes_per_token", 0) == 584:
+                h_n = int(getattr(_mod, "padded_heads", getattr(_mod, "n_local_heads", 0)))
+                sw_n = int(getattr(_mod, "window_size", 0))
+                tk_buf = getattr(_mod, "topk_indices_buffer", None)
+                iw_n = int(tk_buf.shape[-1]) if (int(getattr(_mod, "compress_ratio", 0)) > 0 and tk_buf is not None) else 0
+                if h_n > 0 and sw_n > 0 and (iw_n > 0 or sw_n == 128):
+                    csmla_sigs.add((h_n, sw_n, iw_n, getattr(_mod, "attn_sink", None) is not None))
+        if csmla_sigs and csmla_caps:
+            dummy_kv = torch.zeros((16, 64 * 584), dtype=torch.uint8, device=device)
+            for h_n, sw_n, iw_n, has_sink in sorted(csmla_sigs):
+                d_sink = torch.zeros((h_n,), dtype=torch.float32, device=device) if has_sink else None
+                modes = (("decode", csmla_caps), ("extend", (ext_cap,))) if (iw_n > 0 and ext_cap >= 1024) else (("decode", csmla_caps),)
+                for mode_s, m_caps in modes:
+                    sig_plans: list[Any] = []
+                    for cap in m_caps:
+                        dq = torch.empty((cap, h_n, 512), dtype=torch.bfloat16, device=device)
+                        inv = _csmla.invocation_from_tensors(q=dq, swa_k_cache=dummy_kv, indexed_k_cache=dummy_kv if iw_n > 0 else None, attn_sink=d_sink, return_lse=False, out=torch.empty_like(dq))
+                        ckw: dict[str, Any] = dict(device=device, num_q_heads=h_n, max_q_rows=cap, max_width=sw_n + iw_n, swa_width=sw_n, swa_page_size=64, indexed_width=iw_n, page_size=64, mode=mode_s)
+                        if iw_n > 0:
+                            ckw["indexed_page_size"] = 64
+                        cp = _csmla.plan(_csmla.Caps(**ckw), invocation=inv)
+                        sig_plans.append(cp)
+
+                        def _mk_csmla(state: Any, *, _p: Any = cp, _c: int = cap, _h: int = h_n, _sw: int = sw_n, _iw: int = iw_n, _hs: bool = has_sink) -> PreparedCall:
+                            q_t = torch.randn((_c, _h, 512), dtype=torch.bfloat16, device=device) * 0.1
+                            o_t, kv_t = torch.empty_like(q_t), torch.zeros((16, 64 * 584), dtype=torch.uint8, device=device)
+                            si = torch.arange(_sw, dtype=torch.int32, device=device).view(1, _sw).expand(_c, _sw).contiguous()
+                            sl = torch.full((_c,), _sw, dtype=torch.int32, device=device)
+                            ii = torch.arange(_iw, dtype=torch.int32, device=device).view(1, _iw).expand(_c, _iw).contiguous() if _iw > 0 else None
+                            il = torch.full((_c,), _iw, dtype=torch.int32, device=device) if _iw > 0 else None
+                            sk = torch.zeros((_h,), dtype=torch.float32, device=device) if _hs else None
+                            sc = [torch.empty(sp.shape, dtype=sp.dtype, device=device) for sp in _p.scratch_specs()]
+                            bd = state.bind(_p, scratch=sc, q=q_t, swa_indices=si, swa_lengths=sl, indexed_indices=ii, indexed_lengths=il)
+                            return PreparedCall(run=lambda: state.run(bd, swa_k_cache=kv_t, indexed_k_cache=kv_t if _iw > 0 else None, sm_scale=512**-0.5, attn_sink=sk, out=o_t), produce=lambda: q_t.normal_(std=0.1))
+
+                        requests.append(cp.request(name=f"dsv41_csmla_{mode_s}_h{h_n}_s{sw_n}_i{iw_n}_m{cap}", prepare_call=_mk_csmla, benchmark_call=_mk_csmla))
+                    csmla_plans[(h_n, sw_n, iw_n, has_sink, mode_s)] = tuple(sig_plans)
+    except Exception as exc:
+        _LOG.warning("b12x compressed_sparse_mla preparation skipped: %s", exc)
+        csmla_plans.clear()
+
     # 3. Run `PreparationSession` on rank 0 FIRST so compilation & GPU autotuning
     # happen free of multi-rank filesystem races or GPU power throttling, then
     # let ranks 1..7 load the warm persistent cache in <1s.
@@ -2732,10 +2783,77 @@ def prepare_b12x_dsv41_model(
             qm._b12x_scratches = slot_shape_scratches[(slot, skey)]
             qm._b12x_fast_plans = slot_shape_fast_plans[(slot, skey)]
 
+        csmla_arena: torch.Tensor | None = None
+        if csmla_plans:
+            csmla_bytes = max(_specs_nbytes(p.scratch_specs()) for plans in csmla_plans.values() for p in plans)
+            csmla_arena = torch.empty(max(1024, csmla_bytes), dtype=torch.uint8, device=device)
+            dev_tbl_new: dict[tuple[int, int, int, bool, str], tuple[tuple[int, Any, Any, Any], ...]] = {}
+            for sig, plans in csmla_plans.items():
+                m_caps = (ext_cap,) if sig[4] == "extend" else csmla_caps
+                entries_list: list[tuple[int, Any, Any, Any]] = []
+                for cap, p in zip(m_caps, plans, strict=True):
+                    st_p = require_prepared(p, "attention.compressed_sparse_mla")
+                    sc_l = _slice_arena_for_specs(csmla_arena, p.scratch_specs())
+                    if sig[4] == "extend":
+                        dq = torch.empty((cap, sig[0], 512), dtype=torch.bfloat16, device=device)
+                        si_d = torch.zeros((cap, sig[1]), dtype=torch.int32, device=device)
+                        sl_d = torch.zeros((cap,), dtype=torch.int32, device=device)
+                        ii_d = torch.zeros((cap, sig[2]), dtype=torch.int32, device=device)
+                        sc_l = st_p.bind(p, scratch=sc_l, q=dq, swa_indices=si_d, swa_lengths=sl_d, indexed_indices=ii_d, indexed_lengths=sl_d).scratch
+                    entries_list.append((int(cap), p, st_p, sc_l))
+                dev_tbl_new[sig] = tuple(entries_list)
+            _CSMLA_STATE_BY_DEV[dev_idx] = dev_tbl_new
+            from b12x.attention._shared.mla.compressed_api import _run_sm120_compressed_prefill as _b12x_prefill
+            from vllm.forward_context import get_forward_context as _get_fc
+            from vllm.models.deepseek_v41.nvidia import model as _dsv41_m
+
+            _smla_mod = sys.modules.get(_dsv41_m.DeepseekV4FlashInferSM120Attention.__module__, _dsv41_m)
+            if not getattr(_smla_mod, "_zstep_b12x_csmla_patched", False):
+                orig_smla = _smla_mod.flashinfer_trtllm_batch_decode_sparse_mla_dsv4
+
+                def _patched_smla(**kw: Any) -> Any:
+                    q, swa_kv, out = kw.get("query"), kw.get("swa_kv_cache"), kw.get("out")
+                    comp_kv, swa_lens = kw.get("compressed_kv_cache"), kw.get("swa_topk_lens")
+                    if (
+                        q is not None and out is not None and swa_kv is not None and swa_lens is not None
+                        and kw.get("kv_layout", "NHD") == "NHD"
+                        and q.dtype == torch.bfloat16 and q.shape[-1] == 512 and out.shape[-1] == 512
+                        and swa_kv.is_contiguous() and swa_kv.shape[-1] == 584 and swa_kv.numel() % (64 * 584) == 0
+                        and (comp_kv is None or (comp_kv.is_contiguous() and comp_kv.shape[-1] == 584 and comp_kv.numel() % (64 * 584) == 0))
+                    ):
+                        dev_tbl = _CSMLA_STATE_BY_DEV.get(0 if q.device.index is None else int(q.device.index))
+                        if dev_tbl is not None:
+                            rows, h_n = int(q.shape[0]), int(q.shape[-2])
+                            swa_i2 = kw["sparse_indices"].view(rows, -1)
+                            ex_i = kw.get("extra_sparse_indices")
+                            idx_i2 = ex_i.view(rows, -1) if ex_i is not None else None
+                            iw_n = int(idx_i2.shape[1]) if idx_i2 is not None else 0
+                            sinks = kw.get("sinks")
+                            if torch.cuda.is_current_stream_capturing():
+                                entries = dev_tbl.get((h_n, int(swa_i2.shape[1]), iw_n, sinks is not None, "decode"))
+                                if entries is not None and (iw_n > 0 or rows <= 64):
+                                    for cap_n, pl, st_p, sc_l in entries:
+                                        if cap_n >= rows:
+                                            bd = st_p.bind(pl, scratch=sc_l, q=q.view(rows, h_n, 512), swa_indices=swa_i2, swa_lengths=swa_lens, indexed_indices=idx_i2, indexed_lengths=kw.get("extra_sparse_topk_lens"))
+                                            return st_p.run(bd, swa_k_cache=swa_kv.view(-1, 64 * 584), indexed_k_cache=comp_kv.view(-1, 64 * 584) if comp_kv is not None else None, sm_scale=float(kw.get("bmm1_scale", 1.0)), attn_sink=sinks, out=out.view(rows, h_n, 512))
+                            elif rows >= 1024 and iw_n > 0 and comp_kv is not None:
+                                entries = dev_tbl.get((h_n, int(swa_i2.shape[1]), iw_n, sinks is not None, "extend"))
+                                if entries is not None and entries[0][0] >= rows:
+                                    am = _get_fc().attn_metadata
+                                    msl = max((getattr(v, "max_seq_len", 0) for v in am.values()), default=0) if isinstance(am, dict) else 0
+                                    if msl >= 1024:
+                                        _, _, st_p, ext_ws = entries[0]
+                                        return _b12x_prefill(q3=q.view(rows, h_n, 512), swa_k_cache=swa_kv.view(-1, 64 * 584), swa_indices=swa_i2, swa_topk_lengths=swa_lens, workspace=ext_ws, sm_scale=float(kw.get("bmm1_scale", 1.0)), swa_page_size=64, indexed_k_cache=comp_kv.view(-1, 64 * 584), indexed_indices=idx_i2, indexed_topk_lengths=kw.get("extra_sparse_topk_lens"), indexed_page_size=64, attn_sink=sinks, return_lse=False, lse_scale="base2", out=out.view(rows, h_n, 512), prepared=st_p.launch)
+                    return orig_smla(**kw)
+
+                _smla_mod.flashinfer_trtllm_batch_decode_sparse_mla_dsv4 = _patched_smla
+                _smla_mod._zstep_b12x_csmla_patched = True  # type: ignore[attr-defined]
+
         model._b12x_session = active_sess  # type: ignore[attr-defined]
         model._b12x_scratch_arenas = (  # type: ignore[attr-defined]
             moe_arena if moe_layers else None,
             slot_arenas,
+            csmla_arena,
         )
     except BaseException:
         if active_sess is not None:
@@ -2785,8 +2903,10 @@ def close_b12x_dsv41_model(model: torch.nn.Module | None) -> None:
                     owners.discard(id(model))
                     if not owners:
                         _MHC_STATE_BY_DEV.pop(mhc_dev, None)
+                        _CSMLA_STATE_BY_DEV.pop(mhc_dev, None)
                 else:
                     _MHC_STATE_BY_DEV.pop(mhc_dev, None)
+                    _CSMLA_STATE_BY_DEV.pop(mhc_dev, None)
             model._sm120_mhc_dev = None  # type: ignore[attr-defined]
 
     dsa_api = sys.modules.get("flashinfer.experimental.sm120_dsa_indexer._api")
