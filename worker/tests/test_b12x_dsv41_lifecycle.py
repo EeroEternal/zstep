@@ -378,3 +378,35 @@ def test_attach_sm120_mhc_shm_ar_uses_weakrefs_and_cleans_up() -> None:
         assert dev_idx not in _MHC_STATE_BY_DEV
     finally:
         _MHC_STATE_BY_DEV.pop(dev_idx, None)
+
+
+def test_close_b12x_evicts_csmla_per_owner_independently_of_mhc() -> None:
+    from zstep_worker.kernels_sm120.b12x_dsv41 import _CSMLA_STATE_BY_DEV
+
+    main_model = torch.nn.Linear(4, 4)
+    dspark_model = torch.nn.Linear(4, 4)
+    dev_idx = 777
+    sig_dec = (8, 128, 512, True, "decode")
+    sig_ext = (8, 128, 512, True, "extend")
+    main_model._b12x_csmla_dev = dev_idx  # type: ignore[attr-defined]
+    dspark_model._b12x_csmla_dev = dev_idx  # type: ignore[attr-defined]
+    # Intentionally leave `_sm120_mhc_dev` unset (None) on both models.
+    _CSMLA_STATE_BY_DEV[dev_idx] = {
+        sig_dec: (
+            (16, "p_dspark", "s_dspark", [], id(dspark_model)),
+            (128, "p_main", "s_main", [], id(main_model)),
+        ),
+        sig_ext: ((3072, "p_ext", "s_ext", "ws", id(main_model)),),
+    }
+    try:
+        close_b12x_dsv41_model(dspark_model)
+        assert getattr(dspark_model, "_b12x_csmla_dev", None) is None
+        assert dev_idx in _CSMLA_STATE_BY_DEV
+        assert [e[4] for e in _CSMLA_STATE_BY_DEV[dev_idx][sig_dec]] == [id(main_model)]
+        assert sig_ext in _CSMLA_STATE_BY_DEV[dev_idx]
+
+        close_b12x_dsv41_model(main_model)
+        assert getattr(main_model, "_b12x_csmla_dev", None) is None
+        assert dev_idx not in _CSMLA_STATE_BY_DEV
+    finally:
+        _CSMLA_STATE_BY_DEV.pop(dev_idx, None)
