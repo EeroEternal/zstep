@@ -1772,7 +1772,27 @@ def _prepare_sm12x_mega_gate(
 
 
 _MHC_STATE_BY_DEV: dict[int, Any] = {}
-_CSMLA_STATE_BY_DEV: dict[int, dict[tuple[int, int, int, bool], tuple[tuple[int, Any, Any, list[torch.Tensor]], ...]]] = {}
+_CSMLA_STATE_BY_DEV: dict[
+    int,
+    dict[tuple[int, int, int, bool, str], tuple[tuple[int, Any, Any, Any, int], ...]],
+] = {}
+
+
+def _evict_csmla_owner(dev_idx: int, owner_id: int) -> None:
+    dev_tbl = _CSMLA_STATE_BY_DEV.get(dev_idx)
+    if not dev_tbl:
+        return
+    empty_sigs: list[tuple[int, int, int, bool, str]] = []
+    for sig, entries in dev_tbl.items():
+        kept = tuple(e for e in entries if e[4] != owner_id)
+        if kept:
+            dev_tbl[sig] = kept
+        else:
+            empty_sigs.append(sig)
+    for sig in empty_sigs:
+        dev_tbl.pop(sig, None)
+    if not dev_tbl:
+        _CSMLA_STATE_BY_DEV.pop(dev_idx, None)
 
 
 def _compute_mhc_split_cap(compute_splits_fn: Any, cap: int) -> int:
@@ -2592,6 +2612,7 @@ def prepare_b12x_dsv41_model(
     # 2b. Build shared `b12x.attention.compressed_sparse_mla` plans (decode CG + long-prefill extend).
     csmla_caps: tuple[int, ...] = tuple(sorted(int(b) for b in decode_buckets if int(b) > 0))
     csmla_plans: dict[tuple[int, int, int, bool, str], tuple[Any, ...]] = {}
+    csmla_requests: list[Any] = []
     ext_cap = min(3072, int(max_tokens))
     try:
         from b12x.attention import compressed_sparse_mla as _csmla
@@ -2633,8 +2654,9 @@ def prepare_b12x_dsv41_model(
                             bd = state.bind(_p, scratch=sc, q=q_t, swa_indices=si, swa_lengths=sl, indexed_indices=ii, indexed_lengths=il)
                             return PreparedCall(run=lambda: state.run(bd, swa_k_cache=kv_t, indexed_k_cache=kv_t if _iw > 0 else None, sm_scale=512**-0.5, attn_sink=sk, out=o_t), produce=lambda: q_t.normal_(std=0.1))
 
-                        requests.append(cp.request(name=f"dsv41_csmla_{mode_s}_h{h_n}_s{sw_n}_i{iw_n}_m{cap}", prepare_call=_mk_csmla, benchmark_call=_mk_csmla))
+                        csmla_requests.append(cp.request(name=f"dsv41_csmla_{mode_s}_h{h_n}_s{sw_n}_i{iw_n}_m{cap}", prepare_call=_mk_csmla, benchmark_call=_mk_csmla))
                     csmla_plans[(h_n, sw_n, iw_n, has_sink, mode_s)] = tuple(sig_plans)
+            requests.extend(csmla_requests)
     except Exception as exc:
         _LOG.warning("b12x compressed_sparse_mla preparation skipped: %s", exc)
         csmla_plans.clear()
@@ -2671,6 +2693,7 @@ def prepare_b12x_dsv41_model(
             raise
 
     active_sess: Any = None
+    dev_idx = 0 if device.index is None else int(device.index)
     try:
         if exchange_group is not None and dist.is_initialized():
             if rank == 0:
@@ -2686,7 +2709,6 @@ def prepare_b12x_dsv41_model(
 
         # 4. Pre-allocate static 1024B-aligned scratch arenas (zero-alloc CUDAGraph capture & replay).
         moe_scratch_bytes = 0
-        dev_idx = 0 if device.index is None else int(device.index)
         if moe_layers:
             for _mname, _layer, qm in moe_layers:
                 moe_scratch_bytes = max(
@@ -2785,12 +2807,13 @@ def prepare_b12x_dsv41_model(
 
         csmla_arena: torch.Tensor | None = None
         if csmla_plans:
+            owner_id = id(model)
             csmla_bytes = max(_specs_nbytes(p.scratch_specs()) for plans in csmla_plans.values() for p in plans)
             csmla_arena = torch.empty(max(1024, csmla_bytes), dtype=torch.uint8, device=device)
-            dev_tbl_new: dict[tuple[int, int, int, bool, str], tuple[tuple[int, Any, Any, Any], ...]] = {}
+            dev_tbl_new: dict[tuple[int, int, int, bool, str], tuple[tuple[int, Any, Any, Any, int], ...]] = {}
             for sig, plans in csmla_plans.items():
                 m_caps = (ext_cap,) if sig[4] == "extend" else csmla_caps
-                entries_list: list[tuple[int, Any, Any, Any]] = []
+                entries_list: list[tuple[int, Any, Any, Any, int]] = []
                 for cap, p in zip(m_caps, plans, strict=True):
                     st_p = require_prepared(p, "attention.compressed_sparse_mla")
                     sc_l = _slice_arena_for_specs(csmla_arena, p.scratch_specs())
@@ -2800,10 +2823,12 @@ def prepare_b12x_dsv41_model(
                         sl_d = torch.zeros((cap,), dtype=torch.int32, device=device)
                         ii_d = torch.zeros((cap, sig[2]), dtype=torch.int32, device=device)
                         sc_l = st_p.bind(p, scratch=sc_l, q=dq, swa_indices=si_d, swa_lengths=sl_d, indexed_indices=ii_d, indexed_lengths=sl_d).scratch
-                    entries_list.append((int(cap), p, st_p, sc_l))
+                    entries_list.append((int(cap), p, st_p, sc_l, owner_id))
                 dev_tbl_new[sig] = tuple(entries_list)
-            _CSMLA_STATE_BY_DEV[dev_idx] = dev_tbl_new
-            from b12x.attention._shared.mla.compressed_api import _run_sm120_compressed_prefill as _b12x_prefill
+            try:
+                from b12x.attention._shared.mla.compressed_api import _run_sm120_compressed_prefill as _b12x_prefill
+            except ImportError:
+                _b12x_prefill = None
             from vllm.forward_context import get_forward_context as _get_fc
             from vllm.models.deepseek_v41.nvidia import model as _dsv41_m
 
@@ -2814,40 +2839,54 @@ def prepare_b12x_dsv41_model(
                 def _patched_smla(**kw: Any) -> Any:
                     q, swa_kv, out = kw.get("query"), kw.get("swa_kv_cache"), kw.get("out")
                     comp_kv, swa_lens = kw.get("compressed_kv_cache"), kw.get("swa_topk_lens")
+                    swa_i = kw.get("sparse_indices")
+                    ex_i = kw.get("extra_sparse_indices")
                     if (
-                        q is not None and out is not None and swa_kv is not None and swa_lens is not None
+                        q is not None and out is not None and swa_kv is not None and swa_lens is not None and swa_i is not None
+                        and (q.ndim == 3 or (q.ndim == 4 and int(q.shape[1]) == 1))
+                        and q.shape == out.shape
                         and kw.get("kv_layout", "NHD") == "NHD"
-                        and q.dtype == torch.bfloat16 and q.shape[-1] == 512 and out.shape[-1] == 512
+                        and q.dtype == torch.bfloat16 and out.dtype == torch.bfloat16
+                        and q.is_contiguous() and out.is_contiguous()
+                        and q.shape[-1] == 512 and out.shape[-1] == 512
+                        and swa_i.is_contiguous() and (ex_i is None or ex_i.is_contiguous())
                         and swa_kv.is_contiguous() and swa_kv.shape[-1] == 584 and swa_kv.numel() % (64 * 584) == 0
                         and (comp_kv is None or (comp_kv.is_contiguous() and comp_kv.shape[-1] == 584 and comp_kv.numel() % (64 * 584) == 0))
                     ):
                         dev_tbl = _CSMLA_STATE_BY_DEV.get(0 if q.device.index is None else int(q.device.index))
                         if dev_tbl is not None:
                             rows, h_n = int(q.shape[0]), int(q.shape[-2])
-                            swa_i2 = kw["sparse_indices"].view(rows, -1)
-                            ex_i = kw.get("extra_sparse_indices")
+                            swa_i2 = swa_i.view(rows, -1)
                             idx_i2 = ex_i.view(rows, -1) if ex_i is not None else None
                             iw_n = int(idx_i2.shape[1]) if idx_i2 is not None else 0
                             sinks = kw.get("sinks")
                             if torch.cuda.is_current_stream_capturing():
                                 entries = dev_tbl.get((h_n, int(swa_i2.shape[1]), iw_n, sinks is not None, "decode"))
-                                if entries is not None and (iw_n > 0 or rows <= 64):
-                                    for cap_n, pl, st_p, sc_l in entries:
+                                if entries is not None and (iw_n == 0 or comp_kv is not None) and (iw_n > 0 or rows <= 64):
+                                    for cap_n, pl, st_p, sc_l, _own in entries:
                                         if cap_n >= rows:
                                             bd = st_p.bind(pl, scratch=sc_l, q=q.view(rows, h_n, 512), swa_indices=swa_i2, swa_lengths=swa_lens, indexed_indices=idx_i2, indexed_lengths=kw.get("extra_sparse_topk_lens"))
-                                            return st_p.run(bd, swa_k_cache=swa_kv.view(-1, 64 * 584), indexed_k_cache=comp_kv.view(-1, 64 * 584) if comp_kv is not None else None, sm_scale=float(kw.get("bmm1_scale", 1.0)), attn_sink=sinks, out=out.view(rows, h_n, 512))
-                            elif rows >= 1024 and iw_n > 0 and comp_kv is not None:
+                                            return st_p.run(bd, swa_k_cache=swa_kv.view(-1, 64 * 584), indexed_k_cache=comp_kv.view(-1, 64 * 584) if (iw_n > 0 and comp_kv is not None) else None, sm_scale=float(kw.get("bmm1_scale", 1.0)), attn_sink=sinks, out=out.view(rows, h_n, 512))
+                            elif _b12x_prefill is not None and rows >= 1024 and iw_n > 0 and comp_kv is not None:
                                 entries = dev_tbl.get((h_n, int(swa_i2.shape[1]), iw_n, sinks is not None, "extend"))
                                 if entries is not None and entries[0][0] >= rows:
                                     am = _get_fc().attn_metadata
-                                    msl = max((getattr(v, "max_seq_len", 0) for v in am.values()), default=0) if isinstance(am, dict) else 0
+                                    msl = max((int(getattr(v, "max_seq_len", 0) or 0) for v in am.values()), default=0) if isinstance(am, dict) else 0
                                     if msl >= 1024:
-                                        _, _, st_p, ext_ws = entries[0]
+                                        _, _, st_p, ext_ws, _own = entries[0]
                                         return _b12x_prefill(q3=q.view(rows, h_n, 512), swa_k_cache=swa_kv.view(-1, 64 * 584), swa_indices=swa_i2, swa_topk_lengths=swa_lens, workspace=ext_ws, sm_scale=float(kw.get("bmm1_scale", 1.0)), swa_page_size=64, indexed_k_cache=comp_kv.view(-1, 64 * 584), indexed_indices=idx_i2, indexed_topk_lengths=kw.get("extra_sparse_topk_lens"), indexed_page_size=64, attn_sink=sinks, return_lse=False, lse_scale="base2", out=out.view(rows, h_n, 512), prepared=st_p.launch)
                     return orig_smla(**kw)
 
                 _smla_mod.flashinfer_trtllm_batch_decode_sparse_mla_dsv4 = _patched_smla
                 _smla_mod._zstep_b12x_csmla_patched = True  # type: ignore[attr-defined]
+
+            merged_tbl = _CSMLA_STATE_BY_DEV.setdefault(dev_idx, {})
+            for sig, new_entries in dev_tbl_new.items():
+                existing = tuple(e for e in merged_tbl.get(sig, ()) if e[4] != owner_id)
+                combined = existing + new_entries
+                reverse_order = sig[4] == "extend"
+                merged_tbl[sig] = tuple(sorted(combined, key=lambda e: e[0], reverse=reverse_order))
+            model._b12x_csmla_dev = dev_idx  # type: ignore[attr-defined]
 
         model._b12x_session = active_sess  # type: ignore[attr-defined]
         model._b12x_scratch_arenas = (  # type: ignore[attr-defined]
@@ -2856,6 +2895,8 @@ def prepare_b12x_dsv41_model(
             csmla_arena,
         )
     except BaseException:
+        _evict_csmla_owner(dev_idx, id(model))
+        model._b12x_csmla_dev = None  # type: ignore[attr-defined]
         if active_sess is not None:
             active_sess.close()
         raise
@@ -2903,11 +2944,13 @@ def close_b12x_dsv41_model(model: torch.nn.Module | None) -> None:
                     owners.discard(id(model))
                     if not owners:
                         _MHC_STATE_BY_DEV.pop(mhc_dev, None)
-                        _CSMLA_STATE_BY_DEV.pop(mhc_dev, None)
                 else:
                     _MHC_STATE_BY_DEV.pop(mhc_dev, None)
-                    _CSMLA_STATE_BY_DEV.pop(mhc_dev, None)
             model._sm120_mhc_dev = None  # type: ignore[attr-defined]
+        csmla_dev = getattr(model, "_b12x_csmla_dev", None)
+        if csmla_dev is not None:
+            _evict_csmla_owner(csmla_dev, id(model))
+            model._b12x_csmla_dev = None  # type: ignore[attr-defined]
 
     dsa_api = sys.modules.get("flashinfer.experimental.sm120_dsa_indexer._api")
     if dsa_api is not None:
