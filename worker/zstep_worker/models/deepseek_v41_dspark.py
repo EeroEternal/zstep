@@ -99,6 +99,12 @@ class DeepSeekV41DSparkDrafter:
             dtype=torch.int64,
             device=runner.device,
         )
+        self.ctx_rows_cpu: torch.Tensor = torch.zeros(
+            max(runner.max_step_tokens, 8192), dtype=torch.int64, pin_memory=True
+        )
+        self.ctx_rows_gpu: torch.Tensor = torch.zeros(
+            max(runner.max_step_tokens, 8192), dtype=torch.int64, device=runner.device
+        )
 
         self.step_logits_buf: torch.Tensor = torch.empty(
             (max_b, vpr), dtype=torch.bfloat16, device=runner.device
@@ -270,11 +276,14 @@ class DeepSeekV41DSparkDrafter:
         self.ctx_slot_mapping_gpu[:n_ctx].copy_(
             self.ctx_slot_mapping_cpu[:n_ctx], non_blocking=True
         )
-        ctx_main_x = (
-            main_x
-            if n_ctx == main_x.shape[0] and bool(np.all(ctx_rows == np.arange(n_ctx)))
-            else main_x[torch.from_numpy(ctx_rows).to(self.runner.device)]
-        )
+        if n_ctx == main_x.shape[0] and bool(np.all(ctx_rows == np.arange(n_ctx))):
+            ctx_main_x = main_x
+        else:
+            np.copyto(self.ctx_rows_cpu[:n_ctx].numpy(), ctx_rows)
+            self.ctx_rows_gpu[:n_ctx].copy_(
+                self.ctx_rows_cpu[:n_ctx], non_blocking=True
+            )
+            ctx_main_x = main_x[self.ctx_rows_gpu[:n_ctx]]
         slot_view = self.ctx_slot_mapping_gpu[:n_ctx]
         self.model.precompute_and_store_context_kv(
             ctx_main_x,
@@ -333,21 +342,27 @@ class DeepSeekV41DSparkDrafter:
         actual_rows = n * k
 
         active_pt = page_table[req_slots, :] + 1
-        mla_bt_np = runner.mla_bt_cpu[:eff_b].numpy()
-        mla_bt_np[:n] = active_pt
-        if eff_b > n:
-            mla_bt_np[n:eff_b] = 0
+        bt_cached = getattr(runner, "_last_verify_bt_sig", None) == (
+            eff_b,
+            tuple(int(s) for s in req_slots),
+        )
+        if not bt_cached:
+            mla_bt_np = runner.mla_bt_cpu[:eff_b].numpy()
+            mla_bt_np[:n] = active_pt
+            if eff_b > n:
+                mla_bt_np[n:eff_b] = 0
 
-        swa_bt_np = runner.swa_bt_cpu[:eff_b].numpy()
-        swa_bt_np[:n, 0::2] = active_pt * 2
-        swa_bt_np[:n, 1::2] = active_pt * 2 + 1
-        if eff_b > n:
-            swa_bt_np[n:eff_b] = 0
+            swa_bt_np = runner.swa_bt_cpu[:eff_b].numpy()
+            swa_bt_np[:n, 0::2] = active_pt * 2
+            swa_bt_np[:n, 1::2] = active_pt * 2 + 1
+            if eff_b > n:
+                swa_bt_np[n:eff_b] = 0
 
-        comp_bt_np = runner.comp_bt_cpu[:eff_b, 0].numpy()
-        comp_bt_np[:n] = req_slots + 1
-        if eff_b > n:
-            comp_bt_np[n:eff_b] = runner.dummy_comp_block
+            comp_bt_np = runner.comp_bt_cpu[:eff_b, 0].numpy()
+            comp_bt_np[:n] = req_slots + 1
+            if eff_b > n:
+                comp_bt_np[n:eff_b] = runner.dummy_comp_block
+            runner._last_verify_bt_sig = None
 
         sl_cpu_np = runner.seq_lens_cpu[:eff_b].numpy()
         sl_cpu_np[:n] = seq_lens_np
@@ -377,9 +392,10 @@ class DeepSeekV41DSparkDrafter:
         if eff_b > n:
             sm_cpu_np[actual_rows:rows] = -1
 
-        runner.mla_bt_gpu[:eff_b].copy_(runner.mla_bt_cpu[:eff_b], non_blocking=True)
-        runner.swa_bt_gpu[:eff_b].copy_(runner.swa_bt_cpu[:eff_b], non_blocking=True)
-        runner.comp_bt_gpu[:eff_b].copy_(runner.comp_bt_cpu[:eff_b], non_blocking=True)
+        if not bt_cached:
+            runner.mla_bt_gpu[:eff_b].copy_(runner.mla_bt_cpu[:eff_b], non_blocking=True)
+            runner.swa_bt_gpu[:eff_b].copy_(runner.swa_bt_cpu[:eff_b], non_blocking=True)
+            runner.comp_bt_gpu[:eff_b].copy_(runner.comp_bt_cpu[:eff_b], non_blocking=True)
         runner.seq_lens_gpu[:eff_b].copy_(
             runner.seq_lens_cpu[:eff_b], non_blocking=True
         )
@@ -496,7 +512,8 @@ class DeepSeekV41DSparkDrafter:
         # crosses an unallocated 128-token boundary before the next step's page allocation.
         if len(eligible) > 1:
             dummy_page = self.runner.num_kv_pages
-            overflow_count = 0
+            safe_seqs: list[VerifiedSequence] = []
+            ovf_seqs: list[VerifiedSequence] = []
             for seq in eligible:
                 pos_next_seq = (
                     int(positions[seq.rows[len(seq.accepted_tokens) - 1]]) + 1
@@ -509,10 +526,21 @@ class DeepSeekV41DSparkDrafter:
                     page_col >= page_table.shape[1]
                     or page_table[seq.req_slot, page_col] >= dummy_page
                 ):
-                    overflow_count += 1
-            if overflow_count > 1:
-                merged: dict[int, list[int]] = {}
-                for seq in eligible:
+                    ovf_seqs.append(seq)
+                else:
+                    safe_seqs.append(seq)
+            if len(ovf_seqs) > 1:
+                # Batch all non-overflowing sequences together with the first overflowing
+                # sequence (at most 1 sequence touches dummy_page per batch), and only
+                # run the remaining overflowing sequences individually.
+                merged = self._draft_batch(
+                    safe_seqs + [ovf_seqs[0]],
+                    positions=positions,
+                    page_table=page_table,
+                )
+                for seq in ovf_seqs[1:]:
+                    if self.runner.rank != 0 and self.runner.device.type == "cuda":
+                        torch.cuda.current_stream(self.runner.device).synchronize()
                     merged.update(
                         self._draft_batch([seq], positions=positions, page_table=page_table)
                     )

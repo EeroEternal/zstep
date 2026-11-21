@@ -297,6 +297,8 @@ def test_deepseek_v41_dspark_guards_max_context_page_table_bounds(monkeypatch):
     drafter.ctx_slot_mapping_cpu = torch.zeros(16, dtype=torch.int64)
     drafter.ctx_positions_gpu = torch.zeros(16, dtype=torch.int64)
     drafter.ctx_slot_mapping_gpu = torch.zeros(16, dtype=torch.int64)
+    drafter.ctx_rows_cpu = torch.zeros(16, dtype=torch.int64)
+    drafter.ctx_rows_gpu = torch.zeros(16, dtype=torch.int64)
     drafter.draft_qsl_cpu = torch.arange(ms + 1, dtype=torch.int32) * k
     drafter.draft_qsl_gpu = torch.arange(ms + 1, dtype=torch.int32) * k
     drafter.draft_tokens_cpu = torch.zeros(rows_cap, dtype=torch.int32)

@@ -367,6 +367,7 @@ class DeepSeekV41StepRunner:
         self.verify_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.verify_graph_aux: dict[int, list[torch.Tensor] | None] = {}
         self.dspark_drafter: Any | None = None
+        self._last_verify_bt_sig: tuple[int, tuple[int, ...]] | None = None
         self.dram_kv_tier: HostDramKvTier | None = None
         self._builder_groups: list[_AttnBuilderGroup] = []
 
@@ -2091,6 +2092,7 @@ class DeepSeekV41StepRunner:
             and bool(np.all(q_lens == width))
         )
         aux_hidden_states: list[torch.Tensor] | None = None
+        self._last_verify_bt_sig = None
         self._h2d_done_event.synchronize()
 
         self.start_events[parity].record()
@@ -2299,6 +2301,7 @@ class DeepSeekV41StepRunner:
             self.comp_bt_gpu[:v_bucket].copy_(
                 self.comp_bt_cpu[:v_bucket], non_blocking=True
             )
+            self._last_verify_bt_sig = (v_bucket, tuple(int(s) for s in seq_slots_np))
             self.lookback_gpu[:v_bucket].copy_(
                 self.lookback_cpu[:v_bucket], non_blocking=True
             )
