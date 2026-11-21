@@ -994,6 +994,10 @@ class DeepSeekV41StepRunner:
 
         self.dram_kv_tier: HostDramKvTier | None = None
         if self.runtime_config.dram_kv_blocks > 0:
+            if self.runtime_config.swa_kv_pages > 0:
+                raise ValueError(
+                    "ZSTEP_SWA_KV_PAGES cannot be combined with dram_kv_blocks > 0"
+                )
             try:
                 numa_node = pin_process_to_device_numa(int(self.device.index)).numa_node
             except Exception:
@@ -1932,7 +1936,11 @@ class DeepSeekV41StepRunner:
         torch.cuda.empty_cache()
         for b in reversed(PREFILL_PIECEWISE_BUCKETS):
             n_pages = (b + 127) // 128
-            if b > self.max_step_tokens or n_pages > self.num_kv_pages:
+            if (
+                b > self.max_step_tokens
+                or n_pages > self.num_kv_pages
+                or n_pages > self.swa_total_128_blocks - 2
+            ):
                 continue
             self.token_ids_gpu[:b].zero_()
             self.positions_gpu[:b].copy_(torch.arange(b, dtype=torch.int64, device=self.device))
@@ -1948,6 +1956,7 @@ class DeepSeekV41StepRunner:
             self.comp_bt_gpu[:1].copy_(self.comp_bt_cpu[:1])
             self.lookback_gpu[:1].fill_(-1)
             self.slot_mapping_gpu[:b].fill_(-1)
+            self.swa_slot_mapping_gpu[:b].fill_(-1)
             self.seq_lens_cpu[0], self.query_start_loc_cpu[0], self.query_start_loc_cpu[1] = b, 0, b
             self.seq_lens_gpu[:1].fill_(b)
             self.query_start_loc_gpu[:2].copy_(self.query_start_loc_cpu[:2])

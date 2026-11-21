@@ -547,6 +547,7 @@ impl PrefixTree {
             matched_tokens,
             leaf_aux_id,
             leaf_anchor_block_id,
+            retained_blocks: Vec::new(),
         }
     }
 
@@ -634,6 +635,7 @@ impl PrefixTree {
         let mut leaf_anchor_block_id = existing_lease.leaf_anchor_block_id;
         // Consume `existing_lease` without decrementing the ancestor pins we are extending.
         let mut transferred = existing_lease;
+        let mut retained_blocks = std::mem::take(&mut transferred.retained_blocks);
         transferred.leaf_node = 0;
         transferred.block_ids.clear();
         drop(transferred);
@@ -653,19 +655,28 @@ impl PrefixTree {
         {
             let existing_child = guard.nodes[current].children.get(chunk).copied();
             if let Some(child_idx) = existing_child {
-                let swa_stale = guard.swa_safe_lru.as_ref().is_some_and(|lru| {
-                    let existing_node = &guard.nodes[child_idx];
-                    existing_node.pin_count == 0
-                        && existing_node
-                            .lease
-                            .as_ref()
-                            .and_then(|l| l.ids().last().copied())
-                            .is_some_and(|pid| !lru.contains(pid))
+                let swa_evicted = guard.swa_safe_lru.as_ref().is_some_and(|lru| {
+                    guard.nodes[child_idx]
+                        .lease
+                        .as_ref()
+                        .and_then(|l| l.ids().last().copied())
+                        .is_some_and(|pid| !lru.contains(pid))
                 });
-                if swa_stale && aux_lease.is_none() && guard.nodes[child_idx].aux_lease.is_none() {
-                    // Refresh the unpinned SWA-evicted node with the newly written SWA-resident
-                    // block lease so chunked prefill continuations keep valid SWA KV.
-                    guard.nodes[child_idx].lease = Some(block_lease);
+                let can_swap_swa =
+                    aux_lease.is_none() && guard.nodes[child_idx].aux_lease.is_none();
+                let mut kept_exclusive_ids: Option<Vec<i32>> = None;
+                if swa_evicted && can_swap_swa {
+                    if guard.nodes[child_idx].pin_count == 0 {
+                        // Refresh the unpinned SWA-evicted node with the newly written SWA-resident
+                        // block lease so chunked prefill continuations keep valid SWA KV.
+                        guard.nodes[child_idx].lease = Some(block_lease);
+                    } else {
+                        // Existing node is pinned by an older sequence whose SWA window already
+                        // moved past it; retain the caller's fresh SWA-resident lease exclusively
+                        // instead of aliasing onto the SWA-evicted page.
+                        kept_exclusive_ids = Some(block_lease.ids().to_vec());
+                        retained_blocks.push(block_lease);
+                    }
                 } else {
                     // Another request already cached this exact node: drop redundant KV and aux
                     // leases so their physical IDs return immediately to their `BlockPool`s.
@@ -676,13 +687,18 @@ impl PrefixTree {
                 let child = &mut guard.nodes[child_idx];
                 child.pin_count += 1;
                 child.last_access_tick = tick;
-                let ids = child
+                let tree_ids = child
                     .lease
                     .as_ref()
                     .expect("live prefix node owns physical KV pages")
                     .ids();
-                block_ids.extend_from_slice(ids);
-                leaf_anchor_block_id = ids.first().copied();
+                if let Some(ref ex_ids) = kept_exclusive_ids {
+                    block_ids.extend_from_slice(ex_ids);
+                    leaf_anchor_block_id = ex_ids.first().copied();
+                } else {
+                    block_ids.extend_from_slice(tree_ids);
+                    leaf_anchor_block_id = tree_ids.first().copied();
+                }
                 leaf_aux_id = child.aux_lease.as_ref().map(|aux| aux.ids()[0]);
                 matched_nodes += 1;
                 current = child_idx;
@@ -743,6 +759,7 @@ impl PrefixTree {
             matched_tokens,
             leaf_aux_id,
             leaf_anchor_block_id,
+            retained_blocks,
         })
     }
 
@@ -817,6 +834,7 @@ pub struct PrefixLease {
     matched_tokens: u32,
     leaf_aux_id: Option<i32>,
     leaf_anchor_block_id: Option<i32>,
+    retained_blocks: Vec<BlockLease>,
 }
 
 impl PrefixLease {
@@ -1175,13 +1193,9 @@ mod swa_safe_lru_tests {
 
         let prompt: Vec<i32> = (1..=12).collect(); // 3 blocks of 4 tokens
         let empty = tree.match_prefix(&prompt);
-        let blocks: Vec<BlockLease> = (0..3)
-            .map(|_| pool.allocate(1).expect("block"))
-            .collect();
+        let blocks: Vec<BlockLease> = (0..3).map(|_| pool.allocate(1).expect("block")).collect();
         let pids: Vec<i32> = blocks.iter().map(|b| b.ids()[0]).collect();
-        let lease = tree
-            .extend_prefix(empty, &prompt, blocks)
-            .expect("extend");
+        let lease = tree.extend_prefix(empty, &prompt, blocks).expect("extend");
         assert_eq!(lease.matched_nodes(), 3);
         drop(lease);
 
@@ -1220,13 +1234,9 @@ mod swa_safe_lru_tests {
 
         let prompt: Vec<i32> = (1..=12).collect(); // 3 blocks of 4 tokens
         let empty = tree.match_prefix(&prompt);
-        let blocks: Vec<BlockLease> = (0..3)
-            .map(|_| pool.allocate(1).expect("block"))
-            .collect();
+        let blocks: Vec<BlockLease> = (0..3).map(|_| pool.allocate(1).expect("block")).collect();
         let old_pids: Vec<i32> = blocks.iter().map(|b| b.ids()[0]).collect();
-        let lease = tree
-            .extend_prefix(empty, &prompt, blocks)
-            .expect("extend");
+        let lease = tree.extend_prefix(empty, &prompt, blocks).expect("extend");
         drop(lease);
 
         // Evict all 3 pages from SWA safe LRU while leaving them in the prefix tree.
@@ -1258,5 +1268,45 @@ mod swa_safe_lru_tests {
         assert_eq!(after.block_ids(), &new_pids);
         drop(after);
         assert_eq!(tree.evictable_blocks(), 3);
+    }
+
+    #[test]
+    fn swa_safe_lru_keeps_exclusive_lease_when_evicted_node_is_pinned() {
+        let pool = BlockPool::new(CacheGroupKind::GlobalAndIndex, 16);
+        let tree = PrefixTree::new(4).expect("tree");
+        tree.set_swa_safe_capacity(Some(2));
+
+        let prompt: Vec<i32> = (1..=8).collect(); // 2 blocks of 4 tokens
+        let empty = tree.match_prefix(&prompt);
+        let blocks_a: Vec<BlockLease> = (0..2).map(|_| pool.allocate(1).expect("a")).collect();
+        let pids_a: Vec<i32> = blocks_a.iter().map(|b| b.ids()[0]).collect();
+        let lease_a = tree
+            .extend_prefix(empty, &prompt, blocks_a)
+            .expect("extend a");
+
+        // Request A remains active (pin_count == 1) while its SWA pages are evicted.
+        tree.touch_swa_pages(&[100, 101]);
+        let trimmed_b = tree.match_prefix(&prompt[..4]);
+        assert_eq!(trimmed_b.matched_nodes(), 0);
+
+        let blocks_b: Vec<BlockLease> = (0..1).map(|_| pool.allocate(1).expect("b")).collect();
+        let pids_b: Vec<i32> = blocks_b.iter().map(|b| b.ids()[0]).collect();
+        assert_ne!(pids_b[0], pids_a[0]);
+        tree.touch_swa_pages(&pids_b);
+
+        let lease_b = tree
+            .extend_prefix(trimmed_b, &prompt[..4], blocks_b)
+            .expect("extend b");
+        assert_eq!(lease_b.matched_nodes(), 1);
+        // Must retain Request B's SWA-resident page, NOT swap onto Request A's SWA-evicted page.
+        assert_eq!(lease_b.block_ids(), &pids_b);
+        assert_eq!(pool.available(), 16 - 3);
+
+        // Dropping lease_b returns its exclusive retained block immediately while lease_a stays valid.
+        drop(lease_b);
+        assert_eq!(pool.available(), 16 - 2);
+        assert_eq!(lease_a.block_ids(), &pids_a);
+        drop(lease_a);
+        assert_eq!(tree.evictable_blocks(), 2);
     }
 }

@@ -266,8 +266,9 @@ class DeepSeekV41DSparkDrafter:
             if n_ctx == 0:
                 return
         physical = page_table[ctx_slots, ctx_pos_i64 // 128].astype(np.int64) + 1
-        if self.runner._swa_pool is not None:
-            physical = self.runner._swa_pool.lookup(physical).astype(np.int64)
+        swa_pool = getattr(self.runner, "_swa_pool", None)
+        if swa_pool is not None:
+            physical = swa_pool.lookup(physical).astype(np.int64)
         slots_i64 = physical * 128 + (ctx_pos_i64 % 128)
 
         np.copyto(self.ctx_positions_cpu[:n_ctx].numpy(), ctx_pos_i64)

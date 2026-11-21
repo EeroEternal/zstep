@@ -1581,9 +1581,30 @@ fn launch_engine(
                     && swa_pages > 0
                     && swa_pages < args.resolved_num_kv_pages() as usize
                 {
-                    let safe_cap = swa_pages
-                        .saturating_sub(2 * args.max_seqs as usize)
-                        .max(1);
+                    if args.dram_tier.is_enabled() {
+                        let _ = engine.shutdown();
+                        if !state.shutdown_requested.load(Ordering::Acquire) {
+                            eprintln!(
+                                "zstep_serve: ZSTEP_SWA_KV_PAGES ({swa_pages}) cannot be combined with --dram-kv-blocks > 0"
+                            );
+                            state.set_phase(EngineState::Faulted);
+                        }
+                        let _ = launch_done_tx.send(());
+                        return;
+                    }
+                    let min_active_swa = 2 * args.max_seqs as usize;
+                    if swa_pages <= min_active_swa {
+                        let _ = engine.shutdown();
+                        if !state.shutdown_requested.load(Ordering::Acquire) {
+                            eprintln!(
+                                "zstep_serve: ZSTEP_SWA_KV_PAGES ({swa_pages}) must exceed 2 * max_seqs ({min_active_swa})"
+                            );
+                            state.set_phase(EngineState::Faulted);
+                        }
+                        let _ = launch_done_tx.send(());
+                        return;
+                    }
+                    let safe_cap = swa_pages - min_active_swa;
                     engine.set_swa_safe_capacity(Some(safe_cap));
                 }
             }
