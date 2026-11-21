@@ -79,7 +79,18 @@ from zstep_worker.shm_bridge import (
 )
 
 _LOG = logging.getLogger(__name__)
-PREFILL_PIECEWISE_BUCKETS: tuple[int, ...] = (64, 128, 256, 512, 640, 1024, 1152)
+PREFILL_PIECEWISE_BUCKETS: tuple[int, ...] = (
+    64,
+    128,
+    256,
+    384,
+    512,
+    640,
+    768,
+    896,
+    1024,
+    1152,
+)
 
 
 def _slice_piecewise_arg(x: Any, n: int) -> Any:
@@ -350,6 +361,7 @@ class DeepSeekV41StepRunner:
         self.decode_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.piecewise_graphs: dict[int, Any] = {}
         self.piecewise_outputs: dict[int, torch.Tensor] = {}
+        self.piecewise_aux_outputs: dict[int, list[torch.Tensor] | None] = {}
         self._pw_live_lookback: torch.Tensor | None = None
         self._pw_live_num_tokens: int = 0
         self.verify_graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -1663,8 +1675,7 @@ class DeepSeekV41StepRunner:
             self._capture_spec_verify_graphs(graph_pool, capture_stream)
         if self.dspark_drafter is not None:
             self.dspark_drafter.capture_graphs(graph_pool, capture_stream)
-        if self.spec_method == "none":
-            self._capture_piecewise_prefill_graphs(graph_pool, capture_stream)
+        self._capture_piecewise_prefill_graphs(graph_pool, capture_stream)
         lock_workspace()
         gc.collect()
         torch.cuda.empty_cache()
@@ -1694,6 +1705,18 @@ class DeepSeekV41StepRunner:
                 f"p2p={self.p2p_report.nccl_p2p_level}"
                 f"(pxb_shm={'on' if self.shm_ar.pxb_enabled else 'off'})"
             )
+            if (
+                self.b12x_summary.dsa_decode_enabled
+                and self.max_model_len > SM120_DSA_CANDIDATE_COVER_TOKENS
+            ):
+                _LOG.warning(
+                    "max_model_len=%d exceeds SM120_DSA_CANDIDATE_COVER_TOKENS=%d; "
+                    "decode CUDA graphs are clamped to %d tokens. Set "
+                    "ZSTEP_ENABLE_SM120_DSA_DECODE=0 for full-context decode graphs.",
+                    self.max_model_len,
+                    SM120_DSA_CANDIDATE_COVER_TOKENS,
+                    self.decode_graph_max_seq_len,
+                )
             print(
                 f"[DeepSeekV41StepRunner] ready: max_model_len={self.max_model_len} "
                 f"kv_pages={self.num_kv_pages} buckets={buckets} "
@@ -1795,7 +1818,8 @@ class DeepSeekV41StepRunner:
         if not is_breakable_cudagraph_enabled():
             return
         self._install_piecewise_hooks()
-        for b in PREFILL_PIECEWISE_BUCKETS:
+        torch.cuda.empty_cache()
+        for b in reversed(PREFILL_PIECEWISE_BUCKETS):
             n_pages = (b + 127) // 128
             if b > self.max_step_tokens or n_pages > self.num_kv_pages:
                 continue
@@ -1838,7 +1862,14 @@ class DeepSeekV41StepRunner:
                         out = self.model(input_ids=self.token_ids_gpu[:b], positions=self.positions_gpu[:b], lookback_token_ids=self.lookback_gpu[:1])
             capture_stream.synchronize()
             dist.barrier(group=self.exchange_group)
-            self.piecewise_graphs[b], self.piecewise_outputs[b] = cap, out
+            if isinstance(out, tuple):
+                out_hidden, out_aux = out
+                self.piecewise_outputs[b] = out_hidden
+                self.piecewise_aux_outputs[b] = out_aux
+            else:
+                self.piecewise_outputs[b] = out
+                self.piecewise_aux_outputs[b] = None
+            self.piecewise_graphs[b] = cap
         self._pw_live_lookback, self._pw_live_num_tokens = None, 0
 
     @torch.inference_mode()
@@ -2475,8 +2506,14 @@ class DeepSeekV41StepRunner:
             ):
                 if pw_b is not None:
                     self.piecewise_graphs[pw_b].replay()
+                    self._pw_live_lookback, self._pw_live_num_tokens = None, 0
                     hidden = self.piecewise_outputs[pw_b][:total_tokens]
-                    aux_hidden_states = None
+                    pw_aux = self.piecewise_aux_outputs.get(pw_b)
+                    aux_hidden_states = (
+                        [t[:total_tokens] for t in pw_aux]
+                        if pw_aux is not None
+                        else None
+                    )
                 else:
                     model_output = self.model(
                         input_ids=self.token_ids_gpu[:total_tokens],
@@ -2615,6 +2652,7 @@ class DeepSeekV41StepRunner:
         self.decode_graphs.clear()
         self.piecewise_graphs.clear()
         self.piecewise_outputs.clear()
+        self.piecewise_aux_outputs.clear()
         self.verify_graphs.clear()
         self.verify_graph_aux.clear()
         if self.dspark_drafter is not None:
@@ -2654,6 +2692,7 @@ class DeepSeekV41StepRunner:
         self.decode_graphs.clear()
         self.piecewise_graphs.clear()
         self.piecewise_outputs.clear()
+        self.piecewise_aux_outputs.clear()
         self.verify_graphs.clear()
         self.verify_graph_aux.clear()
         if self.dspark_drafter is not None:
