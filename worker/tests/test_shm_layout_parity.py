@@ -335,7 +335,9 @@ def test_select_decode_bucket_never_clamps_overflow() -> None:
     assert STEP_FLAG_PENALTY == (1 << 4)
     assert select_decode_bucket(1, 128) == 1
     assert select_decode_bucket(3, 128) == 4
-    assert select_decode_bucket(17, 128) == 24
+    assert select_decode_bucket(10, 128) == 10
+    assert select_decode_bucket(17, 128) == 20
+    assert select_decode_bucket(21, 128) == 24
     assert select_decode_bucket(33, 128) == 48
     assert select_decode_bucket(65, 128) == 96
     assert select_decode_bucket(97, 128) == 128

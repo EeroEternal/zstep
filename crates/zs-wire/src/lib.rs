@@ -66,7 +66,7 @@ pub const STEP_FLAG_SAMPLING: u32 = 1 << 3;
 /// non-zero `presence_penalty` or `frequency_penalty` (always paired with [`STEP_FLAG_SAMPLING`]).
 pub const STEP_FLAG_PENALTY: u32 = 1 << 4;
 /// Canonical CUDA Graph batch buckets for decode-only steps.
-pub const DECODE_GRAPH_BUCKETS: [u32; 11] = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128];
+pub const DECODE_GRAPH_BUCKETS: [u32; 14] = [1, 2, 4, 8, 10, 12, 16, 20, 24, 32, 48, 64, 96, 128];
 /// Maximum active decode sequences supported by pre-captured decode CUDA Graphs.
 pub const MAX_DECODE_GRAPH_SEQS: u32 = 128;
 

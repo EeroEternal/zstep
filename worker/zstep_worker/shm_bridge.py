@@ -71,7 +71,7 @@ STEP_FLAG_DEVICE_TOKENS: int = 1 << 1
 STEP_FLAG_NEXT_PREPUBLISHED: int = 1 << 2
 STEP_FLAG_SAMPLING: int = 1 << 3
 STEP_FLAG_PENALTY: int = 1 << 4
-DECODE_GRAPH_BUCKETS: tuple[int, ...] = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128)
+DECODE_GRAPH_BUCKETS: tuple[int, ...] = (1, 2, 4, 8, 10, 12, 16, 20, 24, 32, 48, 64, 96, 128)
 MAX_DECODE_GRAPH_SEQS: int = 128
 
 
