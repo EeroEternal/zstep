@@ -1498,7 +1498,7 @@ async fn logprobs_and_top_logprobs_non_streaming_and_streaming() {
     .expect("join");
     assert_eq!(status, 200);
     let chunks: Vec<serde_json::Value> = stream_resp
-        .split("\n\n")
+        .lines()
         .filter_map(|line| {
             let line = line.trim();
             if line.starts_with("data: ") && !line.ends_with("[DONE]") {
