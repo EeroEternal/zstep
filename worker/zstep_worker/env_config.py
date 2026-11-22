@@ -155,6 +155,9 @@ class WorkerRuntimeConfig:
     mega_gate_enable_pdl: bool = False
     enable_sm120_mhc_overlap: bool = True
     enable_sm120_fuse_mhc_ar: bool = True
+    prefill_tbo_min_tokens: int = 6144
+    prefill_tbo_min_ctx: int = 32768
+    prefill_tbo_ar_blocks: int = 24
     b12x_compat_dir: str = ""
     b12x_cache_dir: str | None = None
     b12x_autotune: bool = True
@@ -234,6 +237,31 @@ class WorkerRuntimeConfig:
                 f"ZSTEP_SHM_MAX_AG_NUMEL must be >= 0 (got {shm_max_ag_numel})"
             )
 
+        prefill_tbo_min_tokens = env_int(
+            "ZSTEP_PREFILL_TBO_MIN_TOKENS", 6144, environ=env
+        )
+        if prefill_tbo_min_tokens < 0:
+            raise ValueError(
+                "ZSTEP_PREFILL_TBO_MIN_TOKENS must be >= 0 "
+                f"(got {prefill_tbo_min_tokens})"
+            )
+        prefill_tbo_min_ctx = env_int(
+            "ZSTEP_PREFILL_TBO_MIN_CTX", 32768, environ=env
+        )
+        if prefill_tbo_min_ctx < 0:
+            raise ValueError(
+                "ZSTEP_PREFILL_TBO_MIN_CTX must be >= 0 "
+                f"(got {prefill_tbo_min_ctx})"
+            )
+        prefill_tbo_ar_blocks = env_int(
+            "ZSTEP_PREFILL_TBO_AR_BLOCKS", 24, environ=env
+        )
+        if not 1 <= prefill_tbo_ar_blocks <= 64:
+            raise ValueError(
+                "ZSTEP_PREFILL_TBO_AR_BLOCKS must be in 1..=64 "
+                f"(got {prefill_tbo_ar_blocks})"
+            )
+
         raw_cache_dir = env.get("ZSTEP_B12X_CACHE_DIR")
         b12x_cache_dir = (
             raw_cache_dir.strip()
@@ -295,6 +323,9 @@ class WorkerRuntimeConfig:
             enable_sm120_fuse_mhc_ar=env_flag(
                 "ZSTEP_ENABLE_SM120_FUSE_MHC_AR", default=True, environ=env
             ),
+            prefill_tbo_min_tokens=prefill_tbo_min_tokens,
+            prefill_tbo_min_ctx=prefill_tbo_min_ctx,
+            prefill_tbo_ar_blocks=prefill_tbo_ar_blocks,
             b12x_compat_dir=env.get("ZSTEP_B12X_COMPAT_DIR", "").strip(),
             b12x_cache_dir=b12x_cache_dir,
             b12x_autotune=env_flag("ZSTEP_B12X_AUTOTUNE", default=True, environ=env),
