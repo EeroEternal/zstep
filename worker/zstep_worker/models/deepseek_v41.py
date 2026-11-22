@@ -356,6 +356,19 @@ class _SwaPagePool:
     def lookup(self, mla_pages: np.ndarray) -> np.ndarray:
         return self._lut[mla_pages]
 
+    def prune_inactive_slots(self, pt_np: np.ndarray) -> None:
+        if not self._slot_tails:
+            return
+        n_rows = int(pt_np.shape[0])
+        dummy_raw = self.mla_dummy_vb - 1
+        dead = [
+            slot
+            for slot in self._slot_tails
+            if slot >= n_rows or int(pt_np[slot, 0]) >= dummy_raw or int(pt_np[slot, 0]) < 0
+        ]
+        for slot in dead:
+            del self._slot_tails[slot]
+
     def map_active_windows(
         self,
         active_pt: np.ndarray,
@@ -2210,6 +2223,8 @@ class DeepSeekV41StepRunner:
 
         max_slot_end = min(self.max_seqs, int(slot_np.max()) + 1)
         pt_np = plan.global_kv_page_table(max_slot_end)[:, : self.bt_width]
+        if self._swa_pool is not None:
+            self._swa_pool.prune_inactive_slots(pt_np)
 
         is_spec_step = header.is_dspark_verify != 0
         is_decode = (

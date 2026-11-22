@@ -352,6 +352,7 @@ class DeepSeekV41DSparkDrafter:
                 pos_next,
                 np.minimum(pos_next + k - 1, max_ctx - 1),
                 pos_next,
+                active_slots=req_slots,
             )
         else:
             swa_pt = active_pt

@@ -246,9 +246,21 @@ fn cli_parser_enforces_nebula_contract_flags_and_model_defaults() {
         "dspark",
         "--num-speculative-tokens",
         "5",
+        "--max-consecutive-prefills",
+        "0",
     ])
     .expect("dsv41 dspark ok");
     assert_eq!(dsv41_dspark.resolved_num_kv_pages(), 2_560);
+    assert_eq!(dsv41_dspark.prefill_policy.max_consecutive_prefills, 0);
+    assert!(
+        parse(&[
+            "--model-dir",
+            dsv41_path,
+            "--max-consecutive-prefills",
+            "abc"
+        ])
+        .is_err()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

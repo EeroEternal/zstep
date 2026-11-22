@@ -408,9 +408,9 @@ impl ServeArgs {
                 })?;
             }
             if let Some(raw) = values.get("--max-consecutive-prefills") {
-                policy.max_consecutive_prefills = raw.parse::<usize>().map_err(|_| {
-                    format!("invalid value `{raw}` for --max-consecutive-prefills")
-                })?;
+                policy.max_consecutive_prefills = raw
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid value `{raw}` for --max-consecutive-prefills"))?;
             }
             if let Some(raw) = values.get("--dynamic-prefill-budget") {
                 policy.dynamic_budget_enabled = raw == "true";

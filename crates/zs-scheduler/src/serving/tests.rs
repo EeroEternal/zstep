@@ -248,6 +248,31 @@ fn decode_sequences_force_single_prefill_interleaving() {
         0,
         DEFAULT_PREFILL_COALESCE_WAIT_MS,
     ));
+    // Explicit N > 1 allows up to N consecutive prefills before yielding to decode.
+    assert!(should_schedule_prefill(
+        1,
+        2,
+        true,
+        8,
+        4096,
+        2048,
+        &waiting,
+        1,
+        2,
+        DEFAULT_PREFILL_COALESCE_WAIT_MS,
+    ));
+    assert!(!should_schedule_prefill(
+        1,
+        2,
+        true,
+        8,
+        4096,
+        2048,
+        &waiting,
+        2,
+        2,
+        DEFAULT_PREFILL_COALESCE_WAIT_MS,
+    ));
     assert!(should_schedule_prefill(
         0,
         1,
