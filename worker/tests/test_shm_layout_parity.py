@@ -427,6 +427,8 @@ def _make_runtime_loop_fixture(runner: object) -> tuple[object, ShmBridge, int, 
         numa_node=0,
         pinned_cpus=(0,),
     )
+    from zstep_worker.runahead import PrefillRunAheadGuard
+
     loop.bridge = worker_bridge
     loop.runner = runner
     loop.model_type = ""
@@ -434,6 +436,7 @@ def _make_runtime_loop_fixture(runner: object) -> tuple[object, ShmBridge, int, 
     loop._watchdog_thread = threading.Thread(target=lambda: None)
     loop._free_vram_mb = 1024
     loop._total_vram_mb = 2048
+    loop._prefill_runahead = PrefillRunAheadGuard(max_depth=0)
     loop.current_step = 0
     loop.last_step = 0
     loop._pending_plan_signals = 0

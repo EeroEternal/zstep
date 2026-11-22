@@ -5,16 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     name: Rust fmt, clippy & tests
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Clippy
@@ -24,19 +24,18 @@ jobs:
 
   python:
     name: Python ruff, CPU unit tests & AST hot-path guards
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Install worker package with pinned test dependencies
-        run: python -m pip install --upgrade pip -e "./worker[test]"
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -e "./worker[test]"
       - name: Ruff lint
-        run: ruff check worker/
+        run: .venv/bin/ruff check worker/
       - name: CPU unit tests, SHM parity & AST hot-path guards
         run: |
-          pytest -q \
+          .venv/bin/pytest -q \
             worker/tests/test_shm_layout_parity.py \
             worker/tests/test_p2p_probe.py \
             worker/tests/test_spec_decode.py \
