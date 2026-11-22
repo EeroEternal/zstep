@@ -115,3 +115,32 @@ def test_swa_page_pool_slot_tail_pinning_and_prune_on_retire() -> None:
     )
     assert int(pt2[0, 2]) > 0
     assert int(pool.lookup(np.array([2]))[0]) == 0
+
+
+def test_swa_page_pool_tail_bound_on_prefill_vs_straddling_verify() -> None:
+    try:
+        from zstep_worker.models.deepseek_v41 import _SwaPagePool
+    except ImportError as exc:
+        pytest.skip(f"_SwaPagePool import skipped: {exc}")
+
+    pool = _SwaPagePool(num_swa_pages=4, mla_dummy_vb=10)
+
+    # Multi-page prefill (pos 0..300 -> 3 pages): only last 2 tail pages are pinned.
+    pool.map_active_windows(
+        np.array([[1, 2, 3]], dtype=np.int64),
+        seq_pos_min=np.array([0], dtype=np.int64),
+        seq_pos_max=np.array([300], dtype=np.int64),
+        allow_alloc_from=np.array([0], dtype=np.int64),
+        active_slots=np.array([0], dtype=np.int64),
+    )
+    assert pool._slot_tails[0] == (2, 3)
+
+    # Straddling decode/verify window (pos 252..256 -> p_lo=0, p_hi=2): pins all 3 pages.
+    pool.map_active_windows(
+        np.array([[1, 2, 3]], dtype=np.int64),
+        seq_pos_min=np.array([252], dtype=np.int64),
+        seq_pos_max=np.array([256], dtype=np.int64),
+        allow_alloc_from=np.array([252], dtype=np.int64),
+        active_slots=np.array([0], dtype=np.int64),
+    )
+    assert pool._slot_tails[0] == (1, 2, 3)

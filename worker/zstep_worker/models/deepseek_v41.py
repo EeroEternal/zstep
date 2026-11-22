@@ -401,7 +401,15 @@ class _SwaPagePool:
                     to_alloc.append(mp)
             if active_slots is not None:
                 slot = int(active_slots[i])
-                tail_lo = min(p_lo, max(0, p_hi - 1))
+                tail_hi = max(0, p_hi - 1)
+                # Keep at most 2 tail pages on multi-page prefill (>= 128 tokens) to preserve
+                # SwaSafeLru's `2 * max_seqs` bound, while allowing straddling decode/verify
+                # windows (< 128 tokens) to retain `p_lo` in case all drafts are rejected.
+                tail_lo = (
+                    min(p_lo, tail_hi)
+                    if int(seq_pos_max[i]) - int(seq_pos_min[i]) < 128
+                    else tail_hi
+                )
                 tail = tuple(
                     int(active_pt[i, c])
                     for c in range(tail_lo, p_hi + 1)
