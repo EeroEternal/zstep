@@ -125,6 +125,20 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
     assert cfg.enable_driver_batch_memcpy is False
     assert cfg.prefill_runahead_depth == 4
     assert cfg.swa_kv_pages == 2048
+    assert cfg.prefill_tbo_min_tokens == 6144
+    assert cfg.prefill_tbo_min_ctx == 32768
+    assert cfg.prefill_tbo_ar_blocks == 24
+
+    tbo_cfg = WorkerRuntimeConfig.from_env(
+        {
+            "ZSTEP_PREFILL_TBO_MIN_TOKENS": "0",
+            "ZSTEP_PREFILL_TBO_MIN_CTX": "65536",
+            "ZSTEP_PREFILL_TBO_AR_BLOCKS": "16",
+        }
+    )
+    assert tbo_cfg.prefill_tbo_min_tokens == 0
+    assert tbo_cfg.prefill_tbo_min_ctx == 65536
+    assert tbo_cfg.prefill_tbo_ar_blocks == 16
 
 
 @pytest.mark.parametrize(
@@ -143,6 +157,10 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
         ({"ZSTEP_SHM_MAX_AR_NUMEL": "-4"}, "ZSTEP_SHM_MAX_AR_NUMEL"),
         ({"ZSTEP_QWEN_GDN_DECODE_MODE": "invalid_mode"}, "ZSTEP_QWEN_GDN_DECODE_MODE"),
         ({"ZSTEP_SWA_KV_PAGES": "-1"}, "ZSTEP_SWA_KV_PAGES"),
+        ({"ZSTEP_PREFILL_TBO_MIN_TOKENS": "-1"}, "ZSTEP_PREFILL_TBO_MIN_TOKENS"),
+        ({"ZSTEP_PREFILL_TBO_MIN_CTX": "-1"}, "ZSTEP_PREFILL_TBO_MIN_CTX"),
+        ({"ZSTEP_PREFILL_TBO_AR_BLOCKS": "0"}, "ZSTEP_PREFILL_TBO_AR_BLOCKS"),
+        ({"ZSTEP_PREFILL_TBO_AR_BLOCKS": "65"}, "ZSTEP_PREFILL_TBO_AR_BLOCKS"),
     ],
 )
 def test_worker_runtime_config_rejects_invalid_values(

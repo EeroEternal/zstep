@@ -716,7 +716,7 @@ class DeepSeekV41StepRunner:
         self._tbo_comm_stream: torch.cuda.Stream | None = None
         self._tbo_comp_done_ev: list[torch.cuda.Event] = []
         self._tbo_ar_done_ev: list[torch.cuda.Event] = []
-        if use_pxb_ar and tbo_min_tok > 0:
+        if use_pxb_ar and 0 < tbo_min_tok <= 2 * tbo_cap_tokens:
             self.shm_ar_tbo = HostMappedShmAllReduce(
                 name=f"{allreduce_name}_tbo",
                 rank=rank,
@@ -1456,39 +1456,17 @@ class DeepSeekV41StepRunner:
             return False
         return hasattr(dsv4_core, "layers") and hasattr(dsv4_core, "embed_input_ids")
 
-    def _run_prefill_tbo(
-        self,
-        *,
+    @staticmethod
+    def _compute_tbo_microbatch_slices(
         total_tokens: int,
         num_seqs: int,
         q_start_np: np.ndarray,
         pos_i64: np.ndarray,
-        full_attn_meta: dict[str, Any],
-    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        """Prefill Two-Batch Overlap (TBO): split a long prefill chunk into two
-        causal microbatches (`u0`, `u1`) and overlap each microbatch's `shm_v5`
-        AllReduce (`blocks=16`, high-priority comm stream) with the other
-        microbatch's Attn/FFN compute on the main stream."""
-        from vllm.forward_context import get_forward_context
-        from vllm.models.deepseek_v41.nvidia import model as dsv41_model
-
-        lang_mod = getattr(self.model, "language_model", self.model)
-        dsv4_core = getattr(lang_mod, "model", lang_mod)
-        shm_ar_tbo = self.shm_ar_tbo
-        comm_s = self._tbo_comm_stream
-        assert shm_ar_tbo is not None and comm_s is not None
-        main_s = torch.cuda.current_stream(self.device)
-        dev_idx = self.device.index
-
+    ) -> list[tuple[int, int, int, int, list[int], list[int], list[bool], int, int]]:
+        """Split a contiguous prefill batch into two causal microbatch metadata tuples."""
         mid = total_tokens // 2
-        bounds = ((0, mid), (mid, total_tokens))
-        attn_metas: list[dict[str, Any]] = []
-        positions_full = self.positions_gpu[:total_tokens]
-        slot_map_full = self.slot_mapping_gpu[:total_tokens]
-        swa_slot_map_full = self.swa_slot_mapping_gpu[:total_tokens]
-
-        for u, (lo, hi) in enumerate(bounds):
-            u_toks = hi - lo
+        slices: list[tuple[int, int, int, int, list[int], list[int], list[bool], int, int]] = []
+        for lo, hi in ((0, mid), (mid, total_tokens)):
             r_start = -1
             r_end = 0
             u_qsl: list[int] = [0]
@@ -1515,6 +1493,44 @@ class DeepSeekV41StepRunner:
                     max_ql = ql
                 if sl > max_sl:
                     max_sl = sl
+            slices.append((lo, hi, r_start, r_end, u_qsl, u_seqlens, u_is_pref, max_ql, max_sl))
+        return slices
+
+    def _run_prefill_tbo(
+        self,
+        *,
+        total_tokens: int,
+        num_seqs: int,
+        q_start_np: np.ndarray,
+        pos_i64: np.ndarray,
+        full_attn_meta: dict[str, Any],
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """Prefill Two-Batch Overlap (TBO): split a long prefill chunk into two
+        causal microbatches (`u0`, `u1`) and overlap each microbatch's `shm_v5`
+        AllReduce (`blocks=ZSTEP_PREFILL_TBO_AR_BLOCKS`, high-priority comm stream)
+        with the other microbatch's Attn/FFN compute on the main stream."""
+        from vllm.forward_context import get_forward_context
+        from vllm.models.deepseek_v41.nvidia import model as dsv41_model
+
+        lang_mod = getattr(self.model, "language_model", self.model)
+        dsv4_core = getattr(lang_mod, "model", lang_mod)
+        shm_ar_tbo = self.shm_ar_tbo
+        comm_s = self._tbo_comm_stream
+        assert shm_ar_tbo is not None and comm_s is not None
+        main_s = torch.cuda.current_stream(self.device)
+        dev_idx = self.device.index
+
+        mid = total_tokens // 2
+        slices = self._compute_tbo_microbatch_slices(total_tokens, num_seqs, q_start_np, pos_i64)
+        attn_metas: list[dict[str, Any]] = []
+        positions_full = self.positions_gpu[:total_tokens]
+        slot_map_full = self.slot_mapping_gpu[:total_tokens]
+        swa_slot_map_full = self.swa_slot_mapping_gpu[:total_tokens]
+
+        for u, (lo, hi, r_start, r_end, u_qsl, u_seqlens, u_is_pref, max_ql, max_sl) in enumerate(
+            slices
+        ):
+            u_toks = hi - lo
             u_reqs = r_end - r_start
             qsl_cpu = self._tbo_qsl_cpu[u][: u_reqs + 1]
             qsl_cpu.numpy()[:] = u_qsl
@@ -1548,6 +1564,7 @@ class DeepSeekV41StepRunner:
                 comp_bt_gpu=self.comp_bt_gpu[r_start:r_end],
             )
             attn_metas.append(meta_u)
+        self._h2d_done_event.record(main_s)
 
         input_ids_full = self.token_ids_gpu[:total_tokens]
         hidden_full = dsv4_core.embed_input_ids(input_ids_full)
@@ -1765,6 +1782,11 @@ class DeepSeekV41StepRunner:
                     xs[u] = layer.ffn(xs[u], ids_u[u], mega_u[u])
                     xs[u] = _launch_ar(xs[u], u)
         finally:
+            try:
+                flush_sm120_mhc_before_ar(dev_idx)
+                main_s.wait_stream(comm_s)
+            except Exception as exc:
+                _LOG.warning("TBO cleanup stream sync failed: %s", exc)
             fwd_ctx.attn_metadata = full_attn_meta
             for op, orig_buf in cand_orig_by_op.values():
                 op.candidate_blocks = orig_buf
