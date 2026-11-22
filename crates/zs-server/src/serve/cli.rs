@@ -604,10 +604,24 @@ impl ServeArgs {
         }
     }
 
+    fn explicit_swa_env_pages() -> Option<usize> {
+        std::env::var("ZSTEP_SWA_KV_PAGES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+    }
+
+    fn decoupled_swa_default_enabled(&self) -> bool {
+        is_deepseek_v41_dir(&self.model_dir)
+            && !self.dram_tier.is_enabled()
+            && Self::explicit_swa_env_pages() != Some(0)
+    }
+
     pub fn resolved_num_kv_pages(&self) -> u32 {
         self.num_kv_pages.unwrap_or_else(|| {
             let base = if is_deepseek_v41_dir(&self.model_dir) {
-                if self.speculative.method == SpeculativeMethod::Dspark {
+                if self.decoupled_swa_default_enabled() {
+                    10_240.0
+                } else if self.speculative.method == SpeculativeMethod::Dspark {
                     2_560.0
                 } else {
                     4_096.0
@@ -618,6 +632,33 @@ impl ServeArgs {
             let scaled = (self.gpu_memory_utilization / 0.95) * base;
             (scaled.round() as u32).max(128)
         })
+    }
+
+    /// Resolved decoupled SWA 128-token KV page count for DeepSeek-V4.1 (`0` = disabled / uniform).
+    pub fn resolved_swa_kv_pages(&self) -> usize {
+        if !is_deepseek_v41_dir(&self.model_dir) {
+            return 0;
+        }
+        let num_kv = self.resolved_num_kv_pages() as usize;
+        if let Some(explicit) = Self::explicit_swa_env_pages() {
+            return if explicit > 0 && explicit < num_kv {
+                explicit
+            } else {
+                0
+            };
+        }
+        if self.dram_tier.is_enabled() {
+            return 0;
+        }
+        let base_swa = if self.speculative.method == SpeculativeMethod::Dspark {
+            1_536.0
+        } else {
+            2_048.0
+        };
+        let min_active = 2 * self.max_seqs as usize + 128;
+        let scaled = ((self.gpu_memory_utilization / 0.95) * base_swa).round() as usize;
+        let swa = scaled.max(min_active);
+        if swa < num_kv { swa } else { 0 }
     }
 
     pub fn resolved_max_pages_per_seq(&self) -> u32 {
@@ -662,6 +703,7 @@ impl ServeArgs {
                 num_kv_pages,
                 num_recurrent_checkpoints,
                 dram_kv_blocks: self.dram_tier.num_dram_blocks,
+                swa_kv_pages: self.resolved_swa_kv_pages(),
                 max_model_len: Some(self.max_model_len),
                 cancel_flag,
             },

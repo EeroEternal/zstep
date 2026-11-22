@@ -238,7 +238,17 @@ fn cli_parser_enforces_nebula_contract_flags_and_model_defaults() {
     assert!(dsv41_ok.enable_prefix_caching);
     assert_eq!(dsv41_ok.page_block_tokens, 128);
     assert_eq!(dsv41_ok.resolved_apc_geometry().expect("dsv41 apc"), (1, 0));
-    assert_eq!(dsv41_ok.resolved_num_kv_pages(), 4_096);
+    assert_eq!(dsv41_ok.resolved_num_kv_pages(), 10_240);
+    assert_eq!(dsv41_ok.resolved_swa_kv_pages(), 2_048);
+    assert_eq!(dsv41_ok.engine_config(None).launch.swa_kv_pages, 2_048);
+    let dsv41_small = parse(&["--model-dir", dsv41_path, "--num-kv-pages", "1024"])
+        .expect("dsv41 small kv ok");
+    assert_eq!(dsv41_small.resolved_num_kv_pages(), 1_024);
+    assert_eq!(dsv41_small.resolved_swa_kv_pages(), 0);
+    let dsv41_dram = parse(&["--model-dir", dsv41_path, "--dram-kv-blocks", "1024"])
+        .expect("dsv41 dram ok");
+    assert_eq!(dsv41_dram.resolved_num_kv_pages(), 4_096);
+    assert_eq!(dsv41_dram.resolved_swa_kv_pages(), 0);
     let dsv41_dspark = parse(&[
         "--model-dir",
         dsv41_path,
@@ -250,7 +260,8 @@ fn cli_parser_enforces_nebula_contract_flags_and_model_defaults() {
         "0",
     ])
     .expect("dsv41 dspark ok");
-    assert_eq!(dsv41_dspark.resolved_num_kv_pages(), 2_560);
+    assert_eq!(dsv41_dspark.resolved_num_kv_pages(), 10_240);
+    assert_eq!(dsv41_dspark.resolved_swa_kv_pages(), 1_536);
     assert_eq!(dsv41_dspark.prefill_policy.max_consecutive_prefills, 0);
     assert!(
         parse(&[

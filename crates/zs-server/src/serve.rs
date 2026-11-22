@@ -1575,12 +1575,8 @@ fn launch_engine(
                     let publisher = KvEventPublisher::spawn(endpoint.clone(), topic, &tokio_handle);
                     engine.set_prefix_event_sink(Some(publisher.sink()));
                 }
-                if is_dsv41
-                    && let Ok(raw) = std::env::var("ZSTEP_SWA_KV_PAGES")
-                    && let Ok(swa_pages) = raw.trim().parse::<usize>()
-                    && swa_pages > 0
-                    && swa_pages < args.resolved_num_kv_pages() as usize
-                {
+                let swa_pages = args.resolved_swa_kv_pages();
+                if is_dsv41 && swa_pages > 0 {
                     if args.dram_tier.is_enabled() {
                         let _ = engine.shutdown();
                         if !state.shutdown_requested.load(Ordering::Acquire) {

@@ -752,6 +752,7 @@ fn run_engine(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             num_kv_pages,
             num_recurrent_checkpoints: 0,
             dram_kv_blocks: 0,
+            swa_kv_pages: 0,
             max_model_len: None,
             cancel_flag: None,
         },
