@@ -304,22 +304,22 @@ fn cli_parser_enforces_nebula_contract_flags_and_model_defaults() {
         "--gpu-memory-utilization",
         "0.5",
         "--max-seqs",
-        "256",
+        "128",
     ])
     .expect("dsv41 scaled ok");
-    // 0.5 / 0.95 * 2048 = 1078 > min_active = 2 * 256 + 128 = 640
+    // 0.5 / 0.95 * 2048 = 1078 > min_active = 2 * 128 + 128 = 384
     assert_eq!(dsv41_scaled.resolved_swa_kv_pages(), 1_078);
     let dsv41_clamped = parse(&[
         "--model-dir",
         dsv41_path,
         "--gpu-memory-utilization",
-        "0.2",
+        "0.15",
         "--max-seqs",
-        "256",
+        "128",
     ])
     .expect("dsv41 min_active clamp ok");
-    // 0.2 / 0.95 * 2048 = 431 < min_active = 640
-    assert_eq!(dsv41_clamped.resolved_swa_kv_pages(), 640);
+    // 0.15 / 0.95 * 2048 = 323 < min_active = 384
+    assert_eq!(dsv41_clamped.resolved_swa_kv_pages(), 384);
 
     for bad_env in ["abc", "-1", "256", "10240", "12000"] {
         assert!(
