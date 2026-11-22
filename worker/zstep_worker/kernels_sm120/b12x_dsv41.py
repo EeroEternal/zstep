@@ -1946,9 +1946,9 @@ def _prepare_sm120_mhc_overlap(
             mix_flat=torch.empty((mcap * 24,), **f32),
             sqr_flat=torch.empty((mcap,), **f32),
             empty_aux=torch.empty((0, 5120), dtype=torch.bfloat16, device=device),
-            post_buf=(torch.empty((cap, 4, 1), **f32), torch.empty((cap, 4, 1), **f32)),
-            comb_buf=(torch.empty((cap, 4, 4), **f32), torch.empty((cap, 4, 4), **f32)),
-            pre_buf=(torch.empty((cap, 4), **f32), torch.empty((cap, 4), **f32)),
+            post_buf=tuple(torch.empty((cap, 4, 1), **f32) for _ in range(4)),
+            comb_buf=tuple(torch.empty((cap, 4, 4), **f32) for _ in range(4)),
+            pre_buf=tuple(torch.empty((cap, 4), **f32) for _ in range(4)),
             ar_cta_done=torch.zeros((64,), dtype=torch.int64, device=device),
             ar_cta_wait=torch.zeros((128,), dtype=torch.int64, device=device),
             cap=cap,
@@ -2022,9 +2022,9 @@ def _prepare_sm120_mhc_overlap(
         owners.add(id(model))
         if not torch.cuda.is_current_stream_capturing():
             if cap > st.cap:
-                st.post_buf = (torch.empty((cap, 4, 1), **f32), torch.empty((cap, 4, 1), **f32))
-                st.comb_buf = (torch.empty((cap, 4, 4), **f32), torch.empty((cap, 4, 4), **f32))
-                st.pre_buf = (torch.empty((cap, 4), **f32), torch.empty((cap, 4), **f32))
+                st.post_buf = tuple(torch.empty((cap, 4, 1), **f32) for _ in range(4))
+                st.comb_buf = tuple(torch.empty((cap, 4, 4), **f32) for _ in range(4))
+                st.pre_buf = tuple(torch.empty((cap, 4), **f32) for _ in range(4))
                 st.cap = cap
             if mcap > st.sqr_flat.numel():
                 st.mix_flat = torch.empty((mcap * 24,), **f32)
@@ -2302,7 +2302,7 @@ def _prepare_sm120_mhc_overlap(
                             0,
                             main_s.cuda_stream,
                         )
-                    p, s.slot = s.slot, s.slot ^ 1
+                    p, s.slot = s.slot, (s.slot + 1) & 3
                     next_post = s.post_buf[p][:n]
                     next_comb = s.comb_buf[p][:n]
                     next_pre = s.pre_buf[p][:n]

@@ -465,6 +465,7 @@ class DeepSeekV41StepRunner:
         self._closed: bool = False
         self._vllm_config_ctx: Any = None
         self.shm_ar: HostMappedShmAllReduce | None = None
+        self.shm_ar_tbo: HostMappedShmAllReduce | None = None
         self.shm_ag: HostMappedShmAllGather | None = None
         self.argmax_channel: HostMappedShmArgmax | None = None
         self.decode_graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -709,6 +710,34 @@ class DeepSeekV41StepRunner:
             pxb_max_elements=min(ar_max_tokens, 8192) * 5120,
             enable_pxb_bfp=self.runtime_config.shm_pxb_bfp_mode,
         )
+        tbo_min_tok = self.runtime_config.prefill_tbo_min_tokens
+        tbo_cap_tokens = min(max(ar_max_tokens // 2, 2048), 4096)
+        self._tbo_max_ubatch_tokens: int = tbo_cap_tokens
+        self._tbo_comm_stream: torch.cuda.Stream | None = None
+        self._tbo_comp_done_ev: list[torch.cuda.Event] = []
+        self._tbo_ar_done_ev: list[torch.cuda.Event] = []
+        if use_pxb_ar and tbo_min_tok > 0:
+            self.shm_ar_tbo = HostMappedShmAllReduce(
+                name=f"{allreduce_name}_tbo",
+                rank=rank,
+                world_size=self.world_size,
+                capacity_elements=tbo_cap_tokens * 5120,
+                blocks=self.runtime_config.prefill_tbo_ar_blocks,
+                threads=pxb_ar_threads,
+                exchange_group=self.exchange_group,
+                enable_pxb_p2p=True,
+                pxb_max_elements=tbo_cap_tokens * 5120,
+                enable_pxb_bfp=self.runtime_config.shm_pxb_bfp_mode,
+            )
+            self._tbo_comm_stream = torch.cuda.Stream(device=self.device, priority=-1)
+            self._tbo_comp_done_ev = [
+                torch.cuda.Event(enable_timing=False),
+                torch.cuda.Event(enable_timing=False),
+            ]
+            self._tbo_ar_done_ev = [
+                torch.cuda.Event(enable_timing=False),
+                torch.cuda.Event(enable_timing=False),
+            ]
         self.shm_ag: HostMappedShmAllGather = HostMappedShmAllGather(
             name=f"{allreduce_name}_ag",
             rank=rank,
@@ -868,6 +897,22 @@ class DeepSeekV41StepRunner:
         self.sample_rows_cpu: torch.Tensor = torch.zeros(
             sc, dtype=torch.int64, pin_memory=True
         )
+        # Pre-allocated microbatch metadata buffers for Prefill Two-Batch Overlap (TBO)
+        self._tbo_qsl_cpu: list[torch.Tensor] = [
+            torch.zeros(ms + 1, dtype=torch.int32, pin_memory=True) for _ in range(2)
+        ]
+        self._tbo_qsl_gpu: list[torch.Tensor] = [
+            torch.zeros(ms + 1, dtype=torch.int32, device=self.device) for _ in range(2)
+        ]
+        self._tbo_seq_lens_cpu: list[torch.Tensor] = [
+            torch.zeros(ms, dtype=torch.int32, pin_memory=True) for _ in range(2)
+        ]
+        self._tbo_seq_lens_gpu: list[torch.Tensor] = [
+            torch.zeros(ms, dtype=torch.int32, device=self.device) for _ in range(2)
+        ]
+        self._tbo_is_pref_cpu: list[torch.Tensor] = [
+            torch.zeros(ms, dtype=torch.bool) for _ in range(2)
+        ]
 
         # Sampling buffers (deterministic global Top-2 `(logit, token_id)`)
         self.local_max_vals_buf: torch.Tensor = torch.empty(
@@ -1304,12 +1349,15 @@ class DeepSeekV41StepRunner:
         for_capture: bool,
         causal: bool = True,
         only_layer_names: set[str] | None = None,
+        mla_bt_gpu: torch.Tensor | None = None,
+        swa_bt_gpu: torch.Tensor | None = None,
+        comp_bt_gpu: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         from vllm.v1.attention.backend import CommonAttentionMetadata
 
-        mla_bt = self.mla_bt_gpu[:num_reqs]
-        swa_bt = self.swa_bt_gpu[:num_reqs]
-        comp_bt = self.comp_bt_gpu[:num_reqs]
+        mla_bt = self.mla_bt_gpu[:num_reqs] if mla_bt_gpu is None else mla_bt_gpu
+        swa_bt = self.swa_bt_gpu[:num_reqs] if swa_bt_gpu is None else swa_bt_gpu
+        comp_bt = self.comp_bt_gpu[:num_reqs] if comp_bt_gpu is None else comp_bt_gpu
         req_idx = self.req_idx_arange_np[:num_reqs]
         token_to_req_cache: dict[str, torch.Tensor | None] = {"val": None}
 
@@ -1372,6 +1420,373 @@ class DeepSeekV41StepRunner:
                 if only_layer_names is None or lname in only_layer_names:
                     attn_metadata[lname] = meta
         return attn_metadata
+
+    def _can_run_prefill_tbo(
+        self,
+        total_tokens: int,
+        *,
+        max_seq_len: int,
+        is_decode: bool,
+        is_spec_step: bool,
+    ) -> bool:
+        if (
+            is_decode
+            or is_spec_step
+            or self.shm_ar_tbo is None
+            or self._tbo_comm_stream is None
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+        min_tok = self.runtime_config.prefill_tbo_min_tokens
+        if min_tok <= 0 or total_tokens < min_tok:
+            return False
+        min_ctx = self.runtime_config.prefill_tbo_min_ctx
+        if min_ctx > 0 and max_seq_len <= min_ctx:
+            return False
+        mid = total_tokens // 2
+        if mid <= 0 or max(mid, total_tokens - mid) > self._tbo_max_ubatch_tokens:
+            return False
+        lang_mod = getattr(self.model, "language_model", self.model)
+        dsv4_core = getattr(lang_mod, "model", lang_mod)
+        if not getattr(dsv4_core, "fuse_mhc_all_reduce", False):
+            return False
+        if getattr(dsv4_core, "use_sequence_parallel", False):
+            return False
+        if getattr(dsv4_core, "_mtp_hidden_buffer", None) is not None:
+            return False
+        return hasattr(dsv4_core, "layers") and hasattr(dsv4_core, "embed_input_ids")
+
+    def _run_prefill_tbo(
+        self,
+        *,
+        total_tokens: int,
+        num_seqs: int,
+        q_start_np: np.ndarray,
+        pos_i64: np.ndarray,
+        full_attn_meta: dict[str, Any],
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """Prefill Two-Batch Overlap (TBO): split a long prefill chunk into two
+        causal microbatches (`u0`, `u1`) and overlap each microbatch's `shm_v5`
+        AllReduce (`blocks=16`, high-priority comm stream) with the other
+        microbatch's Attn/FFN compute on the main stream."""
+        from vllm.forward_context import get_forward_context
+        from vllm.models.deepseek_v41.nvidia import model as dsv41_model
+
+        lang_mod = getattr(self.model, "language_model", self.model)
+        dsv4_core = getattr(lang_mod, "model", lang_mod)
+        shm_ar_tbo = self.shm_ar_tbo
+        comm_s = self._tbo_comm_stream
+        assert shm_ar_tbo is not None and comm_s is not None
+        main_s = torch.cuda.current_stream(self.device)
+        dev_idx = self.device.index
+
+        mid = total_tokens // 2
+        bounds = ((0, mid), (mid, total_tokens))
+        attn_metas: list[dict[str, Any]] = []
+        positions_full = self.positions_gpu[:total_tokens]
+        slot_map_full = self.slot_mapping_gpu[:total_tokens]
+        swa_slot_map_full = self.swa_slot_mapping_gpu[:total_tokens]
+
+        for u, (lo, hi) in enumerate(bounds):
+            u_toks = hi - lo
+            r_start = -1
+            r_end = 0
+            u_qsl: list[int] = [0]
+            u_seqlens: list[int] = []
+            u_is_pref: list[bool] = []
+            max_ql = 0
+            max_sl = 0
+            for r in range(num_seqs):
+                s = int(q_start_np[r])
+                e = int(q_start_np[r + 1])
+                if e <= lo or s >= hi:
+                    continue
+                if r_start < 0:
+                    r_start = r
+                r_end = r + 1
+                seg_s = max(s, lo)
+                seg_e = min(e, hi)
+                ql = seg_e - seg_s
+                sl = int(pos_i64[seg_e - 1]) + 1
+                u_qsl.append(u_qsl[-1] + ql)
+                u_seqlens.append(sl)
+                u_is_pref.append((ql > 1) or (int(pos_i64[seg_s]) == 0))
+                if ql > max_ql:
+                    max_ql = ql
+                if sl > max_sl:
+                    max_sl = sl
+            u_reqs = r_end - r_start
+            qsl_cpu = self._tbo_qsl_cpu[u][: u_reqs + 1]
+            qsl_cpu.numpy()[:] = u_qsl
+            qsl_gpu = self._tbo_qsl_gpu[u][: u_reqs + 1]
+            qsl_gpu.copy_(qsl_cpu, non_blocking=True)
+
+            sl_cpu = self._tbo_seq_lens_cpu[u][:u_reqs]
+            sl_cpu.numpy()[:] = u_seqlens
+            sl_gpu = self._tbo_seq_lens_gpu[u][:u_reqs]
+            sl_gpu.copy_(sl_cpu, non_blocking=True)
+
+            is_pref_cpu = self._tbo_is_pref_cpu[u][:u_reqs]
+            is_pref_cpu.numpy()[:] = u_is_pref
+
+            meta_u = self._build_step_attn_metadata(
+                num_reqs=u_reqs,
+                num_tokens=u_toks,
+                max_query_len=max_ql,
+                max_seq_len=max_sl,
+                qsl_gpu=qsl_gpu,
+                qsl_cpu=qsl_cpu,
+                seq_lens_gpu=sl_gpu,
+                seq_lens_cpu=sl_cpu,
+                positions_gpu=positions_full[lo:hi],
+                slot_mapping_gpu=slot_map_full[lo:hi],
+                swa_slot_mapping_gpu=swa_slot_map_full[lo:hi],
+                is_prefilling_cpu=is_pref_cpu,
+                for_capture=False,
+                mla_bt_gpu=self.mla_bt_gpu[r_start:r_end],
+                swa_bt_gpu=self.swa_bt_gpu[r_start:r_end],
+                comp_bt_gpu=self.comp_bt_gpu[r_start:r_end],
+            )
+            attn_metas.append(meta_u)
+
+        input_ids_full = self.token_ids_gpu[:total_tokens]
+        hidden_full = dsv4_core.embed_input_ids(input_ids_full)
+        if dsv4_core.use_mega_moe:
+            input_ids_full = input_ids_full.to(torch.int64)
+
+        # Compute Engram n-gram hashes once on the full contiguous token stream.
+        engram_hashes: torch.Tensor | None = None
+        engram_mask: torch.Tensor | None = None
+        gathered_hashes: torch.Tensor | None = None
+        if dsv4_core.engram_hash is not None and dsv4_core.engram_hash.ensure_cache():
+            image_mask = dsv41_model.image_sentinel_mask(input_ids_full)
+            engram_mask = ~image_mask
+            lb_gpu = self.lookback_gpu[:num_seqs]
+            engram_hashes = dsv4_core.engram_hash(
+                input_ids_full,
+                positions_full,
+                self.query_start_loc_gpu[: num_seqs + 1],
+                image_mask,
+                lb_gpu,
+                dsv41_model.image_sentinel_mask(lb_gpu),
+                swa_slot_map_full,
+                self.swa_bt_gpu[:num_seqs],
+            )
+            gathered_hashes = dsv41_model.gather_engram_hashes(
+                engram_hashes, dp_shared_memory=dsv4_core.engram_dp_shared_memory
+            )
+
+        xs = [hidden_full[:mid].contiguous(), hidden_full[mid:].contiguous()]
+        poss = [positions_full[:mid], positions_full[mid:]]
+        ids_u = [input_ids_full[:mid], input_ids_full[mid:]]
+        if dsv4_core.use_mega_moe:
+            img_base = (
+                dsv41_model.IMAGE_SENTINEL_BASE_ID
+                if getattr(dsv4_core.config, "vision_n_layers", 0) > 0
+                else None
+            )
+            mega_u = [
+                dsv41_model.prepare_mega_gate_routing_metadata(
+                    ids_u[u], has_hash_routing=False, image_sentinel_base_id=img_base
+                )
+                for u in (0, 1)
+            ]
+        else:
+            mega_u = [None, None]
+        eh_u = (
+            [engram_hashes[:mid], engram_hashes[mid:]]
+            if engram_hashes is not None
+            else [None, None]
+        )
+        em_u = (
+            [engram_mask[:mid], engram_mask[mid:]]
+            if engram_mask is not None
+            else [None, None]
+        )
+        gh_u = (
+            [gathered_hashes[:mid], gathered_hashes[mid:]]
+            if gathered_hashes is not None
+            else [None, None]
+        )
+
+        res_u: list[torch.Tensor | None] = [None, None]
+        post_u: list[torch.Tensor | None] = [None, None]
+        resmix_u: list[torch.Tensor | None] = [None, None]
+        pre_u: list[torch.Tensor | None] = [None, None]
+        aux_by_layer_u: list[dict[int, torch.Tensor]] = [{}, {}]
+
+        mhc_pre = dsv41_model.mhc_pre_delayed_tilelang
+        mhc_post = dsv41_model.mhc_post_tilelang
+        mhc_shifted = dsv41_model.mhc_shifted_post_pre
+        hc_collapse = dsv41_model.hc_collapse_triton
+
+        def _launch_ar(t: torch.Tensor, u_idx: int) -> torch.Tensor:
+            t_c = t if t.is_contiguous() else t.contiguous()
+            comp_ev = self._tbo_comp_done_ev[u_idx]
+            ar_ev = self._tbo_ar_done_ev[u_idx]
+            comp_ev.record(main_s)
+            with torch.cuda.stream(comm_s):
+                comm_s.wait_event(comp_ev)
+                shm_ar_tbo.all_reduce(t_c, output=t_c)
+                ar_ev.record(comm_s)
+            self.shm_ar_calls += 1
+            return t_c
+
+        fwd_ctx = get_forward_context()
+        # Snapshot candidate_blocks per microbatch when producer layer writes them
+        # (layer 20 -> layers 24, 28, 32, 36 share one buffer on SparseAttnIndexer).
+        cand_saved: list[torch.Tensor | None] = [None, None]
+        cand_orig_by_op: dict[int, tuple[Any, torch.Tensor]] = {}
+        try:
+            for idx in range(dsv4_core.start_layer, dsv4_core.end_layer):
+                layer = dsv4_core.layers[idx]
+                cap_aux = idx in dsv4_core.aux_hidden_state_layers
+                idx_mod = getattr(getattr(layer, "attn", None), "indexer", None)
+                sai_op = getattr(idx_mod, "sparse_attn_indexer", None) if idx_mod is not None else None
+                sai_cand = getattr(sai_op, "candidate_blocks", None) if sai_op is not None else None
+                sai_writes_cand = bool(getattr(sai_op, "candidate_write", False)) if sai_op is not None else False
+
+                # Phase A: Attention (u0 writes KV before u1 reads KV on main_s;
+                # u0's Attn AllReduce overlaps with u1's Attn compute on comm_s).
+                for u in (0, 1):
+                    if idx > dsv4_core.start_layer:
+                        main_s.wait_event(self._tbo_ar_done_ev[u])
+                    if res_u[u] is None:
+                        res_u[u] = (
+                            xs[u].unsqueeze(1).expand(-1, layer.hc_mult, -1).contiguous()
+                        )
+                        post_u[u], resmix_u[u], xs[u], pre_u[u] = mhc_pre(
+                            res_u[u],
+                            layer.hc_attn_fn_broadcast,
+                            layer.hc_attn_scale,
+                            layer.hc_attn_base,
+                            layer.rms_norm_eps,
+                            layer.hc_eps,
+                            layer.hc_eps,
+                            layer.hc_post_alpha,
+                            layer.hc_sinkhorn_iters,
+                            x=xs[u],
+                            norm_weight=layer.attn_norm.weight,
+                            norm_eps=layer.attn_norm.variance_epsilon,
+                        )
+                    elif layer.engram is not None and eh_u[u] is not None:
+                        prev_post = mhc_post(xs[u], res_u[u], post_u[u], resmix_u[u])
+                        if cap_aux:
+                            aux_by_layer_u[u][idx] = prev_post.mean(dim=1)
+                        assert gh_u[u] is not None
+                        layer.engram.prepare_embeddings(
+                            gh_u[u][:, layer.engram.layer_hash_index]
+                        )
+                        res_u[u] = layer.engram(
+                            prev_post,
+                            eh_u[u][:, layer.engram.layer_hash_index],
+                            em_u[u],
+                        )
+                        post_u[u], resmix_u[u], xs[u], pre_u[u] = mhc_pre(
+                            res_u[u],
+                            layer.hc_attn_fn,
+                            layer.hc_attn_scale,
+                            layer.hc_attn_base,
+                            layer.rms_norm_eps,
+                            layer.hc_eps,
+                            layer.hc_eps,
+                            layer.hc_post_alpha,
+                            layer.hc_sinkhorn_iters,
+                            pre_mix=pre_u[u],
+                            norm_weight=layer.attn_norm.weight,
+                            norm_eps=layer.attn_norm.variance_epsilon,
+                        )
+                    else:
+                        (
+                            res_u[u],
+                            post_u[u],
+                            resmix_u[u],
+                            xs[u],
+                            pre_u[u],
+                            aux,
+                        ) = mhc_shifted(
+                            xs[u],
+                            res_u[u],
+                            post_u[u],
+                            resmix_u[u],
+                            layer.hc_attn_fn,
+                            layer.hc_attn_scale,
+                            layer.hc_attn_base,
+                            layer.rms_norm_eps,
+                            layer.hc_eps,
+                            layer.hc_eps,
+                            layer.hc_post_alpha,
+                            layer.hc_sinkhorn_iters,
+                            pre_mix=pre_u[u],
+                            norm_weight=layer.attn_norm.weight,
+                            norm_eps=layer.attn_norm.variance_epsilon,
+                            capture_aux=cap_aux,
+                            stream=None,
+                            reduce_results=False,
+                        )
+                        if cap_aux and aux is not None:
+                            aux_by_layer_u[u][idx] = aux
+                    flush_sm120_mhc_before_ar(dev_idx)
+                    if sai_op is not None and sai_cand is not None and not sai_writes_cand and cand_saved[u] is not None:
+                        if id(sai_op) not in cand_orig_by_op:
+                            cand_orig_by_op[id(sai_op)] = (sai_op, sai_cand)
+                        sai_op.candidate_blocks = cand_saved[u]
+                    fwd_ctx.attn_metadata = attn_metas[u]
+                    xs[u] = layer.attn(poss[u], xs[u], None)
+                    if sai_op is not None and sai_cand is not None and sai_writes_cand:
+                        cand_saved[u] = sai_cand[: xs[u].shape[0]].clone()
+                    xs[u] = _launch_ar(xs[u], u)
+
+                # Phase B: FFN / MoE (u0's FFN overlaps with u1's Attn AR;
+                # u1's FFN overlaps with u0's FFN AR; next layer u0's Attn
+                # overlaps with u1's FFN AR).
+                for u in (0, 1):
+                    main_s.wait_event(self._tbo_ar_done_ev[u])
+                    res_u[u], post_u[u], resmix_u[u], xs[u], pre_u[u], _ = mhc_shifted(
+                        xs[u],
+                        res_u[u],
+                        post_u[u],
+                        resmix_u[u],
+                        layer.hc_ffn_fn,
+                        layer.hc_ffn_scale,
+                        layer.hc_ffn_base,
+                        layer.rms_norm_eps,
+                        layer.hc_eps,
+                        layer.hc_eps,
+                        layer.hc_post_alpha,
+                        layer.hc_sinkhorn_iters,
+                        pre_mix=pre_u[u],
+                        norm_weight=layer.ffn_norm.weight,
+                        norm_eps=layer.ffn_norm.variance_epsilon,
+                        stream=None,
+                        reduce_results=False,
+                    )
+                    flush_sm120_mhc_before_ar(dev_idx)
+                    xs[u] = layer.ffn(xs[u], ids_u[u], mega_u[u])
+                    xs[u] = _launch_ar(xs[u], u)
+        finally:
+            fwd_ctx.attn_metadata = full_attn_meta
+            for op, orig_buf in cand_orig_by_op.values():
+                op.candidate_blocks = orig_buf
+
+        out_u: list[torch.Tensor] = []
+        for u in (0, 1):
+            main_s.wait_event(self._tbo_ar_done_ev[u])
+            h = mhc_post(xs[u], res_u[u], post_u[u], resmix_u[u])
+            if dsv4_core.end_layer in dsv4_core.aux_hidden_state_layers:
+                aux_by_layer_u[u][dsv4_core.end_layer] = h.mean(dim=1)
+            assert pre_u[u] is not None
+            h = hc_collapse(h, pre_u[u])
+            out_u.append(dsv4_core.norm(h))
+        hidden = torch.cat(out_u, dim=0)
+        aux_hidden_states = [
+            torch.cat([aux_by_layer_u[0][lid], aux_by_layer_u[1][lid]], dim=0)
+            for lid in dsv4_core.aux_hidden_state_layers
+            if lid in aux_by_layer_u[0]
+        ]
+        if aux_hidden_states:
+            return hidden, aux_hidden_states
+        return hidden
 
     def _sample_rows_into_argmax(
         self,
@@ -2686,20 +3101,31 @@ class DeepSeekV41StepRunner:
 
             max_q_len = int(q_lens.max())
             max_s_len = int(seq_lens_np.max())
-            attn_meta = self._build_step_attn_metadata(
-                num_reqs=num_seqs,
-                num_tokens=total_tokens,
-                max_query_len=max_q_len,
+            pw_b = None if is_spec_step else self._select_piecewise_bucket(total_tokens)
+            use_tbo = pw_b is None and self._can_run_prefill_tbo(
+                total_tokens,
                 max_seq_len=max_s_len,
-                qsl_gpu=self.query_start_loc_gpu[: num_seqs + 1],
-                qsl_cpu=self.query_start_loc_cpu[: num_seqs + 1],
-                seq_lens_gpu=self.seq_lens_gpu[:num_seqs],
-                seq_lens_cpu=self.seq_lens_cpu[:num_seqs],
-                positions_gpu=self.positions_gpu[:total_tokens],
-                slot_mapping_gpu=self.slot_mapping_gpu[:total_tokens],
-                swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:total_tokens],
-                is_prefilling_cpu=self.mixed_is_prefilling_cpu[:num_seqs],
-                for_capture=False,
+                is_decode=is_decode,
+                is_spec_step=is_spec_step,
+            )
+            attn_meta = (
+                {}
+                if use_tbo
+                else self._build_step_attn_metadata(
+                    num_reqs=num_seqs,
+                    num_tokens=total_tokens,
+                    max_query_len=max_q_len,
+                    max_seq_len=max_s_len,
+                    qsl_gpu=self.query_start_loc_gpu[: num_seqs + 1],
+                    qsl_cpu=self.query_start_loc_cpu[: num_seqs + 1],
+                    seq_lens_gpu=self.seq_lens_gpu[:num_seqs],
+                    seq_lens_cpu=self.seq_lens_cpu[:num_seqs],
+                    positions_gpu=self.positions_gpu[:total_tokens],
+                    slot_mapping_gpu=self.slot_mapping_gpu[:total_tokens],
+                    swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:total_tokens],
+                    is_prefilling_cpu=self.mixed_is_prefilling_cpu[:num_seqs],
+                    for_capture=False,
+                )
             )
             if is_decode:
                 self.slots_cpu[:num_seqs].numpy()[:] = seq_slots_np
@@ -2721,7 +3147,6 @@ class DeepSeekV41StepRunner:
                         out=self.lookback_gpu[:num_seqs],
                     )
             self._h2d_done_event.record()
-            pw_b = None if is_spec_step else self._select_piecewise_bucket(total_tokens)
             if pw_b is not None:
                 if total_tokens < pw_b:
                     self.token_ids_gpu[total_tokens:pw_b].zero_()
@@ -2746,6 +3171,18 @@ class DeepSeekV41StepRunner:
                         if pw_aux is not None
                         else None
                     )
+                elif use_tbo:
+                    model_output = self._run_prefill_tbo(
+                        total_tokens=total_tokens,
+                        num_seqs=num_seqs,
+                        q_start_np=q_start_np,
+                        pos_i64=pos_i64,
+                        full_attn_meta=attn_meta,
+                    )
+                    if isinstance(model_output, tuple):
+                        hidden, aux_hidden_states = model_output
+                    else:
+                        hidden = model_output
                 else:
                     model_output = self.model(
                         input_ids=self.token_ids_gpu[:total_tokens],
@@ -2946,6 +3383,8 @@ class DeepSeekV41StepRunner:
             self.argmax_channel.close()
         if self.shm_ag is not None:
             self.shm_ag.close()
+        if self.shm_ar_tbo is not None:
+            self.shm_ar_tbo.close()
         if self.shm_ar is not None:
             self.shm_ar.close()
         if dist.is_initialized() and hasattr(self, "exchange_group"):
