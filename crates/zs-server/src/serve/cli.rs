@@ -279,6 +279,7 @@ impl ServeArgs {
         )
     }
 
+    #[cfg(test)]
     pub fn parse_with_env(
         argv: &[String],
         env_api_key: Option<&str>,
