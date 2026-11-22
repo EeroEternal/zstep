@@ -120,6 +120,8 @@ pub struct WorkerLaunchConfig {
     pub num_recurrent_checkpoints: u32,
     /// Host DRAM KV cache blocks per GPU (`0` disables DRAM offload and `sm_h2d` channel isolation).
     pub dram_kv_blocks: usize,
+    /// Decoupled SWA 128-token KV pages per GPU for DeepSeek-V4.1 (`0` disables decoupling).
+    pub swa_kv_pages: usize,
     pub max_model_len: Option<usize>,
     pub cancel_flag: Option<Arc<AtomicBool>>,
 }
@@ -816,6 +818,11 @@ fn spawn_workers(
                 "ZSTEP_DRAM_KV_BLOCKS",
                 config.launch.dram_kv_blocks.to_string(),
             );
+        }
+        if config.launch.swa_kv_pages > 0 {
+            command.env("ZSTEP_SWA_KV_PAGES", config.launch.swa_kv_pages.to_string());
+        } else {
+            command.env_remove("ZSTEP_SWA_KV_PAGES");
         }
         command
             .env("ZSTEP_SPEC_METHOD", config.speculative.method.as_str())

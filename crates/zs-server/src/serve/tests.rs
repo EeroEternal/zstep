@@ -204,6 +204,8 @@ fn cli_parser_enforces_nebula_contract_flags_and_model_defaults() {
     assert_eq!(ok.resolved_apc_geometry().expect("disabled apc"), (0, 0));
     assert_eq!(ok.page_block_tokens, 16);
     assert_eq!(ok.resolved_num_kv_pages(), 49_152);
+    assert_eq!(ok.resolved_swa_kv_pages(), 0);
+    assert_eq!(ok.engine_config(None).launch.swa_kv_pages, 0);
     assert_eq!(ok.engine_config(None).launch.max_model_len, Some(16_384));
     assert_eq!(ok.engine_config(None).launch.num_recurrent_checkpoints, 0);
 
@@ -238,7 +240,17 @@ fn cli_parser_enforces_nebula_contract_flags_and_model_defaults() {
     assert!(dsv41_ok.enable_prefix_caching);
     assert_eq!(dsv41_ok.page_block_tokens, 128);
     assert_eq!(dsv41_ok.resolved_apc_geometry().expect("dsv41 apc"), (1, 0));
-    assert_eq!(dsv41_ok.resolved_num_kv_pages(), 4_096);
+    assert_eq!(dsv41_ok.resolved_num_kv_pages(), 10_240);
+    assert_eq!(dsv41_ok.resolved_swa_kv_pages(), 2_048);
+    assert_eq!(dsv41_ok.engine_config(None).launch.swa_kv_pages, 2_048);
+    let dsv41_small =
+        parse(&["--model-dir", dsv41_path, "--num-kv-pages", "1024"]).expect("dsv41 small kv ok");
+    assert_eq!(dsv41_small.resolved_num_kv_pages(), 1_024);
+    assert_eq!(dsv41_small.resolved_swa_kv_pages(), 0);
+    let dsv41_dram =
+        parse(&["--model-dir", dsv41_path, "--dram-kv-blocks", "1024"]).expect("dsv41 dram ok");
+    assert_eq!(dsv41_dram.resolved_num_kv_pages(), 4_096);
+    assert_eq!(dsv41_dram.resolved_swa_kv_pages(), 0);
     let dsv41_dspark = parse(&[
         "--model-dir",
         dsv41_path,
@@ -250,7 +262,8 @@ fn cli_parser_enforces_nebula_contract_flags_and_model_defaults() {
         "0",
     ])
     .expect("dsv41 dspark ok");
-    assert_eq!(dsv41_dspark.resolved_num_kv_pages(), 2_560);
+    assert_eq!(dsv41_dspark.resolved_num_kv_pages(), 10_240);
+    assert_eq!(dsv41_dspark.resolved_swa_kv_pages(), 1_536);
     assert_eq!(dsv41_dspark.prefill_policy.max_consecutive_prefills, 0);
     assert!(
         parse(&[
@@ -260,6 +273,67 @@ fn cli_parser_enforces_nebula_contract_flags_and_model_defaults() {
             "abc"
         ])
         .is_err()
+    );
+
+    let parse_with_swa_env = |argv: &[&str], swa_env: Option<&str>| {
+        let raw: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
+        ServeArgs::parse_with_all_env(&raw, None, None, swa_env)
+    };
+    let dsv41_swa_zero = parse_with_swa_env(&["--model-dir", dsv41_path], Some("0"))
+        .expect("ZSTEP_SWA_KV_PAGES=0 disables decoupled SWA");
+    assert_eq!(dsv41_swa_zero.resolved_num_kv_pages(), 4_096);
+    assert_eq!(dsv41_swa_zero.resolved_swa_kv_pages(), 0);
+    assert_eq!(dsv41_swa_zero.engine_config(None).launch.swa_kv_pages, 0);
+
+    let dsv41_dspark_swa_zero = parse_with_swa_env(
+        &["--model-dir", dsv41_path, "--speculative-method", "dspark"],
+        Some("0"),
+    )
+    .expect("ZSTEP_SWA_KV_PAGES=0 with dspark");
+    assert_eq!(dsv41_dspark_swa_zero.resolved_num_kv_pages(), 2_560);
+    assert_eq!(dsv41_dspark_swa_zero.resolved_swa_kv_pages(), 0);
+
+    let dsv41_swa_1024 = parse_with_swa_env(&["--model-dir", dsv41_path], Some("1024"))
+        .expect("ZSTEP_SWA_KV_PAGES=1024 ok");
+    assert_eq!(dsv41_swa_1024.resolved_num_kv_pages(), 10_240);
+    assert_eq!(dsv41_swa_1024.resolved_swa_kv_pages(), 1_024);
+
+    let dsv41_scaled = parse(&[
+        "--model-dir",
+        dsv41_path,
+        "--gpu-memory-utilization",
+        "0.5",
+        "--max-seqs",
+        "128",
+    ])
+    .expect("dsv41 scaled ok");
+    // 0.5 / 0.95 * 2048 = 1078 > min_active = 2 * 128 + 128 = 384
+    assert_eq!(dsv41_scaled.resolved_swa_kv_pages(), 1_078);
+    let dsv41_clamped = parse(&[
+        "--model-dir",
+        dsv41_path,
+        "--gpu-memory-utilization",
+        "0.15",
+        "--max-seqs",
+        "128",
+    ])
+    .expect("dsv41 min_active clamp ok");
+    // 0.15 / 0.95 * 2048 = 323 < min_active = 384
+    assert_eq!(dsv41_clamped.resolved_swa_kv_pages(), 384);
+
+    for bad_env in ["abc", "-1", "256", "10240", "12000"] {
+        assert!(
+            parse_with_swa_env(&["--model-dir", dsv41_path], Some(bad_env)).is_err(),
+            "ZSTEP_SWA_KV_PAGES={bad_env:?} must fail loudly"
+        );
+    }
+    assert!(
+        parse_with_swa_env(
+            &["--model-dir", dsv41_path, "--dram-kv-blocks", "1024"],
+            Some("1024"),
+        )
+        .is_err(),
+        "ZSTEP_SWA_KV_PAGES > 0 with --dram-kv-blocks > 0 must fail loudly"
     );
 }
 
