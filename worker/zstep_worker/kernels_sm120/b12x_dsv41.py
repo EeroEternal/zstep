@@ -1195,6 +1195,7 @@ def install_sm120_dsa_indexer_patches() -> bool:
                         k_scale_f32 = k_scale.view(torch.float32).squeeze(-1)
                         if run_candidate_sparse_prefill_topk(
                             q_slice=q_slice,
+                            q_scale=q_scale_slice,
                             k_quant=k_quant,
                             k_scale=k_scale_f32,
                             weights=weights[chunk.token_start : chunk.token_end],

@@ -294,8 +294,7 @@ def is_sm120_candidate_mqa_enabled() -> bool:
         return False
     if not torch.cuda.is_available():
         return False
-    major, minor = torch.cuda.get_device_capability()
-    return (major, minor) >= (12, 0)
+    return torch.cuda.get_device_capability() == (12, 0)
 
 
 def get_sm120_candidate_mqa_extension() -> Any | None:
@@ -306,6 +305,7 @@ def get_sm120_candidate_mqa_extension() -> Any | None:
         return None
     from torch.utils.cpp_extension import load_inline
 
+    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
     _EXT = load_inline(
         name="zstep_sm120_candidate_mqa_v1",
         cpp_sources="",
@@ -355,6 +355,7 @@ def _get_scratch(
 def run_candidate_sparse_prefill_topk(
     *,
     q_slice: torch.Tensor,
+    q_scale: torch.Tensor | None = None,
     k_quant: torch.Tensor,
     k_scale: torch.Tensor,
     weights: torch.Tensor,
@@ -370,6 +371,8 @@ def run_candidate_sparse_prefill_topk(
 
     Returns True if executed, False if ineligible (caller should run stock path).
     """
+    if q_scale is not None:
+        return False
     ext = get_sm120_candidate_mqa_extension()
     if ext is None:
         return False
@@ -377,23 +380,31 @@ def run_candidate_sparse_prefill_topk(
         return False
     if q_slice.ndim != 3 or q_slice.shape[1] != 32 or q_slice.shape[2] != 128:
         return False
+    if k_quant.ndim != 2 or k_quant.shape[1] != 128:
+        return False
+    num_rows = int(q_slice.shape[0])
+    if num_rows <= 0 or weights.shape != (num_rows, 32):
+        return False
     if q_slice.dtype != torch.float8_e4m3fn or k_quant.dtype != torch.float8_e4m3fn:
         return False
     num_cand_blocks = int(chunk_candidates.shape[1])
+    if num_cand_blocks <= 0:
+        return False
     compact_width = num_cand_blocks * 8
     if local_total_seq_lens <= compact_width:
+        return False
+    if prefill_topk.stride(1) != 1:
         return False
 
     from vllm import _custom_ops as ops
 
-    num_rows = int(q_slice.shape[0])
     q_contig = q_slice if q_slice.is_contiguous() else q_slice.contiguous()
     k_contig = k_quant if k_quant.is_contiguous() else k_quant.contiguous()
     ks_f32 = k_scale if (k_scale.dtype == torch.float32 and k_scale.is_contiguous()) else k_scale.contiguous().view(torch.float32).squeeze(-1)
     w_contig = weights if (weights.dtype == torch.float32 and weights.is_contiguous()) else weights.to(torch.float32).contiguous()
-    cand_i32 = chunk_candidates if chunk_candidates.dtype == torch.int32 else chunk_candidates.to(torch.int32)
-    ks_i32 = cu_seqlen_ks if cu_seqlen_ks.dtype == torch.int32 else cu_seqlen_ks.to(torch.int32)
-    ke_i32 = cu_seqlen_ke if cu_seqlen_ke.dtype == torch.int32 else cu_seqlen_ke.to(torch.int32)
+    cand_i32 = chunk_candidates if (chunk_candidates.dtype == torch.int32 and chunk_candidates.stride(1) == 1) else chunk_candidates.to(torch.int32).contiguous()
+    ks_i32 = cu_seqlen_ks if (cu_seqlen_ks.dtype == torch.int32 and cu_seqlen_ks.is_contiguous()) else cu_seqlen_ks.to(torch.int32).contiguous()
+    ke_i32 = cu_seqlen_ke if (cu_seqlen_ke.dtype == torch.int32 and cu_seqlen_ke.is_contiguous()) else cu_seqlen_ke.to(torch.int32).contiguous()
 
     compact_logits, compact_ks, compact_ke, compact_topk = _get_scratch(
         q_contig.device, num_rows, compact_width, topk_tokens
@@ -789,13 +800,13 @@ def install_sm120_candidate_mqa_prefill_patch(model: Any | None = None) -> bool:
                 and self.head_dim == 128
                 and not torch.cuda.is_current_stream_capturing()
             ):
-                q_vals = q_quant[0] if isinstance(q_quant, tuple) else q_quant
+                q_vals, q_sc = (q_quant[0], q_quant[1]) if isinstance(q_quant, tuple) else (q_quant, None)
                 return _patched_sparse_attn_indexer(
                     hidden_states,
                     self.k_cache.prefix,
                     self.k_cache.kv_cache,
                     q_vals,
-                    None,
+                    q_sc,
                     k,
                     weights,
                     self.quant_block_size,
