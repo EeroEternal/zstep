@@ -109,6 +109,7 @@ pub struct ServeArgs {
     pub allreduce_blocks: u32,
     pub allreduce_threads: u32,
     pub speculative: SpeculativeConfig,
+    pub swa_kv_pages_env: Option<usize>,
 }
 
 fn default_python_executable() -> String {
@@ -269,13 +270,28 @@ impl ServeArgs {
                     "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
                 )
             });
-        Self::parse_with_env(argv, env_api_key.as_deref(), env_remote_metrics)
+        let env_swa_kv_pages = std::env::var("ZSTEP_SWA_KV_PAGES").ok();
+        Self::parse_with_all_env(
+            argv,
+            env_api_key.as_deref(),
+            env_remote_metrics,
+            env_swa_kv_pages.as_deref(),
+        )
     }
 
     pub fn parse_with_env(
         argv: &[String],
         env_api_key: Option<&str>,
         env_remote_metrics: Option<bool>,
+    ) -> Result<Self, String> {
+        Self::parse_with_all_env(argv, env_api_key, env_remote_metrics, None)
+    }
+
+    pub fn parse_with_all_env(
+        argv: &[String],
+        env_api_key: Option<&str>,
+        env_remote_metrics: Option<bool>,
+        env_swa_kv_pages: Option<&str>,
     ) -> Result<Self, String> {
         let values = validate_known_flags(argv)?;
         let model_dir_raw = values
@@ -525,6 +541,15 @@ impl ServeArgs {
             Some("false") => false,
             _ => env_remote_metrics.unwrap_or(true),
         };
+        let swa_kv_pages_env = match env_swa_kv_pages
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        {
+            Some(raw) => Some(raw.parse::<usize>().map_err(|_| {
+                format!("invalid ZSTEP_SWA_KV_PAGES={raw:?}: must be a non-negative integer")
+            })?),
+            None => None,
+        };
         let args = Self {
             model_dir,
             served_model_name,
@@ -572,7 +597,31 @@ impl ServeArgs {
             allreduce_blocks: parse_map_number(&values, "--allreduce-blocks", 8u32)?,
             allreduce_threads: parse_map_number(&values, "--allreduce-threads", 256u32)?,
             speculative,
+            swa_kv_pages_env,
         };
+        if is_dsv41
+            && let Some(explicit) = args.swa_kv_pages_env
+            && explicit > 0
+        {
+            if args.dram_tier.is_enabled() {
+                return Err(
+                    "ZSTEP_SWA_KV_PAGES > 0 cannot be combined with --dram-kv-blocks > 0"
+                        .to_owned(),
+                );
+            }
+            let min_active_swa = 2 * args.max_seqs as usize;
+            if explicit <= min_active_swa {
+                return Err(format!(
+                    "ZSTEP_SWA_KV_PAGES ({explicit}) must exceed 2 * max_seqs ({min_active_swa})"
+                ));
+            }
+            let num_kv = args.resolved_num_kv_pages() as usize;
+            if explicit >= num_kv {
+                return Err(format!(
+                    "ZSTEP_SWA_KV_PAGES ({explicit}) must be strictly less than resolved num_kv_pages ({num_kv})"
+                ));
+            }
+        }
         let _ = args.resolved_apc_geometry()?;
         Ok(args)
     }
@@ -604,16 +653,10 @@ impl ServeArgs {
         }
     }
 
-    fn explicit_swa_env_pages() -> Option<usize> {
-        std::env::var("ZSTEP_SWA_KV_PAGES")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-    }
-
     fn decoupled_swa_default_enabled(&self) -> bool {
         is_deepseek_v41_dir(&self.model_dir)
             && !self.dram_tier.is_enabled()
-            && Self::explicit_swa_env_pages() != Some(0)
+            && self.swa_kv_pages_env != Some(0)
     }
 
     pub fn resolved_num_kv_pages(&self) -> u32 {
@@ -640,7 +683,7 @@ impl ServeArgs {
             return 0;
         }
         let num_kv = self.resolved_num_kv_pages() as usize;
-        if let Some(explicit) = Self::explicit_swa_env_pages() {
+        if let Some(explicit) = self.swa_kv_pages_env {
             return if explicit > 0 && explicit < num_kv {
                 explicit
             } else {

@@ -820,10 +820,9 @@ fn spawn_workers(
             );
         }
         if config.launch.swa_kv_pages > 0 {
-            command.env(
-                "ZSTEP_SWA_KV_PAGES",
-                config.launch.swa_kv_pages.to_string(),
-            );
+            command.env("ZSTEP_SWA_KV_PAGES", config.launch.swa_kv_pages.to_string());
+        } else {
+            command.env_remove("ZSTEP_SWA_KV_PAGES");
         }
         command
             .env("ZSTEP_SPEC_METHOD", config.speculative.method.as_str())
