@@ -1115,6 +1115,7 @@ fn online_step(
                     max_prefill_chunk,
                     &online.waiting,
                     online.consecutive_prefills,
+                    engine.prefill_policy.max_consecutive_prefills,
                     engine.max_prefill_coalesce_wait_ms,
                 );
             if run_prefill {

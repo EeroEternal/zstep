@@ -33,6 +33,7 @@ Usage: zstep serve --model-dir <PATH> [OPTIONS]\n\
   --max-waiting-requests N       Bounded HTTP waiting queue depth (default: 1024)\n\
   --prefill-policy MODE          Waiting prefill policy: srpt | fifo (default: srpt)\n\
   --prefill-starvation-cap-ms N  Max wait (ms) before long prompt preempts SRPT (default: 60000, 0=off)\n\
+  --max-consecutive-prefills N   Max standalone prefill steps before decode (default: 1, 0=prefill-first)\n\
   --dynamic-prefill-budget       Scale mixed-step budget from --max-mixed-step-tokens to --max-step-tokens (default on srpt)\n\
   --no-dynamic-prefill-budget    Keep mixed-step prefill budget fixed at --max-mixed-step-tokens\n\
   --drain-timeout-secs N         SIGTERM drain grace period in seconds (default: 30)\n\
@@ -170,6 +171,7 @@ pub fn validate_known_flags(argv: &[String]) -> Result<BTreeMap<String, String>,
         "--max-mixed-step-tokens",
         "--prefill-policy",
         "--prefill-starvation-cap-ms",
+        "--max-consecutive-prefills",
         "--dram-kv-blocks",
         "--kv-loading-area-ratio",
         "--allreduce-blocks",
@@ -403,6 +405,11 @@ impl ServeArgs {
             if let Some(raw) = values.get("--prefill-starvation-cap-ms") {
                 policy.starvation_cap_ms = raw.parse::<u64>().map_err(|_| {
                     format!("invalid value `{raw}` for --prefill-starvation-cap-ms")
+                })?;
+            }
+            if let Some(raw) = values.get("--max-consecutive-prefills") {
+                policy.max_consecutive_prefills = raw.parse::<usize>().map_err(|_| {
+                    format!("invalid value `{raw}` for --max-consecutive-prefills")
                 })?;
             }
             if let Some(raw) = values.get("--dynamic-prefill-budget") {

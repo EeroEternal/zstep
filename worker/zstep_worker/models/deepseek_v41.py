@@ -351,6 +351,7 @@ class _SwaPagePool:
         self._free: list[int] = list(range(self.num_swa_pages, 0, -1))
         self._lut: np.ndarray = np.zeros(self.mla_dummy_vb + 2, dtype=np.int32)
         self._lut[self.mla_dummy_vb] = self.swa_dummy_vb
+        self._slot_tails: dict[int, tuple[int, ...]] = {}
 
     def lookup(self, mla_pages: np.ndarray) -> np.ndarray:
         return self._lut[mla_pages]
@@ -361,6 +362,7 @@ class _SwaPagePool:
         seq_pos_min: np.ndarray,
         seq_pos_max: np.ndarray,
         allow_alloc_from: np.ndarray,
+        active_slots: np.ndarray | None = None,
     ) -> tuple[np.ndarray, bool]:
         pinned: set[int] = set()
         to_alloc: list[int] = []
@@ -384,6 +386,16 @@ class _SwaPagePool:
                             f"(currently {self.num_swa_pages})"
                         )
                     to_alloc.append(mp)
+            if active_slots is not None:
+                slot = int(active_slots[i])
+                tail = tuple(
+                    int(active_pt[i, c])
+                    for c in range(max(0, p_hi - 1), p_hi + 1)
+                    if 0 < int(active_pt[i, c]) < self.mla_dummy_vb
+                )
+                self._slot_tails[slot] = tail
+        for tail_pages in self._slot_tails.values():
+            pinned.update(tail_pages)
         allocated_any = False
         for mp in to_alloc:
             if mp in self._mla_to_swa:
@@ -2242,7 +2254,7 @@ class DeepSeekV41StepRunner:
             pos_i64 = pos_np.astype(np.int64)
             if self._swa_pool is not None:
                 swa_pt, _ = self._swa_pool.map_active_windows(
-                    active_pt, pos_i64, pos_i64, pos_i64
+                    active_pt, pos_i64, pos_i64, pos_i64, active_slots=slot_np
                 )
             else:
                 swa_pt = active_pt
@@ -2403,7 +2415,11 @@ class DeepSeekV41StepRunner:
                 p_min = pos_i64[0:total_tokens:width]
                 p_max = pos_i64[width - 1 : total_tokens : width]
                 swa_pt, _ = self._swa_pool.map_active_windows(
-                    active_pt, p_min, p_max, p_min
+                    active_pt,
+                    p_min,
+                    p_max,
+                    p_min,
+                    active_slots=slot_np[0:total_tokens:width],
                 )
             else:
                 swa_pt = active_pt
@@ -2569,7 +2585,7 @@ class DeepSeekV41StepRunner:
                 p_min = pos_i64[q_start_np[:num_seqs]]
                 p_max = pos_i64[q_start_np[1 : num_seqs + 1] - 1]
                 swa_pt, _ = self._swa_pool.map_active_windows(
-                    active_pt, p_min, p_max, p_min
+                    active_pt, p_min, p_max, p_min, active_slots=seq_slots_np
                 )
             else:
                 swa_pt = active_pt
