@@ -1181,6 +1181,33 @@ def install_sm120_dsa_indexer_patches() -> bool:
                 if chunk.local_total_seq_lens == 0 or q_slice.shape[0] == 0:
                     prefill_topk.fill_(-1)
                 else:
+                    if (
+                        not self.use_fp4_cache
+                        and candidate_blocks is not None
+                        and not self.candidate_write
+                    ):
+                        from zstep_worker.kernels_sm120.candidate_mqa import (
+                            run_candidate_sparse_prefill_topk,
+                        )
+                        chunk_candidates = candidate_blocks[
+                            chunk.token_start : chunk.token_end
+                        ]
+                        k_scale_f32 = k_scale.view(torch.float32).squeeze(-1)
+                        if run_candidate_sparse_prefill_topk(
+                            q_slice=q_slice,
+                            q_scale=q_scale_slice,
+                            k_quant=k_quant,
+                            k_scale=k_scale_f32,
+                            weights=weights[chunk.token_start : chunk.token_end],
+                            chunk_candidates=chunk_candidates,
+                            cu_seqlen_ks=cu_seqlen_ks,
+                            cu_seqlen_ke=cu_seqlen_ke,
+                            prefill_topk=prefill_topk,
+                            topk_tokens=topk_tokens,
+                            candidate_block_size=self.candidate_block_size,
+                            local_total_seq_lens=int(chunk.local_total_seq_lens),
+                        ):
+                            continue
                     if self.use_fp4_cache:
                         q_slice_cast = q_slice.view(torch.int8)
                         k_quant_cast = k_quant.view(torch.int8)
@@ -2615,7 +2642,7 @@ def prepare_b12x_dsv41_model(
     csmla_caps: tuple[int, ...] = tuple(sorted(int(b) for b in decode_buckets if int(b) > 0))
     csmla_plans: dict[tuple[int, int, int, bool, str], tuple[Any, ...]] = {}
     csmla_requests: list[Any] = []
-    ext_cap = min(4096, int(max_tokens))
+    ext_cap = min(8192, int(max_tokens))
     try:
         from b12x.attention import compressed_sparse_mla as _csmla
 

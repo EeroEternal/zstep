@@ -33,6 +33,7 @@ def test_worker_runtime_config_defaults_and_summary() -> None:
     assert cfg.require_b12x is False
     assert cfg.require_sm120_exp is False
     assert cfg.enable_sm120_dsa_decode is True
+    assert cfg.enable_sm120_candidate_mqa is True
     assert cfg.enable_sm12x_mega_gate is True
     assert cfg.mega_gate_min_tokens == 1
     assert cfg.mega_gate_enable_pdl is False
@@ -75,6 +76,7 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
         "ZSTEP_REQUIRE_B12X": "1",
         "ZSTEP_REQUIRE_SM120_EXP": "1",
         "ZSTEP_ENABLE_SM120_DSA_DECODE": "false",
+        "ZSTEP_ENABLE_SM120_CANDIDATE_MQA": "0",
         "ZSTEP_ENABLE_SM12X_MEGA_GATE": "no",
         "ZSTEP_MEGA_GATE_MIN_TOKENS": "8",
         "ZSTEP_MEGA_GATE_ENABLE_PDL": "1",
@@ -109,6 +111,7 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
     assert cfg.require_b12x is True
     assert cfg.require_sm120_exp is True
     assert cfg.enable_sm120_dsa_decode is False
+    assert cfg.enable_sm120_candidate_mqa is False
     assert cfg.enable_sm12x_mega_gate is False
     assert cfg.mega_gate_min_tokens == 8
     assert cfg.mega_gate_enable_pdl is True

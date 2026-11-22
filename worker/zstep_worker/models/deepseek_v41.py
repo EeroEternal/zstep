@@ -54,6 +54,10 @@ from zstep_worker.kernels_sm120.b12x_dsv41 import (
     is_sm120_dsa_decode_available,
     prepare_b12x_dsv41_model,
 )
+from zstep_worker.kernels_sm120.candidate_mqa import (
+    get_sm120_candidate_mqa_extension,
+    install_sm120_candidate_mqa_prefill_patch,
+)
 from zstep_worker.kernels_sm120.shm_allreduce import (
     HostMappedShmAllGather,
     HostMappedShmAllReduce,
@@ -645,9 +649,12 @@ class DeepSeekV41StepRunner:
         # Serialize CUDA C++ extension build on rank 0 before ranks 1..7 load it
         if rank == 0:
             get_host_mapped_allreduce_extension()
+            get_sm120_candidate_mqa_extension()
         dist.barrier(group=self.exchange_group)
         if rank != 0:
             get_host_mapped_allreduce_extension()
+            get_sm120_candidate_mqa_extension()
+        install_sm120_candidate_mqa_prefill_patch(self.model)
         dist.barrier(group=self.exchange_group)
 
         # Initialize NUMA-local shm_v5 AllReduce, AllGather, and lock-free TP=8 Argmax
@@ -665,7 +672,7 @@ class DeepSeekV41StepRunner:
             threads=pxb_ar_threads,
             exchange_group=self.exchange_group,
             enable_pxb_p2p=self.p2p_report.pxb_shm_enabled,
-            pxb_max_elements=min(ar_max_tokens, 4096) * 5120,
+            pxb_max_elements=min(ar_max_tokens, 8192) * 5120,
             enable_pxb_bfp=self.runtime_config.shm_pxb_bfp_mode,
         )
         self.shm_ag: HostMappedShmAllGather = HostMappedShmAllGather(
@@ -1055,7 +1062,7 @@ class DeepSeekV41StepRunner:
             default_ar_numel
         )
         default_ag_elems = (
-            min(self.max_step_tokens, 4096) * 3200 if shm_ar.pxb_enabled else 1024 * 4096
+            min(self.max_step_tokens, 8192) * 3200 if shm_ar.pxb_enabled else 1024 * 4096
         )
         shm_max_ag_numel = self.runtime_config.effective_shm_max_ag_numel(
             default_ag_elems
