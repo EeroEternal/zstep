@@ -329,15 +329,17 @@ impl ServeArgs {
                 "--max-seqs {max_seqs} is outside supported decode CUDA Graph range 1..={MAX_DECODE_GRAPH_SEQS}"
             ));
         }
-        let max_step_tokens: u32 = parse_map_number(&values, "--max-step-tokens", 4096)?;
+        let max_prefill_chunk: usize = parse_map_number(&values, "--max-prefill-chunk", 2048usize)?;
+        if max_prefill_chunk == 0 {
+            return Err("--max-prefill-chunk must be positive".to_owned());
+        }
+        let default_step_tokens = 4096u32.max(max_prefill_chunk.min(u32::MAX as usize) as u32);
+        let max_step_tokens: u32 =
+            parse_map_number(&values, "--max-step-tokens", default_step_tokens)?;
         if max_step_tokens < max_seqs {
             return Err(format!(
                 "--max-step-tokens ({max_step_tokens}) must be >= --max-seqs ({max_seqs})"
             ));
-        }
-        let max_prefill_chunk: usize = parse_map_number(&values, "--max-prefill-chunk", 2048usize)?;
-        if max_prefill_chunk == 0 {
-            return Err("--max-prefill-chunk must be positive".to_owned());
         }
         let gpu_memory_utilization: f64 =
             parse_map_number(&values, "--gpu-memory-utilization", 0.95_f64)?;

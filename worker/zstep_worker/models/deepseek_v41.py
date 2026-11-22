@@ -716,6 +716,8 @@ class DeepSeekV41StepRunner:
         self._tbo_comm_stream: torch.cuda.Stream | None = None
         self._tbo_comp_done_ev: list[torch.cuda.Event] = []
         self._tbo_ar_done_ev: list[torch.cuda.Event] = []
+        self._tbo_cand_bufs: list[torch.Tensor] | None = None
+        self._tbo_steps: int = 0
         if use_pxb_ar and 0 < tbo_min_tok <= 2 * tbo_cap_tokens:
             self.shm_ar_tbo = HostMappedShmAllReduce(
                 name=f"{allreduce_name}_tbo",
@@ -1504,7 +1506,8 @@ class DeepSeekV41StepRunner:
         q_start_np: np.ndarray,
         pos_i64: np.ndarray,
         full_attn_meta: dict[str, Any],
-    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        need_hidden: bool = True,
+    ) -> torch.Tensor | None:
         """Prefill Two-Batch Overlap (TBO): split a long prefill chunk into two
         causal microbatches (`u0`, `u1`) and overlap each microbatch's `shm_v5`
         AllReduce (`blocks=ZSTEP_PREFILL_TBO_AR_BLOCKS`, high-priority comm stream)
@@ -1520,6 +1523,14 @@ class DeepSeekV41StepRunner:
         main_s = torch.cuda.current_stream(self.device)
         dev_idx = self.device.index
 
+        self._tbo_steps += 1
+        if self._tbo_steps == 1 and self.rank == 0:
+            _LOG.info(
+                "Prefill TBO active: total_tokens=%d mid=%d ar_blocks=%d",
+                total_tokens,
+                total_tokens // 2,
+                shm_ar_tbo.blocks,
+            )
         mid = total_tokens // 2
         slices = self._compute_tbo_microbatch_slices(total_tokens, num_seqs, q_start_np, pos_i64)
         attn_metas: list[dict[str, Any]] = []
@@ -1630,7 +1641,6 @@ class DeepSeekV41StepRunner:
         post_u: list[torch.Tensor | None] = [None, None]
         resmix_u: list[torch.Tensor | None] = [None, None]
         pre_u: list[torch.Tensor | None] = [None, None]
-        aux_by_layer_u: list[dict[int, torch.Tensor]] = [{}, {}]
 
         mhc_pre = dsv41_model.mhc_pre_delayed_tilelang
         mhc_post = dsv41_model.mhc_post_tilelang
@@ -1650,18 +1660,29 @@ class DeepSeekV41StepRunner:
             return t_c
 
         fwd_ctx = get_forward_context()
-        # Snapshot candidate_blocks per microbatch when producer layer writes them
+        # Zero-copy double-buffered candidate_blocks per microbatch
         # (layer 20 -> layers 24, 28, 32, 36 share one buffer on SparseAttnIndexer).
-        cand_saved: list[torch.Tensor | None] = [None, None]
         cand_orig_by_op: dict[int, tuple[Any, torch.Tensor]] = {}
+        last_layer_idx = dsv4_core.end_layer - 1
         try:
             for idx in range(dsv4_core.start_layer, dsv4_core.end_layer):
                 layer = dsv4_core.layers[idx]
-                cap_aux = idx in dsv4_core.aux_hidden_state_layers
+                is_last_layer = idx == last_layer_idx
                 idx_mod = getattr(getattr(layer, "attn", None), "indexer", None)
                 sai_op = getattr(idx_mod, "sparse_attn_indexer", None) if idx_mod is not None else None
                 sai_cand = getattr(sai_op, "candidate_blocks", None) if sai_op is not None else None
-                sai_writes_cand = bool(getattr(sai_op, "candidate_write", False)) if sai_op is not None else False
+                if sai_op is not None and sai_cand is not None:
+                    if self._tbo_cand_bufs is None:
+                        self._tbo_cand_bufs = [
+                            torch.empty(
+                                (self._tbo_max_ubatch_tokens, sai_cand.shape[1]),
+                                dtype=sai_cand.dtype,
+                                device=sai_cand.device,
+                            )
+                            for _ in range(2)
+                        ]
+                    if id(sai_op) not in cand_orig_by_op:
+                        cand_orig_by_op[id(sai_op)] = (sai_op, sai_cand)
 
                 # Phase A: Attention (u0 writes KV before u1 reads KV on main_s;
                 # u0's Attn AllReduce overlaps with u1's Attn compute on comm_s).
@@ -1688,8 +1709,6 @@ class DeepSeekV41StepRunner:
                         )
                     elif layer.engram is not None and eh_u[u] is not None:
                         prev_post = mhc_post(xs[u], res_u[u], post_u[u], resmix_u[u])
-                        if cap_aux:
-                            aux_by_layer_u[u][idx] = prev_post.mean(dim=1)
                         assert gh_u[u] is not None
                         layer.engram.prepare_embeddings(
                             gh_u[u][:, layer.engram.layer_hash_index]
@@ -1720,7 +1739,7 @@ class DeepSeekV41StepRunner:
                             resmix_u[u],
                             xs[u],
                             pre_u[u],
-                            aux,
+                            _,
                         ) = mhc_shifted(
                             xs[u],
                             res_u[u],
@@ -1737,22 +1756,22 @@ class DeepSeekV41StepRunner:
                             pre_mix=pre_u[u],
                             norm_weight=layer.attn_norm.weight,
                             norm_eps=layer.attn_norm.variance_epsilon,
-                            capture_aux=cap_aux,
+                            capture_aux=False,
                             stream=None,
                             reduce_results=False,
                         )
-                        if cap_aux and aux is not None:
-                            aux_by_layer_u[u][idx] = aux
                     flush_sm120_mhc_before_ar(dev_idx)
-                    if sai_op is not None and sai_cand is not None and not sai_writes_cand and cand_saved[u] is not None:
-                        if id(sai_op) not in cand_orig_by_op:
-                            cand_orig_by_op[id(sai_op)] = (sai_op, sai_cand)
-                        sai_op.candidate_blocks = cand_saved[u]
+                    if sai_op is not None and sai_cand is not None and self._tbo_cand_bufs is not None:
+                        sai_op.candidate_blocks = self._tbo_cand_bufs[u]
                     fwd_ctx.attn_metadata = attn_metas[u]
                     xs[u] = layer.attn(poss[u], xs[u], None)
-                    if sai_op is not None and sai_cand is not None and sai_writes_cand:
-                        cand_saved[u] = sai_cand[: xs[u].shape[0]].clone()
-                    xs[u] = _launch_ar(xs[u], u)
+                    if not (is_last_layer and not need_hidden):
+                        xs[u] = _launch_ar(xs[u], u)
+
+                # On non-final prefill chunks (num_sample == 0), layer 39's KV cache
+                # is now written; skip stateless last-layer FFN + AR + final norm.
+                if is_last_layer and not need_hidden:
+                    return None
 
                 # Phase B: FFN / MoE (u0's FFN overlaps with u1's Attn AR;
                 # u1's FFN overlaps with u0's FFN AR; next layer u0's Attn
@@ -1795,20 +1814,10 @@ class DeepSeekV41StepRunner:
         for u in (0, 1):
             main_s.wait_event(self._tbo_ar_done_ev[u])
             h = mhc_post(xs[u], res_u[u], post_u[u], resmix_u[u])
-            if dsv4_core.end_layer in dsv4_core.aux_hidden_state_layers:
-                aux_by_layer_u[u][dsv4_core.end_layer] = h.mean(dim=1)
             assert pre_u[u] is not None
             h = hc_collapse(h, pre_u[u])
             out_u.append(dsv4_core.norm(h))
-        hidden = torch.cat(out_u, dim=0)
-        aux_hidden_states = [
-            torch.cat([aux_by_layer_u[0][lid], aux_by_layer_u[1][lid]], dim=0)
-            for lid in dsv4_core.aux_hidden_state_layers
-            if lid in aux_by_layer_u[0]
-        ]
-        if aux_hidden_states:
-            return hidden, aux_hidden_states
-        return hidden
+        return torch.cat(out_u, dim=0)
 
     def _sample_rows_into_argmax(
         self,
@@ -3194,23 +3203,33 @@ class DeepSeekV41StepRunner:
                         else None
                     )
                 elif use_tbo:
-                    model_output = self._run_prefill_tbo(
+                    hidden = self._run_prefill_tbo(
                         total_tokens=total_tokens,
                         num_seqs=num_seqs,
                         q_start_np=q_start_np,
                         pos_i64=pos_i64,
                         full_attn_meta=attn_meta,
+                        need_hidden=(num_sample > 0),
                     )
-                    if isinstance(model_output, tuple):
-                        hidden, aux_hidden_states = model_output
-                    else:
-                        hidden = model_output
                 else:
-                    model_output = self.model(
-                        input_ids=self.token_ids_gpu[:total_tokens],
-                        positions=self.positions_gpu[:total_tokens],
-                        lookback_token_ids=self.lookback_gpu[:num_seqs],
+                    lang_mod = getattr(self.model, "language_model", self.model)
+                    dsv4_core = getattr(lang_mod, "model", lang_mod)
+                    saved_aux = (
+                        getattr(dsv4_core, "aux_hidden_state_layers", None)
+                        if not is_spec_step
+                        else None
                     )
+                    if saved_aux:
+                        dsv4_core.aux_hidden_state_layers = ()
+                    try:
+                        model_output = self.model(
+                            input_ids=self.token_ids_gpu[:total_tokens],
+                            positions=self.positions_gpu[:total_tokens],
+                            lookback_token_ids=self.lookback_gpu[:num_seqs],
+                        )
+                    finally:
+                        if saved_aux:
+                            dsv4_core.aux_hidden_state_layers = saved_aux
                     if isinstance(model_output, tuple):
                         hidden, aux_hidden_states = model_output
                     else:

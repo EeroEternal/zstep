@@ -126,7 +126,7 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
     assert cfg.prefill_runahead_depth == 4
     assert cfg.swa_kv_pages == 2048
     assert cfg.prefill_tbo_min_tokens == 6144
-    assert cfg.prefill_tbo_min_ctx == 32768
+    assert cfg.prefill_tbo_min_ctx == 0
     assert cfg.prefill_tbo_ar_blocks == 24
 
     tbo_cfg = WorkerRuntimeConfig.from_env(

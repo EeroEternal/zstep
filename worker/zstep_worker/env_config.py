@@ -156,7 +156,7 @@ class WorkerRuntimeConfig:
     enable_sm120_mhc_overlap: bool = True
     enable_sm120_fuse_mhc_ar: bool = True
     prefill_tbo_min_tokens: int = 6144
-    prefill_tbo_min_ctx: int = 32768
+    prefill_tbo_min_ctx: int = 0
     prefill_tbo_ar_blocks: int = 24
     b12x_compat_dir: str = ""
     b12x_cache_dir: str | None = None
@@ -246,7 +246,7 @@ class WorkerRuntimeConfig:
                 f"(got {prefill_tbo_min_tokens})"
             )
         prefill_tbo_min_ctx = env_int(
-            "ZSTEP_PREFILL_TBO_MIN_CTX", 32768, environ=env
+            "ZSTEP_PREFILL_TBO_MIN_CTX", 0, environ=env
         )
         if prefill_tbo_min_ctx < 0:
             raise ValueError(
