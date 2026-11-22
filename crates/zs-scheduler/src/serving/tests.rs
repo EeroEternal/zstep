@@ -196,6 +196,7 @@ fn decode_sequences_force_single_prefill_interleaving() {
         2048,
         &waiting,
         0,
+        1,
         DEFAULT_PREFILL_COALESCE_WAIT_MS,
     ));
     assert!(!should_schedule_prefill(
@@ -206,6 +207,7 @@ fn decode_sequences_force_single_prefill_interleaving() {
         4096,
         2048,
         &waiting,
+        1,
         1,
         DEFAULT_PREFILL_COALESCE_WAIT_MS,
     ));
@@ -218,6 +220,7 @@ fn decode_sequences_force_single_prefill_interleaving() {
         2048,
         &waiting,
         0,
+        1,
         DEFAULT_PREFILL_COALESCE_WAIT_MS,
     ));
     assert!(!should_schedule_prefill(
@@ -229,6 +232,45 @@ fn decode_sequences_force_single_prefill_interleaving() {
         2048,
         &waiting,
         1,
+        1,
+        DEFAULT_PREFILL_COALESCE_WAIT_MS,
+    ));
+    // Unlimited consecutive prefills (0 = prefill-first) keeps scheduling prefill chunks.
+    assert!(should_schedule_prefill(
+        1,
+        2,
+        true,
+        8,
+        4096,
+        2048,
+        &waiting,
+        5,
+        0,
+        DEFAULT_PREFILL_COALESCE_WAIT_MS,
+    ));
+    // Explicit N > 1 allows up to N consecutive prefills before yielding to decode.
+    assert!(should_schedule_prefill(
+        1,
+        2,
+        true,
+        8,
+        4096,
+        2048,
+        &waiting,
+        1,
+        2,
+        DEFAULT_PREFILL_COALESCE_WAIT_MS,
+    ));
+    assert!(!should_schedule_prefill(
+        1,
+        2,
+        true,
+        8,
+        4096,
+        2048,
+        &waiting,
+        2,
+        2,
         DEFAULT_PREFILL_COALESCE_WAIT_MS,
     ));
     assert!(should_schedule_prefill(
@@ -240,6 +282,7 @@ fn decode_sequences_force_single_prefill_interleaving() {
         2048,
         &waiting,
         4,
+        1,
         DEFAULT_PREFILL_COALESCE_WAIT_MS,
     ));
 }
@@ -1609,6 +1652,7 @@ fn dynamic_mixed_step_budget_ramps_linearly_between_backlog_thresholds() {
         dynamic_budget_enabled: true,
         backlog_low_tokens: 2000,
         backlog_high_tokens: 10000,
+        max_consecutive_prefills: 1,
     };
     assert_eq!(
         compute_dynamic_mixed_step_budget(2048, 4096, 0, policy),

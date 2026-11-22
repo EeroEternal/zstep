@@ -234,6 +234,9 @@ pub struct PrefillSchedulingPolicy {
     pub backlog_low_tokens: usize,
     /// Remaining prefill backlog (tokens) at or above which mixed steps use `max_step_tokens`.
     pub backlog_high_tokens: usize,
+    /// Maximum consecutive standalone prefill steps before forcing a decode step when
+    /// decode-ready sequences exist (non-mixed / speculative mode). `0` = unlimited (prefill-first).
+    pub max_consecutive_prefills: usize,
 }
 
 impl Default for PrefillSchedulingPolicy {
@@ -244,6 +247,7 @@ impl Default for PrefillSchedulingPolicy {
             dynamic_budget_enabled: true,
             backlog_low_tokens: DEFAULT_BACKLOG_LOW_TOKENS,
             backlog_high_tokens: DEFAULT_BACKLOG_HIGH_TOKENS,
+            max_consecutive_prefills: 1,
         }
     }
 }
@@ -257,6 +261,7 @@ impl PrefillSchedulingPolicy {
             dynamic_budget_enabled: false,
             backlog_low_tokens: DEFAULT_BACKLOG_LOW_TOKENS,
             backlog_high_tokens: DEFAULT_BACKLOG_HIGH_TOKENS,
+            max_consecutive_prefills: 1,
         }
     }
 }
@@ -2035,6 +2040,7 @@ impl ServingEngine {
                             max_prefill_chunk,
                             waiting_permitted,
                             consecutive_prefills,
+                            self.prefill_policy.max_consecutive_prefills,
                             self.max_prefill_coalesce_wait_ms,
                         );
                     if run_prefill {
@@ -3362,12 +3368,16 @@ fn should_schedule_prefill(
     max_prefill_chunk: usize,
     waiting_permitted: &VecDeque<PendingRequest>,
     consecutive_prefills: usize,
+    max_consecutive_prefills: usize,
     max_prefill_coalesce_wait_ms: u64,
 ) -> bool {
     if (total_active_count >= max_seqs || waiting_permitted.is_empty()) && !has_partial_prefill {
         return false;
     }
-    if decode_active_count > 0 && consecutive_prefills >= 1 {
+    if decode_active_count > 0
+        && max_consecutive_prefills > 0
+        && consecutive_prefills >= max_consecutive_prefills
+    {
         return false;
     }
     if has_partial_prefill || decode_active_count == 0 {

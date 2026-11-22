@@ -66,3 +66,49 @@ def test_swa_page_pool_pinning_lru_eviction_and_fail_stop() -> None:
             seq_pos_max=np.array([255, 255], dtype=np.int64),
             allow_alloc_from=np.array([0, 0], dtype=np.int64),
         )
+
+
+def test_swa_page_pool_slot_tail_pinning_and_prune_on_retire() -> None:
+    try:
+        from zstep_worker.models.deepseek_v41 import _SwaPagePool
+    except ImportError as exc:
+        pytest.skip(f"_SwaPagePool import skipped: {exc}")
+
+    # 3 physical SWA pages (1..3); global dummy raw=9 -> mla_dummy_vb=10.
+    pool = _SwaPagePool(num_swa_pages=3, mla_dummy_vb=10)
+
+    # Slot 0 prefills page 1, Slot 2 prefills page 2 -> both tails pinned.
+    pool.map_active_windows(
+        np.array([[1, 10], [2, 10]], dtype=np.int64),
+        seq_pos_min=np.array([0, 0], dtype=np.int64),
+        seq_pos_max=np.array([10, 10], dtype=np.int64),
+        allow_alloc_from=np.array([0, 0], dtype=np.int64),
+        active_slots=np.array([0, 2], dtype=np.int64),
+    )
+    assert set(pool._slot_tails.keys()) == {0, 2}
+
+    # Slot 0 runs a step writing page 3; Slot 2 is idle in this step so its page 2 stays pinned.
+    pt1, _ = pool.map_active_windows(
+        np.array([[1, 3]], dtype=np.int64),
+        seq_pos_min=np.array([128], dtype=np.int64),
+        seq_pos_max=np.array([130], dtype=np.int64),
+        allow_alloc_from=np.array([128], dtype=np.int64),
+        active_slots=np.array([0], dtype=np.int64),
+    )
+    assert int(pt1[0, 1]) == 3
+    assert int(pool.lookup(np.array([2]))[0]) > 0  # Slot 2's idle tail stays pinned
+
+    # Retire Slot 2 (either cleared to dummy=9 or dropped beyond max_slot_end).
+    pool.prune_inactive_slots(np.array([[0, 2], [9, 9]], dtype=np.int32))
+    assert set(pool._slot_tails.keys()) == {0}
+
+    # Now Slot 0 can evict Slot 2's unpinned page 2 when allocating page 4.
+    pt2, _ = pool.map_active_windows(
+        np.array([[1, 3, 4]], dtype=np.int64),
+        seq_pos_min=np.array([256], dtype=np.int64),
+        seq_pos_max=np.array([260], dtype=np.int64),
+        allow_alloc_from=np.array([256], dtype=np.int64),
+        active_slots=np.array([0], dtype=np.int64),
+    )
+    assert int(pt2[0, 2]) > 0
+    assert int(pool.lookup(np.array([2]))[0]) == 0
