@@ -401,9 +401,10 @@ class _SwaPagePool:
                     to_alloc.append(mp)
             if active_slots is not None:
                 slot = int(active_slots[i])
+                tail_lo = min(p_lo, max(0, p_hi - 1))
                 tail = tuple(
                     int(active_pt[i, c])
-                    for c in range(max(0, p_hi - 1), p_hi + 1)
+                    for c in range(tail_lo, p_hi + 1)
                     if 0 < int(active_pt[i, c]) < self.mla_dummy_vb
                 )
                 self._slot_tails[slot] = tail
@@ -2224,7 +2225,9 @@ class DeepSeekV41StepRunner:
         max_slot_end = min(self.max_seqs, int(slot_np.max()) + 1)
         pt_np = plan.global_kv_page_table(max_slot_end)[:, : self.bt_width]
         if self._swa_pool is not None:
-            self._swa_pool.prune_inactive_slots(pt_np)
+            self._swa_pool.prune_inactive_slots(
+                plan.global_kv_page_table(self.geometry.max_seqs)
+            )
 
         is_spec_step = header.is_dspark_verify != 0
         is_decode = (

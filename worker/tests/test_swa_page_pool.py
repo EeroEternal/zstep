@@ -87,7 +87,10 @@ def test_swa_page_pool_slot_tail_pinning_and_prune_on_retire() -> None:
     )
     assert set(pool._slot_tails.keys()) == {0, 2}
 
-    # Slot 0 runs a step writing page 3; Slot 2 is idle in this step so its page 2 stays pinned.
+    # Slot 0 runs a step writing page 3; Slot 2 is idle in this step.
+    # Passing full global_kv_page_table(max_seqs) keeps active Slot 2 pinned.
+    pool.prune_inactive_slots(np.array([[0, 2], [9, 9], [1, 9]], dtype=np.int32))
+    assert set(pool._slot_tails.keys()) == {0, 2}
     pt1, _ = pool.map_active_windows(
         np.array([[1, 3]], dtype=np.int64),
         seq_pos_min=np.array([128], dtype=np.int64),
@@ -98,8 +101,8 @@ def test_swa_page_pool_slot_tail_pinning_and_prune_on_retire() -> None:
     assert int(pt1[0, 1]) == 3
     assert int(pool.lookup(np.array([2]))[0]) > 0  # Slot 2's idle tail stays pinned
 
-    # Retire Slot 2 (either cleared to dummy=9 or dropped beyond max_slot_end).
-    pool.prune_inactive_slots(np.array([[0, 2], [9, 9]], dtype=np.int32))
+    # Retire Slot 2 (row 2 cleared to dummy=9 in global_kv_page_table).
+    pool.prune_inactive_slots(np.array([[0, 2], [9, 9], [9, 9]], dtype=np.int32))
     assert set(pool._slot_tails.keys()) == {0}
 
     # Now Slot 0 can evict Slot 2's unpinned page 2 when allocating page 4.
