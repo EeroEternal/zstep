@@ -401,9 +401,18 @@ class _SwaPagePool:
                     to_alloc.append(mp)
             if active_slots is not None:
                 slot = int(active_slots[i])
+                tail_hi = max(0, p_hi - 1)
+                # Keep at most 2 tail pages on multi-page prefill (>= 128 tokens) to preserve
+                # SwaSafeLru's `2 * max_seqs` bound, while allowing straddling decode/verify
+                # windows (< 128 tokens) to retain `p_lo` in case all drafts are rejected.
+                tail_lo = (
+                    min(p_lo, tail_hi)
+                    if int(seq_pos_max[i]) - int(seq_pos_min[i]) < 128
+                    else tail_hi
+                )
                 tail = tuple(
                     int(active_pt[i, c])
-                    for c in range(max(0, p_hi - 1), p_hi + 1)
+                    for c in range(tail_lo, p_hi + 1)
                     if 0 < int(active_pt[i, c]) < self.mla_dummy_vb
                 )
                 self._slot_tails[slot] = tail
@@ -2224,7 +2233,9 @@ class DeepSeekV41StepRunner:
         max_slot_end = min(self.max_seqs, int(slot_np.max()) + 1)
         pt_np = plan.global_kv_page_table(max_slot_end)[:, : self.bt_width]
         if self._swa_pool is not None:
-            self._swa_pool.prune_inactive_slots(pt_np)
+            self._swa_pool.prune_inactive_slots(
+                plan.global_kv_page_table(self.geometry.max_seqs)
+            )
 
         is_spec_step = header.is_dspark_verify != 0
         is_decode = (

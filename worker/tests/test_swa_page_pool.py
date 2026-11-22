@@ -87,7 +87,10 @@ def test_swa_page_pool_slot_tail_pinning_and_prune_on_retire() -> None:
     )
     assert set(pool._slot_tails.keys()) == {0, 2}
 
-    # Slot 0 runs a step writing page 3; Slot 2 is idle in this step so its page 2 stays pinned.
+    # Slot 0 runs a step writing page 3; Slot 2 is idle in this step.
+    # Passing full global_kv_page_table(max_seqs) keeps active Slot 2 pinned.
+    pool.prune_inactive_slots(np.array([[0, 2], [9, 9], [1, 9]], dtype=np.int32))
+    assert set(pool._slot_tails.keys()) == {0, 2}
     pt1, _ = pool.map_active_windows(
         np.array([[1, 3]], dtype=np.int64),
         seq_pos_min=np.array([128], dtype=np.int64),
@@ -98,8 +101,8 @@ def test_swa_page_pool_slot_tail_pinning_and_prune_on_retire() -> None:
     assert int(pt1[0, 1]) == 3
     assert int(pool.lookup(np.array([2]))[0]) > 0  # Slot 2's idle tail stays pinned
 
-    # Retire Slot 2 (either cleared to dummy=9 or dropped beyond max_slot_end).
-    pool.prune_inactive_slots(np.array([[0, 2], [9, 9]], dtype=np.int32))
+    # Retire Slot 2 (row 2 cleared to dummy=9 in global_kv_page_table).
+    pool.prune_inactive_slots(np.array([[0, 2], [9, 9], [9, 9]], dtype=np.int32))
     assert set(pool._slot_tails.keys()) == {0}
 
     # Now Slot 0 can evict Slot 2's unpinned page 2 when allocating page 4.
@@ -112,3 +115,32 @@ def test_swa_page_pool_slot_tail_pinning_and_prune_on_retire() -> None:
     )
     assert int(pt2[0, 2]) > 0
     assert int(pool.lookup(np.array([2]))[0]) == 0
+
+
+def test_swa_page_pool_tail_bound_on_prefill_vs_straddling_verify() -> None:
+    try:
+        from zstep_worker.models.deepseek_v41 import _SwaPagePool
+    except ImportError as exc:
+        pytest.skip(f"_SwaPagePool import skipped: {exc}")
+
+    pool = _SwaPagePool(num_swa_pages=4, mla_dummy_vb=10)
+
+    # Multi-page prefill (pos 0..300 -> 3 pages): only last 2 tail pages are pinned.
+    pool.map_active_windows(
+        np.array([[1, 2, 3]], dtype=np.int64),
+        seq_pos_min=np.array([0], dtype=np.int64),
+        seq_pos_max=np.array([300], dtype=np.int64),
+        allow_alloc_from=np.array([0], dtype=np.int64),
+        active_slots=np.array([0], dtype=np.int64),
+    )
+    assert pool._slot_tails[0] == (2, 3)
+
+    # Straddling decode/verify window (pos 252..256 -> p_lo=0, p_hi=2): pins all 3 pages.
+    pool.map_active_windows(
+        np.array([[1, 2, 3]], dtype=np.int64),
+        seq_pos_min=np.array([252], dtype=np.int64),
+        seq_pos_max=np.array([256], dtype=np.int64),
+        allow_alloc_from=np.array([252], dtype=np.int64),
+        active_slots=np.array([0], dtype=np.int64),
+    )
+    assert pool._slot_tails[0] == (1, 2, 3)
