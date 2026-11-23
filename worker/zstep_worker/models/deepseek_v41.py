@@ -2288,7 +2288,7 @@ class DeepSeekV41StepRunner:
             sl_cpu = torch.ones(b, dtype=torch.int32)
 
             with torch.cuda.stream(capture_stream):
-                for _ in range(2):
+                for w_idx in range(2):
                     attn_meta = self._build_step_attn_metadata(
                         num_reqs=b,
                         num_tokens=b,
@@ -2300,8 +2300,9 @@ class DeepSeekV41StepRunner:
                         seq_lens_cpu=sl_cpu,
                         positions_gpu=self.positions_gpu[:b],
                         slot_mapping_gpu=self.slot_mapping_gpu[:b],
+                        swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:b],
                         is_prefilling_cpu=self.decode_is_prefilling_cpu[:b],
-                        for_capture=True,
+                        for_capture=(w_idx == 0),
                     )
                     with set_forward_context(
                         attn_meta,
@@ -2345,6 +2346,21 @@ class DeepSeekV41StepRunner:
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             ):
                 with torch.cuda.graph(g, pool=graph_pool, stream=capture_stream):
+                    self._build_step_attn_metadata(
+                        num_reqs=b,
+                        num_tokens=b,
+                        max_query_len=1,
+                        max_seq_len=self.decode_graph_max_seq_len,
+                        qsl_gpu=self.decode_qsl_gpu[: b + 1],
+                        qsl_cpu=self.decode_qsl_cpu[: b + 1],
+                        seq_lens_gpu=self.seq_lens_gpu[:b],
+                        seq_lens_cpu=sl_cpu,
+                        positions_gpu=self.positions_gpu[:b],
+                        slot_mapping_gpu=self.slot_mapping_gpu[:b],
+                        swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:b],
+                        is_prefilling_cpu=self.decode_is_prefilling_cpu[:b],
+                        for_capture=False,
+                    )
                     hidden = self.model(
                         input_ids=self.token_ids_gpu[:b],
                         positions=self.positions_gpu[:b],
@@ -2599,7 +2615,7 @@ class DeepSeekV41StepRunner:
             self.seq_lens_gpu[bucket:].zero_()
 
             with torch.cuda.stream(capture_stream):
-                for _ in range(2):
+                for w_idx in range(2):
                     attn_meta = self._build_step_attn_metadata(
                         num_reqs=bucket,
                         num_tokens=rows,
@@ -2611,8 +2627,9 @@ class DeepSeekV41StepRunner:
                         seq_lens_cpu=sl_cpu,
                         positions_gpu=self.positions_gpu[:rows],
                         slot_mapping_gpu=self.slot_mapping_gpu[:rows],
+                        swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:rows],
                         is_prefilling_cpu=self.decode_is_prefilling_cpu[:bucket],
-                        for_capture=True,
+                        for_capture=(w_idx == 0),
                     )
                     with set_forward_context(
                         attn_meta,
@@ -2658,6 +2675,21 @@ class DeepSeekV41StepRunner:
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             ):
                 with torch.cuda.graph(graph, pool=graph_pool, stream=capture_stream):
+                    self._build_step_attn_metadata(
+                        num_reqs=bucket,
+                        num_tokens=rows,
+                        max_query_len=width,
+                        max_seq_len=self.decode_graph_max_seq_len,
+                        qsl_gpu=self.verify_qsl_gpu[: bucket + 1],
+                        qsl_cpu=self.verify_qsl_cpu[: bucket + 1],
+                        seq_lens_gpu=self.seq_lens_gpu[:bucket],
+                        seq_lens_cpu=sl_cpu,
+                        positions_gpu=self.positions_gpu[:rows],
+                        slot_mapping_gpu=self.slot_mapping_gpu[:rows],
+                        swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:rows],
+                        is_prefilling_cpu=self.decode_is_prefilling_cpu[:bucket],
+                        for_capture=False,
+                    )
                     output = self.model(
                         input_ids=self.token_ids_gpu[:rows],
                         positions=self.positions_gpu[:rows],
@@ -2794,6 +2826,7 @@ class DeepSeekV41StepRunner:
         )
         aux_hidden_states: list[torch.Tensor] | None = None
         self._last_verify_bt_sig = None
+        self._last_verify_graph_bucket = None
         self._h2d_done_event.synchronize()
 
         self.start_events[parity].record()
@@ -2919,21 +2952,6 @@ class DeepSeekV41StepRunner:
                     self.swa_slot_mapping_cpu[:bucket], non_blocking=True
                 )
 
-            self._build_step_attn_metadata(
-                num_reqs=bucket,
-                num_tokens=bucket,
-                max_query_len=1,
-                max_seq_len=self.decode_graph_max_seq_len,
-                qsl_gpu=self.decode_qsl_gpu[: bucket + 1],
-                qsl_cpu=self.decode_qsl_cpu[: bucket + 1],
-                seq_lens_gpu=self.seq_lens_gpu[:bucket],
-                seq_lens_cpu=self.seq_lens_cpu[:bucket],
-                positions_gpu=self.positions_gpu[:bucket],
-                slot_mapping_gpu=self.slot_mapping_gpu[:bucket],
-                swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:bucket],
-                is_prefilling_cpu=self.decode_is_prefilling_cpu[:bucket],
-                for_capture=False,
-            )
             self._h2d_done_event.record()
             self.decode_graphs[bucket].replay()
             if is_sampling:
@@ -3060,23 +3078,9 @@ class DeepSeekV41StepRunner:
                     self.swa_slot_mapping_cpu[:rows], non_blocking=True
                 )
 
-            self._build_step_attn_metadata(
-                num_reqs=v_bucket,
-                num_tokens=rows,
-                max_query_len=width,
-                max_seq_len=self.decode_graph_max_seq_len,
-                qsl_gpu=self.verify_qsl_gpu[: v_bucket + 1],
-                qsl_cpu=self.verify_qsl_cpu[: v_bucket + 1],
-                seq_lens_gpu=self.seq_lens_gpu[:v_bucket],
-                seq_lens_cpu=self.seq_lens_cpu[:v_bucket],
-                positions_gpu=self.positions_gpu[:rows],
-                slot_mapping_gpu=self.slot_mapping_gpu[:rows],
-                swa_slot_mapping_gpu=self.swa_slot_mapping_gpu[:rows],
-                is_prefilling_cpu=self.decode_is_prefilling_cpu[:v_bucket],
-                for_capture=False,
-            )
             self._h2d_done_event.record()
             self.verify_graphs[v_bucket].replay()
+            self._last_verify_graph_bucket = v_bucket
             raw_aux = self.verify_graph_aux[v_bucket]
             aux_hidden_states = (
                 [a[:total_tokens] for a in raw_aux] if raw_aux is not None else None
