@@ -845,6 +845,12 @@ class DeepSeekV41StepRunner:
         self.sample_rows_gpu: torch.Tensor = torch.zeros(
             sc, dtype=torch.int64, device=self.device
         )
+        self._verify_real_rows_cpu: torch.Tensor = torch.zeros(
+            sc, dtype=torch.int64, pin_memory=True
+        )
+        self._verify_real_rows_gpu: torch.Tensor = torch.zeros(
+            sc, dtype=torch.int64, device=self.device
+        )
 
         # Decode-only static arange query_start_loc `[0, 1, 2, ..., ms]`
         self.decode_qsl_gpu: torch.Tensor = torch.arange(
@@ -2810,6 +2816,93 @@ class DeepSeekV41StepRunner:
         self.slot_lb_gpu.index_copy_(0, s_idx, self.next_lb_gpu[:n])
         self.slot_last_tok_gpu.index_copy_(0, s_idx, self.out_tokens_gpu[:n, 0])
 
+    @staticmethod
+    def _can_use_ragged_verify_graph(
+        *,
+        q_start_np: np.ndarray,
+        q_lens: np.ndarray,
+        pos_np: np.ndarray,
+        seq_lens_np: np.ndarray,
+        sample_rows_np: np.ndarray,
+        total_tokens: int,
+        width: int,
+        max_seq_len: int,
+    ) -> bool:
+        """Return True when a heterogeneous speculative-verify batch (`1 <= q_len <= width`)
+        can be safely padded into the uniform `verify_graphs[v_bucket]` layout without
+        mutating KV caches (`slot_mapping = -1` on padded slots) or altering causal
+        attention windows (`seq_len += width - q_len`)."""
+        num_seqs = len(q_lens)
+        if num_seqs == 0 or total_tokens == 0:
+            return False
+        if not bool(np.all((q_lens >= 1) & (q_lens <= width))):
+            return False
+        if not bool(
+            np.array_equal(
+                sample_rows_np, np.arange(total_tokens, dtype=sample_rows_np.dtype)
+            )
+        ):
+            return False
+        p_min = pos_np[q_start_np[:num_seqs]].astype(np.int64)
+        p_max = pos_np[q_start_np[1:] - 1].astype(np.int64)
+        if not bool(np.all(p_min > 0)) or not bool(np.all(seq_lens_np == (p_max + 1))):
+            return False
+        p_max_pad = p_max + (width - q_lens).astype(np.int64)
+        return bool(
+            np.all(p_max_pad < max_seq_len)
+            and np.all((p_max_pad // 128) == (p_max // 128))
+        )
+
+    @staticmethod
+    def _pack_ragged_verify_buffers(
+        *,
+        num_seqs: int,
+        v_bucket: int,
+        width: int,
+        q_start_np: np.ndarray,
+        q_lens: np.ndarray,
+        tok_np: np.ndarray,
+        pos_i64: np.ndarray,
+        seq_lens_np: np.ndarray,
+        sm_packed: np.ndarray,
+        swa_sm_packed: np.ndarray | None,
+        tok_cpu_np: np.ndarray,
+        pos_cpu_np: np.ndarray,
+        sl_cpu_np: np.ndarray,
+        sm_cpu_np: np.ndarray,
+        swa_sm_np: np.ndarray | None,
+        real_rows_np: np.ndarray,
+    ) -> None:
+        """Scatter ragged speculative-verify tokens into fixed-width `[v_bucket, width]`
+        CUDAGraph staging buffers while keeping padded tail slots side-effect-free."""
+        rows = v_bucket * width
+        tok_cpu_np[:] = 0
+        pos_cpu_np[:] = np.arange(rows, dtype=np.int64) % width
+        sm_cpu_np[:] = -1
+        if swa_sm_np is not None:
+            swa_sm_np[:] = -1
+        write_idx = 0
+        for s_i in range(num_seqs):
+            src_s = int(q_start_np[s_i])
+            src_e = int(q_start_np[s_i + 1])
+            ql = src_e - src_s
+            dst_s = s_i * width
+            tok_cpu_np[dst_s : dst_s + ql] = tok_np[src_s:src_e]
+            pos_cpu_np[dst_s : dst_s + ql] = pos_i64[src_s:src_e]
+            sm_cpu_np[dst_s : dst_s + ql] = sm_packed[src_s:src_e]
+            if swa_sm_np is not None and swa_sm_packed is not None:
+                swa_sm_np[dst_s : dst_s + ql] = swa_sm_packed[src_s:src_e]
+            if ql < width:
+                last_p = int(pos_i64[src_e - 1])
+                for p_off in range(1, width - ql + 1):
+                    pos_cpu_np[dst_s + ql + p_off - 1] = last_p + p_off
+            for j in range(ql):
+                real_rows_np[write_idx + j] = dst_s + j
+            write_idx += ql
+        sl_cpu_np[:num_seqs] = seq_lens_np + (width - q_lens)
+        if v_bucket > num_seqs:
+            sl_cpu_np[num_seqs:v_bucket] = width
+
     @torch.inference_mode()
     def execute(
         self, plan: StepPlanView, header: StepHeader
@@ -2857,13 +2950,31 @@ class DeepSeekV41StepRunner:
             if self.verify_buckets and num_seqs <= self.verify_buckets[-1]
             else 0
         )
+        is_uniform_verify = bool(
+            total_tokens == num_seqs * width and np.all(q_lens == width)
+        )
+        is_ragged_verify = (
+            is_spec_step
+            and not is_uniform_verify
+            and v_bucket in self.verify_graphs
+            and num_sample == total_tokens
+            and self._can_use_ragged_verify_graph(
+                q_start_np=q_start_np,
+                q_lens=q_lens,
+                pos_np=pos_np,
+                seq_lens_np=seq_lens_np,
+                sample_rows_np=sample_rows_np,
+                total_tokens=total_tokens,
+                width=width,
+                max_seq_len=self.decode_graph_max_seq_len,
+            )
+        )
         use_verify_graph = (
             is_spec_step
             and v_bucket in self.verify_graphs
             and num_sample == total_tokens
-            and total_tokens == num_seqs * width
             and int(seq_lens_np.max()) <= self.decode_graph_max_seq_len
-            and bool(np.all(q_lens == width))
+            and (is_uniform_verify or is_ragged_verify)
         )
         aux_hidden_states: list[torch.Tensor] | None = None
         self._last_verify_bt_sig = None
@@ -3049,10 +3160,15 @@ class DeepSeekV41StepRunner:
             num_out = num_seqs
         elif use_verify_graph:
             rows = v_bucket * width
-            seq_slots_np = slot_np[0:total_tokens:width]
             pos_i64 = pos_np.astype(np.int64)
-            p_min = pos_i64[0:total_tokens:width]
-            p_max = pos_i64[width - 1 : total_tokens : width]
+            if is_ragged_verify:
+                seq_slots_np = slot_np[q_start_np[:num_seqs]]
+                p_min = pos_i64[q_start_np[:num_seqs]]
+                p_max = pos_i64[q_start_np[1:] - 1]
+            else:
+                seq_slots_np = slot_np[0:total_tokens:width]
+                p_min = pos_i64[0:total_tokens:width]
+                p_max = pos_i64[width - 1 : total_tokens : width]
             c_lo = np.maximum(0, (p_min - 127) // 128)
             c_hi = np.minimum(pt_np.shape[1] - 1, p_max // 128)
             swa_epoch = self._swa_pool.epoch if self._swa_pool is not None else -1
@@ -3103,33 +3219,65 @@ class DeepSeekV41StepRunner:
                 lb_np[num_seqs:v_bucket] = -1
 
             tok_cpu_np = self.token_ids_cpu[:rows].numpy()
-            tok_cpu_np[:total_tokens] = tok_np
-            if rows > total_tokens:
-                tok_cpu_np[total_tokens:rows] = 0
-
             pos_cpu_np = self.positions_cpu[:rows].numpy()
-            pos_cpu_np[:total_tokens] = pos_i64
-            if rows > total_tokens:
-                pos_cpu_np[total_tokens:rows] = (
-                    np.arange(rows - total_tokens, dtype=np.int64) % width
-                )
-
             sl_cpu_np = self.seq_lens_cpu[:v_bucket].numpy()
-            sl_cpu_np[:num_seqs] = seq_lens_np
-            if v_bucket > num_seqs:
-                sl_cpu_np[num_seqs:v_bucket] = width
-
             sm_cpu_np = self.slot_mapping_cpu[:rows].numpy()
             vb_tok = (pt_np[slot_np, pos_i64 // 128] + 1).astype(np.int64)
-            sm_cpu_np[:total_tokens] = vb_tok * 128 + (pos_i64 % 128)
-            if rows > total_tokens:
-                sm_cpu_np[total_tokens:rows] = -1
-            if self._swa_pool is not None:
-                swa_sm_np = self.swa_slot_mapping_cpu[:rows].numpy()
-                swa_vb_tok = self._swa_pool.lookup(vb_tok).astype(np.int64)
-                swa_sm_np[:total_tokens] = swa_vb_tok * 128 + (pos_i64 % 128)
+            if is_ragged_verify:
+                sm_packed = vb_tok * 128 + (pos_i64 % 128)
+                swa_sm_np = (
+                    self.swa_slot_mapping_cpu[:rows].numpy()
+                    if self._swa_pool is not None
+                    else None
+                )
+                swa_sm_packed = (
+                    self._swa_pool.lookup(vb_tok).astype(np.int64) * 128
+                    + (pos_i64 % 128)
+                    if self._swa_pool is not None
+                    else None
+                )
+                self._pack_ragged_verify_buffers(
+                    num_seqs=num_seqs,
+                    v_bucket=v_bucket,
+                    width=width,
+                    q_start_np=q_start_np,
+                    q_lens=q_lens,
+                    tok_np=tok_np,
+                    pos_i64=pos_i64,
+                    seq_lens_np=seq_lens_np,
+                    sm_packed=sm_packed,
+                    swa_sm_packed=swa_sm_packed,
+                    tok_cpu_np=tok_cpu_np,
+                    pos_cpu_np=pos_cpu_np,
+                    sl_cpu_np=sl_cpu_np,
+                    sm_cpu_np=sm_cpu_np,
+                    swa_sm_np=swa_sm_np,
+                    real_rows_np=self._verify_real_rows_cpu[:total_tokens].numpy(),
+                )
+            else:
+                tok_cpu_np[:total_tokens] = tok_np
                 if rows > total_tokens:
-                    swa_sm_np[total_tokens:rows] = -1
+                    tok_cpu_np[total_tokens:rows] = 0
+
+                pos_cpu_np[:total_tokens] = pos_i64
+                if rows > total_tokens:
+                    pos_cpu_np[total_tokens:rows] = (
+                        np.arange(rows - total_tokens, dtype=np.int64) % width
+                    )
+
+                sl_cpu_np[:num_seqs] = seq_lens_np
+                if v_bucket > num_seqs:
+                    sl_cpu_np[num_seqs:v_bucket] = width
+
+                sm_cpu_np[:total_tokens] = vb_tok * 128 + (pos_i64 % 128)
+                if rows > total_tokens:
+                    sm_cpu_np[total_tokens:rows] = -1
+                if self._swa_pool is not None:
+                    swa_sm_np = self.swa_slot_mapping_cpu[:rows].numpy()
+                    swa_vb_tok = self._swa_pool.lookup(vb_tok).astype(np.int64)
+                    swa_sm_np[:total_tokens] = swa_vb_tok * 128 + (pos_i64 % 128)
+                    if rows > total_tokens:
+                        swa_sm_np[total_tokens:rows] = -1
 
             if not bt_hit:
                 self.mla_bt_gpu[:v_bucket].copy_(
@@ -3176,19 +3324,40 @@ class DeepSeekV41StepRunner:
                     self.swa_slot_mapping_cpu[:rows], non_blocking=True
                 )
 
+            if is_ragged_verify:
+                self._verify_real_rows_gpu[:total_tokens].copy_(
+                    self._verify_real_rows_cpu[:total_tokens], non_blocking=True
+                )
             self._h2d_done_event.record()
             self.verify_graphs[v_bucket].replay()
-            self._last_verify_graph_bucket = v_bucket
             raw_aux = self.verify_graph_aux[v_bucket]
-            aux_hidden_states = (
-                [a[:total_tokens] for a in raw_aux] if raw_aux is not None else None
-            )
-            self.out_tokens_cpu[parity, :num_sample].copy_(
-                self.out_tokens_gpu[:num_sample], non_blocking=True
-            )
-            self.out_logprobs_cpu[parity, :num_sample].copy_(
-                self.out_logprobs_gpu[:num_sample], non_blocking=True
-            )
+            if is_ragged_verify:
+                real_rows_gpu = self._verify_real_rows_gpu[:total_tokens]
+                self._last_verify_graph_bucket = None
+                aux_hidden_states = (
+                    [a.index_select(0, real_rows_gpu) for a in raw_aux]
+                    if raw_aux is not None
+                    else None
+                )
+                self.out_tokens_cpu[parity, :num_sample].copy_(
+                    self.out_tokens_gpu.index_select(0, real_rows_gpu),
+                    non_blocking=True,
+                )
+                self.out_logprobs_cpu[parity, :num_sample].copy_(
+                    self.out_logprobs_gpu.index_select(0, real_rows_gpu),
+                    non_blocking=True,
+                )
+            else:
+                self._last_verify_graph_bucket = v_bucket
+                aux_hidden_states = (
+                    [a[:total_tokens] for a in raw_aux] if raw_aux is not None else None
+                )
+                self.out_tokens_cpu[parity, :num_sample].copy_(
+                    self.out_tokens_gpu[:num_sample], non_blocking=True
+                )
+                self.out_logprobs_cpu[parity, :num_sample].copy_(
+                    self.out_logprobs_gpu[:num_sample], non_blocking=True
+                )
             sample_slots_out = []
             num_out = num_sample
         else:
