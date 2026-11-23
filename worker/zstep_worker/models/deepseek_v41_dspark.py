@@ -400,23 +400,46 @@ class DeepSeekV41DSparkDrafter:
         rows = eff_b * k
         actual_rows = n * k
 
-        active_pt = page_table[req_slots, :] + 1
-        swa_allocated = False
-        if getattr(runner, "_swa_pool", None) is not None:
-            swa_pt, swa_allocated = runner._swa_pool.map_active_windows(
-                active_pt,
-                pos_next,
-                np.minimum(pos_next + k - 1, max_ctx - 1),
-                pos_next,
-                active_slots=req_slots,
-            )
-        else:
-            swa_pt = active_pt
-        bt_cached = (not swa_allocated) and (
-            getattr(runner, "_last_verify_bt_sig", None)
-            == (eff_b, tuple(int(s) for s in req_slots))
+        q_pos_2d = pos_next[:, None] + np.arange(k, dtype=np.int64)[None, :]
+        in_bounds = (q_pos_2d < max_ctx) & ((q_pos_2d // 128) < page_table.shape[1])
+        safe_cols = np.where(in_bounds, q_pos_2d // 128, 0)
+        mla_2d = page_table[req_slots[:, None], safe_cols] + 1
+        swa_pool = getattr(runner, "_swa_pool", None)
+
+        sig_match = getattr(runner, "_last_verify_bt_sig", None) == (
+            eff_b,
+            tuple(int(s) for s in req_slots),
         )
+        bt_cached = False
+        if sig_match:
+            if swa_pool is None:
+                phys_2d = mla_2d.astype(np.int64)
+                bt_cached = True
+            else:
+                # Fast-path: check if all active draft-window pages (p_lo..p_hi) are
+                # already resident in _swa_pool without touching the full 1024-col table.
+                c_lo = np.maximum(0, (pos_next - 127) // 128)
+                lo_mla = page_table[req_slots, c_lo] + 1
+                hi_phys = swa_pool.lookup(mla_2d)
+                lo_phys = swa_pool.lookup(lo_mla)
+                if bool(np.all(hi_phys > 0)) and bool(np.all(lo_phys > 0)):
+                    phys_2d = hi_phys.astype(np.int64)
+                    bt_cached = True
+
         if not bt_cached:
+            active_pt = page_table[req_slots, :] + 1
+            if swa_pool is not None:
+                swa_pt, _ = swa_pool.map_active_windows(
+                    active_pt,
+                    pos_next,
+                    np.minimum(pos_next + k - 1, max_ctx - 1),
+                    pos_next,
+                    active_slots=req_slots,
+                )
+            else:
+                swa_pt = active_pt
+            phys_2d = swa_pt[np.arange(n)[:, None], safe_cols].astype(np.int64)
+
             mla_bt_np = runner.mla_bt_cpu[:eff_b].numpy()
             mla_bt_np[:n] = active_pt
             if eff_b > n:
@@ -433,6 +456,7 @@ class DeepSeekV41DSparkDrafter:
             if eff_b > n:
                 comp_bt_np[n:eff_b] = runner.dummy_comp_block
             runner._last_verify_bt_sig = None
+            runner._gpu_bt_cache_key = None
 
         sl_cpu_np = runner.seq_lens_cpu[:eff_b].numpy()
         sl_cpu_np[:n] = seq_lens_np
@@ -445,8 +469,6 @@ class DeepSeekV41DSparkDrafter:
         if eff_b > n:
             tok_np[actual_rows:rows:k] = 0
 
-        q_pos_2d = pos_next[:, None] + np.arange(k, dtype=np.int64)[None, :]
-        in_bounds = (q_pos_2d < max_ctx) & ((q_pos_2d // 128) < active_pt.shape[1])
         pos_cpu_np = self.draft_positions_cpu[:rows].numpy()
         pos_cpu_np[:actual_rows] = np.minimum(q_pos_2d, max_ctx - 1).reshape(-1)
         if eff_b > n:
@@ -454,8 +476,6 @@ class DeepSeekV41DSparkDrafter:
                 np.arange(rows - actual_rows, dtype=np.int64) % k
             )
 
-        safe_cols = np.where(in_bounds, q_pos_2d // 128, 0)
-        phys_2d = swa_pt[np.arange(n)[:, None], safe_cols].astype(np.int64)
         slots_2d = np.where(in_bounds, phys_2d * 128 + (q_pos_2d % 128), -1)
         sm_cpu_np = self.draft_slot_mapping_cpu[:rows].numpy()
         sm_cpu_np[:actual_rows] = slots_2d.reshape(-1)
