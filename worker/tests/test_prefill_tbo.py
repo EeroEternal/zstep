@@ -52,11 +52,14 @@ def test_can_run_prefill_tbo_gates(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(dsv41_mod.torch.cuda, "is_current_stream_capturing", lambda: False)
 
     assert runner._can_run_prefill_tbo(8192, max_seq_len=65536, is_decode=False, is_spec_step=False)
+    assert runner._can_run_prefill_tbo(
+        8192, max_seq_len=65536, is_decode=False, is_spec_step=True
+    )
     assert not runner._can_run_prefill_tbo(
         8192, max_seq_len=65536, is_decode=True, is_spec_step=False
     )
     assert not runner._can_run_prefill_tbo(
-        8192, max_seq_len=65536, is_decode=False, is_spec_step=True
+        8192, max_seq_len=65536, is_decode=True, is_spec_step=True
     )
     assert not runner._can_run_prefill_tbo(
         4096, max_seq_len=65536, is_decode=False, is_spec_step=False
@@ -71,6 +74,16 @@ def test_can_run_prefill_tbo_gates(monkeypatch: pytest.MonkeyPatch) -> None:
     runner.runtime_config.prefill_tbo_min_tokens = 0
     assert not runner._can_run_prefill_tbo(
         8192, max_seq_len=65536, is_decode=False, is_spec_step=False
+    )
+
+    runner_mtp = _make_fake_runner(mtp_buf=object())
+    runner_mtp.dspark_drafter = None
+    assert not runner_mtp._can_run_prefill_tbo(
+        8192, max_seq_len=65536, is_decode=False, is_spec_step=True
+    )
+    runner_mtp.dspark_drafter = object()
+    assert runner_mtp._can_run_prefill_tbo(
+        8192, max_seq_len=65536, is_decode=False, is_spec_step=True
     )
 
 
