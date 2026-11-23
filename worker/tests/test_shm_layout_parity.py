@@ -437,6 +437,7 @@ def _make_runtime_loop_fixture(runner: object) -> tuple[object, ShmBridge, int, 
     loop._free_vram_mb = 1024
     loop._total_vram_mb = 2048
     loop._prefill_runahead = PrefillRunAheadGuard(max_depth=0)
+    loop._is_result_rank = True
     loop.current_step = 0
     loop.last_step = 0
     loop._pending_plan_signals = 0

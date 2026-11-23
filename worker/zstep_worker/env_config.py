@@ -268,9 +268,9 @@ class WorkerRuntimeConfig:
         pipeline_parallel_size = env_int(
             "ZSTEP_PIPELINE_PARALLEL_SIZE", 1, environ=env
         )
-        if pipeline_parallel_size < 1:
+        if pipeline_parallel_size not in (1, 2):
             raise ValueError(
-                "ZSTEP_PIPELINE_PARALLEL_SIZE must be >= 1 "
+                "ZSTEP_PIPELINE_PARALLEL_SIZE must be 1 or 2 "
                 f"(got {pipeline_parallel_size})"
             )
         pp_prefill_microbatches = env_int(

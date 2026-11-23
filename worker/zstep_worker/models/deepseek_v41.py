@@ -1720,9 +1720,13 @@ class DeepSeekV41StepRunner:
         assert self._pp_seq_lens_cpu is not None and self._pp_seq_lens_gpu is not None
         assert self._pp_is_pref_cpu is not None
 
-        k = min(
-            self.runtime_config.pp_prefill_microbatches,
-            max(1, total_tokens // 1024),
+        min_k = max(1, (total_tokens + 8191) // 8192)
+        k = max(
+            min_k,
+            min(
+                self.runtime_config.pp_prefill_microbatches,
+                max(1, total_tokens // 1024),
+            ),
         )
         slices = self._compute_pp_microbatch_slices(
             total_tokens, num_seqs, q_start_np, pos_i64, k
