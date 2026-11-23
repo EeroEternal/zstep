@@ -824,6 +824,9 @@ fn spawn_workers(
         } else {
             command.env_remove("ZSTEP_SWA_KV_PAGES");
         }
+        if std::env::var_os("PYTORCH_CUDA_ALLOC_CONF").is_none() {
+            command.env("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True");
+        }
         command
             .env("ZSTEP_SPEC_METHOD", config.speculative.method.as_str())
             .env(
