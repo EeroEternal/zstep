@@ -118,6 +118,7 @@ class _SpecVerifyContext:
     q_start_np: np.ndarray
     pt_np: np.ndarray
     aux_hidden_states: list[torch.Tensor] | None
+    dspark_ctx_prestored: bool = False
 
 
 @dataclass(frozen=True)
@@ -982,6 +983,26 @@ class DeepSeekV41StepRunner:
             self._pp_is_pref_cpu: list[torch.Tensor] = [
                 torch.zeros(ms, dtype=torch.bool) for _ in range(pp_k)
             ]
+            self._pp_recv_h_bufs: list[torch.Tensor] = (
+                [
+                    torch.empty(
+                        (8192, 4, self.hidden_size),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(2)
+                ]
+                if not self.is_first_pp
+                else []
+            )
+            self._pp_recv_p_bufs: list[torch.Tensor] = (
+                [
+                    torch.empty((8192, 4), dtype=torch.float32, device=self.device)
+                    for _ in range(2)
+                ]
+                if not self.is_first_pp
+                else []
+            )
         else:
             self._pp_inter_hidden = None
             self._pp_inter_pre_mix = None
@@ -990,6 +1011,8 @@ class DeepSeekV41StepRunner:
             self._pp_seq_lens_cpu = []
             self._pp_seq_lens_gpu = []
             self._pp_is_pref_cpu = []
+            self._pp_recv_h_bufs = []
+            self._pp_recv_p_bufs = []
 
         # Decode-only static arange query_start_loc `[0, 1, 2, ..., ms]`
         self.decode_qsl_gpu: torch.Tensor = torch.arange(
@@ -1711,6 +1734,8 @@ class DeepSeekV41StepRunner:
         pos_i64: np.ndarray,
         need_hidden: bool = True,
         capture_aux: bool = False,
+        inline_dspark_ctx: bool = False,
+        sample_rows_np: np.ndarray | None = None,
     ) -> tuple[torch.Tensor | None, list[torch.Tensor] | None]:
         """PP=2 x TP=4 intra-step K-microbatch pipelined prefill."""
         from vllm.config import CUDAGraphMode
@@ -1721,12 +1746,10 @@ class DeepSeekV41StepRunner:
         assert self._pp_is_pref_cpu is not None
 
         min_k = max(1, (total_tokens + 8191) // 8192)
+        target_k = max(2 if total_tokens >= 4096 else 1, (total_tokens + 2048) // 4096)
         k = max(
             min_k,
-            min(
-                self.runtime_config.pp_prefill_microbatches,
-                max(1, total_tokens // 1024),
-            ),
+            min(self.runtime_config.pp_prefill_microbatches, target_k),
         )
         slices = self._compute_pp_microbatch_slices(
             total_tokens, num_seqs, q_start_np, pos_i64, k
@@ -1746,9 +1769,19 @@ class DeepSeekV41StepRunner:
         if saved_aux:
             dsv4_core.aux_hidden_state_layers = ()
 
+        compact_sample_rows = (
+            sample_rows_np
+            if (self.is_last_pp and need_hidden and sample_rows_np is not None and len(sample_rows_np) > 0)
+            else None
+        )
         hidden_out: torch.Tensor | None = (
             torch.empty(
-                (total_tokens, self.hidden_size),
+                (
+                    len(compact_sample_rows)
+                    if compact_sample_rows is not None
+                    else total_tokens,
+                    self.hidden_size,
+                ),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
@@ -1762,12 +1795,20 @@ class DeepSeekV41StepRunner:
             from vllm.sequence import IntermediateTensors
 
             u0_toks = slices[0][1] - slices[0][0]
-            h0 = torch.empty(
-                (u0_toks, 4, self.hidden_size),
-                dtype=torch.bfloat16,
-                device=self.device,
+            h0 = (
+                self._pp_recv_h_bufs[0][:u0_toks]
+                if u0_toks <= 8192 and self._pp_recv_h_bufs
+                else torch.empty(
+                    (u0_toks, 4, self.hidden_size),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
             )
-            p0 = torch.empty((u0_toks, 4), dtype=torch.float32, device=self.device)
+            p0 = (
+                self._pp_recv_p_bufs[0][:u0_toks]
+                if u0_toks <= 8192 and self._pp_recv_p_bufs
+                else torch.empty((u0_toks, 4), dtype=torch.float32, device=self.device)
+            )
             next_recv = (self._pp_irecv_intermediate(h0, p0), h0, p0)
         try:
             for u_idx, (
@@ -1831,7 +1872,7 @@ class DeepSeekV41StepRunner:
                     p_send = inter["pre_mix"].contiguous()
                     reqs = self._pp_send_intermediate(h_send, p_send)
                     in_flight.append((reqs, h_send, p_send))
-                    if len(in_flight) >= 2:
+                    if len(in_flight) >= 3:
                         old_reqs, _, _ = in_flight.pop(0)
                         for req in old_reqs:
                             req.wait()
@@ -1843,13 +1884,22 @@ class DeepSeekV41StepRunner:
                         req.wait()
                     if u_idx + 1 < len(slices):
                         un_toks = slices[u_idx + 1][1] - slices[u_idx + 1][0]
-                        hn = torch.empty(
-                            (un_toks, 4, self.hidden_size),
-                            dtype=torch.bfloat16,
-                            device=self.device,
+                        next_slot = (u_idx + 1) & 1
+                        hn = (
+                            self._pp_recv_h_bufs[next_slot][:un_toks]
+                            if un_toks <= 8192 and self._pp_recv_h_bufs
+                            else torch.empty(
+                                (un_toks, 4, self.hidden_size),
+                                dtype=torch.bfloat16,
+                                device=self.device,
+                            )
                         )
-                        pn = torch.empty(
-                            (un_toks, 4), dtype=torch.float32, device=self.device
+                        pn = (
+                            self._pp_recv_p_bufs[next_slot][:un_toks]
+                            if un_toks <= 8192 and self._pp_recv_p_bufs
+                            else torch.empty(
+                                (un_toks, 4), dtype=torch.float32, device=self.device
+                            )
                         )
                         next_recv = (self._pp_irecv_intermediate(hn, pn), hn, pn)
                     inter = IntermediateTensors(
@@ -1872,19 +1922,32 @@ class DeepSeekV41StepRunner:
                     else:
                         h_u, aux_u = out_u, None
                     if hidden_out is not None:
-                        hidden_out[lo:hi].copy_(h_u)
+                        if compact_sample_rows is not None:
+                            for s_idx, s_row in enumerate(compact_sample_rows):
+                                r_int = int(s_row)
+                                if lo <= r_int < hi:
+                                    hidden_out[s_idx].copy_(h_u[r_int - lo])
+                        else:
+                            hidden_out[lo:hi].copy_(h_u)
                     if capture_aux and aux_u is not None:
-                        if aux_out is None:
-                            aux_out = [
-                                torch.empty(
-                                    (total_tokens, t.shape[-1]),
-                                    dtype=t.dtype,
-                                    device=self.device,
-                                )
-                                for t in aux_u
-                            ]
-                        for a_dst, a_src in zip(aux_out, aux_u, strict=True):
-                            a_dst[lo:hi].copy_(a_src)
+                        if inline_dspark_ctx and self.dspark_drafter is not None:
+                            self.dspark_drafter.store_prefill_microbatch_ctx(
+                                aux_u,
+                                positions_full[lo:hi],
+                                swa_slot_map_full[lo:hi],
+                            )
+                        else:
+                            if aux_out is None:
+                                aux_out = [
+                                    torch.empty(
+                                        (total_tokens, t.shape[-1]),
+                                        dtype=t.dtype,
+                                        device=self.device,
+                                    )
+                                    for t in aux_u
+                                ]
+                            for a_dst, a_src in zip(aux_out, aux_u, strict=True):
+                                a_dst[lo:hi].copy_(a_src)
         finally:
             if saved_aux:
                 dsv4_core.aux_hidden_state_layers = saved_aux
@@ -3347,6 +3410,7 @@ class DeepSeekV41StepRunner:
         q_start_np: np.ndarray,
         pt_np: np.ndarray,
         aux_hidden_states: list[torch.Tensor] | None,
+        dspark_ctx_prestored: bool = False,
     ) -> list[SeqResult]:
         tokens = self._out_tokens_np[parity][:num_sample, 0]
         logprobs = self._out_logprobs_np[parity][:num_sample, 0]
@@ -3360,7 +3424,7 @@ class DeepSeekV41StepRunner:
         )
         drafts: dict[int, list[int]] = {}
         if self.dspark_drafter is not None:
-            if aux_hidden_states is None:
+            if not dspark_ctx_prestored and aux_hidden_states is None:
                 raise RuntimeError("DSpark target forward returned no auxiliary hidden states")
             drafts = self.dspark_drafter.draft(
                 verified,
@@ -3369,6 +3433,7 @@ class DeepSeekV41StepRunner:
                 req_slot_ids=slot_np,
                 query_start_loc=q_start_np,
                 page_table=pt_np,
+                ctx_prestored=dspark_ctx_prestored,
             )
         return seq_results(verified, drafts) if self.is_result_rank else []
 
@@ -3544,6 +3609,7 @@ class DeepSeekV41StepRunner:
             and (is_uniform_verify or is_ragged_verify)
         )
         aux_hidden_states: list[torch.Tensor] | None = None
+        dspark_ctx_prestored: bool = False
         self._last_verify_bt_sig = None
         self._last_verify_graph_bucket = None
         self._h2d_done_event.synchronize()
@@ -4179,6 +4245,12 @@ class DeepSeekV41StepRunner:
                         else None
                     )
                 elif use_pp2_prefill:
+                    dspark_ctx_prestored = (
+                        self.is_last_pp
+                        and is_spec_step
+                        and self.dspark_drafter is not None
+                        and num_sample <= num_seqs
+                    )
                     hidden, aux_hidden_states = self._run_prefill_pp2(
                         total_tokens=total_tokens,
                         num_seqs=num_seqs,
@@ -4186,6 +4258,8 @@ class DeepSeekV41StepRunner:
                         pos_i64=pos_i64,
                         need_hidden=(num_sample > 0),
                         capture_aux=is_spec_step,
+                        inline_dspark_ctx=dspark_ctx_prestored,
+                        sample_rows_np=sample_rows_np if num_sample > 0 else None,
                     )
                 elif use_tbo:
                     hidden, aux_hidden_states = self._run_prefill_tbo(
@@ -4251,7 +4325,7 @@ class DeepSeekV41StepRunner:
                 if self.is_last_pp and num_sample > 0:
                     local_logits = self._sample_rows_into_argmax(
                         hidden,
-                        self.sample_rows_gpu[:num_sample],
+                        None if use_pp2_prefill else self.sample_rows_gpu[:num_sample],
                         num_sample,
                         all_ranks=(is_spec_step or is_decode),
                         return_local_logits=is_sampling,
@@ -4288,6 +4362,7 @@ class DeepSeekV41StepRunner:
                 q_start_np=q_start_np.copy(),
                 pt_np=pt_np.copy(),
                 aux_hidden_states=aux_hidden_states,
+                dspark_ctx_prestored=dspark_ctx_prestored,
             )
             if (is_spec_step and self.is_last_pp)
             else None
@@ -4318,6 +4393,7 @@ class DeepSeekV41StepRunner:
                 q_start_np=ctx.q_start_np,
                 pt_np=ctx.pt_np,
                 aux_hidden_states=ctx.aux_hidden_states,
+                dspark_ctx_prestored=ctx.dspark_ctx_prestored,
             )
             self.end_events[p].record()
             self.end_events[p].synchronize()
