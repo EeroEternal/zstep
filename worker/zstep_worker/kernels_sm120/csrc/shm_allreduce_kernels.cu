@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -43,6 +44,26 @@ __device__ __forceinline__ void sys_store_release_u64(uint64_t* addr, uint64_t v
 
 __device__ __forceinline__ void gpu_store_release_u64(uint64_t* addr, uint64_t val) {
     asm volatile("st.global.release.gpu.b64 [%0], %1;" :: "l"(addr), "l"(val) : "memory");
+}
+
+__device__ __forceinline__ void pdl_launch_dependents() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+
+inline bool sm120_pdl_enabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("ZSTEP_SM120_PDL");
+        return v == nullptr || (v[0] != '0' || v[1] != '\0');
+    }();
+    return enabled;
 }
 __device__ __forceinline__ bool gpu_spin_wait_ge_u64(const uint64_t* flag_addr, uint64_t target, const uint64_t* abort_addr) {
     uint32_t iters = 0;
@@ -585,6 +606,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         }
         __syncthreads();
         if (s_aborted) { signal_ar_cta_done(); return; }
+        pdl_launch_dependents();
         for (int64_t p = p_fb + tid; p < p_fe; p += blockDim.x) {
             const int h_par = (p < p_fm) ? 0 : 1;
             uint4 pkts[4];
@@ -669,6 +691,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             return;
         }
 
+        pdl_launch_dependents();
         for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
             const int h_par = (idx < c_mid) ? 0 : 1;
             float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
@@ -923,6 +946,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                 return;
             }
 
+            pdl_launch_dependents();
             for (int k = 1; k < 4; ++k) {
                 const int q = (pair_id + k) & 3;
                 const uint4* o_red = reinterpret_cast<const uint4*>(
@@ -978,6 +1002,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                 return;
             }
 
+            pdl_launch_dependents();
             for (int k = 1; k < 4; ++k) {
                 const int q = (pair_id + k) & 3;
                 const int64_t qb = (pt_pb + (pt_pairs * q) / 4) << 1;
@@ -2623,11 +2648,13 @@ __global__ __launch_bounds__(640, 1) void sm120_mhc_post_collapse_rmsnorm_kernel
     const int64_t base_x = static_cast<int64_t>(tok) * 640 + tid;
     const int64_t base_r = static_cast<int64_t>(tok) * 2560 + tid;
     Pack128Bf16 dx, b0, b1, b2, b3, nr0, nr1, nr2, nr3, aux_pack, w_pack, out_pack;
-    dx.u4 = x_vec[base_x];
     b0.u4 = res_vec[base_r];
     b1.u4 = res_vec[base_r + 640];
     b2.u4 = res_vec[base_r + 1280];
     b3.u4 = res_vec[base_r + 1920];
+    if (!post_only) w_pack.u4 = norm_weight_vec[tid];
+    if (ar_cta_done == nullptr) pdl_wait();
+    dx.u4 = x_vec[base_x];
     float collapsed[8], thread_sq = 0.0f;
 
     #pragma unroll
@@ -2672,7 +2699,6 @@ __global__ __launch_bounds__(640, 1) void sm120_mhc_post_collapse_rmsnorm_kernel
         }
         __syncthreads();
 
-        w_pack.u4 = norm_weight_vec[tid];
         #pragma unroll
         for (int e = 0; e < 8; ++e) {
             out_pack.elems[e] = __float2bfloat16_rn(collapsed[e] * s_inv_rms * __bfloat162float(w_pack.elems[e]));
@@ -2681,6 +2707,7 @@ __global__ __launch_bounds__(640, 1) void sm120_mhc_post_collapse_rmsnorm_kernel
     }
     if (ar_cta_done != nullptr) __syncthreads();
     }
+    if (ar_cta_done == nullptr) pdl_launch_dependents();
 }
 
 // 4-token-per-CTA 16-lane warp-shuffle 4x4 Sinkhorn coefficient generator for SM120 mHC overlap.
@@ -3391,6 +3418,37 @@ void launch_mhc_post_collapse_rmsnorm_cuda(
     if (num_tokens <= 0) return;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
     const int grid = (ar_cta_done_ptr != 0) ? 120 : num_tokens;
+    if (ar_cta_done_ptr == 0 && sm120_pdl_enabled()) {
+        cudaLaunchConfig_t config = {};
+        config.gridDim = dim3(grid, 1, 1);
+        config.blockDim = dim3(640, 1, 1);
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attr[1];
+        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = attr;
+        config.numAttrs = 1;
+        ZSTEP_CUDA_CHECK(cudaLaunchKernelEx(
+            &config,
+            sm120_mhc_post_collapse_rmsnorm_kernel,
+            reinterpret_cast<const uint4*>(x_ptr),
+            reinterpret_cast<uint4*>(residual_ptr),
+            post_mix_ptr,
+            comb_mix_ptr,
+            pre_mix_ptr,
+            reinterpret_cast<const uint4*>(norm_weight_ptr),
+            reinterpret_cast<uint4*>(layer_input_ptr),
+            reinterpret_cast<uint4*>(aux_out_ptr),
+            norm_eps,
+            write_aux,
+            post_only,
+            num_tokens,
+            ar_blocks,
+            reinterpret_cast<const uint64_t*>(ar_cta_done_ptr),
+            reinterpret_cast<uint64_t*>(ar_cta_wait_ptr)));
+        return;
+    }
     sm120_mhc_post_collapse_rmsnorm_kernel<<<grid, 640, 0, stream>>>(
         reinterpret_cast<const uint4*>(x_ptr),
         reinterpret_cast<uint4*>(residual_ptr),
