@@ -355,3 +355,98 @@ def test_deepseek_v41_dspark_guards_max_context_page_table_bounds(monkeypatch):
     ]
     assert int(drafter.draft_positions_gpu[:k].max().item()) == 255
 
+
+def test_ragged_verify_graph_eligibility_and_packing() -> None:
+    pytest.importorskip("torch")
+    from zstep_worker.models.deepseek_v41 import DeepSeekV41StepRunner
+
+    # 3 sequences with ragged q_lens=[4, 2, 1], width=4, v_bucket=4
+    q_start = np.array([0, 4, 6, 7], dtype=np.int32)
+    q_lens = np.diff(q_start)
+    pos = np.array([100, 101, 102, 103, 200, 201, 300], dtype=np.int32)
+    seq_lens = np.array([104, 202, 301], dtype=np.int32)
+    sample_rows = np.arange(7, dtype=np.int32)
+
+    assert DeepSeekV41StepRunner._can_use_ragged_verify_graph(
+        q_start_np=q_start,
+        q_lens=q_lens,
+        pos_np=pos,
+        seq_lens_np=seq_lens,
+        sample_rows_np=sample_rows,
+        total_tokens=7,
+        width=4,
+        max_seq_len=131072,
+    )
+
+    # Reject when padding crosses a 128-token page boundary (pos=126 with q_len=2 -> 128).
+    pos_cross = np.array([100, 101, 102, 103, 125, 126, 300], dtype=np.int32)
+    seq_cross = np.array([104, 127, 301], dtype=np.int32)
+    assert not DeepSeekV41StepRunner._can_use_ragged_verify_graph(
+        q_start_np=q_start,
+        q_lens=q_lens,
+        pos_np=pos_cross,
+        seq_lens_np=seq_cross,
+        sample_rows_np=sample_rows,
+        total_tokens=7,
+        width=4,
+        max_seq_len=131072,
+    )
+
+    # Reject prefill rows starting at pos=0.
+    pos_zero = np.array([100, 101, 102, 103, 200, 201, 0], dtype=np.int32)
+    seq_zero = np.array([104, 202, 1], dtype=np.int32)
+    assert not DeepSeekV41StepRunner._can_use_ragged_verify_graph(
+        q_start_np=q_start,
+        q_lens=q_lens,
+        pos_np=pos_zero,
+        seq_lens_np=seq_zero,
+        sample_rows_np=sample_rows,
+        total_tokens=7,
+        width=4,
+        max_seq_len=131072,
+    )
+
+    # Verify packing preserves causal windows (seq_len + pad), -1 slot mapping on padded
+    # rows, and exact compaction indices.
+    v_bucket, width = 4, 4
+    rows = v_bucket * width
+    tok_np = np.array([11, 12, 13, 14, 21, 22, 31], dtype=np.int32)
+    sm_packed = np.array([1000, 1001, 1002, 1003, 2000, 2001, 3000], dtype=np.int64)
+    swa_packed = np.array([500, 501, 502, 503, 600, 601, 700], dtype=np.int64)
+    tok_buf = np.zeros(rows, dtype=np.int32)
+    pos_buf = np.zeros(rows, dtype=np.int64)
+    sl_buf = np.zeros(v_bucket, dtype=np.int32)
+    sm_buf = np.zeros(rows, dtype=np.int64)
+    swa_buf = np.zeros(rows, dtype=np.int64)
+    real_rows = np.zeros(7, dtype=np.int64)
+
+    DeepSeekV41StepRunner._pack_ragged_verify_buffers(
+        num_seqs=3,
+        v_bucket=v_bucket,
+        width=width,
+        q_start_np=q_start,
+        q_lens=q_lens,
+        tok_np=tok_np,
+        pos_i64=pos.astype(np.int64),
+        seq_lens_np=seq_lens,
+        sm_packed=sm_packed,
+        swa_sm_packed=swa_packed,
+        tok_cpu_np=tok_buf,
+        pos_cpu_np=pos_buf,
+        sl_cpu_np=sl_buf,
+        sm_cpu_np=sm_buf,
+        swa_sm_np=swa_buf,
+        real_rows_np=real_rows,
+    )
+
+    assert real_rows.tolist() == [0, 1, 2, 3, 4, 5, 8]
+    assert sl_buf.tolist() == [104, 204, 304, 4]
+    assert tok_buf[real_rows].tolist() == tok_np.tolist()
+    assert sm_buf[real_rows].tolist() == sm_packed.tolist()
+    assert swa_buf[real_rows].tolist() == swa_packed.tolist()
+    padded_idx = [i for i in range(rows) if i not in set(real_rows.tolist())]
+    assert all(sm_buf[i] == -1 and swa_buf[i] == -1 for i in padded_idx)
+    assert pos_buf[4:8].tolist() == [200, 201, 202, 203]
+    assert pos_buf[8:12].tolist() == [300, 301, 302, 303]
+
+
