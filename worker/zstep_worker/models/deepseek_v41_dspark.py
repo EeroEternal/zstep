@@ -119,6 +119,7 @@ class DeepSeekV41DSparkDrafter:
             (k, max_b), dtype=torch.int32, pin_memory=True
         )
         self.draft_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.ctx_store_graphs: dict[int, torch.cuda.CUDAGraph] = {}
 
     def _run_draft_forward_and_markov(self, b: int) -> None:
         runner = self.runner
@@ -178,7 +179,7 @@ class DeepSeekV41DSparkDrafter:
             sl_cpu = torch.full((b,), k, dtype=torch.int32)
 
             with torch.cuda.stream(capture_stream):
-                for _ in range(2):
+                for w_idx in range(2):
                     attn_meta = runner._build_step_attn_metadata(
                         num_reqs=b,
                         num_tokens=rows,
@@ -191,7 +192,7 @@ class DeepSeekV41DSparkDrafter:
                         positions_gpu=self.draft_positions_gpu[:rows],
                         slot_mapping_gpu=self.draft_slot_mapping_gpu[:rows],
                         is_prefilling_cpu=runner.decode_is_prefilling_cpu[:b],
-                        for_capture=True,
+                        for_capture=(w_idx == 0),
                         causal=False,
                         only_layer_names=self.layer_names,
                     )
@@ -231,13 +232,68 @@ class DeepSeekV41DSparkDrafter:
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             ):
                 with torch.cuda.graph(g, pool=graph_pool, stream=capture_stream):
+                    runner._build_step_attn_metadata(
+                        num_reqs=b,
+                        num_tokens=rows,
+                        max_query_len=k,
+                        max_seq_len=runner.decode_graph_max_seq_len,
+                        qsl_gpu=self.draft_qsl_gpu[: b + 1],
+                        qsl_cpu=self.draft_qsl_cpu[: b + 1],
+                        seq_lens_gpu=runner.seq_lens_gpu[:b],
+                        seq_lens_cpu=sl_cpu,
+                        positions_gpu=self.draft_positions_gpu[:rows],
+                        slot_mapping_gpu=self.draft_slot_mapping_gpu[:rows],
+                        is_prefilling_cpu=runner.decode_is_prefilling_cpu[:b],
+                        for_capture=False,
+                        causal=False,
+                        only_layer_names=self.layer_names,
+                    )
                     self._run_draft_forward_and_markov(b)
             capture_stream.synchronize()
             dist.barrier(group=runner.exchange_group)
             self.draft_graphs[b] = g
 
+        # Capture fused combine_hidden_states + precompute_and_store_context_kv graphs
+        # for each verify graph bucket (slot_mapping == -1 skips rejected/padded rows).
+        width = k + 1
+        for v_bucket, raw_aux in getattr(runner, "verify_graph_aux", {}).items():
+            if raw_aux is None:
+                continue
+            v_rows = v_bucket * width
+            if v_rows > self.ctx_slot_mapping_gpu.shape[0]:
+                continue
+            runner.positions_gpu[:v_rows].copy_(
+                torch.arange(v_rows, dtype=torch.int64, device=runner.device) % width
+            )
+            self.ctx_slot_mapping_gpu[:v_rows].fill_(-1)
+            slot_view = self.ctx_slot_mapping_gpu[:v_rows]
+            with torch.cuda.stream(capture_stream):
+                for _ in range(2):
+                    main_x = self.model.combine_hidden_states(
+                        torch.cat(raw_aux, dim=-1)
+                    )
+                    self.model.precompute_and_store_context_kv(
+                        main_x,
+                        runner.positions_gpu[:v_rows],
+                        [slot_view] * self.num_draft_layers,
+                    )
+            capture_stream.synchronize()
+            dist.barrier(group=runner.exchange_group)
+            ctx_g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(ctx_g, pool=graph_pool, stream=capture_stream):
+                main_x = self.model.combine_hidden_states(torch.cat(raw_aux, dim=-1))
+                self.model.precompute_and_store_context_kv(
+                    main_x,
+                    runner.positions_gpu[:v_rows],
+                    [slot_view] * self.num_draft_layers,
+                )
+            capture_stream.synchronize()
+            dist.barrier(group=runner.exchange_group)
+            self.ctx_store_graphs[v_bucket] = ctx_g
+
     def close(self) -> None:
         self.draft_graphs.clear()
+        self.ctx_store_graphs.clear()
 
     def _store_contexts_batched(
         self,
@@ -423,27 +479,25 @@ class DeepSeekV41DSparkDrafter:
             self.draft_slot_mapping_cpu[:rows], non_blocking=True
         )
 
-        attn_meta = runner._build_step_attn_metadata(
-            num_reqs=eff_b,
-            num_tokens=rows,
-            max_query_len=k,
-            max_seq_len=(
-                runner.decode_graph_max_seq_len if use_graph else max_s_len
-            ),
-            qsl_gpu=self.draft_qsl_gpu[: eff_b + 1],
-            qsl_cpu=self.draft_qsl_cpu[: eff_b + 1],
-            seq_lens_gpu=runner.seq_lens_gpu[:eff_b],
-            seq_lens_cpu=runner.seq_lens_cpu[:eff_b],
-            positions_gpu=self.draft_positions_gpu[:rows],
-            slot_mapping_gpu=self.draft_slot_mapping_gpu[:rows],
-            is_prefilling_cpu=runner.decode_is_prefilling_cpu[:eff_b],
-            for_capture=False,
-            causal=False,
-            only_layer_names=self.layer_names,
-        )
         if use_graph:
             self.draft_graphs[eff_b].replay()
         else:
+            attn_meta = runner._build_step_attn_metadata(
+                num_reqs=eff_b,
+                num_tokens=rows,
+                max_query_len=k,
+                max_seq_len=max_s_len,
+                qsl_gpu=self.draft_qsl_gpu[: eff_b + 1],
+                qsl_cpu=self.draft_qsl_cpu[: eff_b + 1],
+                seq_lens_gpu=runner.seq_lens_gpu[:eff_b],
+                seq_lens_cpu=runner.seq_lens_cpu[:eff_b],
+                positions_gpu=self.draft_positions_gpu[:rows],
+                slot_mapping_gpu=self.draft_slot_mapping_gpu[:rows],
+                is_prefilling_cpu=runner.decode_is_prefilling_cpu[:eff_b],
+                for_capture=False,
+                causal=False,
+                only_layer_names=self.layer_names,
+            )
             with set_forward_context(
                 attn_meta,
                 runner.vllm_config,
@@ -479,41 +533,76 @@ class DeepSeekV41DSparkDrafter:
         query_start_loc: np.ndarray,
         page_table: np.ndarray,
     ) -> dict[int, list[int]]:
-        main_x = self.model.combine_hidden_states(
-            torch.cat(aux_hidden_states, dim=-1)
-        )
-        by_seq = {sequence.batch_index: sequence for sequence in verified}
-        ctx_row_parts: list[np.ndarray] = []
-        ctx_slot_parts: list[np.ndarray] = []
-        for seq_idx in range(len(query_start_loc) - 1):
-            begin = int(query_start_loc[seq_idx])
-            end = int(query_start_loc[seq_idx + 1])
-            if end <= begin:
-                continue
-            sequence = by_seq.get(seq_idx)
-            if sequence is None or len(sequence.rows) == 1:
-                rows_arr = np.arange(begin, end, dtype=np.intp)
-                req_slot = (
-                    int(req_slot_ids[begin]) if sequence is None else sequence.req_slot
-                )
-            else:
-                accepted_count = len(sequence.accepted_tokens)
-                rows_arr = np.asarray(sequence.rows[:accepted_count], dtype=np.intp)
-                req_slot = sequence.req_slot
-            if rows_arr.size > 0:
-                ctx_row_parts.append(rows_arr)
-                ctx_slot_parts.append(np.full(rows_arr.size, req_slot, dtype=np.intp))
-
-        if ctx_row_parts:
-            self._store_contexts_batched(
-                main_x=main_x,
-                ctx_rows=np.concatenate(ctx_row_parts),
-                ctx_slots=np.concatenate(ctx_slot_parts),
-                positions=positions,
-                page_table=page_table,
-            )
-
         max_ctx = min(self.runner.max_model_len, page_table.shape[1] * 128)
+        ctx_v_bucket = getattr(self.runner, "_last_verify_graph_bucket", None)
+        if (
+            ctx_v_bucket is not None
+            and ctx_v_bucket in self.ctx_store_graphs
+            and len(verified) == len(query_start_loc) - 1
+        ):
+            v_rows = ctx_v_bucket * (self.num_draft_tokens + 1)
+            dst_sm = self.ctx_slot_mapping_cpu[:v_rows].numpy()
+            dst_sm[:] = -1
+            src_sm_tensor = (
+                self.runner.swa_slot_mapping_cpu
+                if getattr(self.runner, "_swa_pool", None) is not None
+                else self.runner.slot_mapping_cpu
+            )
+            src_sm = src_sm_tensor[:v_rows].numpy()
+            has_valid_ctx = False
+            for sequence in verified:
+                acc = len(sequence.accepted_tokens)
+                for row_idx in sequence.rows[:acc]:
+                    pos_val = int(positions[row_idx])
+                    if 0 <= pos_val < max_ctx and (pos_val // 128) < page_table.shape[1]:
+                        dst_sm[row_idx] = src_sm[row_idx]
+                        has_valid_ctx = True
+            if has_valid_ctx:
+                self.ctx_slot_mapping_gpu[:v_rows].copy_(
+                    self.ctx_slot_mapping_cpu[:v_rows], non_blocking=True
+                )
+                self.ctx_store_graphs[ctx_v_bucket].replay()
+        else:
+            main_x = self.model.combine_hidden_states(
+                torch.cat(aux_hidden_states, dim=-1)
+            )
+            by_seq = {sequence.batch_index: sequence for sequence in verified}
+            ctx_row_parts: list[np.ndarray] = []
+            ctx_slot_parts: list[np.ndarray] = []
+            for seq_idx in range(len(query_start_loc) - 1):
+                begin = int(query_start_loc[seq_idx])
+                end = int(query_start_loc[seq_idx + 1])
+                if end <= begin:
+                    continue
+                sequence = by_seq.get(seq_idx)
+                if sequence is None or len(sequence.rows) == 1:
+                    rows_arr = np.arange(begin, end, dtype=np.intp)
+                    req_slot = (
+                        int(req_slot_ids[begin])
+                        if sequence is None
+                        else sequence.req_slot
+                    )
+                else:
+                    accepted_count = len(sequence.accepted_tokens)
+                    rows_arr = np.asarray(
+                        sequence.rows[:accepted_count], dtype=np.intp
+                    )
+                    req_slot = sequence.req_slot
+                if rows_arr.size > 0:
+                    ctx_row_parts.append(rows_arr)
+                    ctx_slot_parts.append(
+                        np.full(rows_arr.size, req_slot, dtype=np.intp)
+                    )
+
+            if ctx_row_parts:
+                self._store_contexts_batched(
+                    main_x=main_x,
+                    ctx_rows=np.concatenate(ctx_row_parts),
+                    ctx_slots=np.concatenate(ctx_slot_parts),
+                    positions=positions,
+                    page_table=page_table,
+                )
+
         eligible = [
             seq
             for seq in verified
