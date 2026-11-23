@@ -70,7 +70,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v30_ext",
+            name="zstep_shm_allreduce_sm120_v31_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -292,7 +292,7 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
                     extension=self._extension,
                 )
                 self._registered = True
-                if world_size == 8:
+                if world_size in (4, 8):
                     self._init_pxb_ipc(
                         exchange_group=exchange_group,
                         want_pxb=enable_pxb_p2p,

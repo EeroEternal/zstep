@@ -344,6 +344,14 @@ class RuntimeLoop:
         # Pin host CPU affinity to this rank's PCIe NUMA domain BEFORE touching SHM or CUDA.
         self.numa_topology: DeviceNumaTopology = pin_process_to_device_numa(args.rank)
         self.bridge = ShmBridge(name=args.shm_name, shm_fd=args.shm_fd)
+        pp_size = self.runtime_config.pipeline_parallel_size
+        ws = self.bridge.superblock.geometry.world_size
+        if pp_size not in (1, 2) or (ws % pp_size) != 0:
+            raise ValueError(
+                f"Invalid ZSTEP_PIPELINE_PARALLEL_SIZE={pp_size} for world_size={ws}"
+            )
+        self._result_rank: int = (pp_size - 1) * (ws // pp_size)
+        self._is_result_rank: bool = args.rank == self._result_rank
         self.runner: object | None = None
         self._watchdog_stop = threading.Event()
         self.bridge.touch_heartbeat(args.rank)
@@ -457,7 +465,7 @@ class RuntimeLoop:
     def _complete_step(
         self, step_id: int, outputs: list, gpu_exec_us: int, watched_count: int
     ) -> None:
-        if self.args.rank == 0:
+        if self._is_result_rank:
             self.bridge.result(step_id).write(
                 step_id=step_id,
                 gpu_exec_us=gpu_exec_us,
@@ -573,7 +581,7 @@ class RuntimeLoop:
                             )
                         self._prefill_runahead.drain()
                         recompiled_count = sum(spy.call_count for _, spy in spies)
-                        if self.args.rank == 0:
+                        if self._is_result_rank:
                             self.bridge.result(header.step_id).write(
                                 step_id=header.step_id,
                                 gpu_exec_us=0,
@@ -668,7 +676,7 @@ class RuntimeLoop:
     def report_error(self, error: BaseException) -> None:
         print(f"rank {self.args.rank}: {type(error).__name__}: {error}", flush=True)
         traceback.print_exc()
-        if self.args.rank == 0 and self.current_step > 0 and self.last_step < self.current_step:
+        if self._is_result_rank and self.current_step > 0 and self.last_step < self.current_step:
             self.bridge.result(self.current_step).write(
                 step_id=self.current_step,
                 gpu_exec_us=0,

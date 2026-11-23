@@ -529,8 +529,24 @@ class DeepSeekV41StepRunner:
         self.world_size: int = self.geometry.world_size
         if self.world_size != 8:
             raise ValueError(
-                f"DeepSeekV41StepRunner requires TP=8, got world_size={self.world_size}"
+                f"DeepSeekV41StepRunner requires world_size=8, got world_size={self.world_size}"
             )
+        self.pp_size: int = self.runtime_config.pipeline_parallel_size
+        if self.pp_size not in (1, 2) or (self.world_size % self.pp_size) != 0:
+            raise ValueError(
+                f"Unsupported pipeline_parallel_size={self.pp_size} for world_size={self.world_size}"
+            )
+        self.tp_size: int = self.world_size // self.pp_size
+        self.pp_rank: int = self.rank // self.tp_size
+        self.tp_rank: int = self.rank % self.tp_size
+        self.is_first_pp: bool = self.pp_rank == 0
+        self.is_last_pp: bool = self.pp_rank == self.pp_size - 1
+        self.is_result_rank: bool = self.is_last_pp and self.tp_rank == 0
+        self._pp_peer: int = (
+            (self.rank + self.tp_size if self.is_first_pp else self.rank - self.tp_size)
+            if self.pp_size > 1
+            else -1
+        )
         if self.geometry.page_block_tokens != 128:
             raise ValueError(
                 f"DeepSeekV41StepRunner requires page_block_tokens=128, got {self.geometry.page_block_tokens}"
@@ -593,13 +609,18 @@ class DeepSeekV41StepRunner:
             block_size=128,
             max_model_len=self.max_model_len,
             max_num_seqs=self.max_seqs,
-            max_num_batched_tokens=max(self.max_step_tokens, 8192),
-            tensor_parallel_size=self.world_size,
-            distributed_executor_backend="external_launcher",
+            max_num_batched_tokens=(
+                8192 if self.pp_size > 1 else max(self.max_step_tokens, 8192)
+            ),
+            tensor_parallel_size=self.tp_size,
+            pipeline_parallel_size=self.pp_size,
+            distributed_executor_backend=(
+                "mp" if self.pp_size > 1 else "external_launcher"
+            ),
             enforce_eager=True,
             enable_prefix_caching=False,
             limit_mm_per_prompt={"image": 0},
-            engram_config=EngramConfig(cpu_offload=False),
+            engram_config=EngramConfig(cpu_offload=(self.pp_size > 1)),
             speculative_config=(
                 {
                     "method": "dspark",
@@ -634,11 +655,57 @@ class DeepSeekV41StepRunner:
             local_rank=rank,
             backend="nccl",
         )
-        initialize_model_parallel(tensor_model_parallel_size=self.world_size)
+        initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            pipeline_model_parallel_size=self.pp_size,
+        )
         self.exchange_group: dist.ProcessGroup = get_world_group().cpu_group
+        tp_group_init = get_tp_group()
+        self.tp_cpu_group: dist.ProcessGroup = tp_group_init.cpu_group
         init_workspace_manager(self.device)
 
-        self.model = get_model(vllm_config=self.vllm_config)
+        # In PP>1 mode, keep the first `pp_engram_gpu_layers` Engram layers (e.g. L1,
+        # which has only 1 preceding layer to hide PCIe offload latency) resident on
+        # Stage 0 GPU while offloading later Engram layers (e.g. L14) to CPU.
+        pp_engram_gpu_layers = (
+            self.runtime_config.pp_engram_gpu_layers if self.pp_size > 1 else 0
+        )
+        orig_create_embedding = None
+        engram_cls = None
+        if pp_engram_gpu_layers > 0:
+            from vllm.models.deepseek_v41.nvidia import engram as dsv41_engram
+
+            engram_cls = dsv41_engram.Engram
+            orig_create_embedding = engram_cls._create_embedding
+
+            def _hybrid_create_embedding(
+                engram_self: Any, layout: Any, layer_hash_index: int
+            ) -> Any:
+                engram_cfg = self.vllm_config.engram_config
+                assert engram_cfg is not None
+                use_cpu_offload = (
+                    engram_cfg.cpu_offload
+                    and layer_hash_index >= pp_engram_gpu_layers
+                )
+                return dsv41_engram.ParallelEngramEmbedding(
+                    layout.num_embeddings[layer_hash_index],
+                    layout.head_dim,
+                    tuple(
+                        size
+                        for order in layout.primes[layer_hash_index]
+                        for size in order
+                    ),
+                    cpu_offload=use_cpu_offload,
+                    dp_shared_memory=bool(engram_cfg.dp_shared_memory),
+                    use_thp=engram_cfg.use_thp,
+                )
+
+            engram_cls._create_embedding = _hybrid_create_embedding
+        try:
+            self.model = get_model(vllm_config=self.vllm_config)
+        finally:
+            if engram_cls is not None and orig_create_embedding is not None:
+                engram_cls._create_embedding = orig_create_embedding
         self.model.eval()
         if self.spec_method == "dspark":
             draft_config = self.vllm_config.speculative_config.draft_model_config.hf_config
@@ -654,7 +721,7 @@ class DeepSeekV41StepRunner:
             self.model,
             rank=rank,
             device=self.device,
-            max_tokens=max(self.max_step_tokens, 8192),
+            max_tokens=(8192 if self.pp_size > 1 else max(self.max_step_tokens, 8192)),
             decode_buckets=DECODE_GRAPH_BUCKETS,
             exchange_group=self.exchange_group,
         )
@@ -672,12 +739,12 @@ class DeepSeekV41StepRunner:
             self.engram_depth = 3
 
         vocab_size = int(self.vllm_config.model_config.get_vocab_size())
-        if vocab_size % self.world_size != 0:
+        if vocab_size % self.tp_size != 0:
             raise ValueError(
-                f"vocab_size={vocab_size} must be divisible by world_size={self.world_size}"
+                f"vocab_size={vocab_size} must be divisible by tp_size={self.tp_size}"
             )
         self.vocab_size: int = vocab_size
-        self.vocab_per_rank: int = vocab_size // self.world_size
+        self.vocab_per_rank: int = vocab_size // self.tp_size
         self.hidden_size: int = int(self.vllm_config.model_config.get_hidden_size())
 
         # Load cached FlashInfer autotune configs if present in ~/.cache/flashinfer
@@ -697,20 +764,23 @@ class DeepSeekV41StepRunner:
         install_sm120_candidate_mqa_prefill_patch(self.model)
         dist.barrier(group=self.exchange_group)
 
-        # Initialize NUMA-local shm_v5 AllReduce, AllGather, and lock-free TP=8 Argmax
-        ar_max_tokens = max(self.max_step_tokens, 2048)
+        # Initialize NUMA-local shm_v5 AllReduce, AllGather, and lock-free TP Argmax
+        ar_max_tokens = (
+            8192 if self.pp_size > 1 else max(self.max_step_tokens, 2048)
+        )
         use_pxb_ar = self.p2p_report.pxb_shm_enabled
         pxb_ar_blocks = max(allreduce_blocks, 56) if use_pxb_ar else allreduce_blocks
         pxb_ag_blocks = max(allreduce_blocks, 32) if use_pxb_ar else allreduce_blocks
         pxb_ar_threads = max(allreduce_threads, 512) if use_pxb_ar else allreduce_threads
+        stage_suffix = f"_pp{self.pp_rank}" if self.pp_size > 1 else ""
         self.shm_ar: HostMappedShmAllReduce = HostMappedShmAllReduce(
-            name=allreduce_name,
-            rank=rank,
-            world_size=self.world_size,
+            name=f"{allreduce_name}{stage_suffix}",
+            rank=self.tp_rank,
+            world_size=self.tp_size,
             capacity_elements=ar_max_tokens * 8192,
             blocks=pxb_ar_blocks,
             threads=pxb_ar_threads,
-            exchange_group=self.exchange_group,
+            exchange_group=self.tp_cpu_group,
             enable_pxb_p2p=self.p2p_report.pxb_shm_enabled,
             pxb_max_elements=min(ar_max_tokens, 8192) * 5120,
             enable_pxb_bfp=self.runtime_config.shm_pxb_bfp_mode,
@@ -723,15 +793,15 @@ class DeepSeekV41StepRunner:
         self._tbo_ar_done_ev: list[torch.cuda.Event] = []
         self._tbo_cand_bufs: list[torch.Tensor] | None = None
         self._tbo_steps: int = 0
-        if use_pxb_ar and 0 < tbo_min_tok <= 2 * tbo_cap_tokens:
+        if self.pp_size == 1 and use_pxb_ar and 0 < tbo_min_tok <= 2 * tbo_cap_tokens:
             self.shm_ar_tbo = HostMappedShmAllReduce(
                 name=f"{allreduce_name}_tbo",
-                rank=rank,
-                world_size=self.world_size,
+                rank=self.tp_rank,
+                world_size=self.tp_size,
                 capacity_elements=tbo_cap_tokens * 5120,
                 blocks=self.runtime_config.prefill_tbo_ar_blocks,
                 threads=pxb_ar_threads,
-                exchange_group=self.exchange_group,
+                exchange_group=self.tp_cpu_group,
                 enable_pxb_p2p=True,
                 pxb_max_elements=tbo_cap_tokens * 5120,
                 enable_pxb_bfp=self.runtime_config.shm_pxb_bfp_mode,
@@ -746,22 +816,26 @@ class DeepSeekV41StepRunner:
                 torch.cuda.Event(enable_timing=False),
             ]
         self.shm_ag: HostMappedShmAllGather = HostMappedShmAllGather(
-            name=f"{allreduce_name}_ag",
-            rank=rank,
-            world_size=self.world_size,
+            name=f"{allreduce_name}_ag{stage_suffix}",
+            rank=self.tp_rank,
+            world_size=self.tp_size,
             capacity_input_elements=ar_max_tokens * 4096,
             blocks=pxb_ag_blocks,
             threads=pxb_ar_threads,
-            exchange_group=self.exchange_group,
+            exchange_group=self.tp_cpu_group,
         )
         self.shm_ag.attach_pxb_ipc(self.shm_ar)
-        self.argmax_channel: HostMappedShmArgmax = HostMappedShmArgmax(
-            name=f"{allreduce_name}_argmax",
-            rank=rank,
-            world_size=self.world_size,
-            device=self.device,
-            exchange_group=self.exchange_group,
-            max_rows_per_step=max(512, self.max_step_tokens, self.max_seqs),
+        self.argmax_channel: HostMappedShmArgmax | None = (
+            HostMappedShmArgmax(
+                name=f"{allreduce_name}_argmax{stage_suffix}",
+                rank=self.tp_rank,
+                world_size=self.tp_size,
+                device=self.device,
+                exchange_group=self.tp_cpu_group,
+                max_rows_per_step=max(512, self.max_step_tokens, self.max_seqs),
+            )
+            if self.is_last_pp
+            else None
         )
         self.shm_ar_calls: int = 0
         self.shm_ag_calls: int = 0
@@ -770,7 +844,35 @@ class DeepSeekV41StepRunner:
         tp_group = get_tp_group()
         self.tp_device_group = tp_group.device_group
         self._install_tp_shm_collectives(tp_group)
-        if self.spec_method == "dspark":
+        if self.spec_method == "dspark" and self.pp_size > 1:
+            # Share Stage 0's VocabParallelEmbedding weights with Stage 1 so
+            # DSparkDeepseekV4ForCausalLM can bind target_inner.embed_tokens.
+            from vllm.model_executor.layers.vocab_parallel_embedding import (
+                VocabParallelEmbedding,
+            )
+
+            t_lang = getattr(self.model, "language_model", self.model)
+            t_inner = getattr(t_lang, "model", t_lang)
+            if self.is_first_pp:
+                emb_w = t_inner.embed_tokens.weight.data.contiguous()
+                for req in dist.batch_isend_irecv(
+                    [dist.P2POp(dist.isend, emb_w, self._pp_peer)]
+                ):
+                    req.wait()
+            else:
+                emb_mod = VocabParallelEmbedding(
+                    self.vocab_size,
+                    self.hidden_size,
+                    prefix="language_model.model.embed_tokens",
+                ).to(device=self.device, dtype=torch.bfloat16)
+                for req in dist.batch_isend_irecv(
+                    [dist.P2POp(dist.irecv, emb_mod.weight.data, self._pp_peer)]
+                ):
+                    req.wait()
+                t_inner.embed_tokens = emb_mod
+            torch.cuda.synchronize(self.device)
+            dist.barrier(group=self.exchange_group)
+        if self.spec_method == "dspark" and self.is_last_pp:
             from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
             self.dspark_model = load_dspark_model(self.model, self.vllm_config)
@@ -785,10 +887,11 @@ class DeepSeekV41StepRunner:
                 self.dspark_model,
                 rank=rank,
                 device=self.device,
-                max_tokens=max(self.max_step_tokens, 8192),
+                max_tokens=(8192 if self.pp_size > 1 else max(self.max_step_tokens, 8192)),
                 decode_buckets=dspark_buckets,
-                exchange_group=self.exchange_group,
+                exchange_group=self.tp_cpu_group,
             )
+        dist.barrier(group=self.exchange_group)
         attach_sm120_mhc_shm_ar(self.device.index, self.shm_ar, self)
 
         # Reclaim transient b12x / weight-conversion blocks before large KV allocation
@@ -851,6 +954,42 @@ class DeepSeekV41StepRunner:
         self._verify_real_rows_gpu: torch.Tensor = torch.zeros(
             sc, dtype=torch.int64, device=self.device
         )
+        if self.pp_size > 1:
+            pp_g_rows = max(256, ms * max(1, self.num_spec_tokens + 1))
+            self._pp_inter_hidden: torch.Tensor | None = torch.zeros(
+                (pp_g_rows, 4, self.hidden_size), dtype=torch.bfloat16, device=self.device
+            )
+            self._pp_inter_pre_mix: torch.Tensor | None = torch.zeros(
+                (pp_g_rows, 4), dtype=torch.float32, device=self.device
+            )
+            pp_k = max(1, self.runtime_config.pp_prefill_microbatches)
+            self._pp_qsl_cpu: list[torch.Tensor] = [
+                torch.zeros(ms + 1, dtype=torch.int32, pin_memory=True)
+                for _ in range(pp_k)
+            ]
+            self._pp_qsl_gpu: list[torch.Tensor] = [
+                torch.zeros(ms + 1, dtype=torch.int32, device=self.device)
+                for _ in range(pp_k)
+            ]
+            self._pp_seq_lens_cpu: list[torch.Tensor] = [
+                torch.zeros(ms, dtype=torch.int32, pin_memory=True)
+                for _ in range(pp_k)
+            ]
+            self._pp_seq_lens_gpu: list[torch.Tensor] = [
+                torch.zeros(ms, dtype=torch.int32, device=self.device)
+                for _ in range(pp_k)
+            ]
+            self._pp_is_pref_cpu: list[torch.Tensor] = [
+                torch.zeros(ms, dtype=torch.bool) for _ in range(pp_k)
+            ]
+        else:
+            self._pp_inter_hidden = None
+            self._pp_inter_pre_mix = None
+            self._pp_qsl_cpu = []
+            self._pp_qsl_gpu = []
+            self._pp_seq_lens_cpu = []
+            self._pp_seq_lens_gpu = []
+            self._pp_is_pref_cpu = []
 
         # Decode-only static arange query_start_loc `[0, 1, 2, ..., ms]`
         self.decode_qsl_gpu: torch.Tensor = torch.arange(
@@ -1489,6 +1628,267 @@ class DeepSeekV41StepRunner:
                     attn_metadata[lname] = meta
         return attn_metadata
 
+    def _pp_send_intermediate(
+        self, hidden_states: torch.Tensor, pre_mix: torch.Tensor
+    ) -> list[Any]:
+        ops = [
+            dist.P2POp(dist.isend, hidden_states.contiguous(), self._pp_peer),
+            dist.P2POp(dist.isend, pre_mix.contiguous(), self._pp_peer),
+        ]
+        return dist.batch_isend_irecv(ops)
+
+    def _pp_irecv_intermediate(
+        self, hidden_states: torch.Tensor, pre_mix: torch.Tensor
+    ) -> list[Any]:
+        ops = [
+            dist.P2POp(dist.irecv, hidden_states, self._pp_peer),
+            dist.P2POp(dist.irecv, pre_mix, self._pp_peer),
+        ]
+        return dist.batch_isend_irecv(ops)
+
+    def _pp_recv_intermediate(
+        self, hidden_states: torch.Tensor, pre_mix: torch.Tensor
+    ) -> Any:
+        from vllm.sequence import IntermediateTensors
+
+        for req in self._pp_irecv_intermediate(hidden_states, pre_mix):
+            req.wait()
+        return IntermediateTensors(
+            {"hidden_states": hidden_states, "pre_mix": pre_mix}
+        )
+
+    @staticmethod
+    def _compute_pp_microbatch_slices(
+        total_tokens: int,
+        num_seqs: int,
+        q_start_np: np.ndarray,
+        pos_i64: np.ndarray,
+        num_microbatches: int,
+    ) -> list[tuple[int, int, int, int, list[int], list[int], list[bool], int, int]]:
+        """Split a contiguous prefill batch into `K` causal microbatch metadata tuples."""
+        k = max(1, min(num_microbatches, total_tokens))
+        slices: list[tuple[int, int, int, int, list[int], list[int], list[bool], int, int]] = []
+        for u in range(k):
+            lo = (total_tokens * u) // k
+            hi = (total_tokens * (u + 1)) // k
+            if hi <= lo:
+                continue
+            r_start = -1
+            r_end = 0
+            u_qsl: list[int] = [0]
+            u_seqlens: list[int] = []
+            u_is_pref: list[bool] = []
+            max_ql = 0
+            max_sl = 0
+            for r in range(num_seqs):
+                s = int(q_start_np[r])
+                e = int(q_start_np[r + 1])
+                if e <= lo or s >= hi:
+                    continue
+                if r_start < 0:
+                    r_start = r
+                r_end = r + 1
+                seg_s = max(s, lo)
+                seg_e = min(e, hi)
+                ql = seg_e - seg_s
+                sl = int(pos_i64[seg_e - 1]) + 1
+                u_qsl.append(u_qsl[-1] + ql)
+                u_seqlens.append(sl)
+                u_is_pref.append((ql > 1) or (int(pos_i64[seg_s]) == 0))
+                if ql > max_ql:
+                    max_ql = ql
+                if sl > max_sl:
+                    max_sl = sl
+            slices.append((lo, hi, r_start, r_end, u_qsl, u_seqlens, u_is_pref, max_ql, max_sl))
+        return slices
+
+    def _run_prefill_pp2(
+        self,
+        *,
+        total_tokens: int,
+        num_seqs: int,
+        q_start_np: np.ndarray,
+        pos_i64: np.ndarray,
+        need_hidden: bool = True,
+        capture_aux: bool = False,
+    ) -> tuple[torch.Tensor | None, list[torch.Tensor] | None]:
+        """PP=2 x TP=4 intra-step K-microbatch pipelined prefill."""
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import set_forward_context
+
+        assert self._pp_qsl_cpu is not None and self._pp_qsl_gpu is not None
+        assert self._pp_seq_lens_cpu is not None and self._pp_seq_lens_gpu is not None
+        assert self._pp_is_pref_cpu is not None
+
+        k = min(
+            self.runtime_config.pp_prefill_microbatches,
+            max(1, total_tokens // 1024),
+        )
+        slices = self._compute_pp_microbatch_slices(
+            total_tokens, num_seqs, q_start_np, pos_i64, k
+        )
+        input_ids_full = self.token_ids_gpu[:total_tokens]
+        positions_full = self.positions_gpu[:total_tokens]
+        slot_map_full = self.slot_mapping_gpu[:total_tokens]
+        swa_slot_map_full = self.swa_slot_mapping_gpu[:total_tokens]
+
+        lang_mod = getattr(self.model, "language_model", self.model)
+        dsv4_core = getattr(lang_mod, "model", lang_mod)
+        saved_aux = (
+            getattr(dsv4_core, "aux_hidden_state_layers", None)
+            if (self.is_last_pp and not capture_aux)
+            else None
+        )
+        if saved_aux:
+            dsv4_core.aux_hidden_state_layers = ()
+
+        hidden_out: torch.Tensor | None = (
+            torch.empty(
+                (total_tokens, self.hidden_size),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            if (self.is_last_pp and need_hidden)
+            else None
+        )
+        aux_out: list[torch.Tensor] | None = None
+        in_flight: list[tuple[list[Any], torch.Tensor, torch.Tensor]] = []
+        next_recv: tuple[list[Any], torch.Tensor, torch.Tensor] | None = None
+        if not self.is_first_pp and slices:
+            from vllm.sequence import IntermediateTensors
+
+            u0_toks = slices[0][1] - slices[0][0]
+            h0 = torch.empty(
+                (u0_toks, 4, self.hidden_size),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            p0 = torch.empty((u0_toks, 4), dtype=torch.float32, device=self.device)
+            next_recv = (self._pp_irecv_intermediate(h0, p0), h0, p0)
+        try:
+            for u_idx, (
+                lo,
+                hi,
+                r_start,
+                r_end,
+                u_qsl,
+                u_seqlens,
+                u_is_pref,
+                max_ql,
+                max_sl,
+            ) in enumerate(slices):
+                u_toks = hi - lo
+                u_reqs = r_end - r_start
+                qsl_cpu = self._pp_qsl_cpu[u_idx][: u_reqs + 1]
+                qsl_cpu.numpy()[:] = u_qsl
+                qsl_gpu = self._pp_qsl_gpu[u_idx][: u_reqs + 1]
+                qsl_gpu.copy_(qsl_cpu, non_blocking=True)
+
+                sl_cpu = self._pp_seq_lens_cpu[u_idx][:u_reqs]
+                sl_cpu.numpy()[:] = u_seqlens
+                sl_gpu = self._pp_seq_lens_gpu[u_idx][:u_reqs]
+                sl_gpu.copy_(sl_cpu, non_blocking=True)
+
+                is_pref_cpu = self._pp_is_pref_cpu[u_idx][:u_reqs]
+                is_pref_cpu.numpy()[:] = u_is_pref
+
+                meta_u = self._build_step_attn_metadata(
+                    num_reqs=u_reqs,
+                    num_tokens=u_toks,
+                    max_query_len=max_ql,
+                    max_seq_len=max_sl,
+                    qsl_gpu=qsl_gpu,
+                    qsl_cpu=qsl_cpu,
+                    seq_lens_gpu=sl_gpu,
+                    seq_lens_cpu=sl_cpu,
+                    positions_gpu=positions_full[lo:hi],
+                    slot_mapping_gpu=slot_map_full[lo:hi],
+                    swa_slot_mapping_gpu=swa_slot_map_full[lo:hi],
+                    is_prefilling_cpu=is_pref_cpu,
+                    for_capture=False,
+                    mla_bt_gpu=self.mla_bt_gpu[r_start:r_end],
+                    swa_bt_gpu=self.swa_bt_gpu[r_start:r_end],
+                    comp_bt_gpu=self.comp_bt_gpu[r_start:r_end],
+                )
+                lb_u = self.lookback_gpu[r_start:r_end]
+                if self.is_first_pp:
+                    with set_forward_context(
+                        meta_u,
+                        self.vllm_config,
+                        num_tokens=u_toks,
+                        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    ):
+                        inter = self.model(
+                            input_ids=input_ids_full[lo:hi],
+                            positions=positions_full[lo:hi],
+                            lookback_token_ids=lb_u,
+                        )
+                    h_send = inter["hidden_states"].contiguous()
+                    p_send = inter["pre_mix"].contiguous()
+                    reqs = self._pp_send_intermediate(h_send, p_send)
+                    in_flight.append((reqs, h_send, p_send))
+                    if len(in_flight) >= 2:
+                        old_reqs, _, _ = in_flight.pop(0)
+                        for req in old_reqs:
+                            req.wait()
+                else:
+                    assert next_recv is not None
+                    cur_reqs, h_recv, p_recv = next_recv
+                    next_recv = None
+                    for req in cur_reqs:
+                        req.wait()
+                    if u_idx + 1 < len(slices):
+                        un_toks = slices[u_idx + 1][1] - slices[u_idx + 1][0]
+                        hn = torch.empty(
+                            (un_toks, 4, self.hidden_size),
+                            dtype=torch.bfloat16,
+                            device=self.device,
+                        )
+                        pn = torch.empty(
+                            (un_toks, 4), dtype=torch.float32, device=self.device
+                        )
+                        next_recv = (self._pp_irecv_intermediate(hn, pn), hn, pn)
+                    inter = IntermediateTensors(
+                        {"hidden_states": h_recv, "pre_mix": p_recv}
+                    )
+                    with set_forward_context(
+                        meta_u,
+                        self.vllm_config,
+                        num_tokens=u_toks,
+                        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    ):
+                        out_u = self.model(
+                            input_ids=input_ids_full[lo:hi],
+                            positions=positions_full[lo:hi],
+                            intermediate_tensors=inter,
+                            lookback_token_ids=lb_u,
+                        )
+                    if isinstance(out_u, tuple):
+                        h_u, aux_u = out_u
+                    else:
+                        h_u, aux_u = out_u, None
+                    if hidden_out is not None:
+                        hidden_out[lo:hi].copy_(h_u)
+                    if capture_aux and aux_u is not None:
+                        if aux_out is None:
+                            aux_out = [
+                                torch.empty(
+                                    (total_tokens, t.shape[-1]),
+                                    dtype=t.dtype,
+                                    device=self.device,
+                                )
+                                for t in aux_u
+                            ]
+                        for a_dst, a_src in zip(aux_out, aux_u, strict=True):
+                            a_dst[lo:hi].copy_(a_src)
+        finally:
+            if saved_aux:
+                dsv4_core.aux_hidden_state_layers = saved_aux
+            for reqs, _, _ in in_flight:
+                for req in reqs:
+                    req.wait()
+        return hidden_out, aux_out
+
     def _can_run_prefill_tbo(
         self,
         total_tokens: int,
@@ -2047,7 +2447,7 @@ class DeepSeekV41StepRunner:
             top_k=self.sample_top_k_gpu[:count],
             rng_seeds=self.sample_seed_gpu[:count],
             tp_group=self.tp_device_group,
-            world_size=self.world_size,
+            world_size=self.tp_size,
             vocab_size=self.vocab_size,
             penalty_state=penalty_state,
             slots=slots_gpu,
@@ -2101,7 +2501,7 @@ class DeepSeekV41StepRunner:
         self.lookback_gpu.fill_(-1)
 
         warmup_cases: list[tuple[list[int], int]] = [
-            ([self.max_step_tokens], 0),
+            ([min(self.max_step_tokens, 8192) if self.pp_size > 1 else self.max_step_tokens], 0),
             ([1], 0),
             ([5], 0),
             ([16], 0),
@@ -2128,7 +2528,7 @@ class DeepSeekV41StepRunner:
             ([1] * min(127, self.max_seqs - 1) + [1921], -1),
         ]
         tuning_buckets = fi_utils.flashinfer_get_hybrid_num_tokens_buckets(
-            max(self.max_step_tokens, 8192)
+            8192 if self.pp_size > 1 else max(self.max_step_tokens, 8192)
         )
         set_autotune_process_group(self.exchange_group)
         try:
@@ -2207,12 +2607,26 @@ class DeepSeekV41StepRunner:
                             cudagraph_runtime_mode=CUDAGraphMode.NONE,
                         )
                     )
-                    hidden = self.model(
-                        input_ids=self.token_ids_gpu[:n_toks],
-                        positions=self.positions_gpu[:n_toks],
-                        lookback_token_ids=self.lookback_gpu,
-                    )
-                    self._sample_rows_into_argmax(hidden, self.sample_rows_gpu[:1], 1)
+                    if self.pp_size > 1 and not self.is_first_pp:
+                        lang_m = getattr(self.model, "language_model", self.model)
+                        core_m = getattr(lang_m, "model", lang_m)
+                        w_inter = core_m.make_empty_intermediate_tensors(
+                            n_toks, torch.bfloat16, self.device
+                        )
+                        hidden = self.model(
+                            input_ids=self.token_ids_gpu[:n_toks],
+                            positions=self.positions_gpu[:n_toks],
+                            intermediate_tensors=w_inter,
+                            lookback_token_ids=self.lookback_gpu,
+                        )
+                    else:
+                        hidden = self.model(
+                            input_ids=self.token_ids_gpu[:n_toks],
+                            positions=self.positions_gpu[:n_toks],
+                            lookback_token_ids=self.lookback_gpu,
+                        )
+                    if self.is_last_pp:
+                        self._sample_rows_into_argmax(hidden, self.sample_rows_gpu[:1], 1)
                     del hidden
                 torch.cuda.synchronize(self.device)
                 if n_toks >= 2048:
@@ -2271,12 +2685,33 @@ class DeepSeekV41StepRunner:
                             cudagraph_runtime_mode=CUDAGraphMode.NONE,
                         )
                     )
-                    hidden = self.model(
-                        input_ids=self.token_ids_gpu[:warm_b],
-                        positions=self.positions_gpu[:warm_b],
-                        lookback_token_ids=self.lookback_gpu,
-                    )
-                    self._sample_rows_into_argmax(hidden, None, warm_b)
+                    if self.pp_size > 1 and not self.is_first_pp:
+                        from vllm.sequence import IntermediateTensors
+
+                        assert (
+                            self._pp_inter_hidden is not None
+                            and self._pp_inter_pre_mix is not None
+                        )
+                        w_inter = IntermediateTensors(
+                            {
+                                "hidden_states": self._pp_inter_hidden[:warm_b],
+                                "pre_mix": self._pp_inter_pre_mix[:warm_b],
+                            }
+                        )
+                        hidden = self.model(
+                            input_ids=self.token_ids_gpu[:warm_b],
+                            positions=self.positions_gpu[:warm_b],
+                            intermediate_tensors=w_inter,
+                            lookback_token_ids=self.lookback_gpu,
+                        )
+                    else:
+                        hidden = self.model(
+                            input_ids=self.token_ids_gpu[:warm_b],
+                            positions=self.positions_gpu[:warm_b],
+                            lookback_token_ids=self.lookback_gpu,
+                        )
+                    if self.is_last_pp:
+                        self._sample_rows_into_argmax(hidden, None, warm_b)
                     del hidden
                 torch.cuda.synchronize(self.device)
                 dist.barrier(group=self.exchange_group)
@@ -2357,14 +2792,41 @@ class DeepSeekV41StepRunner:
                         num_tokens=b,
                         cudagraph_runtime_mode=CUDAGraphMode.NONE,
                     ):
-                        hidden = self.model(
-                            input_ids=self.token_ids_gpu[:b],
-                            positions=self.positions_gpu[:b],
-                            lookback_token_ids=self.lookback_gpu,
-                        )
-                        self._sample_rows_into_argmax(
-                            hidden, None, b, all_ranks=True
-                        )
+                        if self.pp_size > 1 and not self.is_first_pp:
+                            from vllm.sequence import IntermediateTensors
+
+                            assert (
+                                self._pp_inter_hidden is not None
+                                and self._pp_inter_pre_mix is not None
+                            )
+                            d_inter = IntermediateTensors(
+                                {
+                                    "hidden_states": self._pp_inter_hidden[:b],
+                                    "pre_mix": self._pp_inter_pre_mix[:b],
+                                }
+                            )
+                            hidden = self.model(
+                                input_ids=self.token_ids_gpu[:b],
+                                positions=self.positions_gpu[:b],
+                                intermediate_tensors=d_inter,
+                                lookback_token_ids=self.lookback_gpu,
+                            )
+                        else:
+                            hidden = self.model(
+                                input_ids=self.token_ids_gpu[:b],
+                                positions=self.positions_gpu[:b],
+                                lookback_token_ids=self.lookback_gpu,
+                            )
+                        if self.is_last_pp:
+                            self._sample_rows_into_argmax(
+                                hidden, None, b, all_ranks=True
+                            )
+                        elif (
+                            self._pp_inter_hidden is not None
+                            and self._pp_inter_pre_mix is not None
+                        ):
+                            self._pp_inter_hidden[:b].copy_(hidden["hidden_states"])
+                            self._pp_inter_pre_mix[:b].copy_(hidden["pre_mix"])
             capture_stream.synchronize()
             dist.barrier(group=self.exchange_group)
 
@@ -2408,14 +2870,41 @@ class DeepSeekV41StepRunner:
                         is_prefilling_cpu=self.decode_is_prefilling_cpu[:b],
                         for_capture=False,
                     )
-                    hidden = self.model(
-                        input_ids=self.token_ids_gpu[:b],
-                        positions=self.positions_gpu[:b],
-                        lookback_token_ids=self.lookback_gpu,
-                    )
-                    self._sample_rows_into_argmax(
-                        hidden, None, b, all_ranks=True
-                    )
+                    if self.pp_size > 1 and not self.is_first_pp:
+                        from vllm.sequence import IntermediateTensors
+
+                        assert (
+                            self._pp_inter_hidden is not None
+                            and self._pp_inter_pre_mix is not None
+                        )
+                        d_inter = IntermediateTensors(
+                            {
+                                "hidden_states": self._pp_inter_hidden[:b],
+                                "pre_mix": self._pp_inter_pre_mix[:b],
+                            }
+                        )
+                        hidden = self.model(
+                            input_ids=self.token_ids_gpu[:b],
+                            positions=self.positions_gpu[:b],
+                            intermediate_tensors=d_inter,
+                            lookback_token_ids=self.lookback_gpu,
+                        )
+                    else:
+                        hidden = self.model(
+                            input_ids=self.token_ids_gpu[:b],
+                            positions=self.positions_gpu[:b],
+                            lookback_token_ids=self.lookback_gpu,
+                        )
+                    if self.is_last_pp:
+                        self._sample_rows_into_argmax(
+                            hidden, None, b, all_ranks=True
+                        )
+                    elif (
+                        self._pp_inter_hidden is not None
+                        and self._pp_inter_pre_mix is not None
+                    ):
+                        self._pp_inter_hidden[:b].copy_(hidden["hidden_states"])
+                        self._pp_inter_pre_mix[:b].copy_(hidden["pre_mix"])
             capture_stream.synchronize()
             dist.barrier(group=self.exchange_group)
             self.decode_graphs[b] = g
@@ -2427,7 +2916,23 @@ class DeepSeekV41StepRunner:
             self._capture_spec_verify_graphs(graph_pool, capture_stream)
         if self.dspark_drafter is not None:
             self.dspark_drafter.capture_graphs(graph_pool, capture_stream)
-        self._capture_piecewise_prefill_graphs(graph_pool, capture_stream)
+        dist.barrier(group=self.exchange_group)
+        if self.pp_size == 1:
+            self._capture_piecewise_prefill_graphs(graph_pool, capture_stream)
+        else:
+            # Warm up NCCL P2P communicators between Stage 0 and Stage 1 once at startup.
+            assert self._pp_inter_hidden is not None and self._pp_inter_pre_mix is not None
+            if self.is_first_pp:
+                for req in self._pp_send_intermediate(
+                    self._pp_inter_hidden[:4], self._pp_inter_pre_mix[:4]
+                ):
+                    req.wait()
+            else:
+                self._pp_recv_intermediate(
+                    self._pp_inter_hidden[:4], self._pp_inter_pre_mix[:4]
+                )
+            torch.cuda.synchronize(self.device)
+            dist.barrier(group=self.exchange_group)
         lock_workspace()
         gc.collect()
         torch.cuda.empty_cache()
@@ -2684,15 +3189,42 @@ class DeepSeekV41StepRunner:
                         num_tokens=rows,
                         cudagraph_runtime_mode=CUDAGraphMode.NONE,
                     ):
-                        output = self.model(
-                            input_ids=self.token_ids_gpu[:rows],
-                            positions=self.positions_gpu[:rows],
-                            lookback_token_ids=self.lookback_gpu,
-                        )
-                        hidden = output[0] if isinstance(output, tuple) else output
-                        self._sample_rows_into_argmax(
-                            hidden, None, rows, all_ranks=True
-                        )
+                        if self.pp_size > 1 and not self.is_first_pp:
+                            from vllm.sequence import IntermediateTensors
+
+                            assert (
+                                self._pp_inter_hidden is not None
+                                and self._pp_inter_pre_mix is not None
+                            )
+                            v_inter = IntermediateTensors(
+                                {
+                                    "hidden_states": self._pp_inter_hidden[:rows],
+                                    "pre_mix": self._pp_inter_pre_mix[:rows],
+                                }
+                            )
+                            output = self.model(
+                                input_ids=self.token_ids_gpu[:rows],
+                                positions=self.positions_gpu[:rows],
+                                intermediate_tensors=v_inter,
+                                lookback_token_ids=self.lookback_gpu,
+                            )
+                        else:
+                            output = self.model(
+                                input_ids=self.token_ids_gpu[:rows],
+                                positions=self.positions_gpu[:rows],
+                                lookback_token_ids=self.lookback_gpu,
+                            )
+                        if self.is_last_pp:
+                            hidden = output[0] if isinstance(output, tuple) else output
+                            self._sample_rows_into_argmax(
+                                hidden, None, rows, all_ranks=True
+                            )
+                        elif (
+                            self._pp_inter_hidden is not None
+                            and self._pp_inter_pre_mix is not None
+                        ):
+                            self._pp_inter_hidden[:rows].copy_(output["hidden_states"])
+                            self._pp_inter_pre_mix[:rows].copy_(output["pre_mix"])
             capture_stream.synchronize()
             dist.barrier(group=self.exchange_group)
 
@@ -2737,18 +3269,45 @@ class DeepSeekV41StepRunner:
                         is_prefilling_cpu=self.decode_is_prefilling_cpu[:bucket],
                         for_capture=False,
                     )
-                    output = self.model(
-                        input_ids=self.token_ids_gpu[:rows],
-                        positions=self.positions_gpu[:rows],
-                        lookback_token_ids=self.lookback_gpu,
-                    )
-                    if isinstance(output, tuple):
-                        hidden, aux = output
+                    if self.pp_size > 1 and not self.is_first_pp:
+                        from vllm.sequence import IntermediateTensors
+
+                        assert (
+                            self._pp_inter_hidden is not None
+                            and self._pp_inter_pre_mix is not None
+                        )
+                        v_inter = IntermediateTensors(
+                            {
+                                "hidden_states": self._pp_inter_hidden[:rows],
+                                "pre_mix": self._pp_inter_pre_mix[:rows],
+                            }
+                        )
+                        output = self.model(
+                            input_ids=self.token_ids_gpu[:rows],
+                            positions=self.positions_gpu[:rows],
+                            intermediate_tensors=v_inter,
+                            lookback_token_ids=self.lookback_gpu,
+                        )
                     else:
-                        hidden, aux = output, None
-                    self._sample_rows_into_argmax(
-                        hidden, None, rows, all_ranks=True
-                    )
+                        output = self.model(
+                            input_ids=self.token_ids_gpu[:rows],
+                            positions=self.positions_gpu[:rows],
+                            lookback_token_ids=self.lookback_gpu,
+                        )
+                    if self.is_last_pp:
+                        if isinstance(output, tuple):
+                            hidden, aux = output
+                        else:
+                            hidden, aux = output, None
+                        self._sample_rows_into_argmax(
+                            hidden, None, rows, all_ranks=True
+                        )
+                    elif (
+                        self._pp_inter_hidden is not None
+                        and self._pp_inter_pre_mix is not None
+                    ):
+                        self._pp_inter_hidden[:rows].copy_(output["hidden_states"])
+                        self._pp_inter_pre_mix[:rows].copy_(output["pre_mix"])
             capture_stream.synchronize()
             dist.barrier(group=self.exchange_group)
             self.verify_graphs[bucket] = graph
@@ -2807,7 +3366,7 @@ class DeepSeekV41StepRunner:
                 query_start_loc=q_start_np,
                 page_table=pt_np,
             )
-        return seq_results(verified, drafts) if self.rank == 0 else []
+        return seq_results(verified, drafts) if self.is_result_rank else []
 
     def _commit_decode_slot_state(self, n: int) -> None:
         s_idx = self.slots_gpu[:n]
@@ -2942,7 +3501,11 @@ class DeepSeekV41StepRunner:
         )
         is_sampling = (header.flags & STEP_FLAG_SAMPLING) != 0
         is_penalty = (header.flags & STEP_FLAG_PENALTY) != 0
-        use_dev_tok = is_decode and (header.flags & STEP_FLAG_DEVICE_TOKENS) != 0
+        use_dev_tok = (
+            self.pp_size == 1
+            and is_decode
+            and (header.flags & STEP_FLAG_DEVICE_TOKENS) != 0
+        )
         width = self.num_spec_tokens + 1
         q_lens = q_start_np[1:] - q_start_np[:-1]
         v_bucket = (
@@ -3134,8 +3697,25 @@ class DeepSeekV41StepRunner:
                 )
 
             self._h2d_done_event.record()
+            if self.pp_size > 1 and not self.is_first_pp:
+                assert (
+                    self._pp_inter_hidden is not None
+                    and self._pp_inter_pre_mix is not None
+                )
+                self._pp_recv_intermediate(
+                    self._pp_inter_hidden[:bucket], self._pp_inter_pre_mix[:bucket]
+                )
             self.decode_graphs[bucket].replay()
-            if is_sampling:
+            if self.pp_size > 1 and self.is_first_pp:
+                assert (
+                    self._pp_inter_hidden is not None
+                    and self._pp_inter_pre_mix is not None
+                )
+                for req in self._pp_send_intermediate(
+                    self._pp_inter_hidden[:bucket], self._pp_inter_pre_mix[:bucket]
+                ):
+                    req.wait()
+            if self.is_last_pp and is_sampling:
                 local_logits = self.model.compute_logits_local(
                     self.decode_hidden_gpu[:num_seqs]
                 )
@@ -3147,9 +3727,10 @@ class DeepSeekV41StepRunner:
                     use_penalty=is_penalty,
                     sample_slots_np=slot_np,
                 )
-            self._commit_decode_slot_state(num_seqs)
+            if self.pp_size == 1:
+                self._commit_decode_slot_state(num_seqs)
 
-            if self.rank == 0:
+            if self.is_result_rank:
                 self.out_tokens_cpu[parity, :num_seqs].copy_(
                     self.out_tokens_gpu[:num_seqs], non_blocking=True
                 )
@@ -3157,7 +3738,7 @@ class DeepSeekV41StepRunner:
                     self.out_logprobs_gpu[:num_seqs], non_blocking=True
                 )
             sample_slots_out = [int(slot_np[i]) for i in range(num_seqs)]
-            num_out = num_seqs
+            num_out = num_seqs if self.is_last_pp else 0
         elif use_verify_graph:
             rows = v_bucket * width
             pos_i64 = pos_np.astype(np.int64)
@@ -3329,37 +3910,59 @@ class DeepSeekV41StepRunner:
                     self._verify_real_rows_cpu[:total_tokens], non_blocking=True
                 )
             self._h2d_done_event.record()
+            if self.pp_size > 1 and not self.is_first_pp:
+                assert (
+                    self._pp_inter_hidden is not None
+                    and self._pp_inter_pre_mix is not None
+                )
+                self._pp_recv_intermediate(
+                    self._pp_inter_hidden[:rows], self._pp_inter_pre_mix[:rows]
+                )
             self.verify_graphs[v_bucket].replay()
-            raw_aux = self.verify_graph_aux[v_bucket]
-            if is_ragged_verify:
-                real_rows_gpu = self._verify_real_rows_gpu[:total_tokens]
-                self._last_verify_graph_bucket = None
-                aux_hidden_states = (
-                    [a.index_select(0, real_rows_gpu) for a in raw_aux]
-                    if raw_aux is not None
-                    else None
+            if self.pp_size > 1 and self.is_first_pp:
+                assert (
+                    self._pp_inter_hidden is not None
+                    and self._pp_inter_pre_mix is not None
                 )
-                self.out_tokens_cpu[parity, :num_sample].copy_(
-                    self.out_tokens_gpu.index_select(0, real_rows_gpu),
-                    non_blocking=True,
-                )
-                self.out_logprobs_cpu[parity, :num_sample].copy_(
-                    self.out_logprobs_gpu.index_select(0, real_rows_gpu),
-                    non_blocking=True,
-                )
+                for req in self._pp_send_intermediate(
+                    self._pp_inter_hidden[:rows], self._pp_inter_pre_mix[:rows]
+                ):
+                    req.wait()
+                sample_slots_out = []
+                num_out = 0
             else:
-                self._last_verify_graph_bucket = v_bucket
-                aux_hidden_states = (
-                    [a[:total_tokens] for a in raw_aux] if raw_aux is not None else None
-                )
-                self.out_tokens_cpu[parity, :num_sample].copy_(
-                    self.out_tokens_gpu[:num_sample], non_blocking=True
-                )
-                self.out_logprobs_cpu[parity, :num_sample].copy_(
-                    self.out_logprobs_gpu[:num_sample], non_blocking=True
-                )
-            sample_slots_out = []
-            num_out = num_sample
+                raw_aux = self.verify_graph_aux[v_bucket]
+                if is_ragged_verify:
+                    real_rows_gpu = self._verify_real_rows_gpu[:total_tokens]
+                    self._last_verify_graph_bucket = None
+                    aux_hidden_states = (
+                        [a.index_select(0, real_rows_gpu) for a in raw_aux]
+                        if raw_aux is not None
+                        else None
+                    )
+                    self.out_tokens_cpu[parity, :num_sample].copy_(
+                        self.out_tokens_gpu.index_select(0, real_rows_gpu),
+                        non_blocking=True,
+                    )
+                    self.out_logprobs_cpu[parity, :num_sample].copy_(
+                        self.out_logprobs_gpu.index_select(0, real_rows_gpu),
+                        non_blocking=True,
+                    )
+                else:
+                    self._last_verify_graph_bucket = v_bucket
+                    aux_hidden_states = (
+                        [a[:total_tokens] for a in raw_aux]
+                        if raw_aux is not None
+                        else None
+                    )
+                    self.out_tokens_cpu[parity, :num_sample].copy_(
+                        self.out_tokens_gpu[:num_sample], non_blocking=True
+                    )
+                    self.out_logprobs_cpu[parity, :num_sample].copy_(
+                        self.out_logprobs_gpu[:num_sample], non_blocking=True
+                    )
+                sample_slots_out = []
+                num_out = num_sample
         else:
             self._gpu_bt_cache_key = None
             first_pos = pos_np[q_start_np[:num_seqs]]
@@ -3492,15 +4095,25 @@ class DeepSeekV41StepRunner:
             max_q_len = int(q_lens.max())
             max_s_len = int(seq_lens_np.max())
             pw_b = None if is_spec_step else self._select_piecewise_bucket(total_tokens)
-            use_tbo = pw_b is None and self._can_run_prefill_tbo(
-                total_tokens,
-                max_seq_len=max_s_len,
-                is_decode=is_decode,
-                is_spec_step=is_spec_step,
+            use_pp2_prefill = (
+                pw_b is None
+                and self.pp_size > 1
+                and total_tokens >= 2048
+                and not is_decode
+            )
+            use_tbo = (
+                pw_b is None
+                and not use_pp2_prefill
+                and self._can_run_prefill_tbo(
+                    total_tokens,
+                    max_seq_len=max_s_len,
+                    is_decode=is_decode,
+                    is_spec_step=is_spec_step,
+                )
             )
             attn_meta = (
                 {}
-                if use_tbo
+                if (use_tbo or use_pp2_prefill)
                 else self._build_step_attn_metadata(
                     num_reqs=num_seqs,
                     num_tokens=total_tokens,
@@ -3561,6 +4174,15 @@ class DeepSeekV41StepRunner:
                         if pw_aux is not None
                         else None
                     )
+                elif use_pp2_prefill:
+                    hidden, aux_hidden_states = self._run_prefill_pp2(
+                        total_tokens=total_tokens,
+                        num_seqs=num_seqs,
+                        q_start_np=q_start_np,
+                        pos_i64=pos_i64,
+                        need_hidden=(num_sample > 0),
+                        capture_aux=is_spec_step,
+                    )
                 elif use_tbo:
                     hidden, aux_hidden_states = self._run_prefill_tbo(
                         total_tokens=total_tokens,
@@ -3576,25 +4198,53 @@ class DeepSeekV41StepRunner:
                     dsv4_core = getattr(lang_mod, "model", lang_mod)
                     saved_aux = (
                         getattr(dsv4_core, "aux_hidden_state_layers", None)
-                        if not is_spec_step
+                        if (self.is_last_pp and not is_spec_step)
                         else None
                     )
                     if saved_aux:
                         dsv4_core.aux_hidden_state_layers = ()
                     try:
-                        model_output = self.model(
-                            input_ids=self.token_ids_gpu[:total_tokens],
-                            positions=self.positions_gpu[:total_tokens],
-                            lookback_token_ids=self.lookback_gpu[:num_seqs],
-                        )
+                        if self.pp_size > 1 and not self.is_first_pp:
+                            h_recv = torch.empty(
+                                (total_tokens, 4, self.hidden_size),
+                                dtype=torch.bfloat16,
+                                device=self.device,
+                            )
+                            p_recv = torch.empty(
+                                (total_tokens, 4),
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            pp_inter = self._pp_recv_intermediate(h_recv, p_recv)
+                            model_output = self.model(
+                                input_ids=self.token_ids_gpu[:total_tokens],
+                                positions=self.positions_gpu[:total_tokens],
+                                intermediate_tensors=pp_inter,
+                                lookback_token_ids=self.lookback_gpu[:num_seqs],
+                            )
+                        else:
+                            model_output = self.model(
+                                input_ids=self.token_ids_gpu[:total_tokens],
+                                positions=self.positions_gpu[:total_tokens],
+                                lookback_token_ids=self.lookback_gpu[:num_seqs],
+                            )
+                            if self.pp_size > 1 and self.is_first_pp:
+                                for req in self._pp_send_intermediate(
+                                    model_output["hidden_states"],
+                                    model_output["pre_mix"],
+                                ):
+                                    req.wait()
                     finally:
                         if saved_aux:
                             dsv4_core.aux_hidden_state_layers = saved_aux
-                    if isinstance(model_output, tuple):
-                        hidden, aux_hidden_states = model_output
+                    if self.is_last_pp:
+                        if isinstance(model_output, tuple):
+                            hidden, aux_hidden_states = model_output
+                        else:
+                            hidden = model_output
                     else:
-                        hidden = model_output
-                if num_sample > 0:
+                        hidden = None
+                if self.is_last_pp and num_sample > 0:
                     local_logits = self._sample_rows_into_argmax(
                         hidden,
                         self.sample_rows_gpu[:num_sample],
@@ -3611,17 +4261,17 @@ class DeepSeekV41StepRunner:
                             use_penalty=is_penalty,
                             sample_slots_np=slot_np[sample_rows_np],
                         )
-            if is_decode:
+            if self.pp_size == 1 and is_decode:
                 self._commit_decode_slot_state(num_seqs)
 
-            if (self.rank == 0 or is_spec_step) and num_sample > 0:
+            if self.is_last_pp and (self.is_result_rank or is_spec_step) and num_sample > 0:
                 self.out_tokens_cpu[parity, :num_sample].copy_(
                     self.out_tokens_gpu[:num_sample], non_blocking=True
                 )
                 self.out_logprobs_cpu[parity, :num_sample].copy_(
                     self.out_logprobs_gpu[:num_sample], non_blocking=True
                 )
-            num_out = num_sample
+            num_out = num_sample if self.is_last_pp else 0
 
         self.end_events[parity].record()
         spec_ctx = (
@@ -3635,7 +4285,7 @@ class DeepSeekV41StepRunner:
                 pt_np=pt_np.copy(),
                 aux_hidden_states=aux_hidden_states,
             )
-            if is_spec_step
+            if (is_spec_step and self.is_last_pp)
             else None
         )
         return _LaunchedStep(
@@ -3667,7 +4317,7 @@ class DeepSeekV41StepRunner:
             )
             self.end_events[p].record()
             self.end_events[p].synchronize()
-        elif self.rank == 0 and step.num_out > 0:
+        elif self.is_result_rank and step.num_out > 0:
             toks_np = self._out_tokens_np[p]
             lps_np = self._out_logprobs_np[p]
             for i in range(step.num_out):
