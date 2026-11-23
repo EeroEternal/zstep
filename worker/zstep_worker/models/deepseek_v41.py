@@ -352,6 +352,7 @@ class _SwaPagePool:
         self._lut: np.ndarray = np.zeros(self.mla_dummy_vb + 2, dtype=np.int32)
         self._lut[self.mla_dummy_vb] = self.swa_dummy_vb
         self._slot_tails: dict[int, tuple[int, ...]] = {}
+        self.epoch: int = 0
 
     def lookup(self, mla_pages: np.ndarray) -> np.ndarray:
         return self._lut[mla_pages]
@@ -440,6 +441,8 @@ class _SwaPagePool:
                 self._lut[evicted_mp] = 0
             self._mla_to_swa[mp] = sp
             self._lut[mp] = sp
+        if allocated_any:
+            self.epoch += 1
         return self._lut[active_pt], allocated_any
 
 
@@ -475,6 +478,7 @@ class DeepSeekV41StepRunner:
         self._pw_live_lookback: torch.Tensor | None = None
         self._pw_live_num_tokens: int = 0
         self.verify_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._gpu_bt_cache_key: tuple[Any, ...] | None = None
         self.verify_graph_aux: dict[int, list[torch.Tensor] | None] = {}
         self.dspark_drafter: Any | None = None
         self._last_verify_bt_sig: tuple[int, tuple[int, ...]] | None = None
@@ -1334,6 +1338,7 @@ class DeepSeekV41StepRunner:
                 )
 
     def _zero_all_caches(self) -> None:
+        self._gpu_bt_cache_key = None
         for buf in self._kv_raw_buffers:
             buf.zero_()
         for mod in self.model.modules():
@@ -2832,35 +2837,49 @@ class DeepSeekV41StepRunner:
         self.start_events[parity].record()
         if is_decode and int(seq_lens_np.max()) <= self.decode_graph_max_seq_len:
             bucket = select_decode_bucket(num_seqs, self.max_graph_bucket)
-            active_pt = pt_np[slot_np, :] + 1
             self.slots_cpu[:num_seqs].numpy()[:] = slot_np
             self.slots_gpu[:num_seqs].copy_(
                 self.slots_cpu[:num_seqs], non_blocking=True
             )
 
-            mla_bt_np = self.mla_bt_cpu[:bucket].numpy()
-            mla_bt_np[:num_seqs] = active_pt
-            if bucket > num_seqs:
-                mla_bt_np[num_seqs:bucket] = 0
-
             pos_i64 = pos_np.astype(np.int64)
-            if self._swa_pool is not None:
-                swa_pt, _ = self._swa_pool.map_active_windows(
-                    active_pt, pos_i64, pos_i64, pos_i64, active_slots=slot_np
-                )
-            else:
-                swa_pt = active_pt
+            c_lo = np.maximum(0, (pos_i64 - 127) // 128)
+            c_hi = pos_i64 // 128
+            swa_epoch = self._swa_pool.epoch if self._swa_pool is not None else -1
+            bt_key = (
+                bucket,
+                swa_epoch,
+                tuple(int(s) for s in slot_np),
+                tuple(int(c) for c in c_lo),
+                tuple(int(c) for c in c_hi),
+                tuple(int(pt_np[s, c]) for s, c in zip(slot_np, c_hi)),
+                tuple(int(pt_np[s, 0]) for s in slot_np),
+            )
+            bt_hit = bt_key == self._gpu_bt_cache_key
+            if not bt_hit:
+                active_pt = pt_np[slot_np, :] + 1
+                mla_bt_np = self.mla_bt_cpu[:bucket].numpy()
+                mla_bt_np[:num_seqs] = active_pt
+                if bucket > num_seqs:
+                    mla_bt_np[num_seqs:bucket] = 0
 
-            swa_bt_np = self.swa_bt_cpu[:bucket].numpy()
-            swa_bt_np[:num_seqs, 0::2] = swa_pt * 2
-            swa_bt_np[:num_seqs, 1::2] = swa_pt * 2 + 1
-            if bucket > num_seqs:
-                swa_bt_np[num_seqs:bucket] = 0
+                if self._swa_pool is not None:
+                    swa_pt, _ = self._swa_pool.map_active_windows(
+                        active_pt, pos_i64, pos_i64, pos_i64, active_slots=slot_np
+                    )
+                else:
+                    swa_pt = active_pt
 
-            comp_bt_np = self.comp_bt_cpu[:bucket, 0].numpy()
-            comp_bt_np[:num_seqs] = slot_np + 1
-            if bucket > num_seqs:
-                comp_bt_np[num_seqs:bucket] = self.dummy_comp_block
+                swa_bt_np = self.swa_bt_cpu[:bucket].numpy()
+                swa_bt_np[:num_seqs, 0::2] = swa_pt * 2
+                swa_bt_np[:num_seqs, 1::2] = swa_pt * 2 + 1
+                if bucket > num_seqs:
+                    swa_bt_np[num_seqs:bucket] = 0
+
+                comp_bt_np = self.comp_bt_cpu[:bucket, 0].numpy()
+                comp_bt_np[:num_seqs] = slot_np + 1
+                if bucket > num_seqs:
+                    comp_bt_np[num_seqs:bucket] = self.dummy_comp_block
 
             if not use_dev_tok:
                 lb_np = self.lookback_cpu[:bucket].numpy()
@@ -2886,7 +2905,7 @@ class DeepSeekV41StepRunner:
                 sl_cpu_np[num_seqs:bucket] = 0
 
             sm_cpu_np = self.slot_mapping_cpu[:bucket].numpy()
-            vb = active_pt[np.arange(num_seqs), pos_i64 // 128].astype(np.int64)
+            vb = (pt_np[slot_np, c_hi] + 1).astype(np.int64)
             sm_cpu_np[:num_seqs] = vb * 128 + (pos_i64 % 128)
             if bucket > num_seqs:
                 sm_cpu_np[num_seqs:bucket] = -1
@@ -2897,11 +2916,22 @@ class DeepSeekV41StepRunner:
                 if bucket > num_seqs:
                     swa_sm_np[num_seqs:bucket] = -1
 
-            self.mla_bt_gpu[:bucket].copy_(self.mla_bt_cpu[:bucket], non_blocking=True)
-            self.swa_bt_gpu[:bucket].copy_(self.swa_bt_cpu[:bucket], non_blocking=True)
-            self.comp_bt_gpu[:bucket].copy_(
-                self.comp_bt_cpu[:bucket], non_blocking=True
-            )
+            if not bt_hit:
+                self.mla_bt_gpu[:bucket].copy_(self.mla_bt_cpu[:bucket], non_blocking=True)
+                self.swa_bt_gpu[:bucket].copy_(self.swa_bt_cpu[:bucket], non_blocking=True)
+                self.comp_bt_gpu[:bucket].copy_(
+                    self.comp_bt_cpu[:bucket], non_blocking=True
+                )
+                post_epoch = self._swa_pool.epoch if self._swa_pool is not None else -1
+                self._gpu_bt_cache_key = (
+                    bucket,
+                    post_epoch,
+                    bt_key[2],
+                    bt_key[3],
+                    bt_key[4],
+                    bt_key[5],
+                    bt_key[6],
+                )
             if use_dev_tok:
                 s_idx = self.slots_gpu[:num_seqs]
                 torch.index_select(
@@ -2980,37 +3010,50 @@ class DeepSeekV41StepRunner:
         elif use_verify_graph:
             rows = v_bucket * width
             seq_slots_np = slot_np[0:total_tokens:width]
-            active_pt = pt_np[seq_slots_np, :] + 1
-
-            mla_bt_np = self.mla_bt_cpu[:v_bucket].numpy()
-            mla_bt_np[:num_seqs] = active_pt
-            if v_bucket > num_seqs:
-                mla_bt_np[num_seqs:v_bucket] = 0
-
             pos_i64 = pos_np.astype(np.int64)
-            if self._swa_pool is not None:
-                p_min = pos_i64[0:total_tokens:width]
-                p_max = pos_i64[width - 1 : total_tokens : width]
-                swa_pt, _ = self._swa_pool.map_active_windows(
-                    active_pt,
-                    p_min,
-                    p_max,
-                    p_min,
-                    active_slots=slot_np[0:total_tokens:width],
-                )
-            else:
-                swa_pt = active_pt
+            p_min = pos_i64[0:total_tokens:width]
+            p_max = pos_i64[width - 1 : total_tokens : width]
+            c_lo = np.maximum(0, (p_min - 127) // 128)
+            c_hi = np.minimum(pt_np.shape[1] - 1, p_max // 128)
+            swa_epoch = self._swa_pool.epoch if self._swa_pool is not None else -1
+            bt_key = (
+                v_bucket,
+                swa_epoch,
+                tuple(int(s) for s in seq_slots_np),
+                tuple(int(c) for c in c_lo),
+                tuple(int(c) for c in c_hi),
+                tuple(int(pt_np[s, c]) for s, c in zip(seq_slots_np, c_hi)),
+                tuple(int(pt_np[s, 0]) for s in seq_slots_np),
+            )
+            bt_hit = bt_key == self._gpu_bt_cache_key
+            if not bt_hit:
+                active_pt = pt_np[seq_slots_np, :] + 1
+                mla_bt_np = self.mla_bt_cpu[:v_bucket].numpy()
+                mla_bt_np[:num_seqs] = active_pt
+                if v_bucket > num_seqs:
+                    mla_bt_np[num_seqs:v_bucket] = 0
 
-            swa_bt_np = self.swa_bt_cpu[:v_bucket].numpy()
-            swa_bt_np[:num_seqs, 0::2] = swa_pt * 2
-            swa_bt_np[:num_seqs, 1::2] = swa_pt * 2 + 1
-            if v_bucket > num_seqs:
-                swa_bt_np[num_seqs:v_bucket] = 0
+                if self._swa_pool is not None:
+                    swa_pt, _ = self._swa_pool.map_active_windows(
+                        active_pt,
+                        p_min,
+                        p_max,
+                        p_min,
+                        active_slots=seq_slots_np,
+                    )
+                else:
+                    swa_pt = active_pt
 
-            comp_bt_np = self.comp_bt_cpu[:v_bucket, 0].numpy()
-            comp_bt_np[:num_seqs] = seq_slots_np + 1
-            if v_bucket > num_seqs:
-                comp_bt_np[num_seqs:v_bucket] = self.dummy_comp_block
+                swa_bt_np = self.swa_bt_cpu[:v_bucket].numpy()
+                swa_bt_np[:num_seqs, 0::2] = swa_pt * 2
+                swa_bt_np[:num_seqs, 1::2] = swa_pt * 2 + 1
+                if v_bucket > num_seqs:
+                    swa_bt_np[num_seqs:v_bucket] = 0
+
+                comp_bt_np = self.comp_bt_cpu[:v_bucket, 0].numpy()
+                comp_bt_np[:num_seqs] = seq_slots_np + 1
+                if v_bucket > num_seqs:
+                    comp_bt_np[num_seqs:v_bucket] = self.dummy_comp_block
 
             lb_np = self.lookback_cpu[:v_bucket].numpy()
             lb_np[:num_seqs, 0] = prev_win_np[:, 2]
@@ -3048,15 +3091,26 @@ class DeepSeekV41StepRunner:
                 if rows > total_tokens:
                     swa_sm_np[total_tokens:rows] = -1
 
-            self.mla_bt_gpu[:v_bucket].copy_(
-                self.mla_bt_cpu[:v_bucket], non_blocking=True
-            )
-            self.swa_bt_gpu[:v_bucket].copy_(
-                self.swa_bt_cpu[:v_bucket], non_blocking=True
-            )
-            self.comp_bt_gpu[:v_bucket].copy_(
-                self.comp_bt_cpu[:v_bucket], non_blocking=True
-            )
+            if not bt_hit:
+                self.mla_bt_gpu[:v_bucket].copy_(
+                    self.mla_bt_cpu[:v_bucket], non_blocking=True
+                )
+                self.swa_bt_gpu[:v_bucket].copy_(
+                    self.swa_bt_cpu[:v_bucket], non_blocking=True
+                )
+                self.comp_bt_gpu[:v_bucket].copy_(
+                    self.comp_bt_cpu[:v_bucket], non_blocking=True
+                )
+                post_epoch = self._swa_pool.epoch if self._swa_pool is not None else -1
+                self._gpu_bt_cache_key = (
+                    v_bucket,
+                    post_epoch,
+                    bt_key[2],
+                    bt_key[3],
+                    bt_key[4],
+                    bt_key[5],
+                    bt_key[6],
+                )
             self._last_verify_bt_sig = (v_bucket, tuple(int(s) for s in seq_slots_np))
             self.lookback_gpu[:v_bucket].copy_(
                 self.lookback_cpu[:v_bucket], non_blocking=True
@@ -3094,6 +3148,7 @@ class DeepSeekV41StepRunner:
             sample_slots_out = []
             num_out = num_sample
         else:
+            self._gpu_bt_cache_key = None
             first_pos = pos_np[q_start_np[:num_seqs]]
             # Enforce vLLM's strict 4-region mixed-batch ordering:
             # 0: decode (q_len==1, pos>0) -> 1: 1-tok prefill (q_len==1, pos==0)

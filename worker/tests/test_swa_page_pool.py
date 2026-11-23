@@ -23,8 +23,19 @@ def test_swa_page_pool_pinning_lru_eviction_and_fail_stop() -> None:
         allow_alloc_from=np.array([0], dtype=np.int64),
     )
     assert alloc1 is True
+    assert pool.epoch == 1
     assert np.array_equal(pt1, np.array([[1, 2, 4, 4]], dtype=np.int32))
     assert np.array_equal(pool.lookup(np.array([1, 2, 10])), np.array([1, 2, 4], dtype=np.int32))
+
+    # Steady-state hit does not bump epoch.
+    _, alloc1_hit = pool.map_active_windows(
+        np.array([[1, 2, 10, 10]], dtype=np.int64),
+        seq_pos_min=np.array([128], dtype=np.int64),
+        seq_pos_max=np.array([255], dtype=np.int64),
+        allow_alloc_from=np.array([128], dtype=np.int64),
+    )
+    assert alloc1_hit is False
+    assert pool.epoch == 1
 
     # Seq 2 prefills tokens 0..127 (global page 3) -> fills capacity 3.
     pt2, alloc2 = pool.map_active_windows(
