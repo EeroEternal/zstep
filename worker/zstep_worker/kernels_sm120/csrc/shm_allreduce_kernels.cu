@@ -561,7 +561,10 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
     const int64_t half_slot = slot_stride_bytes / 2;
     uint4* my_in = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes);
     const bool can_pxb =
-        (my_hbm != nullptr && pt_hbm != nullptr && world_size == 8 && num_vecs <= pxb_max_vecs && c_len >= 8);
+        (my_hbm != nullptr && pt_hbm != nullptr && (world_size == 8 || world_size == 4) && num_vecs <= pxb_max_vecs && c_len >= 8);
+    const int num_pairs = world_size >> 1;
+    const int pair_mask = num_pairs - 1;
+    const int rank_mask = world_size - 1;
     const int64_t cur_pxb_stride = (flag_base > 0) ? 1310720LL : pxb_slot_stride_bytes;
     const int64_t pxb_base_off = 131072LL + (
         (flag_base > 0)
@@ -599,8 +602,8 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         __syncthreads();
         if (tid == 0) __threadfence_system();
         __syncthreads();
-        if (tid < 8) {
-            const int dst = (rank + tid) & 7;
+        if (tid < world_size) {
+            const int dst = (rank + tid) & rank_mask;
             sys_store_release_u64(reinterpret_cast<uint64_t*>(s_peer_shm[dst] + (b * 8 + rank) * 64), step);
             if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_shm + (b * 8 + dst) * 64), step, abort_flag)) s_aborted = 1;
         }
@@ -610,14 +613,12 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         for (int64_t p = p_fb + tid; p < p_fe; p += blockDim.x) {
             const int h_par = (p < p_fm) ? 0 : 1;
             uint4 pkts[4];
-            #pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                const int q = (pair_id + k) & 3, src_r = q * 2 + h_par;
+            for (int k = 0; k < num_pairs; ++k) {
+                const int q = (pair_id + k) & pair_mask, src_r = q * 2 + h_par;
                 pkts[q] = (src_r == rank) ? my_hbm_sum[p] : ld_cv_uint4(reinterpret_cast<const uint4*>(s_peer_shm[src_r] + 131072 + slot * slot_stride_bytes) + p);
             }
             float acc[16] = {0.f};
-            #pragma unroll
-            for (int q = 0; q < 4; ++q) unpack_accum_fp12_bfp7(pkts[q], acc);
+            for (int q = 0; q < num_pairs; ++q) unpack_accum_fp12_bfp7(pkts[q], acc);
             Pack128Bf16 o0, o1;
             #pragma unroll
             for (int j = 0; j < 4; ++j) { o0.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]); o1.pairs[j] = __floats2bfloat162_rn(acc[8 + 2 * j], acc[8 + 2 * j + 1]); }
@@ -625,11 +626,11 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             output_vec[(p << 1) + 1] = o1.u4;
         }
         __syncthreads();
-        if (tid < 8) sys_store_release_u64(reinterpret_cast<uint64_t*>(s_peer_shm[tid] + 65536 + (b * 8 + rank) * 64), step);
+        if (tid < world_size) sys_store_release_u64(reinterpret_cast<uint64_t*>(s_peer_shm[tid] + 65536 + (b * 8 + rank) * 64), step);
         return;
     }
 
-    // Hybrid CX8-partner P2P + 4-pair Host-SHM 1-Shot (`16..64 KiB`)
+    // Hybrid CX8-partner P2P + pair Host-SHM 1-Shot (`16..64 KiB`)
     if (can_pxb && num_vecs > kPxbOneShotMinVecs && num_vecs <= one_shot_max_vecs) {
         const int parity = rank & 1;
         const int64_t c_mid = c_begin + c_len / 2;
@@ -677,7 +678,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             __threadfence_system();
         }
         __syncthreads();
-        if (threadIdx.x < 8) {
+        if (threadIdx.x < world_size) {
             sys_store_release_u64(
                 reinterpret_cast<uint64_t*>(s_peer_shm[threadIdx.x] + (b * 8 + rank) * 64), step);
             if (!spin_wait_ge_u64(
@@ -695,8 +696,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         for (int64_t idx = c_begin + threadIdx.x; idx < c_end; idx += blockDim.x) {
             const int h_par = (idx < c_mid) ? 0 : 1;
             float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-            #pragma unroll
-            for (int q = 0; q < 4; ++q) {
+            for (int q = 0; q < num_pairs; ++q) {
                 const int src_r = q * 2 + h_par;
                 Pack128Bf16 pv;
                 if (src_r == rank) {
@@ -721,14 +721,14 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             output_vec[idx] = out.u4;
         }
         __syncthreads();
-        if (threadIdx.x < 8) {
+        if (threadIdx.x < world_size) {
             sys_store_release_u64(
                 reinterpret_cast<uint64_t*>(s_peer_shm[threadIdx.x] + 65536 + (b * 8 + rank) * 64), step);
         }
         return;
     }
 
-    // Hybrid CX8-partner P2P + 4-pair Host-SHM 2-Shot (`>= 128 KiB`, up to `pxb_max_vecs`)
+    // Hybrid CX8-partner P2P + pair Host-SHM 2-Shot (`>= 128 KiB`, up to `pxb_max_vecs`)
     if (can_pxb && num_vecs >= kPxbTwoShotMinVecs) {
         if (pxb_bfp != 0 && (num_vecs & 15) == 0 && (flag_base == 0 || num_vecs >= 15360)) {
             const int bfp_mode = (pxb_bfp == 2) ? 2 : 1;
@@ -751,8 +751,8 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             const int64_t my_pairs = (my_he - my_hb) >> 1;
             const int64_t pt_pairs = (pt_he - pt_hb) >> 1;
             const int64_t my_pb = my_hb >> 1;
-            const int64_t own_pb = my_pb + (my_pairs * pair_id) / 4;
-            const int64_t own_pe = my_pb + (my_pairs * (pair_id + 1)) / 4;
+            const int64_t own_pb = my_pb + (my_pairs * pair_id) / num_pairs;
+            const int64_t own_pe = my_pb + (my_pairs * (pair_id + 1)) / num_pairs;
             const int64_t half_pxb = cur_pxb_stride / 2;
             const bool do_pipe = (bfp_mode == 1 && flag_base == 0 && gridDim.x == 56 && num_vecs >= 81920), three_stage = (num_vecs <= 327680);
             const int wave_stride = (num_vecs >= 1310720) ? 7 : 14;
@@ -849,7 +849,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                 if (do_pipe && b_local + wave_stride < gridDim.x) gpu_store_release_u64(g2_self, step);
             }
             __syncthreads();
-            if (tid < 4 && tid != pair_id) {
+            if (tid < num_pairs && tid != pair_id) {
                 const int dst_r = tid * 2 + parity;
                 sys_store_release_u64(
                     reinterpret_cast<uint64_t*>(s_peer_shm[dst_r] + (b * 8 + rank) * 64), step);
@@ -881,8 +881,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                     acc[8 + 2 * j] = f1.x;
                     acc[8 + 2 * j + 1] = f1.y;
                 }
-                #pragma unroll
-                for (int q = 0; q < 4; ++q) {
+                for (int q = 0; q < num_pairs; ++q) {
                     if (q == pair_id) continue;
                     const uint4* p_in = reinterpret_cast<const uint4*>(
                         s_peer_shm[q * 2 + parity] + 131072 + slot * slot_stride_bytes);
@@ -915,7 +914,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                 __threadfence_system();
             }
             __syncthreads();
-            if (tid < 4) {
+            if (tid < num_pairs) {
                 if (tid == pair_id) {
                     sys_store_release_u64(
                         reinterpret_cast<uint64_t*>(pt_hbm + 32768 + b * 64), step);
@@ -947,21 +946,21 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             }
 
             pdl_launch_dependents();
-            for (int k = 1; k < 4; ++k) {
-                const int q = (pair_id + k) & 3;
+            for (int k = 1; k < num_pairs; ++k) {
+                const int q = (pair_id + k) & pair_mask;
                 const uint4* o_red = reinterpret_cast<const uint4*>(
                     s_peer_shm[q * 2 + parity] + 131072 + slot * slot_stride_bytes + half_slot);
                 if (bfp_mode == 1) {
-                    const int64_t qb = my_pb + (my_pairs * q) / 4;
-                    const int64_t qe = my_pb + (my_pairs * (q + 1)) / 4;
+                    const int64_t qb = my_pb + (my_pairs * q) / num_pairs;
+                    const int64_t qe = my_pb + (my_pairs * (q + 1)) / num_pairs;
                     for (int64_t p = qb + tid; p < qe; p += blockDim.x) {
                         const uint4 rq = ld_cv_uint4(o_red + p);
                         st_wt_uint4(pt_hbm_red + (my_hb + (p - my_pb)), rq);
                         unpack_to_bf16_pair(rq, output_vec[p << 1], output_vec[(p << 1) + 1]);
                     }
                 } else {
-                    const int64_t qb = (my_pb + (my_pairs * q) / 4) << 1;
-                    const int64_t qe = (my_pb + (my_pairs * (q + 1)) / 4) << 1;
+                    const int64_t qb = (my_pb + (my_pairs * q) / num_pairs) << 1;
+                    const int64_t qe = (my_pb + (my_pairs * (q + 1)) / num_pairs) << 1;
                     for (int64_t idx = qb + tid; idx < qe; idx += blockDim.x) {
                         const uint4 v = ld_cv_uint4(o_red + idx);
                         output_vec[idx] = v;
@@ -970,8 +969,8 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                 }
             }
             const int64_t pt_pb = pt_hb >> 1;
-            const int64_t pt_own_b = (pt_pb + (pt_pairs * pair_id) / 4) << 1;
-            const int64_t pt_own_e = (pt_pb + (pt_pairs * (pair_id + 1)) / 4) << 1;
+            const int64_t pt_own_b = (pt_pb + (pt_pairs * pair_id) / num_pairs) << 1;
+            const int64_t pt_own_e = (pt_pb + (pt_pairs * (pair_id + 1)) / num_pairs) << 1;
             if (bfp_mode == 1) {
                 for (int64_t p = (pt_own_b >> 1) + tid; p < (pt_own_e >> 1); p += blockDim.x) {
                     unpack_to_bf16_pair(
@@ -1003,10 +1002,10 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             }
 
             pdl_launch_dependents();
-            for (int k = 1; k < 4; ++k) {
-                const int q = (pair_id + k) & 3;
-                const int64_t qb = (pt_pb + (pt_pairs * q) / 4) << 1;
-                const int64_t qe = (pt_pb + (pt_pairs * (q + 1)) / 4) << 1;
+            for (int k = 1; k < num_pairs; ++k) {
+                const int q = (pair_id + k) & pair_mask;
+                const int64_t qb = (pt_pb + (pt_pairs * q) / num_pairs) << 1;
+                const int64_t qe = (pt_pb + (pt_pairs * (q + 1)) / num_pairs) << 1;
                 if (bfp_mode == 1) {
                     for (int64_t p = (qb >> 1) + tid; p < (qe >> 1); p += blockDim.x) {
                         unpack_to_bf16_pair(
@@ -1021,7 +1020,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                 }
             }
             __syncthreads();
-            if (tid < 8) {
+            if (tid < world_size) {
                 sys_store_release_u64(
                     reinterpret_cast<uint64_t*>(
                         s_peer_shm[tid] + 65536 + (b * 8 + rank) * 64),
@@ -1059,8 +1058,8 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             return;
         }
 
-        const int64_t own_b = my_hb + (my_hlen * pair_id) / 4;
-        const int64_t own_e = my_hb + (my_hlen * (pair_id + 1)) / 4;
+        const int64_t own_b = my_hb + (my_hlen * pair_id) / num_pairs;
+        const int64_t own_e = my_hb + (my_hlen * (pair_id + 1)) / num_pairs;
         const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + pxb_base_off);
         uint4* my_hbm_red = reinterpret_cast<uint4*>(my_hbm + pxb_base_off + half_pxb);
 
@@ -1085,7 +1084,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             __threadfence_system();
         }
         __syncthreads();
-        if (threadIdx.x < 4 && threadIdx.x != pair_id) {
+        if (threadIdx.x < num_pairs && threadIdx.x != pair_id) {
             const int dst_r = threadIdx.x * 2 + parity;
             sys_store_release_u64(
                 reinterpret_cast<uint64_t*>(s_peer_shm[dst_r] + (b * 8 + rank) * 64), step);
@@ -1096,6 +1095,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         }
         __syncthreads();
         if (s_aborted) {
+            signal_ar_cta_done();
             return;
         }
 
@@ -1103,8 +1103,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         uint4* pt_hbm_red = reinterpret_cast<uint4*>(pt_hbm + pxb_base_off + half_pxb);
         for (int64_t idx = own_b + threadIdx.x; idx < own_e; idx += blockDim.x) {
             float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-            #pragma unroll
-            for (int q = 0; q < 4; ++q) {
+            for (int q = 0; q < num_pairs; ++q) {
                 const int src_r = q * 2 + parity;
                 Pack128Bf16 pv;
                 if (q == pair_id) {
@@ -1135,7 +1134,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             __threadfence_system();
         }
         __syncthreads();
-        if (threadIdx.x < 4) {
+        if (threadIdx.x < num_pairs) {
             if (threadIdx.x == pair_id) {
                 sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 32768 + b * 64), step);
                 if (!spin_wait_ge_u64(
@@ -1154,14 +1153,15 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         }
         __syncthreads();
         if (s_aborted) {
+            signal_ar_cta_done();
             return;
         }
 
-        for (int q = 0; q < 4; ++q) {
+        for (int q = 0; q < num_pairs; ++q) {
             if (q == pair_id) continue;
             const int src_r = q * 2 + parity;
-            const int64_t qb = my_hb + (my_hlen * q) / 4;
-            const int64_t qe = my_hb + (my_hlen * (q + 1)) / 4;
+            const int64_t qb = my_hb + (my_hlen * q) / num_pairs;
+            const int64_t qe = my_hb + (my_hlen * (q + 1)) / num_pairs;
             const uint4* o_red = reinterpret_cast<const uint4*>(
                 s_peer_shm[src_r] + 131072 + slot * slot_stride_bytes + half_slot);
             for (int64_t idx = qb + threadIdx.x; idx < qe; idx += blockDim.x) {
@@ -1170,8 +1170,8 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                 st_wt_uint4(pt_hbm_red + idx, v);
             }
         }
-        const int64_t pt_own_b = pt_hb + (pt_hlen * pair_id) / 4;
-        const int64_t pt_own_e = pt_hb + (pt_hlen * (pair_id + 1)) / 4;
+        const int64_t pt_own_b = pt_hb + (pt_hlen * pair_id) / num_pairs;
+        const int64_t pt_own_e = pt_hb + (pt_hlen * (pair_id + 1)) / num_pairs;
         for (int64_t idx = pt_own_b + threadIdx.x; idx < pt_own_e; idx += blockDim.x) {
             output_vec[idx] = ld_cv_uint4(my_hbm_red + idx);
         }
@@ -1186,22 +1186,24 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
         }
         __syncthreads();
         if (s_aborted) {
+            signal_ar_cta_done();
             return;
         }
 
-        for (int q = 0; q < 4; ++q) {
+        for (int q = 0; q < num_pairs; ++q) {
             if (q == pair_id) continue;
-            const int64_t qb = pt_hb + (pt_hlen * q) / 4;
-            const int64_t qe = pt_hb + (pt_hlen * (q + 1)) / 4;
+            const int64_t qb = pt_hb + (pt_hlen * q) / num_pairs;
+            const int64_t qe = pt_hb + (pt_hlen * (q + 1)) / num_pairs;
             for (int64_t idx = qb + threadIdx.x; idx < qe; idx += blockDim.x) {
                 output_vec[idx] = ld_cv_uint4(my_hbm_red + idx);
             }
         }
         __syncthreads();
-        if (threadIdx.x < 8) {
+        if (threadIdx.x < world_size) {
             sys_store_release_u64(
                 reinterpret_cast<uint64_t*>(s_peer_shm[threadIdx.x] + 65536 + (b * 8 + rank) * 64), step);
         }
+        signal_ar_cta_done();
         return;
     }
 

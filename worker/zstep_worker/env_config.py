@@ -158,6 +158,9 @@ class WorkerRuntimeConfig:
     prefill_tbo_min_tokens: int = 6144
     prefill_tbo_min_ctx: int = 0
     prefill_tbo_ar_blocks: int = 24
+    pipeline_parallel_size: int = 1
+    pp_prefill_microbatches: int = 4
+    pp_engram_gpu_layers: int = 1
     b12x_compat_dir: str = ""
     b12x_cache_dir: str | None = None
     b12x_autotune: bool = True
@@ -262,6 +265,29 @@ class WorkerRuntimeConfig:
                 f"(got {prefill_tbo_ar_blocks})"
             )
 
+        pipeline_parallel_size = env_int(
+            "ZSTEP_PIPELINE_PARALLEL_SIZE", 1, environ=env
+        )
+        if pipeline_parallel_size not in (1, 2):
+            raise ValueError(
+                "ZSTEP_PIPELINE_PARALLEL_SIZE must be 1 or 2 "
+                f"(got {pipeline_parallel_size})"
+            )
+        pp_prefill_microbatches = env_int(
+            "ZSTEP_PP_PREFILL_MICROBATCHES", 4, environ=env
+        )
+        if pp_prefill_microbatches < 1:
+            raise ValueError(
+                "ZSTEP_PP_PREFILL_MICROBATCHES must be >= 1 "
+                f"(got {pp_prefill_microbatches})"
+            )
+        pp_engram_gpu_layers = env_int("ZSTEP_PP_ENGRAM_GPU_LAYERS", 1, environ=env)
+        if pp_engram_gpu_layers < 0:
+            raise ValueError(
+                "ZSTEP_PP_ENGRAM_GPU_LAYERS must be >= 0 "
+                f"(got {pp_engram_gpu_layers})"
+            )
+
         raw_cache_dir = env.get("ZSTEP_B12X_CACHE_DIR")
         b12x_cache_dir = (
             raw_cache_dir.strip()
@@ -326,6 +352,9 @@ class WorkerRuntimeConfig:
             prefill_tbo_min_tokens=prefill_tbo_min_tokens,
             prefill_tbo_min_ctx=prefill_tbo_min_ctx,
             prefill_tbo_ar_blocks=prefill_tbo_ar_blocks,
+            pipeline_parallel_size=pipeline_parallel_size,
+            pp_prefill_microbatches=pp_prefill_microbatches,
+            pp_engram_gpu_layers=pp_engram_gpu_layers,
             b12x_compat_dir=env.get("ZSTEP_B12X_COMPAT_DIR", "").strip(),
             b12x_cache_dir=b12x_cache_dir,
             b12x_autotune=env_flag("ZSTEP_B12X_AUTOTUNE", default=True, environ=env),

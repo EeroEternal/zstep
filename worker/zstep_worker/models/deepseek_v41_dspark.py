@@ -45,7 +45,7 @@ class DeepSeekV41DSparkDrafter:
         self.num_draft_layers: int = len(self.layer_list)
 
         vpr = runner.vocab_per_rank
-        rank = runner.rank
+        rank = getattr(runner, "tp_rank", runner.rank)
         markov_head = self.model.model.markov_head
         self.markov_w1_weight: torch.Tensor = markov_head.markov_w1.weight
         self.markov_w2_shard: torch.Tensor = markov_head.markov_w2.weight[
@@ -204,7 +204,7 @@ class DeepSeekV41DSparkDrafter:
                     ):
                         self._run_draft_forward_and_markov(b)
             capture_stream.synchronize()
-            dist.barrier(group=runner.exchange_group)
+            dist.barrier(group=getattr(runner, "tp_cpu_group", runner.exchange_group))
 
             with torch.cuda.stream(capture_stream):
                 attn_meta = runner._build_step_attn_metadata(
@@ -250,7 +250,7 @@ class DeepSeekV41DSparkDrafter:
                     )
                     self._run_draft_forward_and_markov(b)
             capture_stream.synchronize()
-            dist.barrier(group=runner.exchange_group)
+            dist.barrier(group=getattr(runner, "tp_cpu_group", runner.exchange_group))
             self.draft_graphs[b] = g
 
         # Capture fused combine_hidden_states + precompute_and_store_context_kv graphs
@@ -278,7 +278,7 @@ class DeepSeekV41DSparkDrafter:
                         [slot_view] * self.num_draft_layers,
                     )
             capture_stream.synchronize()
-            dist.barrier(group=runner.exchange_group)
+            dist.barrier(group=getattr(runner, "tp_cpu_group", runner.exchange_group))
             ctx_g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(ctx_g, pool=graph_pool, stream=capture_stream):
                 main_x = self.model.combine_hidden_states(torch.cat(raw_aux, dim=-1))
@@ -288,7 +288,7 @@ class DeepSeekV41DSparkDrafter:
                     [slot_view] * self.num_draft_layers,
                 )
             capture_stream.synchronize()
-            dist.barrier(group=runner.exchange_group)
+            dist.barrier(group=getattr(runner, "tp_cpu_group", runner.exchange_group))
             self.ctx_store_graphs[v_bucket] = ctx_g
 
     def close(self) -> None:
@@ -526,7 +526,7 @@ class DeepSeekV41DSparkDrafter:
             ):
                 self._run_draft_forward_and_markov(eff_b)
 
-        if runner.rank != 0:
+        if not getattr(runner, "is_result_rank", runner.rank == 0):
             return {}
         self.draft_out_tokens_cpu[:, :n].copy_(
             self.draft_out_tokens_gpu[:, :n, 0], non_blocking=True
@@ -583,9 +583,24 @@ class DeepSeekV41DSparkDrafter:
                 )
                 self.ctx_store_graphs[ctx_v_bucket].replay()
         else:
-            main_x = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
-            )
+            total_aux_rows = int(aux_hidden_states[0].shape[0])
+            if total_aux_rows <= 8192:
+                main_x = self.model.combine_hidden_states(
+                    torch.cat(aux_hidden_states, dim=-1)
+                )
+            else:
+                main_x = torch.cat(
+                    [
+                        self.model.combine_hidden_states(
+                            torch.cat(
+                                [a[lo : lo + 8192] for a in aux_hidden_states],
+                                dim=-1,
+                            )
+                        )
+                        for lo in range(0, total_aux_rows, 8192)
+                    ],
+                    dim=0,
+                )
             by_seq = {sequence.batch_index: sequence for sequence in verified}
             ctx_row_parts: list[np.ndarray] = []
             ctx_slot_parts: list[np.ndarray] = []
@@ -662,7 +677,10 @@ class DeepSeekV41DSparkDrafter:
                     page_table=page_table,
                 )
                 for seq in ovf_seqs[1:]:
-                    if self.runner.rank != 0 and self.runner.device.type == "cuda":
+                    if (
+                        not getattr(self.runner, "is_result_rank", self.runner.rank == 0)
+                        and self.runner.device.type == "cuda"
+                    ):
                         torch.cuda.current_stream(self.runner.device).synchronize()
                     merged.update(
                         self._draft_batch([seq], positions=positions, page_table=page_table)

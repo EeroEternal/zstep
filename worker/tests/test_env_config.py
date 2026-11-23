@@ -134,11 +134,17 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
             "ZSTEP_PREFILL_TBO_MIN_TOKENS": "0",
             "ZSTEP_PREFILL_TBO_MIN_CTX": "65536",
             "ZSTEP_PREFILL_TBO_AR_BLOCKS": "16",
+            "ZSTEP_PIPELINE_PARALLEL_SIZE": "2",
+            "ZSTEP_PP_PREFILL_MICROBATCHES": "32",
+            "ZSTEP_PP_ENGRAM_GPU_LAYERS": "1",
         }
     )
     assert tbo_cfg.prefill_tbo_min_tokens == 0
     assert tbo_cfg.prefill_tbo_min_ctx == 65536
     assert tbo_cfg.prefill_tbo_ar_blocks == 16
+    assert tbo_cfg.pipeline_parallel_size == 2
+    assert tbo_cfg.pp_prefill_microbatches == 32
+    assert tbo_cfg.pp_engram_gpu_layers == 1
 
 
 @pytest.mark.parametrize(
@@ -161,6 +167,10 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
         ({"ZSTEP_PREFILL_TBO_MIN_CTX": "-1"}, "ZSTEP_PREFILL_TBO_MIN_CTX"),
         ({"ZSTEP_PREFILL_TBO_AR_BLOCKS": "0"}, "ZSTEP_PREFILL_TBO_AR_BLOCKS"),
         ({"ZSTEP_PREFILL_TBO_AR_BLOCKS": "65"}, "ZSTEP_PREFILL_TBO_AR_BLOCKS"),
+        ({"ZSTEP_PIPELINE_PARALLEL_SIZE": "0"}, "ZSTEP_PIPELINE_PARALLEL_SIZE"),
+        ({"ZSTEP_PIPELINE_PARALLEL_SIZE": "3"}, "ZSTEP_PIPELINE_PARALLEL_SIZE"),
+        ({"ZSTEP_PP_PREFILL_MICROBATCHES": "0"}, "ZSTEP_PP_PREFILL_MICROBATCHES"),
+        ({"ZSTEP_PP_ENGRAM_GPU_LAYERS": "-1"}, "ZSTEP_PP_ENGRAM_GPU_LAYERS"),
     ],
 )
 def test_worker_runtime_config_rejects_invalid_values(
