@@ -794,6 +794,7 @@ class DeepSeekV41StepRunner:
         self._kv_raw_buffers: list[torch.Tensor] = []
         self._paged_kv_raw_buffers: list[torch.Tensor] = []
         self._builder_groups: list[_AttnBuilderGroup] = []
+        self._tbo_builder_groups_u1: list[_AttnBuilderGroup] = []
         self._allocate_and_bind_caches_and_builders()
 
         # Allocate static execution, staging, and sampling workspaces
@@ -1315,6 +1316,22 @@ class DeepSeekV41StepRunner:
             self._builder_groups.append(
                 _AttnBuilderGroup(kind=kind, layer_names=layer_names, builder=builder)
             )
+            if self.shm_ar_tbo is not None and (
+                not self._draft_layer_names
+                or set(layer_names).isdisjoint(self._draft_layer_names)
+            ):
+                builder_u1 = builder_cls(
+                    spec,
+                    layer_names,
+                    self.vllm_config,
+                    self.device,
+                    **kwargs,
+                )
+                self._tbo_builder_groups_u1.append(
+                    _AttnBuilderGroup(
+                        kind=kind, layer_names=layer_names, builder=builder_u1
+                    )
+                )
 
     def _zero_all_caches(self) -> None:
         for buf in self._kv_raw_buffers:
@@ -1354,6 +1371,7 @@ class DeepSeekV41StepRunner:
         mla_bt_gpu: torch.Tensor | None = None,
         swa_bt_gpu: torch.Tensor | None = None,
         comp_bt_gpu: torch.Tensor | None = None,
+        builder_groups: list[_AttnBuilderGroup] | None = None,
     ) -> dict[str, Any]:
         from vllm.v1.attention.backend import CommonAttentionMetadata
 
@@ -1393,7 +1411,8 @@ class DeepSeekV41StepRunner:
         cam_comp = _make_cam(comp_bt)
 
         attn_metadata: dict[str, Any] = {}
-        for grp in self._builder_groups:
+        active_groups = self._builder_groups if builder_groups is None else builder_groups
+        for grp in active_groups:
             if only_layer_names is None:
                 if self._draft_layer_names and not set(grp.layer_names).isdisjoint(
                     self._draft_layer_names
@@ -1429,11 +1448,11 @@ class DeepSeekV41StepRunner:
         *,
         max_seq_len: int,
         is_decode: bool,
-        is_spec_step: bool,
+        is_spec_step: bool = False,
     ) -> bool:
+        del is_spec_step
         if (
             is_decode
-            or is_spec_step
             or self.shm_ar_tbo is None
             or self._tbo_comm_stream is None
             or torch.cuda.is_current_stream_capturing()
@@ -1454,7 +1473,10 @@ class DeepSeekV41StepRunner:
             return False
         if getattr(dsv4_core, "use_sequence_parallel", False):
             return False
-        if getattr(dsv4_core, "_mtp_hidden_buffer", None) is not None:
+        if (
+            getattr(self, "dspark_drafter", None) is None
+            and getattr(dsv4_core, "_mtp_hidden_buffer", None) is not None
+        ):
             return False
         return hasattr(dsv4_core, "layers") and hasattr(dsv4_core, "embed_input_ids")
 
@@ -1507,7 +1529,8 @@ class DeepSeekV41StepRunner:
         pos_i64: np.ndarray,
         full_attn_meta: dict[str, Any],
         need_hidden: bool = True,
-    ) -> torch.Tensor | None:
+        capture_aux: bool = False,
+    ) -> tuple[torch.Tensor | None, list[torch.Tensor] | None]:
         """Prefill Two-Batch Overlap (TBO): split a long prefill chunk into two
         causal microbatches (`u0`, `u1`) and overlap each microbatch's `shm_v5`
         AllReduce (`blocks=ZSTEP_PREFILL_TBO_AR_BLOCKS`, high-priority comm stream)
@@ -1573,6 +1596,11 @@ class DeepSeekV41StepRunner:
                 mla_bt_gpu=self.mla_bt_gpu[r_start:r_end],
                 swa_bt_gpu=self.swa_bt_gpu[r_start:r_end],
                 comp_bt_gpu=self.comp_bt_gpu[r_start:r_end],
+                builder_groups=(
+                    self._builder_groups
+                    if u == 0 or not self._tbo_builder_groups_u1
+                    else self._tbo_builder_groups_u1
+                ),
             )
             attn_metas.append(meta_u)
         self._h2d_done_event.record(main_s)
@@ -1605,6 +1633,7 @@ class DeepSeekV41StepRunner:
             )
 
         xs = [hidden_full[:mid].contiguous(), hidden_full[mid:].contiguous()]
+        del hidden_full
         poss = [positions_full[:mid], positions_full[mid:]]
         ids_u = [input_ids_full[:mid], input_ids_full[mid:]]
         if dsv4_core.use_mega_moe:
@@ -1664,10 +1693,35 @@ class DeepSeekV41StepRunner:
         # (layer 20 -> layers 24, 28, 32, 36 share one buffer on SparseAttnIndexer).
         cand_orig_by_op: dict[int, tuple[Any, torch.Tensor]] = {}
         last_layer_idx = dsv4_core.end_layer - 1
+        aux_layers: tuple[int, ...] = (
+            tuple(getattr(dsv4_core, "aux_hidden_state_layers", ()) or ())
+            if capture_aux
+            else ()
+        )
+        aux_layers_set = set(aux_layers)
+        aux_full_by_layer: dict[int, torch.Tensor] = {}
+
+        def _store_aux(lid: int, u_idx: int, tensor: torch.Tensor) -> None:
+            buf = aux_full_by_layer.get(lid)
+            if buf is None:
+                buf = torch.empty(
+                    (total_tokens, tensor.shape[-1]),
+                    dtype=tensor.dtype,
+                    device=tensor.device,
+                )
+                aux_full_by_layer[lid] = buf
+            if u_idx == 0:
+                buf[:mid].copy_(tensor)
+            else:
+                buf[mid:].copy_(tensor)
+
+        need_final_aux = dsv4_core.end_layer in aux_layers_set
+        need_final_post = need_hidden or need_final_aux
         try:
             for idx in range(dsv4_core.start_layer, dsv4_core.end_layer):
                 layer = dsv4_core.layers[idx]
                 is_last_layer = idx == last_layer_idx
+                capture_prev_aux = idx in aux_layers_set
                 idx_mod = getattr(getattr(layer, "attn", None), "indexer", None)
                 sai_op = getattr(idx_mod, "sparse_attn_indexer", None) if idx_mod is not None else None
                 sai_cand = getattr(sai_op, "candidate_blocks", None) if sai_op is not None else None
@@ -1709,6 +1763,8 @@ class DeepSeekV41StepRunner:
                         )
                     elif layer.engram is not None and eh_u[u] is not None:
                         prev_post = mhc_post(xs[u], res_u[u], post_u[u], resmix_u[u])
+                        if capture_prev_aux:
+                            _store_aux(idx, u, prev_post.mean(dim=1))
                         assert gh_u[u] is not None
                         layer.engram.prepare_embeddings(
                             gh_u[u][:, layer.engram.layer_hash_index]
@@ -1739,7 +1795,7 @@ class DeepSeekV41StepRunner:
                             resmix_u[u],
                             xs[u],
                             pre_u[u],
-                            _,
+                            prev_aux,
                         ) = mhc_shifted(
                             xs[u],
                             res_u[u],
@@ -1756,22 +1812,31 @@ class DeepSeekV41StepRunner:
                             pre_mix=pre_u[u],
                             norm_weight=layer.attn_norm.weight,
                             norm_eps=layer.attn_norm.variance_epsilon,
-                            capture_aux=False,
+                            capture_aux=capture_prev_aux,
                             stream=None,
                             reduce_results=False,
                         )
+                        if capture_prev_aux and prev_aux is not None:
+                            _store_aux(idx, u, prev_aux)
+                            del prev_aux
                     flush_sm120_mhc_before_ar(dev_idx)
                     if sai_op is not None and sai_cand is not None and self._tbo_cand_bufs is not None:
                         sai_op.candidate_blocks = self._tbo_cand_bufs[u]
                     fwd_ctx.attn_metadata = attn_metas[u]
                     xs[u] = layer.attn(poss[u], xs[u], None)
-                    if not (is_last_layer and not need_hidden):
+                    if not (is_last_layer and not need_final_post):
                         xs[u] = _launch_ar(xs[u], u)
 
-                # On non-final prefill chunks (num_sample == 0), layer 39's KV cache
-                # is now written; skip stateless last-layer FFN + AR + final norm.
-                if is_last_layer and not need_hidden:
-                    return None
+                # On non-final prefill chunks (num_sample == 0 and no final-layer aux
+                # capture), layer 39's KV cache is written; skip stateless last-layer
+                # FFN + AR + final norm.
+                if is_last_layer and not need_final_post:
+                    aux_out = [
+                        aux_full_by_layer[lid]
+                        for lid in aux_layers
+                        if lid in aux_full_by_layer
+                    ]
+                    return None, (aux_out if aux_out else None)
 
                 # Phase B: FFN / MoE (u0's FFN overlaps with u1's Attn AR;
                 # u1's FFN overlaps with u0's FFN AR; next layer u0's Attn
@@ -1810,14 +1875,36 @@ class DeepSeekV41StepRunner:
             for op, orig_buf in cand_orig_by_op.values():
                 op.candidate_blocks = orig_buf
 
-        out_u: list[torch.Tensor] = []
+        hidden_out: torch.Tensor | None = None
         for u in (0, 1):
             main_s.wait_event(self._tbo_ar_done_ev[u])
             h = mhc_post(xs[u], res_u[u], post_u[u], resmix_u[u])
-            assert pre_u[u] is not None
-            h = hc_collapse(h, pre_u[u])
-            out_u.append(dsv4_core.norm(h))
-        return torch.cat(out_u, dim=0)
+            res_u[u] = None
+            post_u[u] = None
+            resmix_u[u] = None
+            if need_final_aux:
+                _store_aux(dsv4_core.end_layer, u, h.mean(dim=1))
+            if need_hidden:
+                assert pre_u[u] is not None
+                h = hc_collapse(h, pre_u[u])
+                pre_u[u] = None
+                normed = dsv4_core.norm(h)
+                if hidden_out is None:
+                    hidden_out = torch.empty(
+                        (total_tokens, normed.shape[-1]),
+                        dtype=normed.dtype,
+                        device=normed.device,
+                    )
+                if u == 0:
+                    hidden_out[:mid].copy_(normed)
+                else:
+                    hidden_out[mid:].copy_(normed)
+        aux_out = [
+            aux_full_by_layer[lid]
+            for lid in aux_layers
+            if lid in aux_full_by_layer
+        ]
+        return hidden_out, (aux_out if aux_out else None)
 
     def _sample_rows_into_argmax(
         self,
@@ -3203,13 +3290,14 @@ class DeepSeekV41StepRunner:
                         else None
                     )
                 elif use_tbo:
-                    hidden = self._run_prefill_tbo(
+                    hidden, aux_hidden_states = self._run_prefill_tbo(
                         total_tokens=total_tokens,
                         num_seqs=num_seqs,
                         q_start_np=q_start_np,
                         pos_i64=pos_i64,
                         full_attn_meta=attn_meta,
                         need_hidden=(num_sample > 0),
+                        capture_aux=is_spec_step,
                     )
                 else:
                     lang_mod = getattr(self.model, "language_model", self.model)
@@ -3376,6 +3464,9 @@ class DeepSeekV41StepRunner:
         builder_groups = getattr(self, "_builder_groups", None)
         if builder_groups is not None:
             builder_groups.clear()
+        tbo_u1_groups = getattr(self, "_tbo_builder_groups_u1", None)
+        if tbo_u1_groups is not None:
+            tbo_u1_groups.clear()
         if self.argmax_channel is not None:
             self.argmax_channel.close(abort=True)
         if self.shm_ag is not None:
@@ -3416,6 +3507,9 @@ class DeepSeekV41StepRunner:
         builder_groups = getattr(self, "_builder_groups", None)
         if builder_groups is not None:
             builder_groups.clear()
+        tbo_u1_groups = getattr(self, "_tbo_builder_groups_u1", None)
+        if tbo_u1_groups is not None:
+            tbo_u1_groups.clear()
         gc.collect()
         torch.cuda.empty_cache()
         if dist.is_initialized() and hasattr(self, "exchange_group"):
