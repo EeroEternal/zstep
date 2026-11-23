@@ -479,6 +479,7 @@ class DeepSeekV41StepRunner:
         self._pw_live_num_tokens: int = 0
         self.verify_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._gpu_bt_cache_key: tuple[Any, ...] | None = None
+        self._gpu_bt_raw_pt: np.ndarray | None = None
         self.verify_graph_aux: dict[int, list[torch.Tensor] | None] = {}
         self.dspark_drafter: Any | None = None
         self._last_verify_bt_sig: tuple[int, tuple[int, ...]] | None = None
@@ -1336,6 +1337,41 @@ class DeepSeekV41StepRunner:
                         kind=kind, layer_names=layer_names, builder=builder_u1
                     )
                 )
+
+    def _matches_gpu_bt_cache(
+        self,
+        bt_key: tuple[Any, ...],
+        pt_np: np.ndarray,
+        slots_np: np.ndarray,
+        c_hi: np.ndarray,
+    ) -> bool:
+        if bt_key != self._gpu_bt_cache_key or self._gpu_bt_raw_pt is None:
+            return False
+        cached = self._gpu_bt_raw_pt
+        return all(
+            np.array_equal(pt_np[int(s), : int(ch) + 1], cached[i, : int(ch) + 1])
+            for i, (s, ch) in enumerate(zip(slots_np, c_hi, strict=True))
+        )
+
+    def _store_gpu_bt_cache(
+        self,
+        cache_key: tuple[Any, ...],
+        pt_np: np.ndarray,
+        slots_np: np.ndarray,
+    ) -> None:
+        self._gpu_bt_cache_key = cache_key
+        n_rows = int(slots_np.shape[0])
+        if n_rows == 0:
+            return
+        if (
+            self._gpu_bt_raw_pt is None
+            or self._gpu_bt_raw_pt.shape[0] < n_rows
+            or self._gpu_bt_raw_pt.shape[1] != pt_np.shape[1]
+        ):
+            self._gpu_bt_raw_pt = np.empty(
+                (max(n_rows, int(self.max_seqs)), pt_np.shape[1]), dtype=pt_np.dtype
+            )
+        self._gpu_bt_raw_pt[:n_rows] = pt_np[slots_np, :]
 
     def _zero_all_caches(self) -> None:
         self._gpu_bt_cache_key = None
@@ -2852,10 +2888,10 @@ class DeepSeekV41StepRunner:
                 tuple(int(s) for s in slot_np),
                 tuple(int(c) for c in c_lo),
                 tuple(int(c) for c in c_hi),
-                tuple(int(pt_np[s, c]) for s, c in zip(slot_np, c_hi)),
+                tuple(int(pt_np[s, c]) for s, c in zip(slot_np, c_hi, strict=True)),
                 tuple(int(pt_np[s, 0]) for s in slot_np),
             )
-            bt_hit = bt_key == self._gpu_bt_cache_key
+            bt_hit = self._matches_gpu_bt_cache(bt_key, pt_np, slot_np, c_hi)
             if not bt_hit:
                 active_pt = pt_np[slot_np, :] + 1
                 mla_bt_np = self.mla_bt_cpu[:bucket].numpy()
@@ -2923,14 +2959,18 @@ class DeepSeekV41StepRunner:
                     self.comp_bt_cpu[:bucket], non_blocking=True
                 )
                 post_epoch = self._swa_pool.epoch if self._swa_pool is not None else -1
-                self._gpu_bt_cache_key = (
-                    bucket,
-                    post_epoch,
-                    bt_key[2],
-                    bt_key[3],
-                    bt_key[4],
-                    bt_key[5],
-                    bt_key[6],
+                self._store_gpu_bt_cache(
+                    (
+                        bucket,
+                        post_epoch,
+                        bt_key[2],
+                        bt_key[3],
+                        bt_key[4],
+                        bt_key[5],
+                        bt_key[6],
+                    ),
+                    pt_np,
+                    slot_np,
                 )
             if use_dev_tok:
                 s_idx = self.slots_gpu[:num_seqs]
@@ -3022,10 +3062,10 @@ class DeepSeekV41StepRunner:
                 tuple(int(s) for s in seq_slots_np),
                 tuple(int(c) for c in c_lo),
                 tuple(int(c) for c in c_hi),
-                tuple(int(pt_np[s, c]) for s, c in zip(seq_slots_np, c_hi)),
+                tuple(int(pt_np[s, c]) for s, c in zip(seq_slots_np, c_hi, strict=True)),
                 tuple(int(pt_np[s, 0]) for s in seq_slots_np),
             )
-            bt_hit = bt_key == self._gpu_bt_cache_key
+            bt_hit = self._matches_gpu_bt_cache(bt_key, pt_np, seq_slots_np, c_hi)
             if not bt_hit:
                 active_pt = pt_np[seq_slots_np, :] + 1
                 mla_bt_np = self.mla_bt_cpu[:v_bucket].numpy()
@@ -3102,14 +3142,18 @@ class DeepSeekV41StepRunner:
                     self.comp_bt_cpu[:v_bucket], non_blocking=True
                 )
                 post_epoch = self._swa_pool.epoch if self._swa_pool is not None else -1
-                self._gpu_bt_cache_key = (
-                    v_bucket,
-                    post_epoch,
-                    bt_key[2],
-                    bt_key[3],
-                    bt_key[4],
-                    bt_key[5],
-                    bt_key[6],
+                self._store_gpu_bt_cache(
+                    (
+                        v_bucket,
+                        post_epoch,
+                        bt_key[2],
+                        bt_key[3],
+                        bt_key[4],
+                        bt_key[5],
+                        bt_key[6],
+                    ),
+                    pt_np,
+                    seq_slots_np,
                 )
             self._last_verify_bt_sig = (v_bucket, tuple(int(s) for s in seq_slots_np))
             self.lookback_gpu[:v_bucket].copy_(

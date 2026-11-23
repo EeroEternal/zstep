@@ -155,3 +155,42 @@ def test_swa_page_pool_tail_bound_on_prefill_vs_straddling_verify() -> None:
         active_slots=np.array([0], dtype=np.int64),
     )
     assert pool._slot_tails[0] == (1, 2, 3)
+
+
+def test_gpu_bt_cache_rejects_middle_page_reuse_and_invalidation() -> None:
+    try:
+        from zstep_worker.models.deepseek_v41 import DeepSeekV41StepRunner
+    except ImportError as exc:
+        pytest.skip(f"DeepSeekV41StepRunner import skipped: {exc}")
+
+    runner = DeepSeekV41StepRunner.__new__(DeepSeekV41StepRunner)
+    runner.max_seqs = 4
+    runner._gpu_bt_cache_key = None
+    runner._gpu_bt_raw_pt = None
+
+    slots = np.array([0, 2], dtype=np.int64)
+    c_hi = np.array([2, 2], dtype=np.int64)
+    pt_np = np.array(
+        [
+            [10, 11, 12, 99],
+            [0, 0, 0, 99],
+            [20, 21, 22, 99],
+            [0, 0, 0, 99],
+        ],
+        dtype=np.int32,
+    )
+    key = (2, 1, (0, 2), (1, 1), (2, 2), (12, 22), (10, 20))
+    assert not runner._matches_gpu_bt_cache(key, pt_np, slots, c_hi)
+
+    runner._store_gpu_bt_cache(key, pt_np, slots)
+    assert runner._matches_gpu_bt_cache(key, pt_np, slots, c_hi)
+
+    # Middle block pt_np[0, 1] changes while pt_np[0, 0] and pt_np[0, c_hi] stay identical.
+    pt_mutated = pt_np.copy()
+    pt_mutated[0, 1] = 77
+    assert not runner._matches_gpu_bt_cache(key, pt_mutated, slots, c_hi)
+
+    # Invalidation via epoch bump or key reset.
+    assert not runner._matches_gpu_bt_cache((2, 2, *key[2:]), pt_np, slots, c_hi)
+    runner._gpu_bt_cache_key = None
+    assert not runner._matches_gpu_bt_cache(key, pt_np, slots, c_hi)
