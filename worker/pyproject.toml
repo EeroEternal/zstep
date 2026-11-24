@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zstep-worker"
-version = "0.1.0"
+version = "1.0.0"
 description = "Explicit sm_120 step GPU worker for zstep (NVIDIA RTX 5090 / RTX 6000D)"
 requires-python = ">=3.11"
 license = { text = "MIT" }
