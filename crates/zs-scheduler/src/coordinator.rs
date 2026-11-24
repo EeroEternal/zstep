@@ -970,24 +970,29 @@ fn verify_rank_ready_state(
             "rank {rank} reported worker error {error_code} in phase {step_id}"
         )));
     }
-    if !initializing && status == WORKER_STATUS_RUNNING {
-        return Err(EngineError::Protocol(format!(
-            "rank {rank} remained running in phase {step_id}"
-        )));
-    }
-    if status != WORKER_STATUS_READY {
-        return Err(EngineError::Protocol(format!(
-            "rank {rank} has unexpected status {status} in phase {step_id}"
-        )));
-    }
-    if !initializing {
-        let ready_step = state.ready_step_id.load(Ordering::Acquire);
-        let max_expected_step = last_published_step.max(step_id);
-        if ready_step < step_id || ready_step > max_expected_step {
+    let ready_step = state.ready_step_id.load(Ordering::Acquire);
+    let max_expected_step = last_published_step.max(step_id);
+    let ahead_running = !initializing
+        && status == WORKER_STATUS_RUNNING
+        && last_published_step > step_id
+        && ready_step >= step_id
+        && ready_step <= max_expected_step;
+    if !ahead_running {
+        if !initializing && status == WORKER_STATUS_RUNNING {
             return Err(EngineError::Protocol(format!(
-                "rank {rank} completed unexpected step {ready_step} in phase {step_id} (published up to {max_expected_step})"
+                "rank {rank} remained running in phase {step_id}"
             )));
         }
+        if status != WORKER_STATUS_READY {
+            return Err(EngineError::Protocol(format!(
+                "rank {rank} has unexpected status {status} in phase {step_id}"
+            )));
+        }
+    }
+    if !initializing && (ready_step < step_id || ready_step > max_expected_step) {
+        return Err(EngineError::Protocol(format!(
+            "rank {rank} completed unexpected step {ready_step} in phase {step_id} (published up to {max_expected_step})"
+        )));
     }
     Ok(())
 }

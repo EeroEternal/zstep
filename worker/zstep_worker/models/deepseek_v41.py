@@ -127,6 +127,7 @@ class _LaunchedStep:
     num_out: int
     sample_slots_out: list[int]
     spec_ctx: _SpecVerifyContext | None = None
+    pp_send_reqs: list[Any] | None = None
 
 
 def apply_vllm_sm120_dsv41_patches() -> None:
@@ -962,6 +963,26 @@ class DeepSeekV41StepRunner:
             )
             self._pp_inter_pre_mix: torch.Tensor | None = torch.zeros(
                 (pp_g_rows, 4), dtype=torch.float32, device=self.device
+            )
+            self._pp_p2p_hidden: list[torch.Tensor] = (
+                [
+                    torch.zeros(
+                        (pp_g_rows, 4, self.hidden_size),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(2)
+                ]
+                if self.is_first_pp
+                else []
+            )
+            self._pp_p2p_pre_mix: list[torch.Tensor] = (
+                [
+                    torch.zeros((pp_g_rows, 4), dtype=torch.float32, device=self.device)
+                    for _ in range(2)
+                ]
+                if self.is_first_pp
+                else []
             )
             pp_k = max(1, self.runtime_config.pp_prefill_microbatches)
             self._pp_qsl_cpu: list[torch.Tensor] = [
@@ -3610,6 +3631,7 @@ class DeepSeekV41StepRunner:
         )
         aux_hidden_states: list[torch.Tensor] | None = None
         dspark_ctx_prestored: bool = False
+        pp_send_reqs: list[Any] | None = None
         self._last_verify_bt_sig = None
         self._last_verify_graph_bucket = None
         self._h2d_done_event.synchronize()
@@ -3781,10 +3803,11 @@ class DeepSeekV41StepRunner:
                     self._pp_inter_hidden is not None
                     and self._pp_inter_pre_mix is not None
                 )
-                for req in self._pp_send_intermediate(
-                    self._pp_inter_hidden[:bucket], self._pp_inter_pre_mix[:bucket]
-                ):
-                    req.wait()
+                send_h = self._pp_p2p_hidden[parity][:bucket]
+                send_p = self._pp_p2p_pre_mix[parity][:bucket]
+                send_h.copy_(self._pp_inter_hidden[:bucket])
+                send_p.copy_(self._pp_inter_pre_mix[:bucket])
+                pp_send_reqs = self._pp_send_intermediate(send_h, send_p)
             if self.is_last_pp and is_sampling:
                 local_logits = self.model.compute_logits_local(
                     self.decode_hidden_gpu[:num_seqs]
@@ -3994,10 +4017,11 @@ class DeepSeekV41StepRunner:
                     self._pp_inter_hidden is not None
                     and self._pp_inter_pre_mix is not None
                 )
-                for req in self._pp_send_intermediate(
-                    self._pp_inter_hidden[:rows], self._pp_inter_pre_mix[:rows]
-                ):
-                    req.wait()
+                send_h = self._pp_p2p_hidden[parity][:rows]
+                send_p = self._pp_p2p_pre_mix[parity][:rows]
+                send_h.copy_(self._pp_inter_hidden[:rows])
+                send_p.copy_(self._pp_inter_pre_mix[:rows])
+                pp_send_reqs = self._pp_send_intermediate(send_h, send_p)
                 sample_slots_out = []
                 num_out = 0
             else:
@@ -4372,6 +4396,7 @@ class DeepSeekV41StepRunner:
             num_out=num_out,
             sample_slots_out=sample_slots_out,
             spec_ctx=spec_ctx,
+            pp_send_reqs=pp_send_reqs,
         )
 
     @torch.inference_mode()
@@ -4379,6 +4404,9 @@ class DeepSeekV41StepRunner:
         if step is None:
             return [], 1
         p = step.parity
+        if step.pp_send_reqs is not None:
+            for req in step.pp_send_reqs:
+                req.wait()
         self.end_events[p].synchronize()
         outputs: list[SeqResult] = []
         if step.spec_ctx is not None:
