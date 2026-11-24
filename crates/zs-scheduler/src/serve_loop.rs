@@ -1787,7 +1787,7 @@ mod tests {
             max_waiting: 64,
             pre_staged: Some(7),
             published_ahead: None,
-        pp_1f1b_split: None,
+            pp_1f1b_split: None,
             consecutive_prefills: 0,
             steps: 0,
             pending: Arc::clone(&pending),
@@ -2001,7 +2001,7 @@ mod tests {
             max_waiting: 8,
             pre_staged: Some(42),
             published_ahead: None,
-        pp_1f1b_split: None,
+            pp_1f1b_split: None,
             consecutive_prefills: 0,
             steps: 1,
             pending: Arc::clone(&pending),
@@ -2148,7 +2148,7 @@ mod tests {
             max_waiting: 64,
             pre_staged: None,
             published_ahead: None,
-        pp_1f1b_split: None,
+            pp_1f1b_split: None,
             consecutive_prefills: 0,
             steps: 0,
             pending: Arc::clone(&pending),
@@ -2539,8 +2539,8 @@ mod tests {
     fn test_pp_1f1b_cohorts_eligible_guards() {
         let slot_pool = SlotPool::new(8);
         let now = Instant::now();
-        let make_seq = |id: usize, gen_len: usize, target_len: usize, prefilled: usize| {
-            ActiveSequence {
+        let make_seq =
+            |id: usize, gen_len: usize, target_len: usize, prefilled: usize| ActiveSequence {
                 request_id: id,
                 slot_lease: slot_pool.allocate().expect("slot"),
                 prefix_lease: None,
@@ -2566,8 +2566,7 @@ mod tests {
                 submit_time: now,
                 first_token_time: Some(now),
                 last_token_time: Some(now),
-            }
-        };
+            };
 
         // Fewer than 4 sequences -> ineligible
         let small = vec![

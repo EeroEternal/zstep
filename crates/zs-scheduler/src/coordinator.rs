@@ -989,12 +989,10 @@ fn verify_rank_ready_state(
             )));
         }
     }
-    if !initializing {
-        if ready_step < step_id || ready_step > max_expected_step {
-            return Err(EngineError::Protocol(format!(
-                "rank {rank} completed unexpected step {ready_step} in phase {step_id} (published up to {max_expected_step})"
-            )));
-        }
+    if !initializing && (ready_step < step_id || ready_step > max_expected_step) {
+        return Err(EngineError::Protocol(format!(
+            "rank {rank} completed unexpected step {ready_step} in phase {step_id} (published up to {max_expected_step})"
+        )));
     }
     Ok(())
 }
