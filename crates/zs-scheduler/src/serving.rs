@@ -534,6 +534,7 @@ pub struct ServingEngine {
     prefill_chunk_align: usize,
     prefill_policy: PrefillSchedulingPolicy,
     device_token_overlap: bool,
+    pub(crate) pp_decode_pipeline: bool,
     speculative: SpeculativeConfig,
     poisoned: bool,
     last_generation_schedule: GenerationScheduleStats,
@@ -1184,6 +1185,19 @@ impl ServingEngine {
             prefill_chunk_align: 4,
             prefill_policy: PrefillSchedulingPolicy::default(),
             device_token_overlap: false,
+            pp_decode_pipeline: std::env::var("ZSTEP_PIPELINE_PARALLEL_SIZE")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                >= 2
+                && matches!(
+                    std::env::var("ZSTEP_PP_DECODE_PIPELINE")
+                        .unwrap_or_default()
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "1" | "true" | "yes" | "on"
+                ),
             speculative,
             poisoned: false,
             last_generation_schedule: GenerationScheduleStats::default(),

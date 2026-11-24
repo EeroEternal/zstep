@@ -255,6 +255,7 @@ struct OnlineState {
     max_waiting: usize,
     pre_staged: Option<u64>,
     published_ahead: Option<(u64, bool)>,
+    pp_1f1b_split: Option<(usize, bool)>,
     consecutive_prefills: usize,
     steps: u64,
     pending: Arc<AtomicU64>,
@@ -502,6 +503,7 @@ fn run_loop(
         max_waiting: config.max_waiting_requests.max(1),
         pre_staged: None,
         published_ahead: None,
+        pp_1f1b_split: None,
         consecutive_prefills: 0,
         steps: 0,
         pending,
@@ -1130,13 +1132,39 @@ fn online_step(
                 )?;
                 online.consecutive_prefills += 1;
             } else {
-                engine.stage_decode_step(
-                    sid,
-                    &mut online.active,
-                    page_block_tokens,
-                    max_pages_per_seq,
-                    true,
-                )?;
+                let spec_width = 1 + engine.speculative.num_speculative_tokens;
+                let max_ctx = engine
+                    .coordinator
+                    .config()
+                    .launch
+                    .max_model_len
+                    .unwrap_or(max_pages_per_seq * page_block_tokens);
+                let mid = online.active.len().div_ceil(2);
+                let can_enter_pp_1f1b = engine.pp_decode_pipeline
+                    && !has_partial_prefill
+                    && !waiting_admissible
+                    && online.draining_finished.is_empty()
+                    && online.cancelled.is_empty()
+                    && online.completed_stops.is_empty()
+                    && pp_1f1b_cohorts_eligible(&online.active, mid, max_ctx, spec_width);
+                if can_enter_pp_1f1b {
+                    engine.stage_decode_step(
+                        sid,
+                        &mut online.active[..mid],
+                        page_block_tokens,
+                        max_pages_per_seq,
+                        true,
+                    )?;
+                    online.pp_1f1b_split = Some((mid, true));
+                } else {
+                    engine.stage_decode_step(
+                        sid,
+                        &mut online.active,
+                        page_block_tokens,
+                        max_pages_per_seq,
+                        true,
+                    )?;
+                }
                 online.consecutive_prefills = 0;
             }
         }
@@ -1155,73 +1183,120 @@ fn online_step(
         || !online.cancelled.is_empty()
         || !online.completed_stops.is_empty();
 
-    let publish_next = match ahead_promise {
-        Some(promise) => promise,
-        None => {
-            let promise = engine.device_token_overlap
-                && !engine.speculative.enabled()
-                && !stop_overlap
-                && engine.plan_flags(step_id)? & STEP_FLAG_DECODE_ONLY != 0
+    if let Some((mid, next_is_b)) = online.pp_1f1b_split {
+        let spec_width = 1 + engine.speculative.num_speculative_tokens;
+        let max_ctx = engine
+            .coordinator
+            .config()
+            .launch
+            .max_model_len
+            .unwrap_or(max_pages_per_seq * page_block_tokens);
+        let publish_next = match ahead_promise {
+            Some(promise) => promise,
+            None => {
+                engine.or_plan_flags(step_id, STEP_FLAG_NEXT_PREPUBLISHED)?;
+                engine.coordinator.publish_step(step_id)?;
+                online.steps += 1;
+                true
+            }
+        };
+        if publish_next {
+            let next_sid = engine.step_cursor + 1;
+            engine.step_cursor = next_sid;
+            let cohort_slice = if next_is_b {
+                &mut online.active[mid..]
+            } else {
+                &mut online.active[..mid]
+            };
+            engine.stage_decode_step(
+                next_sid,
+                cohort_slice,
+                page_block_tokens,
+                max_pages_per_seq,
+                true,
+            )?;
+            let next_promise = !stop_overlap
+                && !post_admit_waiting_admissible
+                && pp_1f1b_cohorts_eligible(&online.active, mid, max_ctx, spec_width);
+            if next_promise {
+                engine.or_plan_flags(next_sid, STEP_FLAG_NEXT_PREPUBLISHED)?;
+            }
+            engine.coordinator.publish_step(next_sid)?;
+            online.steps += 1;
+            online.published_ahead = Some((next_sid, next_promise));
+            online.pp_1f1b_split = Some((mid, !next_is_b));
+        } else {
+            online.pp_1f1b_split = None;
+        }
+    } else {
+        let publish_next = match ahead_promise {
+            Some(promise) => promise,
+            None => {
+                let promise = engine.device_token_overlap
+                    && !engine.speculative.enabled()
+                    && !stop_overlap
+                    && engine.plan_flags(step_id)? & STEP_FLAG_DECODE_ONLY != 0
+                    && decode_continues_for_all(
+                        &online.active,
+                        post_admit_waiting_admissible,
+                        0,
+                        has_prefix_cache,
+                    );
+                if promise {
+                    engine.or_plan_flags(step_id, STEP_FLAG_NEXT_PREPUBLISHED)?;
+                }
+                engine.coordinator.publish_step(step_id)?;
+                online.steps += 1;
+                promise
+            }
+        };
+
+        if publish_next {
+            let next_sid = engine.step_cursor + 1;
+            engine.step_cursor = next_sid;
+            engine.stage_decode_step(
+                next_sid,
+                &mut online.active,
+                page_block_tokens,
+                max_pages_per_seq,
+                true,
+            )?;
+            let next_promise = !stop_overlap
                 && decode_continues_for_all(
                     &online.active,
                     post_admit_waiting_admissible,
-                    0,
+                    1,
                     has_prefix_cache,
                 );
-            if promise {
-                engine.or_plan_flags(step_id, STEP_FLAG_NEXT_PREPUBLISHED)?;
+            let mut flags = STEP_FLAG_DEVICE_TOKENS;
+            if next_promise {
+                flags |= STEP_FLAG_NEXT_PREPUBLISHED;
             }
-            engine.coordinator.publish_step(step_id)?;
+            engine.or_plan_flags(next_sid, flags)?;
+            engine.coordinator.publish_step(next_sid)?;
             online.steps += 1;
-            promise
-        }
-    };
-
-    if publish_next {
-        let next_sid = engine.step_cursor + 1;
-        engine.step_cursor = next_sid;
-        engine.stage_decode_step(
-            next_sid,
-            &mut online.active,
-            page_block_tokens,
-            max_pages_per_seq,
-            true,
-        )?;
-        let next_promise = !stop_overlap
+            online.published_ahead = Some((next_sid, next_promise));
+        } else if ahead_promise.is_none()
+            && !engine.device_token_overlap
+            && !engine.speculative.enabled()
+            && !stop_overlap
             && decode_continues_for_all(
                 &online.active,
                 post_admit_waiting_admissible,
-                1,
+                0,
                 has_prefix_cache,
-            );
-        let mut flags = STEP_FLAG_DEVICE_TOKENS;
-        if next_promise {
-            flags |= STEP_FLAG_NEXT_PREPUBLISHED;
+            )
+        {
+            let next_sid = engine.step_cursor + 1;
+            engine.stage_decode_step(
+                next_sid,
+                &mut online.active,
+                page_block_tokens,
+                max_pages_per_seq,
+                false,
+            )?;
+            online.pre_staged = Some(next_sid);
         }
-        engine.or_plan_flags(next_sid, flags)?;
-        engine.coordinator.publish_step(next_sid)?;
-        online.steps += 1;
-        online.published_ahead = Some((next_sid, next_promise));
-    } else if ahead_promise.is_none()
-        && !engine.device_token_overlap
-        && !engine.speculative.enabled()
-        && !stop_overlap
-        && decode_continues_for_all(
-            &online.active,
-            post_admit_waiting_admissible,
-            0,
-            has_prefix_cache,
-        )
-    {
-        let next_sid = engine.step_cursor + 1;
-        engine.stage_decode_step(
-            next_sid,
-            &mut online.active,
-            page_block_tokens,
-            max_pages_per_seq,
-            false,
-        )?;
-        online.pre_staged = Some(next_sid);
     }
 
     engine.coordinator.wait_step_completed(step_id)?;
@@ -1344,6 +1419,30 @@ fn online_step(
         metrics,
     );
     Ok(true)
+}
+
+fn pp_1f1b_cohorts_eligible(
+    active: &[ActiveSequence],
+    mid: usize,
+    max_ctx: usize,
+    width: usize,
+) -> bool {
+    if active.len() < 4 || mid == 0 || mid >= active.len() {
+        return false;
+    }
+    let safe_margin = width.saturating_mul(2).max(2);
+    if !active.iter().all(|seq| {
+        seq.prefilled_tokens == seq.prompt_tokens.len()
+            && seq.current_seq_len + safe_margin < max_ctx
+    }) {
+        return false;
+    }
+    let cohort_has_work = |slice: &[ActiveSequence]| {
+        slice
+            .iter()
+            .any(|seq| seq.generated_tokens.len() + width < seq.target_output_len)
+    };
+    cohort_has_work(&active[..mid]) && cohort_has_work(&active[mid..])
 }
 
 fn dummy_page_value(engine: &ServingEngine) -> i32 {
@@ -1688,6 +1787,7 @@ mod tests {
             max_waiting: 64,
             pre_staged: Some(7),
             published_ahead: None,
+        pp_1f1b_split: None,
             consecutive_prefills: 0,
             steps: 0,
             pending: Arc::clone(&pending),
@@ -1901,6 +2001,7 @@ mod tests {
             max_waiting: 8,
             pre_staged: Some(42),
             published_ahead: None,
+        pp_1f1b_split: None,
             consecutive_prefills: 0,
             steps: 1,
             pending: Arc::clone(&pending),
@@ -2047,6 +2148,7 @@ mod tests {
             max_waiting: 64,
             pre_staged: None,
             published_ahead: None,
+        pp_1f1b_split: None,
             consecutive_prefills: 0,
             steps: 0,
             pending: Arc::clone(&pending),
@@ -2261,6 +2363,7 @@ mod tests {
             max_waiting: 8,
             pre_staged: None,
             published_ahead: Some((9, false)),
+            pp_1f1b_split: None,
             consecutive_prefills: 0,
             steps: 2,
             pending: Arc::clone(&pending),
@@ -2430,5 +2533,71 @@ mod tests {
         // Candidate 0 should be t1 (highest probability), candidate 1 should be t2
         assert_eq!(lp_stoch.top_logprobs[0].token, 42);
         assert_eq!(lp_stoch.top_logprobs[1].token, 99);
+    }
+
+    #[test]
+    fn test_pp_1f1b_cohorts_eligible_guards() {
+        let slot_pool = SlotPool::new(8);
+        let now = Instant::now();
+        let make_seq = |id: usize, gen_len: usize, target_len: usize, prefilled: usize| {
+            ActiveSequence {
+                request_id: id,
+                slot_lease: slot_pool.allocate().expect("slot"),
+                prefix_lease: None,
+                kv_leases: Vec::new(),
+                page_ids: Vec::new(),
+                prompt_tokens: vec![10, 20, 30, 40],
+                prefilled_tokens: prefilled,
+                computed_prompt_tokens: prefilled,
+                cached_prefix_tokens: 0,
+                restore_checkpoint_id: -1,
+                pending_checkpoints: Vec::new(),
+                checkpoint_alloc_stopped: false,
+                current_seq_len: prefilled + gen_len,
+                last_token: 1,
+                generated_tokens: vec![1; gen_len],
+                generated_top2: Vec::new(),
+                pending_draft_tokens: Vec::new(),
+                staged_verify: None,
+                sampling: SamplingParams::default(),
+                target_output_len: target_len,
+                reserved_pages: 1,
+                permit_time: now,
+                submit_time: now,
+                first_token_time: Some(now),
+                last_token_time: Some(now),
+            }
+        };
+
+        // Fewer than 4 sequences -> ineligible
+        let small = vec![
+            make_seq(0, 1, 32, 4),
+            make_seq(1, 1, 32, 4),
+            make_seq(2, 1, 32, 4),
+        ];
+        assert!(!pp_1f1b_cohorts_eligible(&small, 2, 1024, 4));
+        drop(small);
+
+        // 4 prompt-complete sequences with headroom -> eligible
+        let mut ready = vec![
+            make_seq(0, 1, 32, 4),
+            make_seq(1, 1, 32, 4),
+            make_seq(2, 1, 32, 4),
+            make_seq(3, 1, 32, 4),
+        ];
+        assert!(pp_1f1b_cohorts_eligible(&ready, 2, 1024, 4));
+
+        // Near max_ctx margin -> ineligible
+        assert!(!pp_1f1b_cohorts_eligible(&ready, 2, 12, 4));
+
+        // Partial prefill in any sequence -> ineligible
+        ready[3].prefilled_tokens = 2;
+        assert!(!pp_1f1b_cohorts_eligible(&ready, 2, 1024, 4));
+        ready[3].prefilled_tokens = 4;
+
+        // Cohort B nearly finished (within width of target_output_len) -> ineligible
+        ready[2].generated_tokens = vec![1; 29];
+        ready[3].generated_tokens = vec![1; 29];
+        assert!(!pp_1f1b_cohorts_eligible(&ready, 2, 1024, 4));
     }
 }

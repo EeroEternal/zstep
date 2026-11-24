@@ -630,25 +630,37 @@ class RuntimeLoop:
                             self._prefill_runahead.after_launch()
                         self._complete_step(header.step_id, outputs, gpu_exec_us, watched_count)
                         continue
-                    if not is_decode and overlap_flags != 0:
+                    pp_size = int(getattr(self.runner, "pp_size", 1))
+                    is_first_pp = bool(getattr(self.runner, "is_first_pp", True))
+                    pp_1f1b_step = (
+                        pp_size > 1
+                        and (header.flags & STEP_FLAG_DEVICE_TOKENS) == 0
+                        and (
+                            (header.flags & STEP_FLAG_NEXT_PREPUBLISHED) != 0
+                            or pending is not None
+                        )
+                    )
+                    if not is_decode and overlap_flags != 0 and not pp_1f1b_step:
                         raise RuntimeError(
                             f"non-decode step {header.step_id} must not set overlap flags "
                             f"{overlap_flags:#x}"
                         )
-                    if pending is not None and not is_decode:
-                        # Only decode steps double-buffer their host staging.
+                    if pending is not None and not is_decode and not pp_1f1b_step:
+                        # Only decode (or PP=2 1F1B verify) steps double-buffer host staging.
                         self._finish_pending(pending, watched_count)
                         pending = None
-                    if not is_decode:
+                    if not is_decode and not pp_1f1b_step:
                         self._prefill_runahead.before_launch()
                     launched = self.runner.launch(plan, header)
-                    if not is_decode:
+                    if not is_decode and not pp_1f1b_step:
                         self._prefill_runahead.after_launch()
                     if pending is not None:
                         # The GPU already has this step queued behind the pending one.
                         self._finish_pending(pending, watched_count)
                         pending = None
-                    if header.flags & STEP_FLAG_NEXT_PREPUBLISHED:
+                    if (header.flags & STEP_FLAG_NEXT_PREPUBLISHED) != 0 and (
+                        pp_size == 1 or is_first_pp
+                    ):
                         pending = (header.step_id, launched)
                         continue
                     self._finish_pending((header.step_id, launched), watched_count)
