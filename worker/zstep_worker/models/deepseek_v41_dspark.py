@@ -350,6 +350,21 @@ class DeepSeekV41DSparkDrafter:
             [slot_view] * self.num_draft_layers,
         )
 
+    @torch.inference_mode()
+    def store_prefill_microbatch_ctx(
+        self,
+        aux_u: list[torch.Tensor],
+        positions_gpu: torch.Tensor,
+        slot_mapping_gpu: torch.Tensor,
+    ) -> None:
+        """Store DSpark context KV directly for a PP2 prefill microbatch on GPU."""
+        main_x = self.model.combine_hidden_states(torch.cat(aux_u, dim=-1))
+        self.model.precompute_and_store_context_kv(
+            main_x,
+            positions_gpu,
+            [slot_mapping_gpu] * self.num_draft_layers,
+        )
+
     def _draft_batch(
         self,
         sequences: list[VerifiedSequence],
@@ -547,15 +562,18 @@ class DeepSeekV41DSparkDrafter:
         self,
         verified: list[VerifiedSequence],
         *,
-        aux_hidden_states: list[torch.Tensor],
+        aux_hidden_states: list[torch.Tensor] | None,
         positions: np.ndarray,
         req_slot_ids: np.ndarray,
         query_start_loc: np.ndarray,
         page_table: np.ndarray,
+        ctx_prestored: bool = False,
     ) -> dict[int, list[int]]:
         max_ctx = min(self.runner.max_model_len, page_table.shape[1] * 128)
         ctx_v_bucket = getattr(self.runner, "_last_verify_graph_bucket", None)
-        if (
+        if ctx_prestored:
+            pass
+        elif (
             ctx_v_bucket is not None
             and ctx_v_bucket in self.ctx_store_graphs
             and len(verified) == len(query_start_loc) - 1
