@@ -1732,14 +1732,14 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zs-kv"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "zs-scheduler"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "zs-kv",
@@ -1749,7 +1749,7 @@ dependencies = [
 
 [[package]]
 name = "zs-server"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "axum",
  "futures-util",
@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "zs-shm"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "zs-wire",
@@ -1774,7 +1774,7 @@ dependencies = [
 
 [[package]]
 name = "zs-tokenizer"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1784,4 +1784,4 @@ dependencies = [
 
 [[package]]
 name = "zs-wire"
-version = "0.1.0"
+version = "1.0.0"
