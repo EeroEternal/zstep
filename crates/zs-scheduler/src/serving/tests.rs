@@ -1744,3 +1744,54 @@ fn kpool_chunk_align_keeps_non_final_chunks_multiple_of_4_and_allows_unaligned_t
     // Tiny leftover mixed budget (< 4) for a non-final chunk defers rather than splitting a kpool group.
     assert_eq!(prefill_chunk_range_aligned(50, 16, 3, 2048, 4), None);
 }
+
+#[test]
+fn pp_1f1b_cohorts_ready_requires_four_prompt_complete_sequences_with_headroom() {
+    let slot_pool = SlotPool::new(8);
+    let now = std::time::Instant::now();
+    let mk =
+        |prompt_len: usize, prefilled: usize, generated: usize, target_out: usize| ActiveSequence {
+            request_id: 1,
+            slot_lease: slot_pool.allocate().expect("slot"),
+            prefix_lease: None,
+            kv_leases: Vec::new(),
+            page_ids: Vec::new(),
+            prompt_tokens: vec![1; prompt_len],
+            prefilled_tokens: prefilled,
+            computed_prompt_tokens: prefilled,
+            cached_prefix_tokens: 0,
+            restore_checkpoint_id: -1,
+            pending_checkpoints: Vec::new(),
+            checkpoint_alloc_stopped: false,
+            current_seq_len: prefilled + generated,
+            last_token: 1,
+            generated_tokens: vec![2; generated],
+            generated_top2: Vec::new(),
+            pending_draft_tokens: Vec::new(),
+            staged_verify: None,
+            sampling: SamplingParams::default(),
+            target_output_len: target_out,
+            reserved_pages: 1,
+            permit_time: now,
+            submit_time: now,
+            first_token_time: None,
+            last_token_time: None,
+        };
+
+    let ready = vec![
+        mk(16, 16, 0, 4),
+        mk(16, 16, 1, 4),
+        mk(16, 16, 2, 4),
+        mk(16, 16, 0, 4),
+    ];
+    assert!(pp_1f1b_cohorts_ready(&ready, 2, 128));
+    assert!(!pp_1f1b_cohorts_ready(&ready[..3], 2, 128));
+
+    let near_eos = vec![
+        mk(16, 16, 3, 4),
+        mk(16, 16, 0, 4),
+        mk(16, 16, 0, 4),
+        mk(16, 16, 0, 4),
+    ];
+    assert!(!pp_1f1b_cohorts_ready(&near_eos, 2, 128));
+}

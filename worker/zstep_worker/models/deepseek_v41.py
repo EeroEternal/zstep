@@ -1004,6 +1004,18 @@ class DeepSeekV41StepRunner:
             self._pp_is_pref_cpu: list[torch.Tensor] = [
                 torch.zeros(ms, dtype=torch.bool) for _ in range(pp_k)
             ]
+            self._pp_comp_bt_gpu: list[torch.Tensor] = [
+                torch.full(
+                    (ms, 1), self.dummy_comp_block, dtype=torch.int32, device=self.device
+                )
+                for _ in range(pp_k)
+            ]
+            self._pp_lookback_gpu: list[torch.Tensor] = [
+                torch.full(
+                    (ms, self.engram_depth), -1, dtype=torch.int32, device=self.device
+                )
+                for _ in range(pp_k)
+            ]
             self._pp_recv_h_bufs: list[torch.Tensor] = (
                 [
                     torch.empty(
@@ -1032,6 +1044,8 @@ class DeepSeekV41StepRunner:
             self._pp_seq_lens_cpu = []
             self._pp_seq_lens_gpu = []
             self._pp_is_pref_cpu = []
+            self._pp_comp_bt_gpu = []
+            self._pp_lookback_gpu = []
             self._pp_recv_h_bufs = []
             self._pp_recv_p_bufs = []
 
@@ -1713,8 +1727,14 @@ class DeepSeekV41StepRunner:
         k = max(1, min(num_microbatches, total_tokens))
         slices: list[tuple[int, int, int, int, list[int], list[int], list[bool], int, int]] = []
         for u in range(k):
-            lo = (total_tokens * u) // k
-            hi = (total_tokens * (u + 1)) // k
+            raw_lo = (total_tokens * u) // k
+            raw_hi = (total_tokens * (u + 1)) // k
+            lo = 0 if u == 0 else ((raw_lo // 4) * 4 if total_tokens >= 8 * k else raw_lo)
+            hi = (
+                total_tokens
+                if u + 1 == k
+                else ((raw_hi // 4) * 4 if total_tokens >= 8 * k else raw_hi)
+            )
             if hi <= lo:
                 continue
             r_start = -1
@@ -1874,9 +1894,13 @@ class DeepSeekV41StepRunner:
                     for_capture=False,
                     mla_bt_gpu=self.mla_bt_gpu[r_start:r_end],
                     swa_bt_gpu=self.swa_bt_gpu[r_start:r_end],
-                    comp_bt_gpu=self.comp_bt_gpu[r_start:r_end],
+                    comp_bt_gpu=self._pp_comp_bt_gpu[u_idx][:u_reqs].copy_(
+                        self.comp_bt_gpu[r_start:r_end], non_blocking=True
+                    ),
                 )
-                lb_u = self.lookback_gpu[r_start:r_end]
+                lb_u = self._pp_lookback_gpu[u_idx][:u_reqs].copy_(
+                    self.lookback_gpu[r_start:r_end], non_blocking=True
+                )
                 if self.is_first_pp:
                     with set_forward_context(
                         meta_u,

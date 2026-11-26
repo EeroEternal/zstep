@@ -556,6 +556,17 @@ fn validate_serving_max_seqs(max_seqs: u32) -> Result<()> {
 
 /// Whether every active sequence is prompt-complete and still needs a decode step after the
 /// step being planned, given `in_flight` earlier steps whose tokens are not harvested yet.
+fn pp_1f1b_cohorts_ready(active: &[ActiveSequence], mid: usize, max_ctx: usize) -> bool {
+    active.len() >= 4
+        && mid > 0
+        && mid < active.len()
+        && active.iter().all(|seq| {
+            seq.prefilled_tokens == seq.prompt_tokens.len()
+                && seq.current_seq_len + 2 < max_ctx
+                && seq.generated_tokens.len() + 2 <= seq.target_output_len
+        })
+}
+
 fn decode_continues_for_all(
     active: &[ActiveSequence],
     waiting_admissible: bool,
@@ -1615,7 +1626,102 @@ impl ServingEngine {
     /// `STEP_FLAG_NEXT_PREPUBLISHED`, maintaining device-resident sampled tokens (and any
     /// per-slot Engram lookback window) across overlapped decode bursts.
     pub fn set_device_token_overlap(&mut self, enabled: bool) {
-        self.device_token_overlap = enabled;
+        let pp_size = std::env::var("ZSTEP_PIPELINE_PARALLEL_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1);
+        self.device_token_overlap = enabled && pp_size <= 1;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_decode_or_pp_1f1b(
+        &mut self,
+        sid: u64,
+        active: &mut [ActiveSequence],
+        pp_1f1b_split: &mut Option<(usize, bool)>,
+        max_ctx: usize,
+        has_partial_prefill: bool,
+        waiting_admissible: bool,
+        page_block_tokens: usize,
+        max_pages_per_seq: usize,
+    ) -> Result<()> {
+        let mid = active.len().div_ceil(2);
+        if self.pp_decode_pipeline
+            && !self.speculative.enabled()
+            && !has_partial_prefill
+            && !waiting_admissible
+            && pp_1f1b_cohorts_ready(active, mid, max_ctx)
+        {
+            self.stage_decode_step(
+                sid,
+                &mut active[..mid],
+                page_block_tokens,
+                max_pages_per_seq,
+                true,
+            )?;
+            *pp_1f1b_split = Some((mid, true));
+            Ok(())
+        } else {
+            self.stage_decode_step(sid, active, page_block_tokens, max_pages_per_seq, true)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn advance_pp_1f1b_decode(
+        &mut self,
+        step_id: u64,
+        ahead_promise: Option<bool>,
+        mid: usize,
+        next_is_b: bool,
+        max_ctx: usize,
+        waiting_admissible: bool,
+        page_block_tokens: usize,
+        max_pages_per_seq: usize,
+        active: &mut [ActiveSequence],
+        steps_out: &mut u64,
+        published_ahead: &mut Option<(u64, bool)>,
+        pp_1f1b_split: &mut Option<(usize, bool)>,
+    ) -> Result<()> {
+        let publish_next = match ahead_promise {
+            Some(promise) => promise,
+            None => {
+                self.or_plan_flags(step_id, STEP_FLAG_NEXT_PREPUBLISHED)?;
+                self.coordinator.publish_step(step_id)?;
+                *steps_out += 1;
+                true
+            }
+        };
+        if publish_next {
+            let next_sid = self.step_cursor + 1;
+            self.step_cursor = next_sid;
+            self.last_generation_schedule.decode_steps += 1;
+            let cohort = if next_is_b {
+                &mut active[mid..]
+            } else {
+                &mut active[..mid]
+            };
+            self.stage_decode_step(next_sid, cohort, page_block_tokens, max_pages_per_seq, true)?;
+            let next_slice: &[ActiveSequence] = if next_is_b { &*active } else { &active[mid..] };
+            let next_promise = !waiting_admissible
+                && active.len() >= 4
+                && mid > 0
+                && mid < active.len()
+                && next_slice.iter().all(|seq| {
+                    seq.prefilled_tokens == seq.prompt_tokens.len()
+                        && seq.current_seq_len + 1 < max_ctx
+                        && seq.generated_tokens.len() + 2 <= seq.target_output_len
+                });
+            if next_promise {
+                self.or_plan_flags(next_sid, STEP_FLAG_NEXT_PREPUBLISHED)?;
+            }
+            self.coordinator.publish_step(next_sid)?;
+            *steps_out += 1;
+            *published_ahead = Some((next_sid, next_promise));
+            *pp_1f1b_split = Some((mid, !next_is_b));
+        } else {
+            *pp_1f1b_split = None;
+        }
+        Ok(())
     }
 
     fn harvested_outputs(&mut self, step_id: u64) -> Result<Vec<HarvestedOutput>> {
@@ -1957,6 +2063,13 @@ impl ServingEngine {
         // A decode step published before its predecessor's result was read, and whether its
         // plan promised that the step after it is also published ahead.
         let mut published_ahead: Option<(u64, bool)> = None;
+        let mut pp_1f1b_split: Option<(usize, bool)> = None;
+        let max_ctx = self
+            .coordinator
+            .config()
+            .launch
+            .max_model_len
+            .unwrap_or(max_pages_per_seq * page_block_tokens);
 
         while !active.is_empty() || !waiting_permitted.is_empty() || !unpermitted_pool.is_empty() {
             let mut ahead_promise = None;
@@ -2033,12 +2146,15 @@ impl ServingEngine {
                             }
                         }
                     } else {
-                        self.stage_decode_step(
+                        self.stage_decode_or_pp_1f1b(
                             sid,
                             &mut active,
+                            &mut pp_1f1b_split,
+                            max_ctx,
+                            has_partial_prefill,
+                            waiting_admissible,
                             page_block_tokens,
                             max_pages_per_seq,
-                            true,
                         )?;
                         self.last_generation_schedule.decode_steps += 1;
                         consecutive_prefills = 0;
@@ -2085,12 +2201,15 @@ impl ServingEngine {
                             .max(active.len());
                         consecutive_prefills += 1;
                     } else {
-                        self.stage_decode_step(
+                        self.stage_decode_or_pp_1f1b(
                             sid,
                             &mut active,
+                            &mut pp_1f1b_split,
+                            max_ctx,
+                            has_partial_prefill,
+                            waiting_admissible,
                             page_block_tokens,
                             max_pages_per_seq,
-                            true,
                         )?;
                         self.last_generation_schedule.decode_steps += 1;
                         if has_partial_prefill {
@@ -2111,24 +2230,43 @@ impl ServingEngine {
             );
 
             let has_prefix_cache = self.has_prefix_cache();
-            let publish_next = match ahead_promise {
-                Some(promise) => promise,
-                None => {
-                    let promise = self.device_token_overlap
-                        && !self.speculative.enabled()
-                        && self.plan_flags(step_id)? & STEP_FLAG_DECODE_ONLY != 0
-                        && decode_continues_for_all(
-                            &active,
-                            waiting_admissible,
-                            0,
-                            has_prefix_cache,
-                        );
-                    if promise {
-                        self.or_plan_flags(step_id, STEP_FLAG_NEXT_PREPUBLISHED)?;
+            let was_pp_1f1b = pp_1f1b_split.is_some();
+            let publish_next = if let Some((mid, next_is_b)) = pp_1f1b_split {
+                self.advance_pp_1f1b_decode(
+                    step_id,
+                    ahead_promise,
+                    mid,
+                    next_is_b,
+                    max_ctx,
+                    waiting_admissible,
+                    page_block_tokens,
+                    max_pages_per_seq,
+                    &mut active,
+                    steps_out,
+                    &mut published_ahead,
+                    &mut pp_1f1b_split,
+                )?;
+                false
+            } else {
+                match ahead_promise {
+                    Some(promise) => promise,
+                    None => {
+                        let promise = self.device_token_overlap
+                            && !self.speculative.enabled()
+                            && self.plan_flags(step_id)? & STEP_FLAG_DECODE_ONLY != 0
+                            && decode_continues_for_all(
+                                &active,
+                                waiting_admissible,
+                                0,
+                                has_prefix_cache,
+                            );
+                        if promise {
+                            self.or_plan_flags(step_id, STEP_FLAG_NEXT_PREPUBLISHED)?;
+                        }
+                        self.coordinator.publish_step(step_id)?;
+                        *steps_out += 1;
+                        promise
                     }
-                    self.coordinator.publish_step(step_id)?;
-                    *steps_out += 1;
-                    promise
                 }
             };
 
@@ -2161,7 +2299,14 @@ impl ServingEngine {
             // `in_flight_depth = 1` overlap: if no prefills are waiting and every active
             // sequence still needs >= 2 tokens (so none retires after `step_id`), pre-allocate
             // pages and pre-write `plan_slot(step_id + 1)` while the 8 GPUs execute `step_id`.
+            let will_enter_1f1b = self.pp_decode_pipeline
+                && !self.speculative.enabled()
+                && !waiting_admissible
+                && pp_1f1b_cohorts_ready(&active, active.len().div_ceil(2), max_ctx);
             let can_overlap_next = !publish_next
+                && !was_pp_1f1b
+                && ahead_promise.is_none()
+                && !will_enter_1f1b
                 && !self.speculative.enabled()
                 && decode_continues_for_all(&active, waiting_admissible, 0, has_prefix_cache);
 
