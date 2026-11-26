@@ -410,3 +410,52 @@ def test_close_b12x_evicts_csmla_per_owner_independently_of_mhc() -> None:
         assert dev_idx not in _CSMLA_STATE_BY_DEV
     finally:
         _CSMLA_STATE_BY_DEV.pop(dev_idx, None)
+
+
+def test_attach_decode_ar_and_close_restores_wo_proj() -> None:
+    import gc
+
+    class _Box:
+        pass
+
+    class _FakeAttn(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self._o_proj = self._orig_impl
+
+        def _orig_impl(self, x: torch.Tensor) -> torch.Tensor:
+            return x
+
+    parent = torch.nn.Module()
+    attn = _FakeAttn()
+    orig_fn = attn._o_proj
+    attn._zstep_orig_o_proj = orig_fn  # type: ignore[attr-defined]
+    attn._o_proj = lambda x: x + 1  # type: ignore[method-assign]
+    parent.add_module("attn", attn)
+    parent._b12x_wo_z_buf = torch.zeros(4)  # type: ignore[attr-defined]
+    dev_idx = 778
+    parent._sm120_mhc_dev = dev_idx  # type: ignore[attr-defined]
+    _MHC_STATE_BY_DEV[dev_idx] = types.SimpleNamespace(
+        dev=torch.device("cpu"),
+        deferred=None,
+        pending=False,
+        shm_ar_ref=None,
+        shm_ar_dec_ref=None,
+        runner_ref=None,
+        owners={id(parent)},
+    )
+    try:
+        dec_ar = _Box()
+        attach_sm120_mhc_shm_ar(dev_idx, None, None, dec_ar)
+        st = _MHC_STATE_BY_DEV[dev_idx]
+        assert callable(st.shm_ar_dec_ref) and st.shm_ar_dec_ref() is dec_ar
+        del dec_ar
+        gc.collect()
+        assert st.shm_ar_dec_ref() is None
+
+        close_b12x_dsv41_model(parent)
+        assert getattr(parent, "_b12x_wo_z_buf", None) is None
+        assert attn._o_proj == orig_fn
+        assert not hasattr(attn, "_zstep_orig_o_proj")
+    finally:
+        _MHC_STATE_BY_DEV.pop(dev_idx, None)

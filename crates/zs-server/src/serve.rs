@@ -1588,12 +1588,12 @@ fn launch_engine(
                         let _ = launch_done_tx.send(());
                         return;
                     }
-                    let min_active_swa = 2 * args.max_seqs as usize;
+                    let min_active_swa = 3 * args.max_seqs as usize;
                     if swa_pages <= min_active_swa {
                         let _ = engine.shutdown();
                         if !state.shutdown_requested.load(Ordering::Acquire) {
                             eprintln!(
-                                "zstep_serve: ZSTEP_SWA_KV_PAGES ({swa_pages}) must exceed 2 * max_seqs ({min_active_swa})"
+                                "zstep_serve: ZSTEP_SWA_KV_PAGES ({swa_pages}) must exceed 3 * max_seqs ({min_active_swa})"
                             );
                             state.set_phase(EngineState::Faulted);
                         }

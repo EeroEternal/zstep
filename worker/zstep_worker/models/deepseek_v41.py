@@ -471,6 +471,7 @@ class DeepSeekV41StepRunner:
         self._vllm_config_ctx: Any = None
         self.shm_ar: HostMappedShmAllReduce | None = None
         self.shm_ar_tbo: HostMappedShmAllReduce | None = None
+        self.shm_ar_decode: HostMappedShmAllReduce | None = None
         self.shm_ag: HostMappedShmAllGather | None = None
         self.argmax_channel: HostMappedShmArgmax | None = None
         self.decode_graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -805,7 +806,7 @@ class DeepSeekV41StepRunner:
                 threads=pxb_ar_threads,
                 exchange_group=self.tp_cpu_group,
                 enable_pxb_p2p=True,
-                pxb_max_elements=tbo_cap_tokens * 5120,
+                pxb_max_elements=min(tbo_cap_tokens, 2048) * 5120,
                 enable_pxb_bfp=self.runtime_config.shm_pxb_bfp_mode,
             )
             self._tbo_comm_stream = torch.cuda.Stream(device=self.device, priority=-1)
@@ -817,6 +818,19 @@ class DeepSeekV41StepRunner:
                 torch.cuda.Event(enable_timing=False),
                 torch.cuda.Event(enable_timing=False),
             ]
+        if self.pp_size == 1 and self.tp_size == 8 and use_pxb_ar:
+            self.shm_ar_decode = HostMappedShmAllReduce(
+                name=f"{allreduce_name}_dec",
+                rank=self.tp_rank,
+                world_size=self.tp_size,
+                capacity_elements=128 * 5120,
+                blocks=64,
+                threads=256,
+                exchange_group=self.tp_cpu_group,
+                enable_pxb_p2p=True,
+                pxb_max_elements=128 * 5120,
+                enable_pxb_bfp=1,
+            )
         self.shm_ag: HostMappedShmAllGather = HostMappedShmAllGather(
             name=f"{allreduce_name}_ag{stage_suffix}",
             rank=self.tp_rank,
@@ -894,7 +908,7 @@ class DeepSeekV41StepRunner:
                 exchange_group=self.tp_cpu_group,
             )
         dist.barrier(group=self.exchange_group)
-        attach_sm120_mhc_shm_ar(self.device.index, self.shm_ar, self)
+        attach_sm120_mhc_shm_ar(self.device.index, self.shm_ar, self, self.shm_ar_decode)
 
         # Reclaim transient b12x / weight-conversion blocks before large KV allocation
         gc.collect()
@@ -1004,6 +1018,18 @@ class DeepSeekV41StepRunner:
             self._pp_is_pref_cpu: list[torch.Tensor] = [
                 torch.zeros(ms, dtype=torch.bool) for _ in range(pp_k)
             ]
+            self._pp_comp_bt_gpu: list[torch.Tensor] = [
+                torch.full(
+                    (ms, 1), self.dummy_comp_block, dtype=torch.int32, device=self.device
+                )
+                for _ in range(pp_k)
+            ]
+            self._pp_lookback_gpu: list[torch.Tensor] = [
+                torch.full(
+                    (ms, self.engram_depth), -1, dtype=torch.int32, device=self.device
+                )
+                for _ in range(pp_k)
+            ]
             self._pp_recv_h_bufs: list[torch.Tensor] = (
                 [
                     torch.empty(
@@ -1032,6 +1058,8 @@ class DeepSeekV41StepRunner:
             self._pp_seq_lens_cpu = []
             self._pp_seq_lens_gpu = []
             self._pp_is_pref_cpu = []
+            self._pp_comp_bt_gpu = []
+            self._pp_lookback_gpu = []
             self._pp_recv_h_bufs = []
             self._pp_recv_p_bufs = []
 
@@ -1713,8 +1741,14 @@ class DeepSeekV41StepRunner:
         k = max(1, min(num_microbatches, total_tokens))
         slices: list[tuple[int, int, int, int, list[int], list[int], list[bool], int, int]] = []
         for u in range(k):
-            lo = (total_tokens * u) // k
-            hi = (total_tokens * (u + 1)) // k
+            raw_lo = (total_tokens * u) // k
+            raw_hi = (total_tokens * (u + 1)) // k
+            lo = 0 if u == 0 else ((raw_lo // 4) * 4 if total_tokens >= 8 * k else raw_lo)
+            hi = (
+                total_tokens
+                if u + 1 == k
+                else ((raw_hi // 4) * 4 if total_tokens >= 8 * k else raw_hi)
+            )
             if hi <= lo:
                 continue
             r_start = -1
@@ -1874,9 +1908,13 @@ class DeepSeekV41StepRunner:
                     for_capture=False,
                     mla_bt_gpu=self.mla_bt_gpu[r_start:r_end],
                     swa_bt_gpu=self.swa_bt_gpu[r_start:r_end],
-                    comp_bt_gpu=self.comp_bt_gpu[r_start:r_end],
+                    comp_bt_gpu=self._pp_comp_bt_gpu[u_idx][:u_reqs].copy_(
+                        self.comp_bt_gpu[r_start:r_end], non_blocking=True
+                    ),
                 )
-                lb_u = self.lookback_gpu[r_start:r_end]
+                lb_u = self._pp_lookback_gpu[u_idx][:u_reqs].copy_(
+                    self.lookback_gpu[r_start:r_end], non_blocking=True
+                )
                 if self.is_first_pp:
                     with set_forward_context(
                         meta_u,
@@ -3844,7 +3882,7 @@ class DeepSeekV41StepRunner:
                 p_min = pos_i64[0:total_tokens:width]
                 p_max = pos_i64[width - 1 : total_tokens : width]
             c_lo = np.maximum(0, (p_min - 127) // 128)
-            c_hi = np.minimum(pt_np.shape[1] - 1, p_max // 128)
+            c_hi = np.minimum(pt_np.shape[1] - 1, (p_max + self.num_spec_tokens) // 128)
             swa_epoch = self._swa_pool.epoch if self._swa_pool is not None else -1
             bt_key = (
                 v_bucket,
@@ -4469,6 +4507,8 @@ class DeepSeekV41StepRunner:
             self.argmax_channel.signal_abort()
         if self.shm_ag is not None:
             self.shm_ag.signal_abort()
+        if self.shm_ar_decode is not None:
+            self.shm_ar_decode.signal_abort()
         if self.shm_ar is not None:
             self.shm_ar.signal_abort()
 
@@ -4501,6 +4541,8 @@ class DeepSeekV41StepRunner:
             self.argmax_channel.close(abort=True)
         if self.shm_ag is not None:
             self.shm_ag.close(abort=True)
+        if self.shm_ar_decode is not None:
+            self.shm_ar_decode.close(abort=True)
         if self.shm_ar is not None:
             self.shm_ar.close(abort=True)
         if self._vllm_config_ctx is not None:
@@ -4550,6 +4592,8 @@ class DeepSeekV41StepRunner:
             self.shm_ag.close()
         if self.shm_ar_tbo is not None:
             self.shm_ar_tbo.close()
+        if self.shm_ar_decode is not None:
+            self.shm_ar_decode.close()
         if self.shm_ar is not None:
             self.shm_ar.close()
         if dist.is_initialized() and hasattr(self, "exchange_group"):

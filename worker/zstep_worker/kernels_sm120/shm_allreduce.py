@@ -89,6 +89,7 @@ def get_host_mapped_allreduce_extension():
                 "launch_mhc_post_collapse_rmsnorm",
                 "launch_mhc_sinkhorn_stats",
                 "launch_ar_mhc_cluster8",
+                "launch_ar_mhc_decode",
                 "launch_local_top2_bf16",
                 "launch_tp8_argmax_gather_shm",
             ],

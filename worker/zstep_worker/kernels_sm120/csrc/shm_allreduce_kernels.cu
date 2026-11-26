@@ -572,7 +572,7 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             : (pxb_slot * pxb_slot_stride_bytes)
     );
 
-    if (can_pxb && pxb_bfp == 1 && num_vecs > kPxbOneShotMinVecs && num_vecs <= 15360 && (num_vecs & 15) == 0 && (num_vecs >> 4) >= gridDim.x) {
+    if (can_pxb && pxb_bfp == 1 && num_vecs > kPxbOneShotMinVecs && num_vecs <= 20480 && (num_vecs & 15) == 0 && (num_vecs >> 4) >= gridDim.x) {
         const int parity = rank & 1, pair_id = rank >> 1, tid = threadIdx.x, sh = ((num_vecs & 127) == 0 && (num_vecs >> 7) >= gridDim.x) ? 7 : 4;
         const int64_t g16 = num_vecs >> sh, fb = ((g16 * b_local) / gridDim.x) << sh, fe = (b_local + 1 == gridDim.x) ? num_vecs : (((g16 * (b_local + 1)) / gridDim.x) << sh);
         const int64_t fm = fb + (((fe - fb) >> 2) << 1), p_fb = fb >> 1, p_fm = fm >> 1, p_fe = fe >> 1;
@@ -754,8 +754,8 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
             const int64_t own_pb = my_pb + (my_pairs * pair_id) / num_pairs;
             const int64_t own_pe = my_pb + (my_pairs * (pair_id + 1)) / num_pairs;
             const int64_t half_pxb = cur_pxb_stride / 2;
-            const bool do_pipe = (bfp_mode == 1 && flag_base == 0 && gridDim.x == 56 && num_vecs >= 81920), three_stage = (num_vecs <= 327680);
-            const int wave_stride = (num_vecs >= 1310720) ? 7 : 14;
+            const bool do_pipe = (bfp_mode == 1 && flag_base == 0 && gridDim.x == 56 && num_vecs >= 81920), three_stage = true;
+            const int wave_stride = (num_vecs >= 655360) ? 4 : ((num_vecs >= 327680) ? 7 : 14);
             uint64_t *g1_self = reinterpret_cast<uint64_t*>(my_hbm + 118848 + b * 64), *g2_self = reinterpret_cast<uint64_t*>(my_hbm + 122432 + b * 64);
             if (do_pipe && b_local >= wave_stride) {
                 if (tid == 0 && !gpu_spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + (three_stage ? 118848 : 122432) + (b - wave_stride) * 64), step, abort_flag)) s_aborted = 1;
@@ -1020,13 +1020,13 @@ __global__ __launch_bounds__(512, 1) void shm_v5_allreduce_kernel(
                 }
             }
             __syncthreads();
+            signal_ar_cta_done();
             if (tid < world_size) {
                 sys_store_release_u64(
                     reinterpret_cast<uint64_t*>(
                         s_peer_shm[tid] + 65536 + (b * 8 + rank) * 64),
                     step);
             }
-            signal_ar_cta_done();
             return;
         }
         const int parity = rank & 1;
@@ -3115,6 +3115,309 @@ __global__ __cluster_dims__(8, 1, 1) __launch_bounds__(320, 1) void shm_v5_ar_mh
             reinterpret_cast<uint64_t*>(s_peer_shm[tid] + 65536 + (b * 8 + rank) * 64), step);
     }
 }
+template <int PAIR4>
+__global__ __launch_bounds__(640, 1) void shm_v5_ar_mhc_decode_kernel(
+    const uint4* __restrict__ input_vec,
+    uint4* __restrict__ res_vec,
+    const float* __restrict__ post_mix,
+    const float* __restrict__ comb_mix,
+    const float* __restrict__ pre_mix,
+    const uint4* __restrict__ norm_weight_vec,
+    uint4* __restrict__ layer_input_vec,
+    uint4* __restrict__ aux_out_vec,
+    uint64_t* __restrict__ control,
+    char* const* __restrict__ rank_shm,
+    char* __restrict__ my_hbm,
+    char* __restrict__ pt_hbm,
+    int64_t slot_stride_bytes,
+    int64_t pxb_slot_stride_bytes,
+    int rows,
+    float norm_eps,
+    int write_aux,
+    int rank) {
+    const int b = blockIdx.x, tid = threadIdx.x, parity = rank & 1, pair_id = rank >> 1;
+    __shared__ uint64_t s_step;
+    __shared__ int s_aborted;
+    __shared__ char* s_peer_shm[kMaxRanks];
+    __shared__ uint4 s_my_sum[320], s_dx_u4[1280];
+    __shared__ float s_post[4], s_comb[16], s_pre[4], s_warp_sq[20], s_inv_rms;
+
+    if (tid < kMaxRanks) s_peer_shm[tid] = rank_shm[tid];
+    if (tid == 0) {
+        const uint64_t ns = control[b] + 1ULL;
+        control[b] = ns;
+        s_step = ns;
+        s_aborted = 0;
+    }
+    __syncthreads();
+
+    const uint64_t step = s_step;
+    const int slot = static_cast<int>((step - 1ULL) & 1);
+    char* my_shm = s_peer_shm[rank];
+    const uint64_t* abort_flag = reinterpret_cast<const uint64_t*>(my_shm + kShmV5AbortOffset);
+    if (step > 2ULL) {
+        if (tid < kMaxRanks
+            && !spin_wait_ge_u64(
+                reinterpret_cast<const uint64_t*>(my_shm + 65536 + (b * 8 + tid) * 64),
+                step - 2ULL,
+                abort_flag)) {
+            s_aborted = 1;
+        }
+        __syncthreads();
+        if (s_aborted) return;
+    }
+
+    const int tok_begin = (rows <= 64) ? b : (b << 1);
+    const int n_tok = min(rows, tok_begin + ((rows <= 64) ? 1 : 2)) - tok_begin;
+    if (n_tok <= 0) return;
+
+    const int half_pairs = n_tok * 160, quarter_pairs = n_tok * 40;
+    const int64_t in_pair_base = static_cast<int64_t>(tok_begin) * 320;
+    const int64_t cta_pair_base = static_cast<int64_t>(b) * 640;
+    const int64_t pxb_off = 131072LL + slot * pxb_slot_stride_bytes;
+    const int64_t half_slot = slot_stride_bytes / 2;
+    uint4* pt_in = reinterpret_cast<uint4*>(pt_hbm + pxb_off);
+    uint4* pt_red = reinterpret_cast<uint4*>(pt_hbm + pxb_off + pxb_slot_stride_bytes / 2);
+    uint4* my_in = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes);
+    uint4* my_red = reinterpret_cast<uint4*>(my_shm + 131072 + slot * slot_stride_bytes + half_slot);
+    const uint4* from_pt = reinterpret_cast<const uint4*>(my_hbm + pxb_off);
+    const uint4* from_pt_red = reinterpret_cast<const uint4*>(my_hbm + pxb_off + pxb_slot_stride_bytes / 2);
+
+    if (tid < half_pairs) {
+        const int p_pt = (parity == 0 ? half_pairs : 0) + tid;
+        st_wt_uint4(pt_in + cta_pair_base + p_pt, pack_bf16_pair(input_vec, (in_pair_base + p_pt) << 1));
+    }
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence_system();
+        sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + b * 64), step);
+        if (!spin_wait_ge_u64(reinterpret_cast<const uint64_t*>(my_hbm + b * 64), step, abort_flag)) {
+            s_aborted = 1;
+        }
+    }
+    __syncthreads();
+    if (s_aborted) return;
+
+    if (tid < half_pairs) {
+        const int p_my = (parity == 0 ? 0 : half_pairs) + tid;
+        const int64_t idx0 = (in_pair_base + p_my) << 1;
+        Pack128Bf16 a0{input_vec[idx0]}, a1{input_vec[idx0 + 1]};
+        float v[16];
+        for (int j = 0; j < 8; ++j) {
+            v[j] = __bfloat162float(a0.elems[j]);
+            v[8 + j] = __bfloat162float(a1.elems[j]);
+        }
+        unpack_accum_fp12_bfp7(ld_cv_uint4(from_pt + cta_pair_base + p_my), v);
+        const uint4 rq = pack_fp12_bfp7(v);
+        s_my_sum[tid] = rq;
+        if constexpr (PAIR4 == 0) {
+            st_wt_uint4(my_in + cta_pair_base + p_my, rq);
+        } else if (tid < pair_id * quarter_pairs || tid >= (pair_id + 1) * quarter_pairs) {
+            st_wt_uint4(my_in + cta_pair_base + p_my, rq);
+        }
+    }
+    __syncthreads();
+    if (tid == 0) __threadfence_system();
+    __syncthreads();
+
+    if constexpr (PAIR4 == 0) {
+        if (tid < kMaxRanks) {
+            const int dst = (rank + tid) & 7;
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(s_peer_shm[dst] + (b * 8 + rank) * 64), step);
+            if (!spin_wait_ge_u64(
+                    reinterpret_cast<const uint64_t*>(my_shm + (b * 8 + dst) * 64),
+                    step,
+                    abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) return;
+        if (tid < 320) {
+            const int h_par = (tid < 160) ? 0 : 1;
+            const int sub_idx = (tid < 160) ? tid : (tid - 160);
+            uint4 pkts[4];
+            float acc[16] = {0.f};
+            Pack128Bf16 o0, o1;
+            for (int k = 0; k < 4; ++k) {
+                const int q = (pair_id + k) & 3;
+                const int src_r = (q << 1) | h_par;
+                pkts[q] = (src_r == rank)
+                    ? s_my_sum[sub_idx]
+                    : ld_cv_uint4(
+                        reinterpret_cast<const uint4*>(s_peer_shm[src_r] + 131072 + slot * slot_stride_bytes)
+                        + cta_pair_base + tid);
+            }
+            for (int q = 0; q < 4; ++q) unpack_accum_fp12_bfp7(pkts[q], acc);
+            for (int j = 0; j < 4; ++j) {
+                o0.pairs[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+                o1.pairs[j] = __floats2bfloat162_rn(acc[8 + 2 * j], acc[8 + 2 * j + 1]);
+            }
+            s_dx_u4[tid << 1] = o0.u4;
+            s_dx_u4[(tid << 1) + 1] = o1.u4;
+        }
+        __syncthreads();
+    } else {
+        if (tid < 4 && tid != pair_id) {
+            const int dst = (tid << 1) | parity;
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(s_peer_shm[dst] + (b * 8 + rank) * 64), step);
+            if (!spin_wait_ge_u64(
+                    reinterpret_cast<const uint64_t*>(my_shm + (b * 8 + dst) * 64),
+                    step,
+                    abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) return;
+
+        if (tid < quarter_pairs) {
+            const int local_off = pair_id * quarter_pairs + tid;
+            const int p_my = (parity == 0 ? 0 : half_pairs) + local_off;
+            uint4 pkts[4];
+            float acc[16] = {0.f};
+            for (int k = 0; k < 4; ++k) {
+                const int q = (pair_id + k) & 3;
+                const int src_r = (q << 1) | parity;
+                pkts[q] = (src_r == rank)
+                    ? s_my_sum[local_off]
+                    : ld_cv_uint4(
+                        reinterpret_cast<const uint4*>(s_peer_shm[src_r] + 131072 + slot * slot_stride_bytes)
+                        + cta_pair_base + p_my);
+            }
+            for (int q = 0; q < 4; ++q) unpack_accum_fp12_bfp7(pkts[q], acc);
+            const uint4 rq_red = pack_fp12_bfp7(acc);
+            st_wt_uint4(my_red + cta_pair_base + p_my, rq_red);
+            st_wt_uint4(pt_red + cta_pair_base + p_my, rq_red);
+            unpack_to_bf16_pair(rq_red, s_dx_u4[p_my << 1], s_dx_u4[(p_my << 1) + 1]);
+        }
+        __syncthreads();
+        if (tid == 0) __threadfence_system();
+        __syncthreads();
+
+        if (tid < 4 && tid != pair_id) {
+            const int dst = (tid << 1) | parity;
+            sys_store_release_u64(
+                reinterpret_cast<uint64_t*>(s_peer_shm[dst] + 32768 + (b * 8 + rank) * 64), step);
+            if (!spin_wait_ge_u64(
+                    reinterpret_cast<const uint64_t*>(my_shm + 32768 + (b * 8 + dst) * 64),
+                    step,
+                    abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) return;
+
+        if (tid < 3 * quarter_pairs) {
+            const int rem_q = tid / quarter_pairs;
+            const int q = (pair_id + 1 + rem_q) & 3;
+            const int local_off = q * quarter_pairs + (tid - rem_q * quarter_pairs);
+            const int p_my = (parity == 0 ? 0 : half_pairs) + local_off;
+            const uint4 pkt = ld_cv_uint4(
+                reinterpret_cast<const uint4*>(
+                    s_peer_shm[(q << 1) | parity] + 131072 + slot * slot_stride_bytes + half_slot)
+                + cta_pair_base + p_my);
+            st_wt_uint4(pt_red + cta_pair_base + p_my, pkt);
+            unpack_to_bf16_pair(pkt, s_dx_u4[p_my << 1], s_dx_u4[(p_my << 1) + 1]);
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            __threadfence_system();
+            sys_store_release_u64(reinterpret_cast<uint64_t*>(pt_hbm + 4096 + b * 64), step);
+            if (!spin_wait_ge_u64(
+                    reinterpret_cast<const uint64_t*>(my_hbm + 4096 + b * 64), step, abort_flag)) {
+                s_aborted = 1;
+            }
+        }
+        __syncthreads();
+        if (s_aborted) return;
+
+        if (tid < half_pairs) {
+            const int p_pt = ((parity == 0) ? half_pairs : 0) + tid;
+            unpack_to_bf16_pair(
+                ld_cv_uint4(from_pt_red + cta_pair_base + p_pt),
+                s_dx_u4[p_pt << 1],
+                s_dx_u4[(p_pt << 1) + 1]);
+        }
+        __syncthreads();
+    }
+
+    Pack128Bf16 w_pack{norm_weight_vec[tid]};
+    for (int t_i = 0; t_i < n_tok; ++t_i) {
+        const int tok = tok_begin + t_i;
+        if (tid < 4) {
+            s_post[tid] = post_mix[tok * 4 + tid];
+            s_pre[tid] = pre_mix[tok * 4 + tid];
+        }
+        if (tid < 16) s_comb[tid] = comb_mix[tok * 16 + tid];
+        __syncthreads();
+
+        const int64_t base_r = static_cast<int64_t>(tok) * 2560 + tid;
+        const int64_t base_x = static_cast<int64_t>(tok) * 640 + tid;
+        Pack128Bf16 dx{s_dx_u4[t_i * 640 + tid]};
+        Pack128Bf16 b0{res_vec[base_r]};
+        Pack128Bf16 b1{res_vec[base_r + 640]};
+        Pack128Bf16 b2{res_vec[base_r + 1280]};
+        Pack128Bf16 b3{res_vec[base_r + 1920]};
+        Pack128Bf16 nr0, nr1, nr2, nr3, aux_pack, out_pack;
+        float collapsed[8], thread_sq = 0.0f;
+        for (int e = 0; e < 8; ++e) {
+            const float df = __bfloat162float(dx.elems[e]);
+            const float r0 = __bfloat162float(b0.elems[e]);
+            const float r1 = __bfloat162float(b1.elems[e]);
+            const float r2 = __bfloat162float(b2.elems[e]);
+            const float r3 = __bfloat162float(b3.elems[e]);
+            const __nv_bfloat16 o0 = __float2bfloat16_rn(
+                s_post[0] * df + s_comb[0] * r0 + s_comb[4] * r1 + s_comb[8] * r2 + s_comb[12] * r3);
+            const __nv_bfloat16 o1 = __float2bfloat16_rn(
+                s_post[1] * df + s_comb[1] * r0 + s_comb[5] * r1 + s_comb[9] * r2 + s_comb[13] * r3);
+            const __nv_bfloat16 o2 = __float2bfloat16_rn(
+                s_post[2] * df + s_comb[2] * r0 + s_comb[6] * r1 + s_comb[10] * r2 + s_comb[14] * r3);
+            const __nv_bfloat16 o3 = __float2bfloat16_rn(
+                s_post[3] * df + s_comb[3] * r0 + s_comb[7] * r1 + s_comb[11] * r2 + s_comb[15] * r3);
+            nr0.elems[e] = o0;
+            nr1.elems[e] = o1;
+            nr2.elems[e] = o2;
+            nr3.elems[e] = o3;
+            const float x0 = __bfloat162float(o0);
+            const float x1 = __bfloat162float(o1);
+            const float x2 = __bfloat162float(o2);
+            const float x3 = __bfloat162float(o3);
+            if (write_aux) aux_pack.elems[e] = __float2bfloat16_rn((x0 + x1 + x2 + x3) * 0.25f);
+            const float val = __bfloat162float(
+                __float2bfloat16_rn(s_pre[0] * x0 + s_pre[1] * x1 + s_pre[2] * x2 + s_pre[3] * x3));
+            collapsed[e] = val;
+            thread_sq += val * val;
+        }
+        res_vec[base_r] = nr0.u4;
+        res_vec[base_r + 640] = nr1.u4;
+        res_vec[base_r + 1280] = nr2.u4;
+        res_vec[base_r + 1920] = nr3.u4;
+        if (write_aux) aux_out_vec[base_x] = aux_pack.u4;
+
+        const float w_sq = warp_reduce_sum(thread_sq);
+        const int warp_id = tid >> 5, lane = tid & 31;
+        if (lane == 0) s_warp_sq[warp_id] = w_sq;
+        __syncthreads();
+        if (warp_id == 0) {
+            const float acc = warp_reduce_sum((lane < 20) ? s_warp_sq[lane] : 0.0f);
+            if (lane == 0) s_inv_rms = rsqrtf(acc * (1.0f / 5120.0f) + norm_eps);
+        }
+        __syncthreads();
+        for (int e = 0; e < 8; ++e) {
+            out_pack.elems[e] = __float2bfloat16_rn(
+                collapsed[e] * s_inv_rms * __bfloat162float(w_pack.elems[e]));
+        }
+        layer_input_vec[base_x] = out_pack.u4;
+        __syncthreads();
+    }
+    if (tid < kMaxRanks) {
+        sys_store_release_u64(
+            reinterpret_cast<uint64_t*>(s_peer_shm[tid] + 65536 + (b * 8 + rank) * 64), step);
+    }
+}
 }  // namespace
 
 std::uintptr_t register_mapped_host_cuda(std::uintptr_t host_address, int64_t bytes) {
@@ -3245,7 +3548,7 @@ void launch_shm_v5_allreduce_cuda(
     const int64_t vecs_per_cta = (num_vecs + launch_blocks - 1) / launch_blocks;
     const int capped_threads = threads > 512 ? 512 : threads;
     const int launch_threads = small_pxb
-        ? ((pxb_bfp == 1 && num_vecs > 2560 && num_vecs <= 15360) ? 512 : 256)
+        ? ((pxb_bfp == 1 && num_vecs > 2560 && num_vecs <= 20480) ? 512 : 256)
         : ((capped_threads == 256 && vecs_per_cta > 256) ? 512 : capped_threads);
     shm_v5_allreduce_kernel<<<launch_blocks, launch_threads, 0, stream>>>(
         reinterpret_cast<const uint4*>(input_ptr),
@@ -3419,7 +3722,9 @@ void launch_mhc_post_collapse_rmsnorm_cuda(
     std::uintptr_t stream_handle) {
     if (num_tokens <= 0) return;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    const int grid = (ar_cta_done_ptr != 0) ? 120 : num_tokens;
+    const int wave_grid =
+        (156 - ar_blocks) < 1 ? 1 : ((156 - ar_blocks) > 128 ? 128 : (156 - ar_blocks));
+    const int grid = (ar_cta_done_ptr != 0) ? wave_grid : num_tokens;
     if (ar_cta_done_ptr == 0 && sm120_pdl_enabled()) {
         cudaLaunchConfig_t config = {};
         config.gridDim = dim3(grid, 1, 1);
@@ -3565,6 +3870,50 @@ void launch_ar_mhc_cluster8_cuda(
         write_aux,
         rank,
         flag_base);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
+void launch_ar_mhc_decode_cuda(
+    const void* x,
+    void* r,
+    const float* pm,
+    const float* cm,
+    const float* pr,
+    const void* nw,
+    void* li,
+    void* ax,
+    uint64_t* ct,
+    const std::uintptr_t* rs,
+    std::uintptr_t mh,
+    std::uintptr_t ph,
+    int64_t ss,
+    int64_t ps,
+    int rows,
+    float eps,
+    int wa,
+    int rk,
+    std::uintptr_t st) {
+    const int grid = (rows <= 64) ? rows : ((rows + 1) >> 1);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(st);
+    auto kern = (rows <= 16) ? shm_v5_ar_mhc_decode_kernel<0> : shm_v5_ar_mhc_decode_kernel<1>;
+    kern<<<grid, 640, 0, stream>>>(
+        reinterpret_cast<const uint4*>(x),
+        reinterpret_cast<uint4*>(r),
+        pm,
+        cm,
+        pr,
+        reinterpret_cast<const uint4*>(nw),
+        reinterpret_cast<uint4*>(li),
+        reinterpret_cast<uint4*>(ax),
+        ct,
+        reinterpret_cast<char* const*>(rs),
+        reinterpret_cast<char*>(mh),
+        reinterpret_cast<char*>(ph),
+        ss,
+        ps,
+        rows,
+        eps,
+        wa,
+        rk);
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 

@@ -142,6 +142,26 @@ void launch_ar_mhc_cluster8_cuda(
     int rank,
     int flag_base,
     std::uintptr_t stream_handle);
+void launch_ar_mhc_decode_cuda(
+    const void* input_ptr,
+    void* residual_ptr,
+    const float* post_mix_ptr,
+    const float* comb_mix_ptr,
+    const float* pre_mix_ptr,
+    const void* norm_weight_ptr,
+    void* layer_input_ptr,
+    void* aux_out_ptr,
+    uint64_t* control_ptr,
+    const std::uintptr_t* rank_shm_ptrs,
+    std::uintptr_t my_hbm_ptr,
+    std::uintptr_t pt_hbm_ptr,
+    int64_t slot_stride_bytes,
+    int64_t pxb_slot_stride_bytes,
+    int rows,
+    float norm_eps,
+    int write_aux,
+    int rank,
+    std::uintptr_t stream_handle);
 
 void launch_local_top2_bf16_cuda(
     const void* logits_bf16,
@@ -550,6 +570,11 @@ void launch_mhc_post_collapse_rmsnorm(
                 "aux_out must be 16B-aligned contiguous BF16 CUDA tensor [num_tokens, 5120]");
         }
     }
+    if (ar_cta_done_ptr != 0) {
+        TORCH_CHECK(
+            ar_cta_wait_ptr != 0 && ar_blocks > 0 && ar_blocks <= 64,
+            "wave mHC requires non-null ar_cta_wait_ptr and 1 <= ar_blocks <= 64");
+    }
     launch_mhc_post_collapse_rmsnorm_cuda(
         x.data_ptr(),
         residual.data_ptr(),
@@ -739,6 +764,52 @@ void launch_ar_mhc_cluster8(
         static_cast<int>(rank),
         static_cast<int>(flag_base),
         stream_handle);
+}
+void launch_ar_mhc_decode(
+    torch::Tensor x,
+    torch::Tensor r,
+    torch::Tensor pm,
+    torch::Tensor cm,
+    torch::Tensor pr,
+    torch::Tensor nw,
+    torch::Tensor li,
+    torch::Tensor ax,
+    torch::Tensor ct,
+    torch::Tensor rs,
+    std::uintptr_t mh,
+    std::uintptr_t ph,
+    int64_t ss,
+    int64_t ps,
+    double eps,
+    int64_t wa,
+    int64_t rk,
+    std::uintptr_t st) {
+    TORCH_CHECK(
+        x.is_cuda() && r.is_cuda() && x.is_contiguous() && r.is_contiguous()
+            && x.size(0) >= 5 && x.size(0) <= 128 && x.size(1) == 5120
+            && r.size(0) == x.size(0) && mh != 0 && ph != 0 && ct.numel() >= 64
+            && rk >= 0 && rk < 8,
+        "invalid decode AR+mHC args");
+    launch_ar_mhc_decode_cuda(
+        x.data_ptr(),
+        r.data_ptr(),
+        pm.data_ptr<float>(),
+        cm.data_ptr<float>(),
+        pr.data_ptr<float>(),
+        nw.data_ptr(),
+        li.data_ptr(),
+        wa ? ax.data_ptr() : nullptr,
+        reinterpret_cast<uint64_t*>(ct.data_ptr<int64_t>()),
+        reinterpret_cast<const std::uintptr_t*>(rs.data_ptr<int64_t>()),
+        mh,
+        ph,
+        ss,
+        ps,
+        static_cast<int>(x.size(0)),
+        static_cast<float>(eps),
+        static_cast<int>(wa),
+        static_cast<int>(rk),
+        st);
 }
 
 void launch_local_top2_bf16(
