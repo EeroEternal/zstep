@@ -649,7 +649,11 @@ def install_b12x_dsv41_quant_patches() -> bool:
             import b12x.moe.fused_moe._impl as moe_impl
             st, rec, orig_gdk = self._b12x_moe_state, [], moe_impl._get_dynamic_kernel
             vm, a16 = st.variants, st.a16_max_tokens
-            vcap = a16 if (0 < m <= a16 and m not in vm) else (m if m in vm else max(vm))
+            vcap = (
+                a16
+                if (0 < m <= a16 and m not in vm)
+                else min((v for v in vm if v >= m), default=max(vm))
+            )
             binding = vm[vcap].bind(scratch=self._b12x_scratch, a=x_2d, experts=layer._b12x_prepared_experts, topk_weights=wts, topk_ids=ids, output=out_2d, input_scales_static=True)
             def _spy_gdk(*a: Any, **kw: Any) -> Any:
                 comp, mac_v = orig_gdk(*a, **kw)
@@ -924,7 +928,37 @@ def install_b12x_dsv41_quant_patches() -> bool:
                 return UnquantizedLinearMethod()
             # Keep 3D batched matmul `.wo_a` on standard `ModelOptLinearMethod`.
             if prefix.endswith(".wo_a") or getattr(layer, "is_bmm", False):
-                return orig_get_quant_method(self, layer, prefix)
+                qm_bmm = orig_get_quant_method(self, layer, prefix)
+                if prefix.endswith(".wo_a") and not getattr(qm_bmm, "_zstep_wo_a_wrapped", False):
+
+                    def _wo_a_pwal(
+                        lyr: torch.nn.Module,
+                        _orig: Any = qm_bmm.process_weights_after_loading,
+                    ) -> None:
+                        w = getattr(lyr, "weight", None)
+                        ws = getattr(lyr, "weight_scale", None)
+                        if (
+                            getattr(lyr, "bmm_batch_size", 0) == 1
+                            and w is not None
+                            and ws is not None
+                            and w.shape == (1024, 4096)
+                            and ws.ndim == 2
+                        ):
+                            ws_blk = (
+                                ws.data[::32, :].contiguous()
+                                if ws.shape[0] == 1024
+                                else ws.data.contiguous()
+                            )
+                            lyr._b12x_wo_a_packed = block_fp8_linear.pack_weight(
+                                w.data.contiguous(),
+                                ws_blk.view(torch.float8_e8m0fnu),
+                                block_size=(32, 32),
+                            )
+                        _orig(lyr)
+
+                    qm_bmm.process_weights_after_loading = _wo_a_pwal
+                    qm_bmm._zstep_wo_a_wrapped = True
+                return qm_bmm
             rows, cols = self.weight_block_size
             return ZstepB12xBlock32LinearMethod(
                 QuantSpec(weight=kMxfp8Static, activation=kMxfp8Dynamic),
@@ -1898,12 +1932,16 @@ def flush_sm120_mhc_before_ar(device_idx: int | None) -> None:
 
 
 def attach_sm120_mhc_shm_ar(
-    device_idx: int | None, shm_ar: Any | None, runner: Any | None = None
+    device_idx: int | None,
+    shm_ar: Any | None,
+    runner: Any | None = None,
+    shm_ar_decode: Any | None = None,
 ) -> None:
     """Bind weak references to `HostMappedShmAllReduce` and runner for `M in {1, 2, 4}` cluster8 fusion."""
     s = _MHC_STATE_BY_DEV.get(0 if device_idx is None else int(device_idx))
     if s is not None:
         s.shm_ar_ref = weakref.ref(shm_ar) if shm_ar is not None else None
+        s.shm_ar_dec_ref = weakref.ref(shm_ar_decode) if shm_ar_decode is not None else None
         s.runner_ref = weakref.ref(runner) if runner is not None else None
 
 
@@ -1957,6 +1995,7 @@ def _prepare_sm120_mhc_overlap(
             deferred=None,
             ext=None,
             shm_ar_ref=None,
+            shm_ar_dec_ref=None,
             runner_ref=None,
             owners={id(model)},
         )
@@ -2209,9 +2248,26 @@ def _prepare_sm120_mhc_overlap(
                     and (ar.blocks == 8 or (ar._pxb_enabled and 32 <= ar.blocks <= 56))
                     and (x.data_ptr() & 15) == 0
                 )
+                ar_dec = (
+                    s.shm_ar_dec_ref()
+                    if callable(getattr(s, "shm_ar_dec_ref", None))
+                    else None
+                )
+                use_dec_ar = bool(
+                    reduce_results
+                    and not use_c8
+                    and 5 <= n <= 128
+                    and ar_dec is not None
+                    and not getattr(ar_dec, "_closed", True)
+                    and getattr(ar_dec, "_use_shm_v5", False)
+                    and ar_dec.world_size == 8
+                    and ar_dec._pxb_enabled
+                    and (x.data_ptr() & 15) == 0
+                )
                 use_wave_mhc = bool(
                     reduce_results
                     and not use_c8
+                    and not use_dec_ar
                     and ar is not None
                     and not getattr(ar, "_closed", True)
                     and getattr(ar, "_use_shm_v5", False)
@@ -2222,7 +2278,7 @@ def _prepare_sm120_mhc_overlap(
                     and n * 640 <= ar.pxb_max_vecs
                     and (x.data_ptr() & 15) == 0
                 )
-                if reduce_results and not use_c8 and not use_wave_mhc:
+                if reduce_results and not use_c8 and not use_dec_ar and not use_wave_mhc:
                     x = tensor_model_parallel_all_reduce(x)
                     x = x if x.is_contiguous() else x.contiguous()
                 if (x.data_ptr() & 15) == 0:
@@ -2253,6 +2309,35 @@ def _prepare_sm120_mhc_overlap(
                         s.pending = False
                         runner_ref = getattr(s, "runner_ref", None)
                         runner_obj = runner_ref() if callable(runner_ref) else None
+                        if runner_obj is not None:
+                            runner_obj.shm_ar_calls += 1
+                    elif use_dec_ar:
+                        _sync_mhc_state_in(s, main_s)
+                        s.ext.launch_ar_mhc_decode(
+                            x,
+                            residual,
+                            post_layer_mix,
+                            comb_res_mix,
+                            pre_mix,
+                            norm_weight,
+                            layer_in,
+                            aux_buf,
+                            ar_dec.control,
+                            ar_dec._rank_shm_ptrs,
+                            ar_dec._my_hbm_ptr,
+                            ar_dec._pt_hbm_ptr,
+                            ar_dec.slot_stride_bytes,
+                            ar_dec.pxb_slot_stride_bytes,
+                            float(norm_eps),
+                            1 if capture_aux else 0,
+                            ar_dec.rank,
+                            main_s.cuda_stream,
+                        )
+                        runner_obj = (
+                            s.runner_ref()
+                            if callable(getattr(s, "runner_ref", None))
+                            else None
+                        )
                         if runner_obj is not None:
                             runner_obj.shm_ar_calls += 1
                     elif use_c8:
@@ -2336,7 +2421,7 @@ def _prepare_sm120_mhc_overlap(
                     )
                 # If `(x.data_ptr() & 15) != 0` after external AR (`not use_c8`), `x` was
                 # already reduced above; pass `reduce_results=False` to `orig_shifted`.
-                if reduce_results and not use_c8 and not use_wave_mhc:
+                if reduce_results and not use_c8 and not use_dec_ar and not use_wave_mhc:
                     reduce_results = False
             if s is not None:
                 _sync_mhc_state_in(s, torch.cuda.current_stream(residual.device))
@@ -2497,7 +2582,7 @@ def prepare_b12x_dsv41_model(
                 64,
                 80,
                 128,
-                512,
+                *(c for c in (24, 48, 96, 256, 512, 1024, 2048) if c <= int(max_tokens)),
                 min(3072, int(max_tokens)),
                 int(max_tokens),
             }
@@ -2586,6 +2671,98 @@ def prepare_b12x_dsv41_model(
             shape_rep_weight[skey] = layer._b12x_packed_weight
         stream_slot = 1 if qm._is_shared_expert else 0
         shape_streams.setdefault(skey, set()).add(stream_slot)
+
+    wo_attn_mods = [
+        m
+        for m in model.modules()
+        if getattr(getattr(m, "wo_a", None), "_b12x_wo_a_packed", None) is not None
+        and getattr(getattr(m, "wo_b", None), "_b12x_packed_weight", None) is not None
+        and (
+            int(getattr(m, "n_local_groups", 0)),
+            int(getattr(m, "n_local_heads", 0)),
+            int(getattr(m, "nope_head_dim", 0)),
+            int(getattr(m, "rope_head_dim", 0)),
+            int(getattr(m, "o_lora_rank", 0)),
+        )
+        == (1, 8, 448, 64, 1024)
+    ]
+    pwo_dyn: Any = None
+    if wo_attn_mods:
+        from b12x.gemm import wo_projection
+        from b12x.preparation import FrozenMapping
+
+        shape_rep_weight[(1024, 4096)] = wo_attn_mods[0].wo_a._b12x_wo_a_packed
+        shape_streams.setdefault((1024, 4096), set()).add(0)
+        pwo_dyn = wo_projection.plan(
+            wo_projection.Caps(
+                device=device,
+                max_tokens=int(max_tokens),
+                groups=1,
+                group_width=4096,
+                rank=1024,
+                hidden=5120,
+            ),
+            invocation=FrozenMapping(
+                {
+                    "operation": "inv_rope",
+                    "heads_per_group": 8,
+                    "nope_dim": 448,
+                    "rope_dim": 64,
+                    "positions_dtype": "int64",
+                    "cos_sin_dtype": "float32",
+                    "dynamic_tokens": True,
+                }
+            ),
+        )
+
+        def _mk_wodyn(st_w: Any, *, _p: Any = pwo_dyn) -> PreparedCall:
+            n_w = min(64, int(max_tokens))
+            ot = torch.randn((n_w, 8, 512), dtype=torch.bfloat16, device=device) * 0.1
+            pt = torch.arange(n_w, dtype=torch.int64, device=device)
+            cs = torch.ones(
+                (max(64, int(max_tokens)), 64), dtype=torch.float32, device=device
+            )
+            dw = wo_projection.pack_weights(
+                torch.zeros((1024, 4096), dtype=torch.float8_e4m3fn, device=device),
+                torch.full((32, 128), 127, dtype=torch.uint8, device=device).view(
+                    torch.float8_e8m0fnu
+                ),
+                torch.zeros((5120, 1024), dtype=torch.float8_e4m3fn, device=device),
+                torch.full((160, 32), 127, dtype=torch.uint8, device=device).view(
+                    torch.float8_e8m0fnu
+                ),
+                groups=1,
+                group_width=4096,
+                rank=1024,
+                hidden=5120,
+                block_size=(32, 32),
+            )
+            scr = [
+                torch.empty(sp.shape, dtype=sp.dtype, device=device)
+                for sp in _p.scratch_specs()
+            ]
+            bd = st_w.bind_inv_rope(
+                scratch=scr,
+                o=ot,
+                positions=pt,
+                cos_sin_cache=cs,
+                weights=dw,
+                heads_per_group=8,
+                nope_dim=448,
+                rope_dim=64,
+            )
+            return PreparedCall(
+                run=lambda: st_w.run_inv_rope(bd),
+                produce=lambda: ot.normal_(std=0.1),
+            )
+
+        requests.append(
+            pwo_dyn.request(
+                name="dsv41_wo_inv_rope_dyn",
+                prepare_call=_mk_wodyn,
+                benchmark_call=_mk_wodyn,
+            )
+        )
 
     shape_plans: dict[tuple[int, int], tuple[Any, ...]] = {}
     for (out_f, in_f), rep_w in sorted(shape_rep_weight.items()):
@@ -2746,6 +2923,19 @@ def prepare_b12x_dsv41_model(
             moe_arena = torch.empty(
                 max(1024, moe_scratch_bytes), dtype=torch.uint8, device=device
             )
+            d_hs = int(moe_layers[0][2].hidden_size)
+            d_tk = int(moe_layers[0][1].moe_config.experts_per_token)
+            d_ne = int(moe_layers[0][2].num_experts)
+            d_x = torch.zeros((int(max_tokens), d_hs), dtype=torch.bfloat16, device=device)
+            d_out = torch.empty((int(max_tokens), d_hs), dtype=torch.bfloat16, device=device)
+            d_ids = (
+                (torch.arange(int(max_tokens) * d_tk, device=device, dtype=torch.int32) % d_ne)
+                .view(int(max_tokens), d_tk)
+                .contiguous()
+            )
+            d_wts = torch.full(
+                (int(max_tokens), d_tk), 1.0 / d_tk, dtype=torch.float32, device=device
+            )
             for _mname, _layer, qm in moe_layers:
                 qm._b12x_moe_state = require_prepared(qm._b12x_eplan, "moe.decode")
                 qm._b12x_scratch = tuple(
@@ -2755,6 +2945,22 @@ def prepare_b12x_dsv41_model(
                 qm._b12x_moe_by_m = [None] * (int(max_tokens) + 1)
                 qm._b12x_moe_capi_by_kern = {}
                 qm._b12x_dev_idx = dev_idx
+                vm = qm._b12x_moe_state.variants
+                a16 = int(qm._b12x_moe_state.a16_max_tokens)
+                vm_s = sorted(v for v in vm if 0 < v <= int(max_tokens))
+                for vc in vm_s:
+                    qm._capture_fast_moe_m(
+                        _layer, d_x[:vc], d_wts[:vc], d_ids[:vc], d_out[:vc], vc
+                    )
+                for m_i in range(1, int(max_tokens) + 1) if vm_s else ():
+                    if qm._b12x_moe_by_m[m_i] is None:
+                        src_vc = (
+                            a16
+                            if 0 < m_i <= a16 <= int(max_tokens)
+                            else min((v for v in vm_s if v >= m_i), default=vm_s[-1])
+                        )
+                        qm._b12x_moe_by_m[m_i] = qm._b12x_moe_by_m[src_vc]
+            del d_x, d_out, d_ids, d_wts
 
         # Separate linear scratch arenas for main stream (slot 0) vs `SharedExperts` aux stream (slot 1).
         slot_max_bytes: dict[int, int] = {0: 0, 1: 0}
@@ -2833,6 +3039,71 @@ def prepare_b12x_dsv41_model(
             qm._b12x_plans = shape_plans[skey]
             qm._b12x_scratches = slot_shape_scratches[(slot, skey)]
             qm._b12x_fast_plans = slot_shape_fast_plans[(slot, skey)]
+
+        if pwo_dyn is not None and wo_attn_mods and (0, (1024, 4096)) in slot_shape_fast_plans:
+            st_wodyn = require_prepared(pwo_dyn, "gemm.wo_projection")
+            wo_fast_a = slot_shape_fast_plans[(0, (1024, 4096))]
+            wo_max_tok = int(max_tokens)
+            wo_z_buf = torch.empty((wo_max_tok, 1024), dtype=torch.bfloat16, device=device)
+            for attn_m in wo_attn_mods:
+                pk_a = attn_m.wo_a._b12x_wo_a_packed
+                orig_op = attn_m._o_proj
+                rhs_a = (pk_a.weight.values.view(1024, 4096, 1), pk_a.weight.scale_mma)
+
+                def _fast_o_proj(
+                    attn_out: torch.Tensor,
+                    positions: torch.Tensor,
+                    *,
+                    _am: Any = attn_m,
+                    _rhs: Any = rhs_a,
+                    _orig: Any = orig_op,
+                ) -> torch.Tensor:
+                    o = attn_out[:, :8, :]
+                    m_r = int(attn_out.shape[0])
+                    if (
+                        0 < m_r <= wo_max_tok
+                        and o.dtype == torch.bfloat16
+                        and positions.dtype == torch.int64
+                        and positions.is_contiguous()
+                    ):
+                        cap_idx = next(
+                            (i_c for i_c, c_v in enumerate(caps_tuple) if c_v >= m_r),
+                            len(caps_tuple) - 1,
+                        )
+                        _pl, st_a, scr_a, ws_a, cap_a, _tm, ex_xq = wo_fast_a[cap_idx]
+                        xq_a = (
+                            ex_xq
+                            if m_r == cap_a
+                            else _block_fp8_linear_x_q_from_scratch(
+                                scr_a,
+                                tokens=m_r,
+                                in_features=4096,
+                                output_dtype=torch.bfloat16,
+                            )
+                        )
+                        z_m = wo_z_buf[:m_r]
+                        st_wodyn.quantize_a_inv_rope(
+                            o if o.is_contiguous() else o.contiguous(),
+                            positions,
+                            _am.rotary_emb.cos_sin_cache,
+                            groups=1,
+                            heads_per_group=8,
+                            nope_dim=448,
+                            rope_dim=64,
+                            out=xq_a,
+                        )
+                        st_a.dense.run(
+                            (xq_a.values.view(m_r, 4096, 1), xq_a.scale_mma),
+                            _rhs,
+                            out=z_m.view(m_r, 1024, 1),
+                            split_k_workspace=ws_a,
+                        )
+                        return _am._wo_b_proj(z_m)
+                    return _orig(attn_out, positions)
+
+                attn_m._zstep_orig_o_proj = orig_op
+                attn_m._o_proj = _fast_o_proj
+            model._b12x_wo_z_buf = wo_z_buf  # type: ignore[attr-defined]
 
         csmla_arena: torch.Tensor | None = None
         if csmla_plans:
@@ -2955,6 +3226,12 @@ def close_b12x_dsv41_model(model: torch.nn.Module | None) -> None:
             sess.close()
         if hasattr(model, "_b12x_scratch_arenas"):
             model._b12x_scratch_arenas = None  # type: ignore[attr-defined]
+        if hasattr(model, "_b12x_wo_z_buf"):
+            model._b12x_wo_z_buf = None  # type: ignore[attr-defined]
+        for sub_m in model.modules():
+            if hasattr(sub_m, "_zstep_orig_o_proj"):
+                sub_m._o_proj = sub_m._zstep_orig_o_proj  # type: ignore[attr-defined]
+                delattr(sub_m, "_zstep_orig_o_proj")
         if hasattr(model, "_sm120_mega_gate_state"):
             model._sm120_mega_gate_state = None  # type: ignore[attr-defined]
         for target_mod in (model, getattr(model, "model", None)):

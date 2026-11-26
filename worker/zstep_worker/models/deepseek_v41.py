@@ -471,6 +471,7 @@ class DeepSeekV41StepRunner:
         self._vllm_config_ctx: Any = None
         self.shm_ar: HostMappedShmAllReduce | None = None
         self.shm_ar_tbo: HostMappedShmAllReduce | None = None
+        self.shm_ar_decode: HostMappedShmAllReduce | None = None
         self.shm_ag: HostMappedShmAllGather | None = None
         self.argmax_channel: HostMappedShmArgmax | None = None
         self.decode_graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -817,6 +818,19 @@ class DeepSeekV41StepRunner:
                 torch.cuda.Event(enable_timing=False),
                 torch.cuda.Event(enable_timing=False),
             ]
+        if self.pp_size == 1 and use_pxb_ar:
+            self.shm_ar_decode = HostMappedShmAllReduce(
+                name=f"{allreduce_name}_dec",
+                rank=self.tp_rank,
+                world_size=self.tp_size,
+                capacity_elements=128 * 5120,
+                blocks=64,
+                threads=256,
+                exchange_group=self.tp_cpu_group,
+                enable_pxb_p2p=True,
+                pxb_max_elements=128 * 5120,
+                enable_pxb_bfp=1,
+            )
         self.shm_ag: HostMappedShmAllGather = HostMappedShmAllGather(
             name=f"{allreduce_name}_ag{stage_suffix}",
             rank=self.tp_rank,
@@ -894,7 +908,7 @@ class DeepSeekV41StepRunner:
                 exchange_group=self.tp_cpu_group,
             )
         dist.barrier(group=self.exchange_group)
-        attach_sm120_mhc_shm_ar(self.device.index, self.shm_ar, self)
+        attach_sm120_mhc_shm_ar(self.device.index, self.shm_ar, self, self.shm_ar_decode)
 
         # Reclaim transient b12x / weight-conversion blocks before large KV allocation
         gc.collect()
@@ -4493,6 +4507,8 @@ class DeepSeekV41StepRunner:
             self.argmax_channel.signal_abort()
         if self.shm_ag is not None:
             self.shm_ag.signal_abort()
+        if self.shm_ar_decode is not None:
+            self.shm_ar_decode.signal_abort()
         if self.shm_ar is not None:
             self.shm_ar.signal_abort()
 
@@ -4525,6 +4541,8 @@ class DeepSeekV41StepRunner:
             self.argmax_channel.close(abort=True)
         if self.shm_ag is not None:
             self.shm_ag.close(abort=True)
+        if self.shm_ar_decode is not None:
+            self.shm_ar_decode.close(abort=True)
         if self.shm_ar is not None:
             self.shm_ar.close(abort=True)
         if self._vllm_config_ctx is not None:
@@ -4574,6 +4592,8 @@ class DeepSeekV41StepRunner:
             self.shm_ag.close()
         if self.shm_ar_tbo is not None:
             self.shm_ar_tbo.close()
+        if self.shm_ar_decode is not None:
+            self.shm_ar_decode.close()
         if self.shm_ar is not None:
             self.shm_ar.close()
         if dist.is_initialized() and hasattr(self, "exchange_group"):
