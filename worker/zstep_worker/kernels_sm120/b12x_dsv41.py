@@ -2956,7 +2956,7 @@ def prepare_b12x_dsv41_model(
                     if qm._b12x_moe_by_m[m_i] is None:
                         src_vc = (
                             a16
-                            if 0 < m_i <= a16 <= int(max_tokens)
+                            if 0 < m_i <= a16 <= int(max_tokens) and a16 in vm
                             else min((v for v in vm_s if v >= m_i), default=vm_s[-1])
                         )
                         qm._b12x_moe_by_m[m_i] = qm._b12x_moe_by_m[src_vc]

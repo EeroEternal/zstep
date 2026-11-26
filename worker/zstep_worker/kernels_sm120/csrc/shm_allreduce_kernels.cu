@@ -3722,7 +3722,9 @@ void launch_mhc_post_collapse_rmsnorm_cuda(
     std::uintptr_t stream_handle) {
     if (num_tokens <= 0) return;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    const int grid = (ar_cta_done_ptr != 0) ? (156 - ar_blocks) : num_tokens;
+    const int wave_grid =
+        (156 - ar_blocks) < 1 ? 1 : ((156 - ar_blocks) > 128 ? 128 : (156 - ar_blocks));
+    const int grid = (ar_cta_done_ptr != 0) ? wave_grid : num_tokens;
     if (ar_cta_done_ptr == 0 && sm120_pdl_enabled()) {
         cudaLaunchConfig_t config = {};
         config.gridDim = dim3(grid, 1, 1);

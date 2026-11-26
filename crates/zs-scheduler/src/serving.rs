@@ -554,19 +554,25 @@ fn validate_serving_max_seqs(max_seqs: u32) -> Result<()> {
     Ok(())
 }
 
-/// Whether every active sequence is prompt-complete and still needs a decode step after the
-/// step being planned, given `in_flight` earlier steps whose tokens are not harvested yet.
-fn pp_1f1b_cohorts_ready(active: &[ActiveSequence], mid: usize, max_ctx: usize) -> bool {
+fn pp_1f1b_cohorts_ready(
+    active: &[ActiveSequence],
+    mid: usize,
+    max_ctx: usize,
+    has_prefix_cache: bool,
+) -> bool {
     active.len() >= 4
         && mid > 0
         && mid < active.len()
         && active.iter().all(|seq| {
             seq.prefilled_tokens == seq.prompt_tokens.len()
+                && (!has_prefix_cache || seq.computed_prompt_tokens == seq.prompt_tokens.len())
                 && seq.current_seq_len + 2 < max_ctx
                 && seq.generated_tokens.len() + 2 <= seq.target_output_len
         })
 }
 
+/// Whether every active sequence is prompt-complete and still needs a decode step after the
+/// step being planned, given `in_flight` earlier steps whose tokens are not harvested yet.
 fn decode_continues_for_all(
     active: &[ActiveSequence],
     waiting_admissible: bool,
@@ -1646,11 +1652,12 @@ impl ServingEngine {
         max_pages_per_seq: usize,
     ) -> Result<()> {
         let mid = active.len().div_ceil(2);
+        let has_prefix_cache = self.has_prefix_cache();
         if self.pp_decode_pipeline
             && !self.speculative.enabled()
             && !has_partial_prefill
             && !waiting_admissible
-            && pp_1f1b_cohorts_ready(active, mid, max_ctx)
+            && pp_1f1b_cohorts_ready(active, mid, max_ctx, has_prefix_cache)
         {
             self.stage_decode_step(
                 sid,
@@ -1701,6 +1708,7 @@ impl ServingEngine {
                 &mut active[..mid]
             };
             self.stage_decode_step(next_sid, cohort, page_block_tokens, max_pages_per_seq, true)?;
+            let has_prefix_cache = self.has_prefix_cache();
             let next_slice: &[ActiveSequence] = if next_is_b { &*active } else { &active[mid..] };
             let next_promise = !waiting_admissible
                 && active.len() >= 4
@@ -1708,6 +1716,8 @@ impl ServingEngine {
                 && mid < active.len()
                 && next_slice.iter().all(|seq| {
                     seq.prefilled_tokens == seq.prompt_tokens.len()
+                        && (!has_prefix_cache
+                            || seq.computed_prompt_tokens == seq.prompt_tokens.len())
                         && seq.current_seq_len + 1 < max_ctx
                         && seq.generated_tokens.len() + 2 <= seq.target_output_len
                 });
@@ -2302,7 +2312,12 @@ impl ServingEngine {
             let will_enter_1f1b = self.pp_decode_pipeline
                 && !self.speculative.enabled()
                 && !waiting_admissible
-                && pp_1f1b_cohorts_ready(&active, active.len().div_ceil(2), max_ctx);
+                && pp_1f1b_cohorts_ready(
+                    &active,
+                    active.len().div_ceil(2),
+                    max_ctx,
+                    has_prefix_cache,
+                );
             let can_overlap_next = !publish_next
                 && !was_pp_1f1b
                 && ahead_promise.is_none()

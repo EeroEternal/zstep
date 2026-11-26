@@ -818,7 +818,7 @@ class DeepSeekV41StepRunner:
                 torch.cuda.Event(enable_timing=False),
                 torch.cuda.Event(enable_timing=False),
             ]
-        if self.pp_size == 1 and use_pxb_ar:
+        if self.pp_size == 1 and self.tp_size == 8 and use_pxb_ar:
             self.shm_ar_decode = HostMappedShmAllReduce(
                 name=f"{allreduce_name}_dec",
                 rank=self.tp_rank,

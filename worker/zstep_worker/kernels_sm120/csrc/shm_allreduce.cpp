@@ -570,6 +570,11 @@ void launch_mhc_post_collapse_rmsnorm(
                 "aux_out must be 16B-aligned contiguous BF16 CUDA tensor [num_tokens, 5120]");
         }
     }
+    if (ar_cta_done_ptr != 0) {
+        TORCH_CHECK(
+            ar_cta_wait_ptr != 0 && ar_blocks > 0 && ar_blocks <= 64,
+            "wave mHC requires non-null ar_cta_wait_ptr and 1 <= ar_blocks <= 64");
+    }
     launch_mhc_post_collapse_rmsnorm_cuda(
         x.data_ptr(),
         residual.data_ptr(),

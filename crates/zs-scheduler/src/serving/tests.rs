@@ -1784,8 +1784,9 @@ fn pp_1f1b_cohorts_ready_requires_four_prompt_complete_sequences_with_headroom()
         mk(16, 16, 2, 4),
         mk(16, 16, 0, 4),
     ];
-    assert!(pp_1f1b_cohorts_ready(&ready, 2, 128));
-    assert!(!pp_1f1b_cohorts_ready(&ready[..3], 2, 128));
+    assert!(pp_1f1b_cohorts_ready(&ready, 2, 128, false));
+    assert!(pp_1f1b_cohorts_ready(&ready, 2, 128, true));
+    assert!(!pp_1f1b_cohorts_ready(&ready[..3], 2, 128, false));
 
     let near_eos = vec![
         mk(16, 16, 3, 4),
@@ -1793,5 +1794,5 @@ fn pp_1f1b_cohorts_ready_requires_four_prompt_complete_sequences_with_headroom()
         mk(16, 16, 0, 4),
         mk(16, 16, 0, 4),
     ];
-    assert!(!pp_1f1b_cohorts_ready(&near_eos, 2, 128));
+    assert!(!pp_1f1b_cohorts_ready(&near_eos, 2, 128, false));
 }
