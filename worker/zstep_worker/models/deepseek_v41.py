@@ -805,7 +805,7 @@ class DeepSeekV41StepRunner:
                 threads=pxb_ar_threads,
                 exchange_group=self.tp_cpu_group,
                 enable_pxb_p2p=True,
-                pxb_max_elements=tbo_cap_tokens * 5120,
+                pxb_max_elements=min(tbo_cap_tokens, 2048) * 5120,
                 enable_pxb_bfp=self.runtime_config.shm_pxb_bfp_mode,
             )
             self._tbo_comm_stream = torch.cuda.Stream(device=self.device, priority=-1)
@@ -3844,7 +3844,7 @@ class DeepSeekV41StepRunner:
                 p_min = pos_i64[0:total_tokens:width]
                 p_max = pos_i64[width - 1 : total_tokens : width]
             c_lo = np.maximum(0, (p_min - 127) // 128)
-            c_hi = np.minimum(pt_np.shape[1] - 1, p_max // 128)
+            c_hi = np.minimum(pt_np.shape[1] - 1, (p_max + self.num_spec_tokens) // 128)
             swa_epoch = self._swa_pool.epoch if self._swa_pool is not None else -1
             bt_key = (
                 v_bucket,

@@ -612,10 +612,10 @@ impl ServeArgs {
                         .to_owned(),
                 );
             }
-            let min_active_swa = 2 * args.max_seqs as usize;
+            let min_active_swa = 3 * args.max_seqs as usize;
             if explicit <= min_active_swa {
                 return Err(format!(
-                    "ZSTEP_SWA_KV_PAGES ({explicit}) must exceed 2 * max_seqs ({min_active_swa})"
+                    "ZSTEP_SWA_KV_PAGES ({explicit}) must exceed 3 * max_seqs ({min_active_swa})"
                 ));
             }
             let num_kv = args.resolved_num_kv_pages() as usize;
