@@ -2075,7 +2075,7 @@ class DeepSeekV41StepRunner:
         pos_i64: np.ndarray,
     ) -> list[tuple[int, int, int, int, list[int], list[int], list[bool], int, int]]:
         """Split a contiguous prefill batch into two causal microbatch metadata tuples."""
-        mid = total_tokens // 2
+        mid = ((total_tokens // 2) + 8) & ~15 if total_tokens >= 256 else total_tokens // 2
         slices: list[tuple[int, int, int, int, list[int], list[int], list[bool], int, int]] = []
         for lo, hi in ((0, mid), (mid, total_tokens)):
             r_start = -1
@@ -2133,16 +2133,16 @@ class DeepSeekV41StepRunner:
         main_s = torch.cuda.current_stream(self.device)
         dev_idx = self.device.index
 
+        slices = self._compute_tbo_microbatch_slices(total_tokens, num_seqs, q_start_np, pos_i64)
+        mid = slices[0][1]
         self._tbo_steps += 1
         if self._tbo_steps == 1 and self.rank == 0:
             _LOG.info(
                 "Prefill TBO active: total_tokens=%d mid=%d ar_blocks=%d",
                 total_tokens,
-                total_tokens // 2,
+                mid,
                 shm_ar_tbo.blocks,
             )
-        mid = total_tokens // 2
-        slices = self._compute_tbo_microbatch_slices(total_tokens, num_seqs, q_start_np, pos_i64)
         attn_metas: list[dict[str, Any]] = []
         positions_full = self.positions_gpu[:total_tokens]
         slot_map_full = self.slot_mapping_gpu[:total_tokens]
@@ -2663,6 +2663,14 @@ class DeepSeekV41StepRunner:
             ([24], 2560),
             ([17, 24, 13], 2560),
             ([64, 64], 2560),
+            *(
+                [
+                    ([1] * min(15, self.max_seqs - 1) + [2048], -1),
+                    ([1] * min(16, self.max_seqs - 1) + [2048], -1),
+                ]
+                if getattr(self, "dspark_drafter", None) is None
+                else []
+            ),
             ([1] * min(15, self.max_seqs - 1) + [512], -1),
             ([1] * min(31, self.max_seqs - 1) + [1024], -1),
             ([1] * min(31, self.max_seqs - 1) + [512, 512], -2),
@@ -2775,8 +2783,11 @@ class DeepSeekV41StepRunner:
                         and self.pp_size == 1
                         and self.shm_ar_tbo is not None
                         and self._tbo_comm_stream is not None
-                        and min(q_lens) > 1
-                        and n_toks % 256 == 0
+                        and (
+                            (min(q_lens) > 1 and n_toks % 256 == 0)
+                            if getattr(self, "dspark_drafter", None) is not None
+                            else (max(q_lens) >= 512)
+                        )
                         and self._can_run_prefill_tbo(
                             n_toks, max_seq_len=max(s_lens), is_decode=False
                         )
@@ -4275,8 +4286,11 @@ class DeepSeekV41StepRunner:
             use_tbo = (
                 pw_b is None
                 and not use_pp2_prefill
-                and min_q_len > 1
-                and total_tokens % 256 == 0
+                and (
+                    (min_q_len > 1 and total_tokens % 256 == 0)
+                    if getattr(self, "dspark_drafter", None) is not None
+                    else (max_q_len >= 512)
+                )
                 and self._can_run_prefill_tbo(
                     total_tokens,
                     max_seq_len=max_s_len,

@@ -8,6 +8,7 @@
   - [`docs/benchmarks/phase311_6000d_scout_comm_and_dsa.json`](benchmarks/phase311_6000d_scout_comm_and_dsa.json)
   - [`docs/benchmarks/phase311_6000d_round1_round2_ab_verify.json`](benchmarks/phase311_6000d_round1_round2_ab_verify.json)
   - [`docs/benchmarks/phase311_6000d_round3_3track_results.json`](benchmarks/phase311_6000d_round3_3track_results.json)
+  - [`docs/benchmarks/phase311_6000d_round4_composed_abba_verify.json`](benchmarks/phase311_6000d_round4_composed_abba_verify.json)
 
 ---
 
@@ -77,4 +78,20 @@ Every verification cell below averages **3 interleaved cold container pairs (`AB
 3. **Track 3 — Speculative Decoding `spec-dspark` (`ZSTEP_SPEC_METHOD=dspark`, `num_spec_tokens=5`, `72 LOC`)**:
    - Baseline `zstep@8ad676f` achieves **`177.61` out tok/s (`5.29 ms` TPOT)** at `spec_c1` and **`820.38` out tok/s (`8.08 ms` TPOT)** at `spec_c8`.
    - Capturing `(b, k)` contiguous draft packing inside `draft_graphs[b]` + single contiguous D2H DMA + zero-`.tolist()` NumPy slicing improved **`spec_c8` to `825.20` out tok/s (`+0.59%`, TPOT `8.08 → 8.02 ms`, `-0.74%`)** with `TRITON_RECOMPILATIONS=0` and 100% Greedy parity.
+
+---
+
+## 5. Round 4 Orthogonal Composition 3-Round `AB/BA` Verification & Final Landed Increment
+
+Before merging Round 3's `89 LOC` composed candidate (`Track 1` `17 LOC` + `Track 3 v2` `72 LOC`) into `perf/sm120-aligned-tbo-megagate-dspark`, we ran full 3-Round Interleaved Cold `AB/BA` Verification (`repeats=3`, `phase311_6000d_round4_composed_abba_verify.json`) against `zstep@5fbcdbe`:
+
+1. **`longctx-tp8` 3-Round `AB/BA` Verify — All 4 Tiers Positive (`geomean = +0.64%`, `paired_lcb_2se = +0.58%`)**:
+   - `ctx16k_c12`: **`+0.87%`** (TPOT `75.63 → 74.92 ms`, **`+1.24%` cumulative** vs `f2c23b1`)
+   - `ctx32k_c4`: **`+0.70%`** (TPOT `43.25 → 42.92 ms`, **`+1.62%` cumulative** vs `f2c23b1`)
+   - `ctx32k_c8`: **`+0.70%`** (TPOT `87.05 → 86.49 ms`, **`+1.30%` cumulative** vs `f2c23b1`)
+   - `ctx8k_c16`: **`+0.30%`** (**`+0.78%` cumulative** vs `f2c23b1`)
+   - `TRITON_RECOMPILATIONS=0`, 100% Greedy parity, `Trace Conformance = CONFORMANT` (**`+1.23%` cumulative 3-Round `AB/BA` geomean** over `f2c23b1`).
+2. **`spec-dspark` 3-Round `AB/BA` Verify — Hidden `spec_c16` Gate Catch (`Track 3 v2` Excluded)**:
+   - Even after isolating `dspark_drafter` from mixed-step TBO (`g0001-c657e439`), `Track 3 v2` won public Screen `spec_c8` (`+1.05%`, `829.0` out tok/s) but regressed hidden `spec_c16` (`16:48:1024:256`) by **`-2.74%`** (`p99_itl_ms +6.83%`) due to CPython `np.int32` scalar-boxing in `draft_np[i, ...]` / `verify_batch` and in-graph transpose at `b=16`.
+   - **Landed Decision**: Merged **only** verified `Track 1` (`worker/zstep_worker/models/deepseek_v41.py`: 16-token-aligned mixed-step TBO gated on `getattr(self, "dspark_drafter", None) is None`, `31 LOC`), preserving `0.00%` change on `spec-dspark` while banking the full `+0.64%` (`+1.23%` cumulative) 3-Round `AB/BA` gain on `longctx-tp8`.
 
