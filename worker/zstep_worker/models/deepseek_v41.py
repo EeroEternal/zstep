@@ -475,6 +475,7 @@ class DeepSeekV41StepRunner:
         self.shm_ag: HostMappedShmAllGather | None = None
         self.argmax_channel: HostMappedShmArgmax | None = None
         self.decode_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.long_decode_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.piecewise_graphs: dict[int, Any] = {}
         self.piecewise_outputs: dict[int, torch.Tensor] = {}
         self.piecewise_aux_outputs: dict[int, list[torch.Tensor] | None] = {}
@@ -2936,7 +2937,20 @@ class DeepSeekV41StepRunner:
         graph_pool = torch.cuda.graph_pool_handle()
         capture_stream = torch.cuda.Stream(device=self.device)
 
-        for b in buckets:
+        capture_schedule: list[tuple[int, int, bool]] = [
+            (b, self.decode_graph_max_seq_len, False) for b in buckets
+        ]
+        if (
+            self.b12x_summary.dsa_decode_enabled
+            and self.max_model_len > self.decode_graph_max_seq_len
+        ):
+            capture_schedule.extend(
+                (b, self.max_model_len, True)
+                for b in (1, 2, 4, 8, 10, 12, 16, 20, 24, 32)
+                if b <= self.max_graph_bucket
+            )
+
+        for b, cap_max_seq, is_long in capture_schedule:
             self.token_ids_gpu[:b].zero_()
             self.positions_gpu[:b].zero_()
             self.seq_lens_gpu[:b].fill_(1)
@@ -2950,7 +2964,7 @@ class DeepSeekV41StepRunner:
                         num_reqs=b,
                         num_tokens=b,
                         max_query_len=1,
-                        max_seq_len=self.decode_graph_max_seq_len,
+                        max_seq_len=cap_max_seq,
                         qsl_gpu=self.decode_qsl_gpu[: b + 1],
                         qsl_cpu=self.decode_qsl_cpu[: b + 1],
                         seq_lens_gpu=self.seq_lens_gpu[:b],
@@ -3010,7 +3024,7 @@ class DeepSeekV41StepRunner:
                     num_reqs=b,
                     num_tokens=b,
                     max_query_len=1,
-                    max_seq_len=self.decode_graph_max_seq_len,
+                    max_seq_len=cap_max_seq,
                     qsl_gpu=self.decode_qsl_gpu[: b + 1],
                     qsl_cpu=self.decode_qsl_cpu[: b + 1],
                     seq_lens_gpu=self.seq_lens_gpu[:b],
@@ -3034,7 +3048,7 @@ class DeepSeekV41StepRunner:
                         num_reqs=b,
                         num_tokens=b,
                         max_query_len=1,
-                        max_seq_len=self.decode_graph_max_seq_len,
+                        max_seq_len=cap_max_seq,
                         qsl_gpu=self.decode_qsl_gpu[: b + 1],
                         qsl_cpu=self.decode_qsl_cpu[: b + 1],
                         seq_lens_gpu=self.seq_lens_gpu[:b],
@@ -3082,7 +3096,7 @@ class DeepSeekV41StepRunner:
                         self._pp_inter_pre_mix[:b].copy_(hidden["pre_mix"])
             capture_stream.synchronize()
             dist.barrier(group=self.exchange_group)
-            self.decode_graphs[b] = g
+            (self.long_decode_graphs if is_long else self.decode_graphs)[b] = g
 
         if (
             self.spec_method != "none"
@@ -3129,7 +3143,12 @@ class DeepSeekV41StepRunner:
                 else "mega_gate=off"
             )
             dsa_info = (
-                f"dsa_decode=on(cg_max_seq={self.decode_graph_max_seq_len})"
+                (
+                    f"dsa_decode=on(cg_max_seq={self.decode_graph_max_seq_len},"
+                    f"long_cg={len(self.long_decode_graphs)}@{self.max_model_len})"
+                    if self.long_decode_graphs
+                    else f"dsa_decode=on(cg_max_seq={self.decode_graph_max_seq_len})"
+                )
                 if self.b12x_summary.dsa_decode_enabled
                 else "dsa_decode=off"
             )
@@ -3140,6 +3159,7 @@ class DeepSeekV41StepRunner:
             if (
                 self.b12x_summary.dsa_decode_enabled
                 and self.max_model_len > SM120_DSA_CANDIDATE_COVER_TOKENS
+                and not self.long_decode_graphs
             ):
                 _LOG.warning(
                     "max_model_len=%d exceeds SM120_DSA_CANDIDATE_COVER_TOKENS=%d; "
@@ -3724,8 +3744,15 @@ class DeepSeekV41StepRunner:
         self._h2d_done_event.synchronize()
 
         self.start_events[parity].record()
-        if is_decode and int(seq_lens_np.max()) <= self.decode_graph_max_seq_len:
-            bucket = select_decode_bucket(num_seqs, self.max_graph_bucket)
+        max_decode_seq = int(seq_lens_np.max()) if is_decode else 0
+        decode_bucket = select_decode_bucket(num_seqs, self.max_graph_bucket) if is_decode else 0
+        use_short_decode_graph = is_decode and max_decode_seq <= self.decode_graph_max_seq_len
+        use_long_decode_graph = (
+            is_decode and not use_short_decode_graph
+            and max_decode_seq <= self.max_model_len and decode_bucket in self.long_decode_graphs
+        )
+        if use_short_decode_graph or use_long_decode_graph:
+            bucket = decode_bucket
             self.slots_cpu[:num_seqs].numpy()[:] = slot_np
             self.slots_gpu[:num_seqs].copy_(
                 self.slots_cpu[:num_seqs], non_blocking=True
@@ -3884,7 +3911,7 @@ class DeepSeekV41StepRunner:
                 self._pp_recv_intermediate(
                     self._pp_inter_hidden[:bucket], self._pp_inter_pre_mix[:bucket]
                 )
-            self.decode_graphs[bucket].replay()
+            (self.long_decode_graphs if use_long_decode_graph else self.decode_graphs)[bucket].replay()
             if self.pp_size > 1 and self.is_first_pp:
                 assert (
                     self._pp_inter_hidden is not None
@@ -4573,6 +4600,7 @@ class DeepSeekV41StepRunner:
         self._closed = True
         self.signal_abort()
         self.decode_graphs.clear()
+        self.long_decode_graphs.clear()
         self.piecewise_graphs.clear()
         self.piecewise_outputs.clear()
         self.piecewise_aux_outputs.clear()
@@ -4618,6 +4646,7 @@ class DeepSeekV41StepRunner:
 
         torch.cuda.synchronize(self.device)
         self.decode_graphs.clear()
+        self.long_decode_graphs.clear()
         self.piecewise_graphs.clear()
         self.piecewise_outputs.clear()
         self.piecewise_aux_outputs.clear()
