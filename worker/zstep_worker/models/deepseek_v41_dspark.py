@@ -51,6 +51,7 @@ class DeepSeekV41DSparkDrafter:
         self.markov_w2_shard: torch.Tensor = markov_head.markov_w2.weight[
             rank * vpr : (rank + 1) * vpr
         ].contiguous()
+        self.markov_w2_shard_t: torch.Tensor = self.markov_w2_shard.t()
 
         k = self.num_draft_tokens
         max_draft_rows = min(256, runner.max_step_tokens)
@@ -106,6 +107,11 @@ class DeepSeekV41DSparkDrafter:
             max(runner.max_step_tokens, 8192), dtype=torch.int64, device=runner.device
         )
 
+        self.markov_vec_buf: torch.Tensor = torch.empty(
+            (max_b, self.markov_w1_weight.shape[1]),
+            dtype=self.markov_w1_weight.dtype,
+            device=runner.device,
+        )
         self.step_logits_buf: torch.Tensor = torch.empty(
             (max_b, vpr), dtype=torch.bfloat16, device=runner.device
         )
@@ -133,15 +139,24 @@ class DeepSeekV41DSparkDrafter:
         )
         normed = self.model.model.norm(head_hidden)
         base_logits = runner.model.compute_logits_local(normed).view(b, k, vpr)
+        step_logits = self.step_logits_buf[:b]
+        markov_vec = self.markov_vec_buf[:b]
+        w2_t = self.markov_w2_shard_t
+        local_vals = runner.local_max_vals_buf[:b]
+        local_ids = runner.local_max_ids_buf[:b]
         prev_tok = self.draft_tokens_gpu[0:rows:k]
         for step_idx in range(k):
-            markov_vec = torch.index_select(self.markov_w1_weight, 0, prev_tok)
-            self.step_logits_buf[:b].copy_(base_logits[:, step_idx, :])
-            self.step_logits_buf[:b].addmm_(markov_vec, self.markov_w2_shard.t())
+            torch.index_select(self.markov_w1_weight, 0, prev_tok, out=markov_vec)
+            torch.addmm(
+                base_logits[:, step_idx, :],
+                markov_vec,
+                w2_t,
+                out=step_logits,
+            )
             runner.argmax_channel.gather_top2_from_logits(
-                self.step_logits_buf[:b],
-                local_top2_vals_buf=runner.local_max_vals_buf[:b],
-                local_top2_ids_buf=runner.local_max_ids_buf[:b],
+                step_logits,
+                local_top2_vals_buf=local_vals,
+                local_top2_ids_buf=local_ids,
                 out_tokens=self.draft_out_tokens_gpu[step_idx, :b],
                 out_logprob_bits=self.draft_out_logprobs_gpu[step_idx, :b],
                 vocab_per_rank=vpr,

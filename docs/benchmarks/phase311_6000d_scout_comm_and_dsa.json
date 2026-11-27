@@ -1,0 +1,387 @@
+{
+  "dsv41_config_index": {
+    "candidate_source_layer_id": 20,
+    "candidate_topk_blocks": 2048,
+    "compress_ratios": [
+      0,
+      0,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0
+    ],
+    "compress_rope_theta": 160000,
+    "dspark_target_layer_ids": [
+      37,
+      38,
+      39
+    ],
+    "engram_compressed_vocab_size": 99092,
+    "engram_head_dim": 256,
+    "engram_layer_ids": [
+      1,
+      14
+    ],
+    "engram_n_heads": 8,
+    "head_dim": 512,
+    "index_head_dim": 128,
+    "index_n_heads": 32,
+    "index_source_layer_ids": [
+      2,
+      8,
+      14,
+      20,
+      24,
+      28,
+      32,
+      36
+    ],
+    "index_topk": 512,
+    "kv_source_layer_ids": [
+      2,
+      8,
+      14,
+      20
+    ],
+    "norm_topk_prob": true,
+    "num_attention_heads": 64,
+    "num_hidden_layers": 40,
+    "num_key_value_heads": 1,
+    "num_nextn_predict_layers": 3,
+    "qk_rope_head_dim": 64,
+    "topk_method": "noaux_tc"
+  },
+  "dsa_ragged_prefill": [
+    {
+      "case": "short_in512_b1_r1",
+      "stock_us": 36.01,
+      "sm120_us": 39.97,
+      "speedup_x": 0.901,
+      "last_row_overlap": 1.0,
+      "exact_set_match": true,
+      "stock_last_minmax": [
+        0,
+        511
+      ],
+      "sm120_last_minmax": [
+        0,
+        511
+      ]
+    },
+    {
+      "case": "short_in512_b4_r1",
+      "stock_us": 34.99,
+      "sm120_us": 39.57,
+      "speedup_x": 0.884,
+      "last_row_overlap": 1.0,
+      "exact_set_match": true,
+      "stock_last_minmax": [
+        0,
+        511
+      ],
+      "sm120_last_minmax": [
+        0,
+        511
+      ]
+    },
+    {
+      "case": "short_in1024_b2_r1",
+      "stock_us": 50.9,
+      "sm120_us": 49.37,
+      "speedup_x": 1.031,
+      "last_row_overlap": 1.0,
+      "exact_set_match": true,
+      "stock_last_minmax": [
+        1,
+        1020
+      ],
+      "sm120_last_minmax": [
+        1,
+        1020
+      ]
+    },
+    {
+      "case": "ctx8k_chunk0_2k_r1",
+      "stock_us": 78.44,
+      "sm120_us": 60.24,
+      "speedup_x": 1.302,
+      "last_row_overlap": 1.0,
+      "exact_set_match": true,
+      "stock_last_minmax": [
+        10,
+        2044
+      ],
+      "sm120_last_minmax": [
+        10,
+        2044
+      ]
+    },
+    {
+      "case": "ctx8k_chunk3_8k_r1",
+      "stock_us": 552.64,
+      "sm120_us": 494.7,
+      "speedup_x": 1.117,
+      "last_row_overlap": 1.0,
+      "exact_set_match": true,
+      "stock_last_minmax": [
+        26,
+        8113
+      ],
+      "sm120_last_minmax": [
+        26,
+        8113
+      ]
+    },
+    {
+      "case": "ctx16k_chunk7_16k_r1",
+      "stock_us": 1181.53,
+      "sm120_us": 1134.83,
+      "speedup_x": 1.041,
+      "last_row_overlap": 1.0,
+      "exact_set_match": true,
+      "stock_last_minmax": [
+        55,
+        16366
+      ],
+      "sm120_last_minmax": [
+        55,
+        16366
+      ]
+    },
+    {
+      "case": "ctx32k_chunk15_16k_r2",
+      "stock_us": 1239.69,
+      "sm120_us": 1196.22,
+      "speedup_x": 1.036,
+      "last_row_overlap": 1.0,
+      "exact_set_match": true,
+      "stock_last_minmax": [
+        55,
+        16366
+      ],
+      "sm120_last_minmax": [
+        55,
+        16366
+      ]
+    },
+    {
+      "case": "ctx32k_chunk15_32k_r1",
+      "stock_us": 2489.52,
+      "sm120_us": 2362.4,
+      "speedup_x": 1.054,
+      "last_row_overlap": 1.0,
+      "exact_set_match": true,
+      "stock_last_minmax": [
+        17,
+        32714
+      ],
+      "sm120_last_minmax": [
+        17,
+        32714
+      ]
+    },
+    {
+      "case": "ctx16k_chunk7_16k_fp4",
+      "stock_us": 607.41,
+      "sm120_us": 570.66,
+      "speedup_x": 1.064,
+      "last_row_overlap": 1.0,
+      "exact_set_match": true,
+      "stock_last_minmax": [
+        0,
+        16358
+      ],
+      "sm120_last_minmax": [
+        0,
+        16358
+      ]
+    },
+    {
+      "case": "ctx32k_chunk15_16k_r2_fp4",
+      "stock_us": 625.05,
+      "sm120_us": 612.67,
+      "speedup_x": 1.02,
+      "last_row_overlap": 1.0,
+      "exact_set_match": true,
+      "stock_last_minmax": [
+        0,
+        16358
+      ],
+      "sm120_last_minmax": [
+        0,
+        16358
+      ]
+    }
+  ],
+  "vllm_sai_info": {
+    "SparseAttnIndexer_init": "    def __init__(\n        self,\n        k_cache,\n        quant_block_size: int,\n        scale_fmt: str,\n        topk_tokens: int,\n        head_dim: int,\n        max_model_len: int,\n        max_total_seq_len: int,\n        topk_indices_buffer: torch.Tensor,\n        skip_k_cache_insert: bool = False,\n        use_fp4_cache: bool = False,\n        compress_ratio: int = 1,\n        candidate_blocks: torch.Tensor | None = None,\n        candidate_block_size: int = 0,\n        candidate_write: bool = False,\n    ):\n        super().__init__()\n        self.k_cache = k_cache\n        self.quant_block_size = quant_block_size\n        self.scale_fmt = scale_fmt\n        self.topk_tokens = topk_tokens\n        self.head_dim = head_dim\n        self.max_model_len = max_model_len\n        self.max_total_seq_len = max_total_seq_len\n        self.topk_indices_buffer = topk_indices_buffer\n        self.skip_k_cache_insert = skip_k_cache_insert\n        self.use_fp4_cache = use_fp4_cache\n        self.compress_ratio = compress_ratio\n        # v4.1 two-level selection: the candidate source indexer writes the\n        # top candidate blocks here; later indexers mask their scores with it.\n        self.candidate_blocks = candidate_blocks\n        self.candidate_block_size = candidate_block_size\n        self.candidate_write = candidate_write\n        self.dense_mha_metadata_layer_name = \"\"\n        # DCP scalars are constant for the run; resolve them here (config is set\n        # during model construction) and pass them into the custom op, rather\n        # than threading them through per-step metadata.\n        vllm_config = get_current_vllm_config()\n        parallel_config = vllm_config.parallel_config\n        self.topk_backend = vllm_config.kernel_config.sparse_indexer_topk_backend\n        self._parallel_config = parallel_config\n        self.dcp_world_size = parallel_config.decode_context_parallel_size\n        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0\n        self.use_pcp = parallel_config.prefill_context_parallel_size > 1\n        self._cp_kv_cache_interleave_size: int | None = None\n        if current_platform.is_cuda() and not has_deep_gemm():\n            raise RuntimeError(\n                \"Sparse Attention Indexer CUDA op requires DeepGEMM support in \"\n                \"the current vLLM environment.\"\n            )\n\n        if vllm_config.kernel_config.enable_jit_warmup:\n            from vllm.v1.attention.ops.common import (\n                _PACK_SEQ_TRITON_KERNEL,\n                _UNPACK_SEQ_TRITON_KERNEL,\n            )\n\n            pack_dtype = torch.uint8 if use_fp4_cache else current_platform.fp8_dtype()\n            _PACK_SEQ_TRITON_KERNEL.register_warmup(\n                dtype=pack_dtype,\n                pad_value=0 if use_fp4_cache else -float(\"inf\"),\n            )\n            _UNPACK_SEQ_TRITON_KERNEL.register_warmup()\n\n            if self.dcp_world_size > 1 and current_platform.is_cuda() and has_cutedsl():\n                from vllm.model_exec",
+    "SparseAttnIndexer_fwd": "    def forward_cuda(\n        self,\n        hidden_states: torch.Tensor,\n        q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],\n        k: torch.Tensor | None,\n        weights: torch.Tensor,\n    ):\n        # FP8 path: single tensor (per-token scale is folded into `weights`).\n        # FP4 path: (values, scales) tuple with scales required by the kernel.\n        if isinstance(q_quant, tuple):\n            q_values, q_scale = q_quant\n        else:\n            q_values, q_scale = q_quant, None\n        return torch.ops.vllm.sparse_attn_indexer(\n            hidden_states,\n            _encode_layer_name(self.k_cache.prefix),\n            self.k_cache.kv_cache,\n            q_values,\n            q_scale,\n            k,\n            weights,\n            self.quant_block_size,\n            self.scale_fmt,\n            self.topk_tokens,\n            self.head_dim,\n            self.max_model_len,\n            self.max_total_seq_len,\n            self.topk_indices_buffer,\n            self.skip_k_cache_insert,\n            self.use_pcp,\n            _encode_layer_name(self.dense_mha_metadata_layer_name),\n            self.use_fp4_cache,\n            self.dcp_rank,\n            self.dcp_world_size,\n            self.cp_kv_cache_interleave_size,\n            False,\n            candidate_blocks=self.candidate_blocks,\n            candidate_block_size=self.candidate_block_size,\n            candidate_write=self.candidate_write,\n            topk_backend=self.topk_backend,\n        )\n",
+    "sparse_attn_indexer_fn": "@eager_break_during_capture\ndef sparse_attn_indexer(\n    hidden_states: torch.Tensor,\n    k_cache_prefix: LayerNameType,\n    kv_cache: torch.Tensor,\n    q_quant: torch.Tensor,\n    q_scale: torch.Tensor | None,\n    k: torch.Tensor | None,\n    weights: torch.Tensor,\n    quant_block_size: int,\n    scale_fmt: str | None,\n    topk_tokens: int,\n    head_dim: int,\n    max_model_len: int,\n    total_seq_lens: int,\n    topk_indices_buffer: torch.Tensor,\n    skip_k_cache_insert: bool,\n    use_pcp: bool,\n    dense_mha_metadata_layer_name: LayerNameType,\n    use_fp4_cache: bool = False,\n    dcp_rank: int = 0,\n    dcp_world_size: int = 1,\n    cp_kv_cache_interleave_size: int = 1,\n    skip_topk_buffer_clear: bool = False,\n    candidate_blocks: torch.Tensor | None = None,\n    candidate_block_size: int = 0,\n    candidate_write: bool = False,\n    topk_backend: str = \"auto\",\n) -> torch.Tensor:\n    # careful! this will be None in dummy run\n    forward_context = get_forward_context()\n    attn_metadata = forward_context.attn_metadata\n    fp8_dtype = current_platform.fp8_dtype()\n    k_cache_prefix = _resolve_layer_name(k_cache_prefix)\n\n    if candidate_blocks is not None:\n        # Candidate blocks are request-local; the DCP-sharded logits layout\n        # would need per-rank translation that is not implemented.\n        assert dcp_world_size == 1, (\n            \"v4.1 two-level candidate filtering is not supported with DCP.\"\n        )\n        assert candidate_block_size > 0\n\n    # assert isinstance(attn_metadata, dict)\n    if not isinstance(attn_metadata, dict):\n        # Reserve workspace for indexer during profiling run\n        values_spec, scales_spec = _gather_workspace_shapes(\n            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache\n        )\n        profile_specs: list[tuple[tuple[int, ...], torch.dtype]] = [\n            values_spec,\n            scales_spec,\n            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),\n        ]\n        if use_pcp and dcp_world_size > 1:\n            # The PCP+DCP path takes an all-gather destination and a\n            # de-interleaved result.\n            gather_spec = _gather_workspace_shapes(\n                total_seq_lens, head_dim, fp8_dtype, use_fp4_cache\n            )\n            profile_specs.extend(gather_spec * 2)\n        current_workspace_manager().get_simultaneous(*profile_specs)\n\n        # Dummy allocation to simulate for peak logits tensor memory during inference.\n        # FP8 elements so elements == bytes\n        max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024\n        _ = torch.empty(\n            max_logits_elems, dtype=torch.uint8, device=hidden_states.device\n        )\n\n        return sparse_attn_indexer_fake(\n            hidden_states,\n            k_cache_prefix,\n            kv_cache,\n            q_quant,\n            q_scale,\n            k,\n            weights,\n            quant_block_size,\n            scale_fmt,\n            topk_tokens,\n            head_dim,\n            max_model_len,\n            total_seq_lens,\n            topk_indices_buffer,\n            skip_k_cache_insert,\n            use_pcp,\n            dense_mha_metadata_layer_name,\n            use_fp4_cache,\n            candidate_blocks=candidate_blocks,\n            candidate_block_size=candidate_block_size,\n            candidate_write=candidate_write,\n        )\n    attn_metadata_narrowed = attn_metadata[k_cache_prefix]\n    assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)\n    slot_mapping = attn_metadata_narrowed.slot_mapping\n    has_decode = attn_metadata_narrowed.num_decodes > 0\n    has_prefill = attn_metadata_narrowed.num_prefills > 0\n    num_decode_tokens = attn_metadata_narrowed.num_decode_tokens\n\n    # q_scale is required iff the FP4 cache path is enabled; the FP8 path\n    # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.\n    if use_fp4_cache:\n        assert q_scale is not None, \"use_fp4_cache=True requires q_scale\"\n    else:\n        assert q_scale is None, \"q_scale must be None when use_fp4_cache=False\"\n\n    # During speculative decoding, k may be padded to the CUDA graph batch\n    # size while slot_mapping only covers actual tokens. Truncate k to avoid\n    # out-of-bounds reads in the kernel.\n    # Keep PCP padding so every rank contributes the same all-gather shape.\n    num_tokens = slot_mapping.shape[0]\n    if k is not None:\n        # MTP draft decodes are replicated and use an unexpanded slot mapping.\n        if use_pcp and num_tokens > k.shape[0]:\n            num_tokens //= get_pcp_group().world_size\n        k = k[:num_tokens]\n\n    if not skip_k_cache_insert:\n        assert k is not None\n        k, slot_mapping_for_cache = maybe_gather_indexer_k(\n            k,\n            slot_mapping,\n            num_decode_tokens,\n            use_pcp,\n        )\n        # scale_fmt can be None, but the function expects str\n        assert scale_fmt is not None\n        assert not use_fp4_cache, \"Unfused FP4 Insert is not supported yet\"\n        ops.indexer_k_"
+  },
+  "p2p_report": {
+    "p2p_enabled": true,
+    "pxb_shm_enabled": true,
+    "nccl_p2p_level": "PXB",
+    "symmetric_pxb_pairs": true,
+    "measured_pxb_bi_gbps": 106.1,
+    "reason": "verified_p2p"
+  },
+  "pcie_ipc_profile": "pcieswitch-pairs",
+  "pcie_ipc_reason": "rank 0 shares a PCIe switch with group member GPU-472538b7-a04a-0036-29e1-565cd33f39e3",
+  "allreduce_tp8": [
+    {
+      "M": 64,
+      "bytes_mib": 0.625,
+      "shm_pxb_bfp1_us": 58.69,
+      "shm_pxb_bfp0_us": 76.81,
+      "nccl_us": 133.14,
+      "err_bfp1": 0.21875,
+      "err_bfp0": 0.0625,
+      "err_pcie": 0.0625,
+      "staged_ring_b4": 119.58,
+      "staged_ring_b16": 91.77,
+      "staged_b8": 98.85
+    },
+    {
+      "M": 128,
+      "bytes_mib": 1.25,
+      "shm_pxb_bfp1_us": 73.0,
+      "shm_pxb_bfp0_us": 234.65,
+      "nccl_us": 249.83,
+      "err_bfp1": 0.21875,
+      "err_bfp0": 0.0625,
+      "err_pcie": 0.0625,
+      "staged_ring_b4": 173.16,
+      "staged_ring_b16": 218.72,
+      "staged_b8": 180.31
+    },
+    {
+      "M": 256,
+      "bytes_mib": 2.5,
+      "shm_pxb_bfp1_us": 97.39,
+      "shm_pxb_bfp0_us": 349.7,
+      "nccl_us": 229.82,
+      "err_bfp1": 0.21875,
+      "err_bfp0": 0.0625,
+      "err_pcie": 0.0625,
+      "staged_ring_b4": 302.41,
+      "staged_ring_b16": 791.56,
+      "staged_b8": 617.03
+    },
+    {
+      "M": 384,
+      "bytes_mib": 3.75,
+      "shm_pxb_bfp1_us": 134.89,
+      "shm_pxb_bfp0_us": 480.47,
+      "nccl_us": 303.64,
+      "err_bfp1": 0.20312,
+      "err_bfp0": 0.0625,
+      "err_pcie": 0.0625,
+      "staged_ring_b4": 426.53,
+      "staged_ring_b16": 1328.52,
+      "staged_b8": 814.04
+    },
+    {
+      "M": 512,
+      "bytes_mib": 5.0,
+      "shm_pxb_bfp1_us": 140.64,
+      "shm_pxb_bfp0_us": 548.32,
+      "nccl_us": 363.85,
+      "err_bfp1": 0.20312,
+      "err_bfp0": 0.0625,
+      "err_pcie": 0.0625,
+      "staged_ring_b4": 555.34,
+      "staged_ring_b16": 2219.26,
+      "staged_b8": 1227.59
+    },
+    {
+      "M": 1024,
+      "bytes_mib": 10.0,
+      "shm_pxb_bfp1_us": 261.78,
+      "shm_pxb_bfp0_us": 929.56,
+      "nccl_us": 738.32,
+      "err_bfp1": 0.21875,
+      "err_bfp0": 0.0625,
+      "err_pcie": 0.0625,
+      "staged_ring_b4": 1146.66,
+      "staged_ring_b16": 4058.72,
+      "staged_b8": 1725.74
+    },
+    {
+      "M": 2048,
+      "bytes_mib": 20.0,
+      "shm_pxb_bfp1_us": 472.21,
+      "shm_pxb_bfp0_us": 1656.06,
+      "nccl_us": 1468.09,
+      "err_bfp1": 0.2207,
+      "err_bfp0": 0.0625,
+      "err_pcie": 0.0625,
+      "staged_ring_b4": 2519.03,
+      "staged_ring_b16": 8036.42,
+      "staged_b8": 5263.47
+    },
+    {
+      "M": 3072,
+      "bytes_mib": 30.0,
+      "shm_pxb_bfp1_us": 695.53,
+      "shm_pxb_bfp0_us": 2436.6,
+      "nccl_us": 2209.58,
+      "err_bfp1": 0.22656,
+      "err_bfp0": 0.0625,
+      "err_pcie": 0.0625,
+      "staged_ring_b4": 4111.07,
+      "staged_ring_b16": 12334.62,
+      "staged_b8": 7553.94
+    },
+    {
+      "M": 4096,
+      "bytes_mib": 40.0,
+      "shm_pxb_bfp1_us": 914.37,
+      "shm_pxb_bfp0_us": 3230.1,
+      "nccl_us": 2986.62,
+      "err_bfp1": 0.25,
+      "err_bfp0": 0.0625,
+      "err_pcie": 0.0625,
+      "staged_ring_b4": 5544.38,
+      "staged_ring_b16": 16948.0,
+      "staged_b8": 10344.15
+    }
+  ]
+}

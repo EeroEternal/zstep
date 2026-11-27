@@ -1548,7 +1548,7 @@ def _prepare_sm12x_mega_gate(
             _LOG.warning("SM12x MegaGate found 0 eligible MoERunner layers")
         return 0, 0, 0
 
-    enable_pdl = cfg_env.mega_gate_enable_pdl
+    enable_pdl = bool(cfg_env.mega_gate_enable_pdl or str(arch).startswith("sm_120"))
     specs_to_compile: list[KernelSpec] = []
     geom_cfg_by_m: dict[
         tuple[int, int, int, bool, bool], list[MegaGateConfig | None]
@@ -1561,6 +1561,11 @@ def _prepare_sm12x_mega_gate(
         seen_cfgs: dict[MegaGateConfig, KernelSpec] = {}
         for m in range(min_tokens, max_tok_cap + 1):
             cfg = select_config(m, hidden, num_experts, sms, False)
+            if (
+                cfg.num_logical_ctas > sms
+                or (hidden // BLOCK_K) % cfg.num_split_k != 0
+            ) and sms > 110:
+                cfg = select_config(m, hidden, num_experts, 110, False)
             if cfg.num_logical_ctas > sms or (hidden // BLOCK_K) % cfg.num_split_k != 0:
                 continue
             cfgs_m[m] = cfg

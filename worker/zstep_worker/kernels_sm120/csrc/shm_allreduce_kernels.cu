@@ -135,18 +135,51 @@ __device__ __forceinline__ void load_peer_vecs(
     int64_t idx,
     int rank,
     int world_size) {
+    const int64_t slot_offset = 131072 + static_cast<int64_t>(slot) * slot_stride_bytes;
+    if (world_size == kMaxRanks) {
+        #pragma unroll
+        for (int p = 0; p < kMaxRanks; ++p) {
+            const uint4* p_in = reinterpret_cast<const uint4*>(peer_shm[p] + slot_offset);
+            vals[p] = (p == rank) ? __ldcs(input_vec + idx) : ld_cv_uint4(p_in + idx);
+        }
+        return;
+    }
     #pragma unroll
     for (int p = 0; p < kMaxRanks; ++p) {
         if (p < world_size) {
-            const uint4* p_in = reinterpret_cast<const uint4*>(
-                peer_shm[p] + 131072 + slot * slot_stride_bytes);
-            vals[p] = (p == rank) ? input_vec[idx] : ld_cv_uint4(p_in + idx);
+            const uint4* p_in = reinterpret_cast<const uint4*>(peer_shm[p] + slot_offset);
+            vals[p] = (p == rank) ? __ldcs(input_vec + idx) : ld_cv_uint4(p_in + idx);
         }
     }
 }
 
 __device__ __forceinline__ void accumulate_peer_vecs(
     float (&acc)[8], const uint4 (&vals)[kMaxRanks], int world_size) {
+    if (world_size == kMaxRanks) {
+        Pack128Bf16 v0, v1, v2, v3, v4, v5, v6, v7;
+        v0.u4 = vals[0];
+        v1.u4 = vals[1];
+        v2.u4 = vals[2];
+        v3.u4 = vals[3];
+        v4.u4 = vals[4];
+        v5.u4 = vals[5];
+        v6.u4 = vals[6];
+        v7.u4 = vals[7];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 f0 = __bfloat1622float2(v0.pairs[j]);
+            const float2 f1 = __bfloat1622float2(v1.pairs[j]);
+            const float2 f2 = __bfloat1622float2(v2.pairs[j]);
+            const float2 f3 = __bfloat1622float2(v3.pairs[j]);
+            const float2 f4 = __bfloat1622float2(v4.pairs[j]);
+            const float2 f5 = __bfloat1622float2(v5.pairs[j]);
+            const float2 f6 = __bfloat1622float2(v6.pairs[j]);
+            const float2 f7 = __bfloat1622float2(v7.pairs[j]);
+            acc[2 * j] += ((f0.x + f1.x) + (f2.x + f3.x)) + ((f4.x + f5.x) + (f6.x + f7.x));
+            acc[2 * j + 1] += ((f0.y + f1.y) + (f2.y + f3.y)) + ((f4.y + f5.y) + (f6.y + f7.y));
+        }
+        return;
+    }
     #pragma unroll
     for (int p = 0; p < kMaxRanks; ++p) {
         if (p < world_size) {
