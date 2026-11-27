@@ -7,6 +7,7 @@
 - **Raw Benchmark Artifacts**:
   - [`docs/benchmarks/phase311_6000d_scout_comm_and_dsa.json`](benchmarks/phase311_6000d_scout_comm_and_dsa.json)
   - [`docs/benchmarks/phase311_6000d_round1_round2_ab_verify.json`](benchmarks/phase311_6000d_round1_round2_ab_verify.json)
+  - [`docs/benchmarks/phase311_6000d_round3_3track_results.json`](benchmarks/phase311_6000d_round3_3track_results.json)
 
 ---
 
@@ -63,3 +64,17 @@ Every verification cell below averages **3 interleaved cold container pairs (`AB
 | **Verify `ctx32k_c4`** (`32768:128`, 3-rd mean) | `48.12` out tok/s (`5071.2 ms` TTFT) | `48.40` out (`+0.48%`) | `48.52` out tok/s (`4991.1 ms` TTFT) | **`+0.91%`** | **`-1.58%`** (`-80.1 ms`) |
 | **Verify `ctx32k_c8`** (`32768:128`, 3-rd mean) | `55.13` out tok/s (`7235.2 ms` TTFT) | `55.40` out (`+0.33%`) | `55.48` out tok/s (`7151.8 ms` TTFT) | **`+0.60%`** | **`-1.15%`** (`-83.4 ms`) |
 | **3-Round Verify Geomean / `lcb_2se`** | — | **`+0.33%`** / **`+0.26%`** | **`+0.59%`** (12/12 wins) | **`+0.59%`** | **`paired_lcb_2se = +0.48%`** |
+
+---
+
+## 4. Round 3 Parallel 3-Track Exploration Results (vs `8ad676f`)
+
+1. **Track 1 — Mixed-Step 16-Aligned TBO (`TP=8`, `longctx-tp8`, `17 LOC`)**:
+   - Snapping `mid` to 16-token multiples (`((total_tokens // 2) + 8) & ~15`) and enabling TBO across mixed decode+prefill steps (`max_q_len >= 512`) further improved `ctx16k_c8` from `12,996.2 → 13,069.5 tok/s` (**`+0.56%`** over `8ad676f`, **`+1.00%` cumulative** over `f2c23b1`), with `TRITON_RECOMPILATIONS=0` and 100% Greedy parity (`ctx8k_c2`: `-0.02%`, zero mixed steps).
+2. **Track 2 — Topology Comparison `PP=2×TP=4` vs `TP=8` (`sm120-8x6000d-pp2tp4`, `46 LOC`)**:
+   - Enabling `ar.world_size in (4, 8)` `use_wave_mhc` + double-buffered P2P improved `PP=2×TP=4` `ctx8k_c2` by **`+0.71%`** (`8,586.3 → 8,647.2 tok/s`).
+   - Head-to-head topology comparison confirms **`TP=8` (`12,749.5 / 13,069.5 tok/s`) outperforms `PP=2×TP=4` (`8,647.2 / 7,620.1 tok/s`) by `+47.4%` to `+71.5%`** on `zstep` because `shm_pxb_bfp1` (`914 µs`) + TBO already eliminated the `~3 ms` NCCL PCIe AllReduce bottleneck that motivated `PP=2` on stock vLLM.
+3. **Track 3 — Speculative Decoding `spec-dspark` (`ZSTEP_SPEC_METHOD=dspark`, `num_spec_tokens=5`, `72 LOC`)**:
+   - Baseline `zstep@8ad676f` achieves **`177.61` out tok/s (`5.29 ms` TPOT)** at `spec_c1` and **`820.38` out tok/s (`8.08 ms` TPOT)** at `spec_c8`.
+   - Capturing `(b, k)` contiguous draft packing inside `draft_graphs[b]` + single contiguous D2H DMA + zero-`.tolist()` NumPy slicing improved **`spec_c8` to `825.20` out tok/s (`+0.59%`, TPOT `8.08 → 8.02 ms`, `-0.74%`)** with `TRITON_RECOMPILATIONS=0` and 100% Greedy parity.
+

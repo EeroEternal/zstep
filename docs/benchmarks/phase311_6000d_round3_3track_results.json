@@ -1,0 +1,1053 @@
+{
+  "campaign": "Round 3 Parallel 3-Track Multi-Regime Evaluation",
+  "incumbent_git_sha": "8ad676f (remote c0c3cd0d6928)",
+  "tracks": {
+    "track1_mixed_step_tbo": {
+      "baseline_screen_tier_aggregates": [
+        {
+          "label": "ctx8k_c2",
+          "repeats": 1,
+          "output_throughput_tok_s": {
+            "mean": 98.833593,
+            "std": 0.0,
+            "min": 98.833593,
+            "max": 98.833593
+          },
+          "total_throughput_tok_s": {
+            "mean": 12749.533502,
+            "std": 0.0,
+            "min": 12749.533502,
+            "max": 12749.533502
+          },
+          "mean_ttft_ms": {
+            "mean": 934.1235,
+            "std": 0.0,
+            "min": 934.1235,
+            "max": 934.1235
+          },
+          "median_ttft_ms": {
+            "mean": 932.977,
+            "std": 0.0,
+            "min": 932.977,
+            "max": 932.977
+          },
+          "p99_ttft_ms": {
+            "mean": 935.27,
+            "std": 0.0,
+            "min": 935.27,
+            "max": 935.27
+          },
+          "mean_submit_ttft_ms": {
+            "mean": 1582.196,
+            "std": 0.0,
+            "min": 1582.196,
+            "max": 1582.196
+          },
+          "median_submit_ttft_ms": {
+            "mean": 935.27,
+            "std": 0.0,
+            "min": 935.27,
+            "max": 935.27
+          },
+          "p99_submit_ttft_ms": {
+            "mean": 2229.122,
+            "std": 0.0,
+            "min": 2229.122,
+            "max": 2229.122
+          },
+          "mean_tpot_ms": {
+            "mean": 5.729,
+            "std": 0.0,
+            "min": 5.729,
+            "max": 5.729
+          },
+          "p99_tpot_ms": {
+            "mean": 5.73,
+            "std": 0.0,
+            "min": 5.73,
+            "max": 5.73
+          },
+          "p99_itl_ms": {
+            "mean": 6.555,
+            "std": 0.0,
+            "min": 6.555,
+            "max": 6.555
+          }
+        },
+        {
+          "label": "ctx16k_c8",
+          "repeats": 1,
+          "output_throughput_tok_s": {
+            "mean": 50.569054,
+            "std": 0.0,
+            "min": 50.569054,
+            "max": 50.569054
+          },
+          "total_throughput_tok_s": {
+            "mean": 12996.246803,
+            "std": 0.0,
+            "min": 12996.246803,
+            "max": 12996.246803
+          },
+          "mean_ttft_ms": {
+            "mean": 4333.16825,
+            "std": 0.0,
+            "min": 4333.16825,
+            "max": 4333.16825
+          },
+          "median_ttft_ms": {
+            "mean": 2178.031,
+            "std": 0.0,
+            "min": 2178.031,
+            "max": 2178.031
+          },
+          "p99_ttft_ms": {
+            "mean": 9931.659,
+            "std": 0.0,
+            "min": 9931.659,
+            "max": 9931.659
+          },
+          "mean_submit_ttft_ms": {
+            "mean": 11234.79525,
+            "std": 0.0,
+            "min": 11234.79525,
+            "max": 11234.79525
+          },
+          "median_submit_ttft_ms": {
+            "mean": 10057.654,
+            "std": 0.0,
+            "min": 10057.654,
+            "max": 10057.654
+          },
+          "p99_submit_ttft_ms": {
+            "mean": 18698.227,
+            "std": 0.0,
+            "min": 18698.227,
+            "max": 18698.227
+          },
+          "mean_tpot_ms": {
+            "mean": 89.679563,
+            "std": 0.0,
+            "min": 89.679563,
+            "max": 89.679563
+          },
+          "p99_tpot_ms": {
+            "mean": 142.018,
+            "std": 0.0,
+            "min": 142.018,
+            "max": 142.018
+          },
+          "p99_itl_ms": {
+            "mean": 252.447,
+            "std": 0.0,
+            "min": 252.447,
+            "max": 252.447
+          }
+        }
+      ],
+      "candidates": {
+        "g0001-39015493": {
+          "screen-decision": {
+            "passed": false,
+            "gain": 0.0026631495099231905,
+            "metric_delta": "screen[ctx16k_c8:+0.55% (50.9 tok/s), ctx8k_c2:-0.02% (98.8 tok/s)]",
+            "reasons": [
+              "screen geomean gain +0.27% below required min_screen_gain +0.30%"
+            ]
+          },
+          "screen-parity": {
+            "git_sha": "unknown",
+            "vllm_version": "0.31.0",
+            "max_prefill_chunk": 24,
+            "all_matched": false,
+            "batched_vs_single_exact_match": false,
+            "chunked_vs_unchunked_exact_match": false,
+            "chunked_schedule": {
+              "prefill_steps": 4,
+              "decode_steps": 127,
+              "chunked_prefill_steps": 4,
+              "decode_steps_with_partial_prefill": 3,
+              "max_active_sequences": 5
+            },
+            "unchunked_schedule": {
+              "prefill_steps": 1,
+              "decode_steps": 127,
+              "chunked_prefill_steps": 0,
+              "decode_steps_with_partial_prefill": 0,
+              "max_active_sequences": 5
+            },
+            "triton_recompilations": 0,
+            "watched_kernels": 5
+          },
+          "failure": {
+            "type": "ScreenRejectedError",
+            "error": "screen geomean gain +0.27% below required min_screen_gain +0.30%"
+          },
+          "redteam-report": {
+            "passed": true,
+            "spec_pins_verified": true,
+            "checked_categories": [
+              "indices_offsets",
+              "value_ranges",
+              "overwrite_war",
+              "execution_context",
+              "async_lifetime",
+              "aliases_views",
+              "initial_values"
+            ],
+            "findings": []
+          },
+          "screen_tier_aggregates": [
+            {
+              "label": "ctx8k_c2",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 98.811219,
+                "std": 0.0,
+                "min": 98.811219,
+                "max": 98.811219
+              },
+              "total_throughput_tok_s": {
+                "mean": 12746.647223,
+                "std": 0.0,
+                "min": 12746.647223,
+                "max": 12746.647223
+              },
+              "mean_ttft_ms": {
+                "mean": 934.76,
+                "std": 0.0,
+                "min": 934.76,
+                "max": 934.76
+              },
+              "median_ttft_ms": {
+                "mean": 932.577,
+                "std": 0.0,
+                "min": 932.577,
+                "max": 932.577
+              },
+              "p99_ttft_ms": {
+                "mean": 936.943,
+                "std": 0.0,
+                "min": 936.943,
+                "max": 936.943
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 1583.6655,
+                "std": 0.0,
+                "min": 1583.6655,
+                "max": 1583.6655
+              },
+              "median_submit_ttft_ms": {
+                "mean": 936.943,
+                "std": 0.0,
+                "min": 936.943,
+                "max": 936.943
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 2230.388,
+                "std": 0.0,
+                "min": 2230.388,
+                "max": 2230.388
+              },
+              "mean_tpot_ms": {
+                "mean": 5.723,
+                "std": 0.0,
+                "min": 5.723,
+                "max": 5.723
+              },
+              "p99_tpot_ms": {
+                "mean": 5.728,
+                "std": 0.0,
+                "min": 5.728,
+                "max": 5.728
+              },
+              "p99_itl_ms": {
+                "mean": 6.59,
+                "std": 0.0,
+                "min": 6.59,
+                "max": 6.59
+              }
+            },
+            {
+              "label": "ctx16k_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 50.854093,
+                "std": 0.0,
+                "min": 50.854093,
+                "max": 50.854093
+              },
+              "total_throughput_tok_s": {
+                "mean": 13069.501885,
+                "std": 0.0,
+                "min": 13069.501885,
+                "max": 13069.501885
+              },
+              "mean_ttft_ms": {
+                "mean": 4319.171625,
+                "std": 0.0,
+                "min": 4319.171625,
+                "max": 4319.171625
+              },
+              "median_ttft_ms": {
+                "mean": 2156.884,
+                "std": 0.0,
+                "min": 2156.884,
+                "max": 2156.884
+              },
+              "p99_ttft_ms": {
+                "mean": 9880.047,
+                "std": 0.0,
+                "min": 9880.047,
+                "max": 9880.047
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 11165.108,
+                "std": 0.0,
+                "min": 11165.108,
+                "max": 11165.108
+              },
+              "median_submit_ttft_ms": {
+                "mean": 10005.806,
+                "std": 0.0,
+                "min": 10005.806,
+                "max": 10005.806
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 18569.058,
+                "std": 0.0,
+                "min": 18569.058,
+                "max": 18569.058
+              },
+              "mean_tpot_ms": {
+                "mean": 89.046813,
+                "std": 0.0,
+                "min": 89.046813,
+                "max": 89.046813
+              },
+              "p99_tpot_ms": {
+                "mean": 140.948,
+                "std": 0.0,
+                "min": 140.948,
+                "max": 140.948
+              },
+              "p99_itl_ms": {
+                "mean": 248.032,
+                "std": 0.0,
+                "min": 248.032,
+                "max": 248.032
+              }
+            }
+          ]
+        }
+      }
+    },
+    "track2_pp2tp4_wave_mhc": {
+      "baseline_screen_tier_aggregates": [
+        {
+          "label": "ctx8k_c2",
+          "repeats": 1,
+          "output_throughput_tok_s": {
+            "mean": 66.560678,
+            "std": 0.0,
+            "min": 66.560678,
+            "max": 66.560678
+          },
+          "total_throughput_tok_s": {
+            "mean": 8586.327445,
+            "std": 0.0,
+            "min": 8586.327445,
+            "max": 8586.327445
+          },
+          "mean_ttft_ms": {
+            "mean": 1355.034,
+            "std": 0.0,
+            "min": 1355.034,
+            "max": 1355.034
+          },
+          "median_ttft_ms": {
+            "mean": 1353.278,
+            "std": 0.0,
+            "min": 1353.278,
+            "max": 1353.278
+          },
+          "p99_ttft_ms": {
+            "mean": 1356.79,
+            "std": 0.0,
+            "min": 1356.79,
+            "max": 1356.79
+          },
+          "mean_submit_ttft_ms": {
+            "mean": 2315.4745,
+            "std": 0.0,
+            "min": 2315.4745,
+            "max": 2315.4745
+          },
+          "median_submit_ttft_ms": {
+            "mean": 1353.278,
+            "std": 0.0,
+            "min": 1353.278,
+            "max": 1353.278
+          },
+          "p99_submit_ttft_ms": {
+            "mean": 3277.671,
+            "std": 0.0,
+            "min": 3277.671,
+            "max": 3277.671
+          },
+          "mean_tpot_ms": {
+            "mean": 9.015,
+            "std": 0.0,
+            "min": 9.015,
+            "max": 9.015
+          },
+          "p99_tpot_ms": {
+            "mean": 9.021,
+            "std": 0.0,
+            "min": 9.021,
+            "max": 9.021
+          },
+          "p99_itl_ms": {
+            "mean": 10.258,
+            "std": 0.0,
+            "min": 10.258,
+            "max": 10.258
+          }
+        },
+        {
+          "label": "ctx16k_c8",
+          "repeats": 1,
+          "output_throughput_tok_s": {
+            "mean": 29.650202,
+            "std": 0.0,
+            "min": 29.650202,
+            "max": 29.650202
+          },
+          "total_throughput_tok_s": {
+            "mean": 7620.101799,
+            "std": 0.0,
+            "min": 7620.101799,
+            "max": 7620.101799
+          },
+          "mean_ttft_ms": {
+            "mean": 5675.192313,
+            "std": 0.0,
+            "min": 5675.192313,
+            "max": 5675.192313
+          },
+          "median_ttft_ms": {
+            "mean": 3003.247,
+            "std": 0.0,
+            "min": 3003.247,
+            "max": 3003.247
+          },
+          "p99_ttft_ms": {
+            "mean": 12867.645,
+            "std": 0.0,
+            "min": 12867.645,
+            "max": 12867.645
+          },
+          "mean_submit_ttft_ms": {
+            "mean": 16148.828563,
+            "std": 0.0,
+            "min": 16148.828563,
+            "max": 16148.828563
+          },
+          "median_submit_ttft_ms": {
+            "mean": 13040.209,
+            "std": 0.0,
+            "min": 13040.209,
+            "max": 13040.209
+          },
+          "p99_submit_ttft_ms": {
+            "mean": 27686.0,
+            "std": 0.0,
+            "min": 27686.0,
+            "max": 27686.0
+          },
+          "mean_tpot_ms": {
+            "mean": 174.20825,
+            "std": 0.0,
+            "min": 174.20825,
+            "max": 174.20825
+          },
+          "p99_tpot_ms": {
+            "mean": 224.214,
+            "std": 0.0,
+            "min": 224.214,
+            "max": 224.214
+          },
+          "p99_itl_ms": {
+            "mean": 348.713,
+            "std": 0.0,
+            "min": 348.713,
+            "max": 348.713
+          }
+        }
+      ],
+      "candidates": {
+        "g0001-e8908ee6": {
+          "screen-decision": {
+            "passed": false,
+            "gain": 0.0003039309014716274,
+            "metric_delta": "screen[ctx16k_c8:-0.64% (29.5 tok/s), ctx8k_c2:+0.71% (67.0 tok/s)]",
+            "reasons": [
+              "screen geomean gain +0.03% below required min_screen_gain +0.30%"
+            ]
+          },
+          "screen-parity": {
+            "git_sha": "unknown",
+            "vllm_version": "0.31.0",
+            "max_prefill_chunk": 24,
+            "all_matched": false,
+            "batched_vs_single_exact_match": false,
+            "chunked_vs_unchunked_exact_match": false,
+            "chunked_schedule": {
+              "prefill_steps": 4,
+              "decode_steps": 190,
+              "chunked_prefill_steps": 4,
+              "decode_steps_with_partial_prefill": 3,
+              "max_active_sequences": 5
+            },
+            "unchunked_schedule": {
+              "prefill_steps": 1,
+              "decode_steps": 190,
+              "chunked_prefill_steps": 0,
+              "decode_steps_with_partial_prefill": 0,
+              "max_active_sequences": 5
+            },
+            "triton_recompilations": 0,
+            "watched_kernels": 5
+          },
+          "failure": {
+            "type": "ScreenRejectedError",
+            "error": "screen geomean gain +0.03% below required min_screen_gain +0.30%"
+          },
+          "redteam-report": {
+            "passed": true,
+            "spec_pins_verified": true,
+            "checked_categories": [
+              "indices_offsets",
+              "value_ranges",
+              "overwrite_war",
+              "execution_context",
+              "async_lifetime",
+              "aliases_views",
+              "initial_values"
+            ],
+            "findings": []
+          },
+          "screen_tier_aggregates": [
+            {
+              "label": "ctx8k_c2",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 67.032678,
+                "std": 0.0,
+                "min": 67.032678,
+                "max": 67.032678
+              },
+              "total_throughput_tok_s": {
+                "mean": 8647.215476,
+                "std": 0.0,
+                "min": 8647.215476,
+                "max": 8647.215476
+              },
+              "mean_ttft_ms": {
+                "mean": 1355.854,
+                "std": 0.0,
+                "min": 1355.854,
+                "max": 1355.854
+              },
+              "median_ttft_ms": {
+                "mean": 1354.729,
+                "std": 0.0,
+                "min": 1354.729,
+                "max": 1354.729
+              },
+              "p99_ttft_ms": {
+                "mean": 1356.979,
+                "std": 0.0,
+                "min": 1356.979,
+                "max": 1356.979
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 2311.547,
+                "std": 0.0,
+                "min": 2311.547,
+                "max": 2311.547
+              },
+              "median_submit_ttft_ms": {
+                "mean": 1354.729,
+                "std": 0.0,
+                "min": 1354.729,
+                "max": 1354.729
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 3268.365,
+                "std": 0.0,
+                "min": 3268.365,
+                "max": 3268.365
+              },
+              "mean_tpot_ms": {
+                "mean": 8.787,
+                "std": 0.0,
+                "min": 8.787,
+                "max": 8.787
+              },
+              "p99_tpot_ms": {
+                "mean": 8.835,
+                "std": 0.0,
+                "min": 8.835,
+                "max": 8.835
+              },
+              "p99_itl_ms": {
+                "mean": 9.923,
+                "std": 0.0,
+                "min": 9.923,
+                "max": 9.923
+              }
+            },
+            {
+              "label": "ctx16k_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 29.455198,
+                "std": 0.0,
+                "min": 29.455198,
+                "max": 29.455198
+              },
+              "total_throughput_tok_s": {
+                "mean": 7569.985824,
+                "std": 0.0,
+                "min": 7569.985824,
+                "max": 7569.985824
+              },
+              "mean_ttft_ms": {
+                "mean": 5686.645312,
+                "std": 0.0,
+                "min": 5686.645312,
+                "max": 5686.645312
+              },
+              "median_ttft_ms": {
+                "mean": 3010.181,
+                "std": 0.0,
+                "min": 3010.181,
+                "max": 3010.181
+              },
+              "p99_ttft_ms": {
+                "mean": 12889.417,
+                "std": 0.0,
+                "min": 12889.417,
+                "max": 12889.417
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 16231.038375,
+                "std": 0.0,
+                "min": 16231.038375,
+                "max": 16231.038375
+              },
+              "median_submit_ttft_ms": {
+                "mean": 13063.055,
+                "std": 0.0,
+                "min": 13063.055,
+                "max": 13063.055
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 27855.095,
+                "std": 0.0,
+                "min": 27855.095,
+                "max": 27855.095
+              },
+              "mean_tpot_ms": {
+                "mean": 175.767375,
+                "std": 0.0,
+                "min": 175.767375,
+                "max": 175.767375
+              },
+              "p99_tpot_ms": {
+                "mean": 226.118,
+                "std": 0.0,
+                "min": 226.118,
+                "max": 226.118
+              },
+              "p99_itl_ms": {
+                "mean": 350.503,
+                "std": 0.0,
+                "min": 350.503,
+                "max": 350.503
+              }
+            }
+          ]
+        }
+      }
+    },
+    "track3_spec_dspark_dma": {
+      "baseline_screen_tier_aggregates": [
+        {
+          "label": "spec_c1",
+          "repeats": 1,
+          "output_throughput_tok_s": {
+            "mean": 177.612599,
+            "std": 0.0,
+            "min": 177.612599,
+            "max": 177.612599
+          },
+          "total_throughput_tok_s": {
+            "mean": 888.062997,
+            "std": 0.0,
+            "min": 888.062997,
+            "max": 888.062997
+          },
+          "mean_ttft_ms": {
+            "mean": 48.608125,
+            "std": 0.0,
+            "min": 48.608125,
+            "max": 48.608125
+          },
+          "median_ttft_ms": {
+            "mean": 48.626,
+            "std": 0.0,
+            "min": 48.626,
+            "max": 48.626
+          },
+          "p99_ttft_ms": {
+            "mean": 48.829,
+            "std": 0.0,
+            "min": 48.829,
+            "max": 48.829
+          },
+          "mean_submit_ttft_ms": {
+            "mean": 2571.75325,
+            "std": 0.0,
+            "min": 2571.75325,
+            "max": 2571.75325
+          },
+          "median_submit_ttft_ms": {
+            "mean": 2211.654,
+            "std": 0.0,
+            "min": 2211.654,
+            "max": 2211.654
+          },
+          "p99_submit_ttft_ms": {
+            "mean": 4373.266,
+            "std": 0.0,
+            "min": 4373.266,
+            "max": 4373.266
+          },
+          "mean_tpot_ms": {
+            "mean": 5.29125,
+            "std": 0.0,
+            "min": 5.29125,
+            "max": 5.29125
+          },
+          "p99_tpot_ms": {
+            "mean": 5.291,
+            "std": 0.0,
+            "min": 5.291,
+            "max": 5.291
+          },
+          "p99_itl_ms": {
+            "mean": 5.706,
+            "std": 0.0,
+            "min": 5.706,
+            "max": 5.706
+          }
+        },
+        {
+          "label": "spec_c8",
+          "repeats": 1,
+          "output_throughput_tok_s": {
+            "mean": 820.383721,
+            "std": 0.0,
+            "min": 820.383721,
+            "max": 820.383721
+          },
+          "total_throughput_tok_s": {
+            "mean": 4101.918604,
+            "std": 0.0,
+            "min": 4101.918604,
+            "max": 4101.918604
+          },
+          "mean_ttft_ms": {
+            "mean": 222.388,
+            "std": 0.0,
+            "min": 222.388,
+            "max": 222.388
+          },
+          "median_ttft_ms": {
+            "mean": 222.218,
+            "std": 0.0,
+            "min": 222.218,
+            "max": 222.218
+          },
+          "p99_ttft_ms": {
+            "mean": 222.896,
+            "std": 0.0,
+            "min": 222.896,
+            "max": 222.896
+          },
+          "mean_submit_ttft_ms": {
+            "mean": 1477.502333,
+            "std": 0.0,
+            "min": 1477.502333,
+            "max": 1477.502333
+          },
+          "median_submit_ttft_ms": {
+            "mean": 1481.222,
+            "std": 0.0,
+            "min": 1481.222,
+            "max": 1481.222
+          },
+          "p99_submit_ttft_ms": {
+            "mean": 2729.235,
+            "std": 0.0,
+            "min": 2729.235,
+            "max": 2729.235
+          },
+          "mean_tpot_ms": {
+            "mean": 8.076333,
+            "std": 0.0,
+            "min": 8.076333,
+            "max": 8.076333
+          },
+          "p99_tpot_ms": {
+            "mean": 8.164,
+            "std": 0.0,
+            "min": 8.164,
+            "max": 8.164
+          },
+          "p99_itl_ms": {
+            "mean": 8.503,
+            "std": 0.0,
+            "min": 8.503,
+            "max": 8.503
+          }
+        }
+      ],
+      "candidates": {
+        "g0001-688bb493": {
+          "failure": {
+            "type": "RedTeamRejectedError",
+            "error": "Red-Team gate rejected patch: [execution_context] worker/zstep_worker/models/deepseek_v41_dspark.py: Line 574 in `_draft_batch`: host sync `.tolist()` introduced on GPU step/draft/verify hot path (breaks CUDAGraph & stalls TP8)"
+          },
+          "redteam-report": {
+            "passed": false,
+            "spec_pins_verified": true,
+            "checked_categories": [
+              "indices_offsets",
+              "value_ranges",
+              "overwrite_war",
+              "execution_context",
+              "async_lifetime",
+              "aliases_views",
+              "initial_values"
+            ],
+            "findings": [
+              {
+                "category": "execution_context",
+                "severity": "blocking",
+                "file_path": "worker/zstep_worker/models/deepseek_v41_dspark.py",
+                "message": "Line 574 in `_draft_batch`: host sync `.tolist()` introduced on GPU step/draft/verify hot path (breaks CUDAGraph & stalls TP8)"
+              }
+            ]
+          }
+        },
+        "g0002-8ab5e8ef": {
+          "screen-decision": {
+            "passed": false,
+            "gain": 0.0029051261874373235,
+            "metric_delta": "screen[spec_c1:-0.01% (177.6 tok/s), spec_c8:+0.59% (825.2 tok/s)]",
+            "reasons": [
+              "screen geomean gain +0.29% below required min_screen_gain +0.30%"
+            ]
+          },
+          "screen-parity": {
+            "git_sha": "unknown",
+            "vllm_version": "0.31.0",
+            "max_prefill_chunk": 24,
+            "all_matched": false,
+            "batched_vs_single_exact_match": false,
+            "chunked_vs_unchunked_exact_match": false,
+            "chunked_schedule": {
+              "prefill_steps": 4,
+              "decode_steps": 127,
+              "chunked_prefill_steps": 4,
+              "decode_steps_with_partial_prefill": 3,
+              "max_active_sequences": 5
+            },
+            "unchunked_schedule": {
+              "prefill_steps": 1,
+              "decode_steps": 127,
+              "chunked_prefill_steps": 0,
+              "decode_steps_with_partial_prefill": 0,
+              "max_active_sequences": 5
+            },
+            "triton_recompilations": 0,
+            "watched_kernels": 5
+          },
+          "failure": {
+            "type": "ScreenRejectedError",
+            "error": "screen geomean gain +0.29% below required min_screen_gain +0.30%"
+          },
+          "redteam-report": {
+            "passed": true,
+            "spec_pins_verified": true,
+            "checked_categories": [
+              "indices_offsets",
+              "value_ranges",
+              "overwrite_war",
+              "execution_context",
+              "async_lifetime",
+              "aliases_views",
+              "initial_values"
+            ],
+            "findings": []
+          },
+          "screen_tier_aggregates": [
+            {
+              "label": "spec_c1",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 177.600763,
+                "std": 0.0,
+                "min": 177.600763,
+                "max": 177.600763
+              },
+              "total_throughput_tok_s": {
+                "mean": 888.003814,
+                "std": 0.0,
+                "min": 888.003814,
+                "max": 888.003814
+              },
+              "mean_ttft_ms": {
+                "mean": 48.891875,
+                "std": 0.0,
+                "min": 48.891875,
+                "max": 48.891875
+              },
+              "median_ttft_ms": {
+                "mean": 48.821,
+                "std": 0.0,
+                "min": 48.821,
+                "max": 48.821
+              },
+              "p99_ttft_ms": {
+                "mean": 49.055,
+                "std": 0.0,
+                "min": 49.055,
+                "max": 49.055
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 2572.316875,
+                "std": 0.0,
+                "min": 2572.316875,
+                "max": 2572.316875
+              },
+              "median_submit_ttft_ms": {
+                "mean": 2212.102,
+                "std": 0.0,
+                "min": 2212.102,
+                "max": 2212.102
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 4373.676,
+                "std": 0.0,
+                "min": 4373.676,
+                "max": 4373.676
+              },
+              "mean_tpot_ms": {
+                "mean": 5.289375,
+                "std": 0.0,
+                "min": 5.289375,
+                "max": 5.289375
+              },
+              "p99_tpot_ms": {
+                "mean": 5.289,
+                "std": 0.0,
+                "min": 5.289,
+                "max": 5.289
+              },
+              "p99_itl_ms": {
+                "mean": 5.55,
+                "std": 0.0,
+                "min": 5.55,
+                "max": 5.55
+              }
+            },
+            {
+              "label": "spec_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 825.201093,
+                "std": 0.0,
+                "min": 825.201093,
+                "max": 825.201093
+              },
+              "total_throughput_tok_s": {
+                "mean": 4126.005464,
+                "std": 0.0,
+                "min": 4126.005464,
+                "max": 4126.005464
+              },
+              "mean_ttft_ms": {
+                "mean": 222.707333,
+                "std": 0.0,
+                "min": 222.707333,
+                "max": 222.707333
+              },
+              "median_ttft_ms": {
+                "mean": 222.68,
+                "std": 0.0,
+                "min": 222.68,
+                "max": 222.68
+              },
+              "p99_ttft_ms": {
+                "mean": 222.977,
+                "std": 0.0,
+                "min": 222.977,
+                "max": 222.977
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 1461.182333,
+                "std": 0.0,
+                "min": 1461.182333,
+                "max": 1461.182333
+              },
+              "median_submit_ttft_ms": {
+                "mean": 1457.206,
+                "std": 0.0,
+                "min": 1457.206,
+                "max": 1457.206
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 2703.364,
+                "std": 0.0,
+                "min": 2703.364,
+                "max": 2703.364
+              },
+              "mean_tpot_ms": {
+                "mean": 8.016667,
+                "std": 0.0,
+                "min": 8.016667,
+                "max": 8.016667
+              },
+              "p99_tpot_ms": {
+                "mean": 8.06,
+                "std": 0.0,
+                "min": 8.06,
+                "max": 8.06
+              },
+              "p99_itl_ms": {
+                "mean": 8.385,
+                "std": 0.0,
+                "min": 8.385,
+                "max": 8.385
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
