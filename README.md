@@ -20,7 +20,7 @@ cargo build --release
 Reference container stack: `vllm/vllm-openai:v0.31.0` (`torch==2.13.0+cu130`, CUDA `13.0`) overlaid with the deterministic SHA256-verified SM120 FlashInfer bundle (`b12x`, `sm12x_mega_gate`, `sm120_dsa_indexer`):
 
 ```bash
-# Unpack and SHA256-verify worker/third_party/flashinfer_sm120_overlay_ae58183f.tar.xz
+# Unpack and SHA256-verify worker/third_party/flashinfer_sm120_overlay_d0cbb476.tar.xz
 OVERLAY_FLAGS="$(./scripts/prepare_sm120_overlay.sh --print-docker-args)"
 ```
 

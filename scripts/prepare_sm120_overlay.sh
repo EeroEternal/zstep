@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Unpack and verify the deterministic SM120 FlashInfer experimental source overlay
-# (`ae58183fff34c545b3e3020d81d591f2a79658fc`: `b12x`, `sm12x_mega_gate`, `sm120_dsa_indexer`)
-# for `vllm/vllm-openai:v0.31.0`, and optionally emit ready-to-use `docker run` mount flags.
+# (`d0cbb476cf4041a619523c325109b4d51f2a45f1`, FlashInfer 0.7.6: `b12x`,
+# `sm120_dsa_indexer` w/ #8740 candidate_blocks, `sm12x_mega_gate` w/ #8479,
+# `pcie_ipc_collectives` w/ #9112 CE & spin timeout) for `vllm/vllm-openai:v0.31.0`.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ARCHIVE="${REPO_ROOT}/worker/third_party/flashinfer_sm120_overlay_ae58183f.tar.xz"
-EXPECTED_SHA256="90e4db7f52f725e969de4f9d3c386112122d77db15bafa3a30515d190660cae4"
+ARCHIVE="${REPO_ROOT}/worker/third_party/flashinfer_sm120_overlay_d0cbb476.tar.xz"
+EXPECTED_SHA256="e09f7c10503e9df6e7345b355cc3becee8d113cf45702963ae5a3833d56cd72c"
 DIST_FLASHINFER="/usr/local/lib/python3.12/dist-packages/flashinfer"
 
 PRINT_DOCKER_ARGS=0
@@ -16,7 +17,7 @@ if [[ "${1:-}" == "--print-docker-args" ]]; then
   shift
 fi
 
-OVERLAY_DIR="${1:-${ZSTEP_SM120_OVERLAY_DIR:-/tmp/zstep-sm120-overlay-ae58183f}}"
+OVERLAY_DIR="${1:-${ZSTEP_SM120_OVERLAY_DIR:-/tmp/zstep-sm120-overlay-d0cbb476}}"
 
 if [[ ! -f "${ARCHIVE}" ]]; then
   echo "ERROR: overlay archive not found at ${ARCHIVE}" >&2
@@ -38,19 +39,35 @@ SUBPATHS=(
   "experimental/b12x"
   "experimental/sm120_dsa_indexer"
   "experimental/sm12x_mega_gate"
+  "experimental/deepgemm_sm120_paged_mqa_logits"
   "jit/core.py"
   "jit/cpp_ext.py"
+  "jit/spdlog_patch.py"
+  "jit/utils.py"
+  "jit/comm.py"
   "jit/cute_dsl_core.py"
   "jit/_cute_dsl_source.py"
   "jit/_cuda_architecture.py"
   "jit/env.py"
+  "compilation_context.py"
+  "trace/templates/comm.py"
   "cute_dsl"
   "mega_gate.py"
   "dsa_indexer.py"
   "api_logging.py"
+  "comm/pcie_ipc_ar.py"
+  "comm/pcie_ipc_policy.py"
+  "comm/pcie_ipc_topology.py"
+  "comm/pcie_ipc_tuning.py"
+  "comm/pcie_ipc_collectives"
+  "comm/cuda_ipc.py"
   "data/csrc/tvm_ffi_utils.h"
   "data/csrc/cake_device_helpers"
   "data/csrc/experimental/cake_host_common.cuh"
+  "data/csrc/pcie_ipc_all_reduce.cu"
+  "data/csrc/pcie_ipc_all_gather.cu"
+  "data/csrc/pcie_ipc_reduce_scatter.cu"
+  "data/include/flashinfer/comm"
 )
 COMPAT_PATHS=(
   "experimental/b12x/_compat/b12x"
@@ -82,11 +99,12 @@ if [[ "${NEED_EXTRACT}" -eq 1 ]]; then
   done
   printf '%s\n' "${EXPECTED_SHA256}" > "${STAMP_FILE}"
 fi
-mkdir -p "${OVERLAY_DIR}/fi-jit-cache"
+FI_CACHE_DIR="${ZSTEP_FI_JIT_CACHE_DIR:-/tmp/zstep-sm120-fi-cache-${EXPECTED_SHA256:0:12}}"
+mkdir -p "${FI_CACHE_DIR}"
 
 if [[ "${PRINT_DOCKER_ARGS}" -eq 1 ]]; then
   OVERLAY_ABS="$(cd "${OVERLAY_DIR}" && pwd)"
-  ARGS=("-v" "${OVERLAY_ABS}/fi-jit-cache:/fi-cache")
+  ARGS=("-v" "${FI_CACHE_DIR}:/fi-cache")
   for rel in "${SUBPATHS[@]}"; do
     ARGS+=("-v" "${OVERLAY_ABS}/flashinfer/${rel}:${DIST_FLASHINFER}/${rel}:ro")
   done

@@ -121,6 +121,13 @@ void launch_mhc_sinkhorn_stats_cuda(
     int sinkhorn_repeat,
     int save_pre_mix,
     std::uintptr_t stream_handle);
+void launch_mhc_prenorm_sinkhorn_smem_cuda(
+    const void* res_ptr, const float* fn_ptr, const float* hc_scale_ptr,
+    const float* hc_base_ptr, float* partial_mul_ptr, float* partial_sqr_ptr,
+    int32_t* done_cnt_ptr, float* post_mix_ptr, float* comb_mix_ptr,
+    float* pre_mix_out_ptr, int num_tokens, int ring_slot, float inv_rms_numel,
+    float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult,
+    int sinkhorn_repeat, int save_pre_mix, std::uintptr_t stream_handle);
 void launch_ar_mhc_cluster8_cuda(
     const void* x_ptr,
     void* residual_ptr,
@@ -664,6 +671,40 @@ void launch_mhc_sinkhorn_stats(
         static_cast<int>(sinkhorn_repeat),
         static_cast<int>(save_pre_mix),
         stream_handle);
+}
+
+void launch_mhc_prenorm_sinkhorn_smem(
+    torch::Tensor residual, torch::Tensor fn, torch::Tensor hc_scale, torch::Tensor hc_base,
+    torch::Tensor partial_mul, torch::Tensor partial_sqr, torch::Tensor done_cnt,
+    torch::Tensor post_mix, torch::Tensor comb_mix, torch::Tensor pre_mix_out,
+    int64_t ring_slot, double rms_eps, double hc_pre_eps, double hc_sinkhorn_eps,
+    double hc_post_mult, int64_t sinkhorn_repeat, int64_t save_pre_mix, std::uintptr_t stream_handle) {
+    const int64_t total_elems = residual.numel(), num_tokens = total_elems / 20480, m_tiles = (num_tokens + 15) / 16;
+    TORCH_CHECK(residual.is_cuda() && residual.scalar_type() == at::kBFloat16 && residual.is_contiguous() &&
+                total_elems > 0 && total_elems % 20480 == 0 && num_tokens <= 256 &&
+                (reinterpret_cast<std::uintptr_t>(residual.data_ptr()) & 15) == 0, "invalid residual");
+    TORCH_CHECK(fn.is_cuda() && fn.scalar_type() == at::kFloat && fn.is_contiguous() &&
+                fn.dim() == 2 && fn.size(0) == 24 && fn.size(1) == 20480 &&
+                (reinterpret_cast<std::uintptr_t>(fn.data_ptr()) & 15) == 0, "invalid fn");
+    TORCH_CHECK(partial_mul.is_cuda() && partial_mul.scalar_type() == at::kFloat &&
+                partial_mul.is_contiguous() && partial_mul.numel() >= 32 * m_tiles * 16 * 24 &&
+                partial_sqr.is_cuda() && partial_sqr.scalar_type() == at::kFloat &&
+                partial_sqr.is_contiguous() && partial_sqr.numel() >= 32 * m_tiles * 16 &&
+                done_cnt.is_cuda() && done_cnt.scalar_type() == at::kInt && done_cnt.is_contiguous() &&
+                ring_slot >= 0 && ring_slot < 4 && done_cnt.numel() >= 64, "invalid smem mHC workspace");
+    TORCH_CHECK(hc_scale.is_cuda() && hc_scale.scalar_type() == at::kFloat && hc_scale.is_contiguous() && hc_scale.numel() >= 3 &&
+                hc_base.is_cuda() && hc_base.scalar_type() == at::kFloat && hc_base.is_contiguous() && hc_base.numel() >= 24 &&
+                post_mix.is_cuda() && post_mix.scalar_type() == at::kFloat && post_mix.is_contiguous() && post_mix.numel() == num_tokens * 4 &&
+                comb_mix.is_cuda() && comb_mix.scalar_type() == at::kFloat && comb_mix.is_contiguous() && comb_mix.numel() == num_tokens * 16 &&
+                (!save_pre_mix || (pre_mix_out.is_cuda() && pre_mix_out.scalar_type() == at::kFloat && pre_mix_out.is_contiguous() && pre_mix_out.numel() == num_tokens * 4)),
+                "invalid mHC mix tensors");
+    launch_mhc_prenorm_sinkhorn_smem_cuda(
+        residual.data_ptr(), fn.data_ptr<float>(), hc_scale.data_ptr<float>(), hc_base.data_ptr<float>(),
+        partial_mul.data_ptr<float>(), partial_sqr.data_ptr<float>(), done_cnt.data_ptr<int32_t>(),
+        post_mix.data_ptr<float>(), comb_mix.data_ptr<float>(), save_pre_mix ? pre_mix_out.data_ptr<float>() : nullptr,
+        static_cast<int>(num_tokens), static_cast<int>(ring_slot), 1.0f / 20480.0f,
+        static_cast<float>(rms_eps), static_cast<float>(hc_pre_eps), static_cast<float>(hc_sinkhorn_eps),
+        static_cast<float>(hc_post_mult), static_cast<int>(sinkhorn_repeat), static_cast<int>(save_pre_mix), stream_handle);
 }
 
 void launch_ar_mhc_cluster8(

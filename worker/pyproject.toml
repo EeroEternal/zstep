@@ -21,7 +21,7 @@ test = [
 ]
 # Reference SM120 runtime stack: `vllm/vllm-openai:v0.31.0` (`torch==2.13.0+cu130`,
 # CUDA 13.0) overlaid with `./scripts/prepare_sm120_overlay.sh`
-# (`worker/third_party/flashinfer_sm120_overlay_ae58183f.tar.xz`).
+# (`worker/third_party/flashinfer_sm120_overlay_d0cbb476.tar.xz`).
 gpu = [
     "torch>=2.13.0",
     "triton>=3.6.0",

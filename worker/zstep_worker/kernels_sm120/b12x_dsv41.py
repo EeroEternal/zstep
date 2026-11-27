@@ -264,7 +264,7 @@ def maybe_enable_b12x_for_dsv41() -> bool:
             f"(checked ZSTEP_B12X_COMPAT_DIR and {_DEFAULT_COMPAT_CANDIDATES}): {exc}. "
             "Mount the bundled SM120 overlay via "
             "`./scripts/prepare_sm120_overlay.sh --print-docker-args` "
-            "(`worker/third_party/flashinfer_sm120_overlay_ae58183f.tar.xz`), "
+            "(`worker/third_party/flashinfer_sm120_overlay_d0cbb476.tar.xz`), "
             "or unset ZSTEP_REQUIRE_B12X / ZSTEP_REQUIRE_SM120_EXP (or set ZSTEP_ENABLE_B12X=0)."
         )
         if require_b12x:
@@ -1074,10 +1074,17 @@ def install_sm120_dsa_indexer_patches() -> bool:
             int(attn_metadata_narrowed.max_seq_len) + self.compress_ratio - 1
         ) // self.compress_ratio
         candidate_blocks = self.candidate_blocks
+        use_long_candidates = False
         if candidate_blocks is not None:
             cand_cover = int(candidate_blocks.shape[1]) * int(self.candidate_block_size)
             if compressed_max_seq > cand_cover:
-                return orig_forward_cuda(self, hidden_states, q_quant, k, weights)
+                if (
+                    int(candidate_blocks.shape[1]) != 2048
+                    or int(self.candidate_block_size) not in (8, 16)
+                    or compressed_max_seq > 65536 * int(self.candidate_block_size)
+                ):
+                    return orig_forward_cuda(self, hidden_states, q_quant, k, weights)
+                use_long_candidates = True
 
         if isinstance(q_quant, tuple):
             q_values, q_scale = q_quant
@@ -1100,6 +1107,12 @@ def install_sm120_dsa_indexer_patches() -> bool:
         else:
             est_next_n = num_decode_tokens // decode_lens.shape[0]
         if not (1 <= est_next_n <= 16):
+            return orig_forward_cuda(self, hidden_states, q_quant, k, weights)
+        if use_long_candidates and (
+            needs_padded_path
+            or candidate_blocks is None
+            or int(decode_lens.shape[0]) * est_next_n > int(candidate_blocks.shape[0])
+        ):
             return orig_forward_cuda(self, hidden_states, q_quant, k, weights)
 
         raw_kv_cache = self.k_cache.kv_cache
@@ -1298,6 +1311,7 @@ def install_sm120_dsa_indexer_patches() -> bool:
         eff_max_ctx = min(bt_cap, max(compressed_max_seq, 1))
         decode_topk = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
+        cand_slice = candidate_blocks[:num_padded_tokens] if (use_long_candidates and candidate_blocks is not None) else None
         dsa_indexer_det_topk_paged(
             padded_q,
             raw_kv_cache,
@@ -1310,6 +1324,9 @@ def install_sm120_dsa_indexer_patches() -> bool:
             q_scale=padded_q_scale,
             indices=decode_topk,
             return_scores=False,
+            candidate_blocks=(None if self.candidate_write else cand_slice),
+            candidate_out=(cand_slice if self.candidate_write else None),
+            candidate_block_size=int(self.candidate_block_size),
         )
 
         if needs_padded_path:
@@ -1340,6 +1357,7 @@ def _prepare_sm120_dsa_indexer(
 
     from flashinfer.experimental.sm120_dsa_indexer._api import (
         _decode_logits,
+        _decode_long_ws,
         _module,
         _row_sel_keys,
     )
@@ -1357,8 +1375,10 @@ def _prepare_sm120_dsa_indexer(
     max_rows = max((int(b) for b in decode_buckets if int(b) > 0), default=128)
     max_rows = max(max_rows, 256)
     _decode_logits(
-        device, max_rows, min(int(_row_sel_keys()), SM120_DSA_CANDIDATE_COVER_TOKENS)
+        device, max_rows, max(int(_row_sel_keys()), SM120_DSA_CANDIDATE_COVER_TOKENS, 65536)
     )
+    _decode_long_ws(device, max_rows, slot=0)
+    _decode_long_ws(device, max_rows, slot=1)
     return True
 
 
@@ -1992,6 +2012,9 @@ def _prepare_sm120_mhc_overlap(
             post_buf=tuple(torch.empty((cap, 4, 1), **f32) for _ in range(4)),
             comb_buf=tuple(torch.empty((cap, 4, 4), **f32) for _ in range(4)),
             pre_buf=tuple(torch.empty((cap, 4), **f32) for _ in range(4)),
+            smem_mul=tuple(torch.empty((32 * 16 * 24,), **f32) for _ in range(4)),
+            smem_sqr=tuple(torch.empty((32 * 16,), **f32) for _ in range(4)),
+            smem_done_cnt=torch.zeros((64,), dtype=torch.int32, device=device),
             ar_cta_done=torch.zeros((64,), dtype=torch.int64, device=device),
             ar_cta_wait=torch.zeros((128,), dtype=torch.int64, device=device),
             cap=cap,
@@ -2021,8 +2044,20 @@ def _prepare_sm120_mhc_overlap(
                     sk_eps,
                     p_mult,
                     sk_rep,
+                    ring_slot,
                 ) = st.deferred
                 st.deferred = None
+                if 1 <= n <= 12 and fn.dtype == torch.float32 and fn.is_contiguous() and (fn.data_ptr() & 15) == 0:
+                    st.ext = st.ext or get_host_mapped_allreduce_extension()
+                    st.mhc_stream.wait_stream(main_s)
+                    with torch.cuda.stream(st.mhc_stream):
+                        st.ext.launch_mhc_prenorm_sinkhorn_smem(
+                            res, fn, hc_scale, hc_base, st.smem_mul[ring_slot], st.smem_sqr[ring_slot],
+                            st.smem_done_cnt, np_.view(n, 4), nc.view(n, 16), npr, int(ring_slot),
+                            r_eps, pre_eps, sk_eps, p_mult, sk_rep, 1, st.mhc_stream.cuda_stream,
+                        )
+                    st.pending = True
+                    return
                 splits = int(compute_mhc_pre_num_splits(20480, n))
                 needed = splits * n
                 if needed > st.sqr_flat.numel():
@@ -2412,7 +2447,7 @@ def _prepare_sm120_mhc_overlap(
                         s.deferred = (
                             n, residual, fn, hc_scale, hc_base, next_post, next_comb, next_pre,
                             float(rms_eps), float(hc_pre_eps), float(hc_sinkhorn_eps),
-                            float(hc_post_mult_value), int(sinkhorn_repeat),
+                            float(hc_post_mult_value), int(sinkhorn_repeat), int(p),
                         )
                         if n <= 256:
                             s.flush(main_s)

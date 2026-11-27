@@ -1,0 +1,331 @@
+{
+  "dsa_8740_candidate_blocks_paged": [
+    {
+      "ctx_len": 16384,
+      "batch": 1,
+      "src_overlap": 1.0,
+      "consumer_overlap": 1.0,
+      "stock_2layer_us": 132.96,
+      "sm120_eager_2layer_us": 79.78,
+      "sm120_graph_2layer_us": 24.16,
+      "speedup_graph_vs_stock_x": 5.503
+    },
+    {
+      "ctx_len": 16384,
+      "batch": 4,
+      "src_overlap": 1.0,
+      "consumer_overlap": 1.0,
+      "stock_2layer_us": 196.77,
+      "sm120_eager_2layer_us": 81.6,
+      "sm120_graph_2layer_us": 29.73,
+      "speedup_graph_vs_stock_x": 6.619
+    },
+    {
+      "ctx_len": 16384,
+      "batch": 8,
+      "src_overlap": 1.0,
+      "consumer_overlap": 1.0,
+      "stock_2layer_us": 182.88,
+      "sm120_eager_2layer_us": 84.48,
+      "sm120_graph_2layer_us": 36.45,
+      "speedup_graph_vs_stock_x": 5.017
+    },
+    {
+      "ctx_len": 16384,
+      "batch": 16,
+      "src_overlap": 1.0,
+      "consumer_overlap": 1.0,
+      "stock_2layer_us": 201.82,
+      "sm120_eager_2layer_us": 85.6,
+      "sm120_graph_2layer_us": 46.69,
+      "speedup_graph_vs_stock_x": 4.323
+    },
+    {
+      "ctx_len": 24576,
+      "batch": 1,
+      "src_overlap": 1.0,
+      "consumer_overlap": 1.0,
+      "stock_2layer_us": 135.65,
+      "sm120_eager_2layer_us": 81.82,
+      "sm120_graph_2layer_us": 28.06,
+      "speedup_graph_vs_stock_x": 4.834
+    },
+    {
+      "ctx_len": 24576,
+      "batch": 4,
+      "src_overlap": 1.0,
+      "consumer_overlap": 1.0,
+      "stock_2layer_us": 250.46,
+      "sm120_eager_2layer_us": 86.69,
+      "sm120_graph_2layer_us": 34.4,
+      "speedup_graph_vs_stock_x": 7.281
+    },
+    {
+      "ctx_len": 24576,
+      "batch": 8,
+      "src_overlap": 1.0,
+      "consumer_overlap": 1.0,
+      "stock_2layer_us": 219.23,
+      "sm120_eager_2layer_us": 86.66,
+      "sm120_graph_2layer_us": 42.56,
+      "speedup_graph_vs_stock_x": 5.151
+    },
+    {
+      "ctx_len": 24576,
+      "batch": 16,
+      "src_overlap": 1.0,
+      "consumer_overlap": 1.0,
+      "stock_2layer_us": 248.29,
+      "sm120_eager_2layer_us": 87.65,
+      "sm120_graph_2layer_us": 54.85,
+      "speedup_graph_vs_stock_x": 4.527
+    },
+    {
+      "ctx_len": 32768,
+      "batch": 1,
+      "src_overlap": 1.0,
+      "consumer_overlap": 1.0,
+      "stock_2layer_us": 143.65,
+      "sm120_eager_2layer_us": 81.66,
+      "sm120_graph_2layer_us": 28.22,
+      "speedup_graph_vs_stock_x": 5.09
+    },
+    {
+      "ctx_len": 32768,
+      "batch": 4,
+      "src_overlap": 1.0,
+      "consumer_overlap": 1.0,
+      "stock_2layer_us": 270.94,
+      "sm120_eager_2layer_us": 85.41,
+      "sm120_graph_2layer_us": 36.42,
+      "speedup_graph_vs_stock_x": 7.439
+    },
+    {
+      "ctx_len": 32768,
+      "batch": 8,
+      "src_overlap": 1.0,
+      "consumer_overlap": 1.0,
+      "stock_2layer_us": 237.95,
+      "sm120_eager_2layer_us": 87.65,
+      "sm120_graph_2layer_us": 44.64,
+      "speedup_graph_vs_stock_x": 5.33
+    },
+    {
+      "ctx_len": 32768,
+      "batch": 16,
+      "src_overlap": 1.0,
+      "consumer_overlap": 1.0,
+      "stock_2layer_us": 299.39,
+      "sm120_eager_2layer_us": 86.62,
+      "sm120_graph_2layer_us": 61.02,
+      "speedup_graph_vs_stock_x": 4.906
+    }
+  ],
+  "mega_gate_8479_sm12x_plan": [
+    {
+      "M": 1,
+      "prepare_mega_gate_us": 10.5
+    },
+    {
+      "M": 4,
+      "prepare_mega_gate_us": 10.59
+    },
+    {
+      "M": 16,
+      "prepare_mega_gate_us": 10.53
+    },
+    {
+      "M": 64,
+      "prepare_mega_gate_us": 12.26
+    },
+    {
+      "M": 512,
+      "prepare_mega_gate_us": 17.02
+    },
+    {
+      "M": 2048,
+      "prepare_mega_gate_us": 40.51
+    }
+  ],
+  "l2_persisting_70mib_fn_probe": [
+    {
+      "M": 1,
+      "cudaStreamSetAttribute_rc": 0,
+      "80layer_fn_no_persist_us": 920.8,
+      "80layer_fn_persist_70mib_us": 903.78,
+      "speedup_x": 1.019
+    },
+    {
+      "M": 4,
+      "cudaStreamSetAttribute_rc": 0,
+      "80layer_fn_no_persist_us": 932.26,
+      "80layer_fn_persist_70mib_us": 947.01,
+      "speedup_x": 0.984
+    },
+    {
+      "M": 16,
+      "cudaStreamSetAttribute_rc": 0,
+      "80layer_fn_no_persist_us": 965.18,
+      "80layer_fn_persist_70mib_us": 982.69,
+      "speedup_x": 0.982
+    }
+  ],
+  "mhc_3kernel_graph_breakdown": [
+    {
+      "M": 1,
+      "splits": 16,
+      "ar_mhc_post_only_us": 24.1,
+      "full_3kern_mhc_us": 33.38,
+      "prenorm_plus_sinkhorn_overhead_us": 9.28,
+      "step_80sublayers_overhead_ms": 0.742
+    },
+    {
+      "M": 2,
+      "splits": 16,
+      "ar_mhc_post_only_us": 24.1,
+      "full_3kern_mhc_us": 35.68,
+      "prenorm_plus_sinkhorn_overhead_us": 11.58,
+      "step_80sublayers_overhead_ms": 0.926
+    },
+    {
+      "M": 4,
+      "splits": 16,
+      "ar_mhc_post_only_us": 22.18,
+      "full_3kern_mhc_us": 38.5,
+      "prenorm_plus_sinkhorn_overhead_us": 16.32,
+      "step_80sublayers_overhead_ms": 1.306
+    },
+    {
+      "M": 8,
+      "splits": 16,
+      "ar_mhc_post_only_us": 24.06,
+      "full_3kern_mhc_us": 40.54,
+      "prenorm_plus_sinkhorn_overhead_us": 16.48,
+      "step_80sublayers_overhead_ms": 1.318
+    },
+    {
+      "M": 16,
+      "splits": 16,
+      "ar_mhc_post_only_us": 28.22,
+      "full_3kern_mhc_us": 46.69,
+      "prenorm_plus_sinkhorn_overhead_us": 18.47,
+      "step_80sublayers_overhead_ms": 1.478
+    },
+    {
+      "M": 32,
+      "splits": 16,
+      "ar_mhc_post_only_us": 30.3,
+      "full_3kern_mhc_us": 50.78,
+      "prenorm_plus_sinkhorn_overhead_us": 20.48,
+      "step_80sublayers_overhead_ms": 1.638
+    },
+    {
+      "M": 64,
+      "splits": 16,
+      "ar_mhc_post_only_us": 40.51,
+      "full_3kern_mhc_us": 58.98,
+      "prenorm_plus_sinkhorn_overhead_us": 18.47,
+      "step_80sublayers_overhead_ms": 1.478
+    }
+  ],
+  "pcie_ipc_076_probe": [
+    {
+      "M": 1,
+      "shm_pxb_bfp1_us": 37.57,
+      "pcie_ipc_ar_default_us": 24.13,
+      "profile": "pcieswitch-pairs",
+      "memop_supported": true,
+      "slow_hops": 136,
+      "variants_available": []
+    },
+    {
+      "M": 8,
+      "shm_pxb_bfp1_us": 19.2,
+      "pcie_ipc_ar_default_us": 36.42,
+      "profile": "pcieswitch-pairs",
+      "memop_supported": true,
+      "slow_hops": 136,
+      "variants_available": []
+    },
+    {
+      "M": 64,
+      "shm_pxb_bfp1_us": 43.62,
+      "pcie_ipc_ar_default_us": 86.72,
+      "profile": "pcieswitch-pairs",
+      "memop_supported": true,
+      "slow_hops": 136,
+      "variants_available": []
+    },
+    {
+      "M": 512,
+      "shm_pxb_bfp1_us": 170.08,
+      "pcie_ipc_ar_default_us": 544.32,
+      "profile": "pcieswitch-pairs",
+      "memop_supported": true,
+      "slow_hops": 136,
+      "variants_available": []
+    },
+    {
+      "M": 2048,
+      "shm_pxb_bfp1_us": 602.72,
+      "pcie_ipc_ar_default_us": 2605.63,
+      "profile": "pcieswitch-pairs",
+      "memop_supported": true,
+      "slow_hops": 136,
+      "variants_available": []
+    },
+    {
+      "M": 4096,
+      "shm_pxb_bfp1_us": 1167.52,
+      "pcie_ipc_ar_default_us": 5866.98,
+      "profile": "pcieswitch-pairs",
+      "memop_supported": true,
+      "slow_hops": 136,
+      "variants_available": []
+    }
+  ],
+  "mhc_realistic_sublayer_overlap": [
+    {
+      "M": 1,
+      "sublayer_without_prenorm_us": 118.37,
+      "sublayer_with_sidestream_mhc_us": 120.38,
+      "exposed_sidestream_delta_us": 2.01,
+      "step_80sublayers_exposed_ms": 0.161
+    },
+    {
+      "M": 4,
+      "sublayer_without_prenorm_us": 122.5,
+      "sublayer_with_sidestream_mhc_us": 132.7,
+      "exposed_sidestream_delta_us": 10.2,
+      "step_80sublayers_exposed_ms": 0.816
+    },
+    {
+      "M": 8,
+      "sublayer_without_prenorm_us": 126.53,
+      "sublayer_with_sidestream_mhc_us": 134.75,
+      "exposed_sidestream_delta_us": 8.22,
+      "step_80sublayers_exposed_ms": 0.658
+    },
+    {
+      "M": 16,
+      "sublayer_without_prenorm_us": 135.87,
+      "sublayer_with_sidestream_mhc_us": 144.99,
+      "exposed_sidestream_delta_us": 9.12,
+      "step_80sublayers_exposed_ms": 0.73
+    },
+    {
+      "M": 32,
+      "sublayer_without_prenorm_us": 142.94,
+      "sublayer_with_sidestream_mhc_us": 149.09,
+      "exposed_sidestream_delta_us": 6.15,
+      "step_80sublayers_exposed_ms": 0.492
+    },
+    {
+      "M": 64,
+      "sublayer_without_prenorm_us": 155.2,
+      "sublayer_with_sidestream_mhc_us": 161.34,
+      "exposed_sidestream_delta_us": 6.14,
+      "step_80sublayers_exposed_ms": 0.491
+    }
+  ]
+}

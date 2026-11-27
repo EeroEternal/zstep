@@ -8,6 +8,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace cg = cooperative_groups;
 
@@ -2811,6 +2812,144 @@ __global__ __launch_bounds__(128, 8) void sm120_mhc_sinkhorn_stats_kernel(
     }
 }
 
+__device__ __forceinline__ float to_tf32_rna(float x) {
+    uint32_t bits;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(bits) : "f"(x));
+    return __uint_as_float(bits);
+}
+
+// SM120 dynamic-SMEM Split-K=32 `mHC Prenorm + Last-CTA Sinkhorn` single-kernel fusion (1 <= M <= 64).
+template <int MAX_M>
+__global__ __launch_bounds__(256) void sm120_mhc_prenorm_sinkhorn_smem_kernel(
+    const uint2* __restrict__ res_u2, const float4* __restrict__ fn_f4,
+    const float* __restrict__ hc_scale, const float* __restrict__ hc_base,
+    float* __restrict__ partial_mul, float* __restrict__ partial_sqr, int32_t* __restrict__ done_cnt,
+    float* __restrict__ post_mix, float* __restrict__ comb_mix, float* __restrict__ pre_mix_out,
+    int num_tokens, int m_tiles, int ring_slot, float inv_rms_numel, float rms_eps,
+    float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult, int sinkhorn_repeat, int save_pre_mix) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    const int s = blockIdx.x, m_blk = blockIdx.y, m_base = m_blk * MAX_M;
+    const int m_cur = min(MAX_M, num_tokens - m_base);
+    if (m_cur <= 0) return;
+    uint2* s_res_u2 = reinterpret_cast<uint2*>(smem_raw);
+    float* s_wsq = reinterpret_cast<float*>(smem_raw + MAX_M * 1280);
+    int* s_is_last = reinterpret_cast<int*>(s_wsq + MAX_M * 8);
+    const int tid = threadIdx.x, warp_id = tid >> 5, lane = tid & 31;
+
+    if (tid < 160) {
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < m_cur) {
+                const uint2 ru2 = res_u2[static_cast<int64_t>(m_base + m) * 5120 + s * 160 + tid];
+                s_res_u2[m * 160 + tid] = ru2;
+                const float2 p0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ru2.x));
+                const float2 p1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ru2.y));
+                const float w_sq = warp_reduce_sum(p0.x * p0.x + p0.y * p0.y + p1.x * p1.x + p1.y * p1.y);
+                if (lane == 0) s_wsq[m * 8 + warp_id] = w_sq;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid < m_cur) {
+        partial_sqr[(s * m_tiles + m_blk) * MAX_M + tid] =
+            s_wsq[tid * 8] + s_wsq[tid * 8 + 1] + s_wsq[tid * 8 + 2] + s_wsq[tid * 8 + 3] + s_wsq[tid * 8 + 4];
+    }
+
+    const int r0 = warp_id * 3;
+    const float4* fn0 = fn_f4 + static_cast<int64_t>(r0) * 5120 + s * 160;
+    const float4 *fn1 = fn0 + 5120, *fn2 = fn0 + 10240;
+    float acc[MAX_M][3];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) acc[m][0] = acc[m][1] = acc[m][2] = 0.0f;
+
+    #pragma unroll
+    for (int it = 0; it < 5; ++it) {
+        const int col_u2 = it * 32 + lane;
+        float4 f0 = __ldcs(fn0 + col_u2), f1 = __ldcs(fn1 + col_u2), f2 = __ldcs(fn2 + col_u2);
+        f0.x = to_tf32_rna(f0.x); f0.y = to_tf32_rna(f0.y); f0.z = to_tf32_rna(f0.z); f0.w = to_tf32_rna(f0.w);
+        f1.x = to_tf32_rna(f1.x); f1.y = to_tf32_rna(f1.y); f1.z = to_tf32_rna(f1.z); f1.w = to_tf32_rna(f1.w);
+        f2.x = to_tf32_rna(f2.x); f2.y = to_tf32_rna(f2.y); f2.z = to_tf32_rna(f2.z); f2.w = to_tf32_rna(f2.w);
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < m_cur) {
+                const uint2 ru2 = s_res_u2[m * 160 + col_u2];
+                const float2 p0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ru2.x));
+                const float2 p1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ru2.y));
+                acc[m][0] += f0.x * p0.x + f0.y * p0.y + f0.z * p1.x + f0.w * p1.y;
+                acc[m][1] += f1.x * p0.x + f1.y * p0.y + f1.z * p1.x + f1.w * p1.y;
+                acc[m][2] += f2.x * p0.x + f2.y * p0.y + f2.z * p1.x + f2.w * p1.y;
+            }
+        }
+    }
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (m < m_cur) {
+            const float sum0 = warp_reduce_sum(acc[m][0]), sum1 = warp_reduce_sum(acc[m][1]), sum2 = warp_reduce_sum(acc[m][2]);
+            if (lane == 0) {
+                float* dst = partial_mul + ((s * m_tiles + m_blk) * MAX_M + m) * 24 + r0;
+                dst[0] = sum0; dst[1] = sum1; dst[2] = sum2;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        __threadfence();
+        int32_t* cnt_ptr = done_cnt + ring_slot * 16 + m_blk;
+        if (atomicAdd(cnt_ptr, 1) == 31) {
+            atomicExch(cnt_ptr, 0);
+            *s_is_last = 1;
+        } else {
+            *s_is_last = 0;
+        }
+    }
+    __syncthreads();
+    if (*s_is_last == 0) return;
+
+    const float sc0 = hc_scale[0], sc1 = hc_scale[1], sc2 = hc_scale[2];
+    const float b_lane = (lane < 24) ? hc_base[lane] : 0.0f;
+    const float b_post = (lane < 4) ? hc_base[lane + 4] : 0.0f, b_cm = (lane < 16) ? hc_base[lane + 8] : 0.0f;
+    for (int m = warp_id; m < m_cur; m += 8) {
+        const int tok = m_base + m;
+        float sq = 0.0f, mix_val = 0.0f;
+        if (lane == 0) {
+            #pragma unroll
+            for (int si = 0; si < 32; ++si) sq += __ldcg(&partial_sqr[(si * m_tiles + m_blk) * MAX_M + m]);
+            sq = rsqrtf(sq * inv_rms_numel + rms_eps);
+        }
+        const float rms = __shfl_sync(0xFFFFFFFFU, sq, 0);
+        if (lane < 24) {
+            #pragma unroll
+            for (int si = 0; si < 32; ++si) mix_val += __ldcg(&partial_mul[((si * m_tiles + m_blk) * MAX_M + m) * 24 + lane]);
+            mix_val *= rms;
+        }
+        const float m_post = __shfl_sync(0xFFFFFFFFU, mix_val, (lane < 4) ? (lane + 4) : 0);
+        if (lane < 4) {
+            if (save_pre_mix) pre_mix_out[tok * 4 + lane] = (1.0f / (1.0f + expf(-(mix_val * sc0 + b_lane)))) + hc_pre_eps;
+            post_mix[tok * 4 + lane] = (1.0f / (1.0f + expf(-(m_post * sc1 + b_post)))) * hc_post_mult;
+        }
+        const float m_cm = __shfl_sync(0xFFFFFFFFU, mix_val, (lane < 16) ? (lane + 8) : 0);
+        if (lane < 16) {
+            const unsigned m16 = 0x0000FFFFU;
+            float cm = m_cm * sc2 + b_cm;
+            float rmax = fmaxf(cm, __shfl_xor_sync(m16, cm, 1));
+            rmax = fmaxf(rmax, __shfl_xor_sync(m16, rmax, 2));
+            cm = expf(cm - rmax);
+            float rsum = cm + __shfl_xor_sync(m16, cm, 1); rsum += __shfl_xor_sync(m16, rsum, 2);
+            cm = cm / rsum + hc_sinkhorn_eps;
+            float csum = cm + __shfl_xor_sync(m16, cm, 4); csum += __shfl_xor_sync(m16, csum, 8);
+            cm = cm / (csum + hc_sinkhorn_eps);
+            for (int it = 0; it < sinkhorn_repeat - 1; ++it) {
+                rsum = cm + __shfl_xor_sync(m16, cm, 1); rsum += __shfl_xor_sync(m16, rsum, 2);
+                cm = cm / (rsum + hc_sinkhorn_eps);
+                csum = cm + __shfl_xor_sync(m16, cm, 4); csum += __shfl_xor_sync(m16, csum, 8);
+                cm = cm / (csum + hc_sinkhorn_eps);
+            }
+            comb_mix[tok * 16 + lane] = cm;
+        }
+    }
+}
+
 // SM120 Cluster-8 DSMEM fused `AllReduce + in-place mHC post/comb + collapse + RMSNorm`
 // for low-concurrency decode / speculative verify (`rows in {1, 2, 4}`, `H = 5120`).
 __global__ __cluster_dims__(8, 1, 1) __launch_bounds__(320, 1) void shm_v5_ar_mhc_cluster8_kernel(
@@ -3845,6 +3984,30 @@ void launch_mhc_sinkhorn_stats_cuda(
         hc_post_mult,
         sinkhorn_repeat,
         save_pre_mix);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_mhc_prenorm_sinkhorn_smem_cuda(
+    const void* res_ptr, const float* fn_ptr, const float* hc_scale_ptr, const float* hc_base_ptr,
+    float* partial_mul_ptr, float* partial_sqr_ptr, int32_t* done_cnt_ptr, float* post_mix_ptr,
+    float* comb_mix_ptr, float* pre_mix_out_ptr, int num_tokens, int ring_slot, float inv_rms_numel,
+    float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult,
+    int sinkhorn_repeat, int save_pre_mix, std::uintptr_t stream_handle) {
+    if (num_tokens <= 0) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    auto run = [&](auto max_m_tag) {
+        constexpr int kMaxM = decltype(max_m_tag)::value;
+        const int m_tiles = (num_tokens + kMaxM - 1) / kMaxM;
+        const size_t smem = kMaxM * 1280 + kMaxM * 32 + 16;
+        sm120_mhc_prenorm_sinkhorn_smem_kernel<kMaxM><<<dim3(32, static_cast<unsigned int>(m_tiles)), 256, smem, stream>>>(
+            reinterpret_cast<const uint2*>(res_ptr), reinterpret_cast<const float4*>(fn_ptr),
+            hc_scale_ptr, hc_base_ptr, partial_mul_ptr, partial_sqr_ptr, done_cnt_ptr,
+            post_mix_ptr, comb_mix_ptr, pre_mix_out_ptr, num_tokens, m_tiles, ring_slot,
+            inv_rms_numel, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult, sinkhorn_repeat, save_pre_mix);
+    };
+    if (num_tokens <= 4) run(std::integral_constant<int, 4>{});
+    else if (num_tokens <= 8) run(std::integral_constant<int, 8>{});
+    else run(std::integral_constant<int, 16>{});
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
 
