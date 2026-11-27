@@ -789,6 +789,12 @@ class DeepSeekV41StepRunner:
             enable_pxb_bfp=self.runtime_config.shm_pxb_bfp_mode,
         )
         tbo_min_tok = self.runtime_config.prefill_tbo_min_tokens
+        eff_tbo_min = (
+            tbo_min_tok
+            if getattr(self.runtime_config, "explicit_prefill_tbo_min_tokens", False)
+            else min(tbo_min_tok, 2048 if self.max_step_tokens >= 2048 else tbo_min_tok)
+        )
+        self._effective_tbo_min_tokens: int = eff_tbo_min
         tbo_cap_tokens = min(max(ar_max_tokens // 2, 2048), 4096)
         self._tbo_max_ubatch_tokens: int = tbo_cap_tokens
         self._tbo_comm_stream: torch.cuda.Stream | None = None
@@ -796,7 +802,7 @@ class DeepSeekV41StepRunner:
         self._tbo_ar_done_ev: list[torch.cuda.Event] = []
         self._tbo_cand_bufs: list[torch.Tensor] | None = None
         self._tbo_steps: int = 0
-        if self.pp_size == 1 and use_pxb_ar and 0 < tbo_min_tok <= 2 * tbo_cap_tokens:
+        if self.pp_size == 1 and use_pxb_ar and 0 < eff_tbo_min <= 2 * tbo_cap_tokens:
             self.shm_ar_tbo = HostMappedShmAllReduce(
                 name=f"{allreduce_name}_tbo",
                 rank=self.tp_rank,
@@ -1134,6 +1140,12 @@ class DeepSeekV41StepRunner:
         ]
         self._tbo_seq_lens_gpu: list[torch.Tensor] = [
             torch.zeros(ms, dtype=torch.int32, device=self.device) for _ in range(2)
+        ]
+        self._tbo_comp_bt_gpu: list[torch.Tensor] = [
+            torch.full(
+                (ms, 1), self.dummy_comp_block, dtype=torch.int32, device=self.device
+            )
+            for _ in range(2)
         ]
         self._tbo_is_pref_cpu: list[torch.Tensor] = [
             torch.zeros(ms, dtype=torch.bool) for _ in range(2)
@@ -2031,7 +2043,9 @@ class DeepSeekV41StepRunner:
             or torch.cuda.is_current_stream_capturing()
         ):
             return False
-        min_tok = self.runtime_config.prefill_tbo_min_tokens
+        min_tok = getattr(
+            self, "_effective_tbo_min_tokens", self.runtime_config.prefill_tbo_min_tokens
+        )
         if min_tok <= 0 or total_tokens < min_tok:
             return False
         min_ctx = self.runtime_config.prefill_tbo_min_ctx
@@ -2061,7 +2075,7 @@ class DeepSeekV41StepRunner:
         pos_i64: np.ndarray,
     ) -> list[tuple[int, int, int, int, list[int], list[int], list[bool], int, int]]:
         """Split a contiguous prefill batch into two causal microbatch metadata tuples."""
-        mid = total_tokens // 2
+        mid = ((total_tokens // 2) + 8) & ~15 if total_tokens >= 256 else total_tokens // 2
         slices: list[tuple[int, int, int, int, list[int], list[int], list[bool], int, int]] = []
         for lo, hi in ((0, mid), (mid, total_tokens)):
             r_start = -1
@@ -2119,16 +2133,16 @@ class DeepSeekV41StepRunner:
         main_s = torch.cuda.current_stream(self.device)
         dev_idx = self.device.index
 
+        slices = self._compute_tbo_microbatch_slices(total_tokens, num_seqs, q_start_np, pos_i64)
+        mid = slices[0][1]
         self._tbo_steps += 1
         if self._tbo_steps == 1 and self.rank == 0:
             _LOG.info(
                 "Prefill TBO active: total_tokens=%d mid=%d ar_blocks=%d",
                 total_tokens,
-                total_tokens // 2,
+                mid,
                 shm_ar_tbo.blocks,
             )
-        mid = total_tokens // 2
-        slices = self._compute_tbo_microbatch_slices(total_tokens, num_seqs, q_start_np, pos_i64)
         attn_metas: list[dict[str, Any]] = []
         positions_full = self.positions_gpu[:total_tokens]
         slot_map_full = self.slot_mapping_gpu[:total_tokens]
@@ -2168,7 +2182,9 @@ class DeepSeekV41StepRunner:
                 for_capture=False,
                 mla_bt_gpu=self.mla_bt_gpu[r_start:r_end],
                 swa_bt_gpu=self.swa_bt_gpu[r_start:r_end],
-                comp_bt_gpu=self.comp_bt_gpu[r_start:r_end],
+                comp_bt_gpu=self._tbo_comp_bt_gpu[u][:u_reqs].copy_(
+                    self.comp_bt_gpu[r_start:r_end], non_blocking=True
+                ),
                 builder_groups=(
                     self._builder_groups
                     if u == 0 or not self._tbo_builder_groups_u1
@@ -2647,6 +2663,14 @@ class DeepSeekV41StepRunner:
             ([24], 2560),
             ([17, 24, 13], 2560),
             ([64, 64], 2560),
+            *(
+                [
+                    ([1] * min(15, self.max_seqs - 1) + [2048], -1),
+                    ([1] * min(16, self.max_seqs - 1) + [2048], -1),
+                ]
+                if getattr(self, "dspark_drafter", None) is None
+                else []
+            ),
             ([1] * min(15, self.max_seqs - 1) + [512], -1),
             ([1] * min(31, self.max_seqs - 1) + [1024], -1),
             ([1] * min(31, self.max_seqs - 1) + [512, 512], -2),
@@ -2754,6 +2778,31 @@ class DeepSeekV41StepRunner:
                     if self.is_last_pp:
                         self._sample_rows_into_argmax(hidden, self.sample_rows_gpu[:1], 1)
                     del hidden
+                    if (
+                        case_idx > 0
+                        and self.pp_size == 1
+                        and self.shm_ar_tbo is not None
+                        and self._tbo_comm_stream is not None
+                        and (
+                            (min(q_lens) > 1 and n_toks % 256 == 0)
+                            if getattr(self, "dspark_drafter", None) is not None
+                            else (max(q_lens) >= 512)
+                        )
+                        and self._can_run_prefill_tbo(
+                            n_toks, max_seq_len=max(s_lens), is_decode=False
+                        )
+                    ):
+                        tbo_hidden = self._run_prefill_tbo(
+                            total_tokens=n_toks,
+                            num_seqs=n_reqs,
+                            q_start_np=np.asarray(qsl, dtype=np.int64),
+                            pos_i64=np.asarray(pos_list, dtype=np.int64),
+                            full_attn_meta=attn_meta,
+                            need_hidden=True,
+                            capture_aux=False,
+                        )
+                        del tbo_hidden
+                        self._tbo_steps = 0
                 torch.cuda.synchronize(self.device)
                 if n_toks >= 2048:
                     torch.cuda.empty_cache()
@@ -4225,6 +4274,7 @@ class DeepSeekV41StepRunner:
                 )
 
             max_q_len = int(q_lens.max())
+            min_q_len = int(q_lens.min())
             max_s_len = int(seq_lens_np.max())
             pw_b = None if is_spec_step else self._select_piecewise_bucket(total_tokens)
             use_pp2_prefill = (
@@ -4236,6 +4286,11 @@ class DeepSeekV41StepRunner:
             use_tbo = (
                 pw_b is None
                 and not use_pp2_prefill
+                and (
+                    (min_q_len > 1 and total_tokens % 256 == 0)
+                    if getattr(self, "dspark_drafter", None) is not None
+                    else (max_q_len >= 512)
+                )
                 and self._can_run_prefill_tbo(
                     total_tokens,
                     max_seq_len=max_s_len,

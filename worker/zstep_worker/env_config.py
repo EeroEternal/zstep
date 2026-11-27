@@ -156,6 +156,7 @@ class WorkerRuntimeConfig:
     enable_sm120_mhc_overlap: bool = True
     enable_sm120_fuse_mhc_ar: bool = True
     prefill_tbo_min_tokens: int = 6144
+    explicit_prefill_tbo_min_tokens: bool = False
     prefill_tbo_min_ctx: int = 0
     prefill_tbo_ar_blocks: int = 24
     pipeline_parallel_size: int = 1
@@ -242,6 +243,9 @@ class WorkerRuntimeConfig:
 
         prefill_tbo_min_tokens = env_int(
             "ZSTEP_PREFILL_TBO_MIN_TOKENS", 6144, environ=env
+        )
+        explicit_prefill_tbo_min_tokens = bool(
+            env.get("ZSTEP_PREFILL_TBO_MIN_TOKENS", "").strip()
         )
         if prefill_tbo_min_tokens < 0:
             raise ValueError(
@@ -350,6 +354,7 @@ class WorkerRuntimeConfig:
                 "ZSTEP_ENABLE_SM120_FUSE_MHC_AR", default=True, environ=env
             ),
             prefill_tbo_min_tokens=prefill_tbo_min_tokens,
+            explicit_prefill_tbo_min_tokens=explicit_prefill_tbo_min_tokens,
             prefill_tbo_min_ctx=prefill_tbo_min_ctx,
             prefill_tbo_ar_blocks=prefill_tbo_ar_blocks,
             pipeline_parallel_size=pipeline_parallel_size,

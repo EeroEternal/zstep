@@ -1,0 +1,4288 @@
+{
+  "hardware": "8x NVIDIA RTX 6000D (SM120, 156 SMs, 85651 MiB VRAM, CUDA 13.0, Dual-Socket Xeon 4+4 PXB 106.1 GB/s)",
+  "incumbent_git_sha": "f2c23b1",
+  "incumbent_archive_sha": "4ba470bc1466",
+  "round1_short_throughput": {},
+  "round2_longctx_tp8": {
+    "g0001-bb227336": {
+      "hot-prescreen": {
+        "passed": true,
+        "geomean_speedup": 0.9996,
+        "summary": "dsa_8k_r1:0.990x(514.2->519.6us), dsa_16k_r1:0.914x(1091.6->1194.3us), dsa_16k_r2:0.960x(1200.7->1250.8us), tbo_4k_auto:enabled(1.150x)"
+      },
+      "hot-prescreen-decision": {
+        "passed": false,
+        "gain": -0.00039999999999995595,
+        "metric_delta": "hot_prescreen[dsa_8k_r1:0.990x(514.2->519.6us), dsa_16k_r1:0.914x(1091.6->1194.3us), dsa_16k_r2:0.960x(1200.7->1250.8us), tbo_4k_auto:enabled(1.150x)]",
+        "reasons": [
+          "hot pre-screen geomean_speedup 0.9996x below min_hot_prescreen_speedup 1.0200x"
+        ]
+      },
+      "failure": {
+        "type": "ScreenRejectedError",
+        "error": "hot pre-screen geomean_speedup 0.9996x below min_hot_prescreen_speedup 1.0200x"
+      }
+    },
+    "g0002-be79ff1b": {
+      "hot-prescreen": {
+        "passed": true,
+        "geomean_speedup": 0.995,
+        "summary": "dsa_8k_r1:1.029x(511.6->497.2us), dsa_16k_r1:0.938x(1101.9->1174.1us), dsa_16k_r2:1.020x(1232.5->1208.1us)"
+      },
+      "hot-prescreen-decision": {
+        "passed": false,
+        "gain": -0.0050000000000000044,
+        "metric_delta": "hot_prescreen[dsa_8k_r1:1.029x(511.6->497.2us), dsa_16k_r1:0.938x(1101.9->1174.1us), dsa_16k_r2:1.020x(1232.5->1208.1us)]",
+        "reasons": [
+          "hot pre-screen geomean_speedup 0.9950x below min_hot_prescreen_speedup 1.0200x"
+        ]
+      },
+      "failure": {
+        "type": "ScreenRejectedError",
+        "error": "hot pre-screen geomean_speedup 0.9950x below min_hot_prescreen_speedup 1.0200x"
+      }
+    },
+    "g0003-7c3ab298": {
+      "hot-prescreen": {
+        "passed": true,
+        "geomean_speedup": 1.1544,
+        "summary": "tbo_2stream:1.154x(1769.5->1532.9us)"
+      },
+      "hot-prescreen-decision": {
+        "passed": true,
+        "gain": 0.1544000000000001,
+        "metric_delta": "hot_prescreen[tbo_2stream:1.154x(1769.5->1532.9us)]",
+        "reasons": []
+      },
+      "failure": {
+        "type": "RuntimeError",
+        "error": "Remote benchmark exited 1: _ms\": 5.72,\n      \"p99_itl_ms\": 6.61\n    },\n    {\n      \"label\": \"ctx16k_c8\",\n      \"repeat\": 0,\n      \"seed\": 11400714819323198486,\n      \"concurrency\": 8,\n      \"num_prompts\": 16,\n      \"input_len\": 16384,\n      \"output_len\": 64,\n      \"steps\": 169,\n      \"overlapped_decode_steps\": 94,\n      \"wall_time_ms\": 20990.359,\n      \"output_throughput_tok_s\": 48.78,\n      \"total_throughput_tok_s\": 12537.57,\n      \"mean_ttft_ms\": 4630.34,\n      \"median_ttft_ms\": 2157.10,\n      \"p99_ttft_ms\": 10717.46,\n      \"mean_submit_ttft_ms\": 11896.58,\n      \"median_submit_ttft_ms\": 10843.15,\n      \"p99_submit_ttft_ms\": 19414.78,\n      \"mean_tpot_ms\": 90.89,\n      \"median_tpot_ms\": 103.86,\n      \"p99_tpot_ms\": 154.33,\n      \"mean_itl_ms\": 90.89,\n      \"median_itl_ms\": 20.22,\n      \"p99_itl_ms\": 249.15\n    }\n  ],\n  \"tier_aggregates\": [\n    {\n      \"label\": \"ctx8k_c2\",\n      \"repeats\": 1,\n      \"output_throughput_tok_s\": {\"mean\": 97.159496, \"std\": 0.000000, \"min\": 97.159496, \"max\": 97.159496},\n      \"total_throughput_tok_s\": {\"mean\": 12533.574972, \"std\": 0.000000, \"min\": 12533.574972, \"max\": 12533.574972},\n      \"mean_ttft_ms\": {\"mean\": 955.940500, \"std\": 0.000000, \"min\": 955.940500, \"max\": 955.940500},\n      \"median_ttft_ms\": {\"mean\": 932.394000, \"std\": 0.000000, \"min\": 932.394000, \"max\": 932.394000},\n      \"p99_ttft_ms\": {\"mean\": 979.487000, \"std\": 0.000000, \"min\": 979.487000, \"max\": 979.487000},\n      \"mean_submit_ttft_ms\": {\"mean\": 1625.839500, \"std\": 0.000000, \"min\": 1625.839500, \"max\": 1625.839500},\n      \"median_submit_ttft_ms\": {\"mean\": 979.487000, \"std\": 0.000000, \"min\": 979.487000, \"max\": 979.487000},\n      \"p99_submit_ttft_ms\": {\"mean\": 2272.192000, \"std\": 0.000000, \"min\": 2272.192000, \"max\": 2272.192000},\n      \"mean_tpot_ms\": {\"mean\": 5.737000, \"std\": 0.000000, \"min\": 5.737000, \"max\": 5.737000},\n      \"p99_tpot_ms\": {\"mean\": 5.755000, \"std\": 0.000000, \"min\": 5.755000, \"max\": 5.755000},\n      \"p99_itl_ms\": {\"mean\": 6.610000, \"std\": 0.000000, \"min\": 6.610000, \"max\": 6.610000}\n    },\n    {\n      \"label\": \"ctx16k_c8\",\n      \"repeats\": 1,\n      \"output_throughput_tok_s\": {\"mean\": 48.784302, \"std\": 0.000000, \"min\": 48.784302, \"max\": 48.784302},\n      \"total_throughput_tok_s\": {\"mean\": 12537.565695, \"std\": 0.000000, \"min\": 12537.565695, \"max\": 12537.565695},\n      \"mean_ttft_ms\": {\"mean\": 4630.335437, \"std\": 0.000000, \"min\": 4630.335437, \"max\": 4630.335437},\n      \"median_ttft_ms\": {\"mean\": 2157.097000, \"std\": 0.000000, \"min\": 2157.097000, \"max\": 2157.097000},\n      \"p99_ttft_ms\": {\"mean\": 10717.463000, \"std\": 0.000000, \"min\": 10717.463000, \"max\": 10717.463000},\n      \"mean_submit_ttft_ms\": {\"mean\": 11896.584688, \"std\": 0.000000, \"min\": 11896.584688, \"max\": 11896.584688},\n      \"median_submit_ttft_ms\": {\"mean\": 10843.150000, \"std\": 0.000000, \"min\": 10843.150000, \"max\": 10843.150000},\n      \"p99_submit_ttft_ms\": {\"mean\": 19414.776000, \"std\": 0.000000, \"min\": 19414.776000, \"max\": 19414.776000},\n      \"mean_tpot_ms\": {\"mean\": 90.885437, \"std\": 0.000000, \"min\": 90.885437, \"max\": 90.885437},\n      \"p99_tpot_ms\": {\"mean\": 154.326000, \"std\": 0.000000, \"min\": 154.326000, \"max\": 154.326000},\n      \"p99_itl_ms\": {\"mean\": 249.148000, \"std\": 0.000000, \"min\": 249.148000, \"max\": 249.148000}\n    }\n  ]\n}\nrank 2: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4\nrank 4: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4\nrank 1: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4\nrank 3: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4TRITON_RECOMPILATIONS=4 WATCHED_KERNELS=5\n\nrank 6: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4rank 0: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4rank 5: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4\n\n\nrank 7: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4"
+      }
+    },
+    "g0004-54b3b25e": {
+      "hot-prescreen": {
+        "passed": true,
+        "geomean_speedup": 1.0579,
+        "summary": "dsa_8k_r1:0.991x(442.6->446.7us), dsa_16k_r1:1.169x(885.9->757.9us), dsa_16k_r2:1.050x(913.0->869.7us), tbo_2stream:1.030x(1815.5->1811.0us)"
+      },
+      "hot-prescreen-decision": {
+        "passed": true,
+        "gain": 0.05790000000000006,
+        "metric_delta": "hot_prescreen[dsa_8k_r1:0.991x(442.6->446.7us), dsa_16k_r1:1.169x(885.9->757.9us), dsa_16k_r2:1.050x(913.0->869.7us), tbo_2stream:1.030x(1815.5->1811.0us)]",
+        "reasons": []
+      },
+      "failure": {
+        "type": "RuntimeError",
+        "error": "Remote benchmark exited 1: _ms\": 5.72,\n      \"p99_itl_ms\": 6.62\n    },\n    {\n      \"label\": \"ctx16k_c8\",\n      \"repeat\": 0,\n      \"seed\": 11400714819323198486,\n      \"concurrency\": 8,\n      \"num_prompts\": 16,\n      \"input_len\": 16384,\n      \"output_len\": 64,\n      \"steps\": 169,\n      \"overlapped_decode_steps\": 94,\n      \"wall_time_ms\": 21133.425,\n      \"output_throughput_tok_s\": 48.45,\n      \"total_throughput_tok_s\": 12452.69,\n      \"mean_ttft_ms\": 4645.88,\n      \"median_ttft_ms\": 2170.45,\n      \"p99_ttft_ms\": 10758.10,\n      \"mean_submit_ttft_ms\": 11952.41,\n      \"median_submit_ttft_ms\": 10884.63,\n      \"p99_submit_ttft_ms\": 19529.44,\n      \"mean_tpot_ms\": 91.75,\n      \"median_tpot_ms\": 104.92,\n      \"p99_tpot_ms\": 155.41,\n      \"mean_itl_ms\": 91.75,\n      \"median_itl_ms\": 20.73,\n      \"p99_itl_ms\": 250.79\n    }\n  ],\n  \"tier_aggregates\": [\n    {\n      \"label\": \"ctx8k_c2\",\n      \"repeats\": 1,\n      \"output_throughput_tok_s\": {\"mean\": 97.251265, \"std\": 0.000000, \"min\": 97.251265, \"max\": 97.251265},\n      \"total_throughput_tok_s\": {\"mean\": 12545.413221, \"std\": 0.000000, \"min\": 12545.413221, \"max\": 12545.413221},\n      \"mean_ttft_ms\": {\"mean\": 954.521500, \"std\": 0.000000, \"min\": 954.521500, \"max\": 954.521500},\n      \"median_ttft_ms\": {\"mean\": 930.335000, \"std\": 0.000000, \"min\": 930.335000, \"max\": 930.335000},\n      \"p99_ttft_ms\": {\"mean\": 978.708000, \"std\": 0.000000, \"min\": 978.708000, \"max\": 978.708000},\n      \"mean_submit_ttft_ms\": {\"mean\": 1624.734500, \"std\": 0.000000, \"min\": 1624.734500, \"max\": 1624.734500},\n      \"median_submit_ttft_ms\": {\"mean\": 978.708000, \"std\": 0.000000, \"min\": 978.708000, \"max\": 978.708000},\n      \"p99_submit_ttft_ms\": {\"mean\": 2270.761000, \"std\": 0.000000, \"min\": 2270.761000, \"max\": 2270.761000},\n      \"mean_tpot_ms\": {\"mean\": 5.739500, \"std\": 0.000000, \"min\": 5.739500, \"max\": 5.739500},\n      \"p99_tpot_ms\": {\"mean\": 5.741000, \"std\": 0.000000, \"min\": 5.741000, \"max\": 5.741000},\n      \"p99_itl_ms\": {\"mean\": 6.623000, \"std\": 0.000000, \"min\": 6.623000, \"max\": 6.623000}\n    },\n    {\n      \"label\": \"ctx16k_c8\",\n      \"repeats\": 1,\n      \"output_throughput_tok_s\": {\"mean\": 48.454048, \"std\": 0.000000, \"min\": 48.454048, \"max\": 48.454048},\n      \"total_throughput_tok_s\": {\"mean\": 12452.690330, \"std\": 0.000000, \"min\": 12452.690330, \"max\": 12452.690330},\n      \"mean_ttft_ms\": {\"mean\": 4645.876250, \"std\": 0.000000, \"min\": 4645.876250, \"max\": 4645.876250},\n      \"median_ttft_ms\": {\"mean\": 2170.452000, \"std\": 0.000000, \"min\": 2170.452000, \"max\": 2170.452000},\n      \"p99_ttft_ms\": {\"mean\": 10758.104000, \"std\": 0.000000, \"min\": 10758.104000, \"max\": 10758.104000},\n      \"mean_submit_ttft_ms\": {\"mean\": 11952.412437, \"std\": 0.000000, \"min\": 11952.412437, \"max\": 11952.412437},\n      \"median_submit_ttft_ms\": {\"mean\": 10884.630000, \"std\": 0.000000, \"min\": 10884.630000, \"max\": 10884.630000},\n      \"p99_submit_ttft_ms\": {\"mean\": 19529.443000, \"std\": 0.000000, \"min\": 19529.443000, \"max\": 19529.443000},\n      \"mean_tpot_ms\": {\"mean\": 91.745688, \"std\": 0.000000, \"min\": 91.745688, \"max\": 91.745688},\n      \"p99_tpot_ms\": {\"mean\": 155.409000, \"std\": 0.000000, \"min\": 155.409000, \"max\": 155.409000},\n      \"p99_itl_ms\": {\"mean\": 250.787000, \"std\": 0.000000, \"min\": 250.787000, \"max\": 250.787000}\n    }\n  ]\n}\nrank 7: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4\nrank 3: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4\nrank 5: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4rank 6: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4\n\nrank 4: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4\nrank 1: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4\nTRITON_RECOMPILATIONS=4 WATCHED_KERNELS=5\nrank 0: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4\nrank 2: runtime step triggered unexpected Triton JIT recompilation: dsv41_comp_ring_slot=4"
+      }
+    },
+    "g0005-6dee7b55": {
+      "hot-prescreen": {
+        "passed": true,
+        "geomean_speedup": 1.0862,
+        "summary": "dsa_8k_r1:1.026x(443.0->431.6us), dsa_16k_r1:1.212x(963.6->795.2us), dsa_16k_r2:1.086x(963.7->887.0us), tbo_2stream:1.030x(1669.0->1736.8us)"
+      },
+      "hot-prescreen-decision": {
+        "passed": true,
+        "gain": 0.08620000000000005,
+        "metric_delta": "hot_prescreen[dsa_8k_r1:1.026x(443.0->431.6us), dsa_16k_r1:1.212x(963.6->795.2us), dsa_16k_r2:1.086x(963.7->887.0us), tbo_2stream:1.030x(1669.0->1736.8us)]",
+        "reasons": []
+      },
+      "screen-decision": {
+        "passed": true,
+        "gain": 0.014483163874297933,
+        "metric_delta": "screen[ctx16k_c8:+0.24% (50.5 tok/s), ctx8k_c2:+2.67% (98.7 tok/s)]",
+        "reasons": []
+      },
+      "screen-parity": {
+        "git_sha": "unknown",
+        "vllm_version": "0.31.0",
+        "max_prefill_chunk": 24,
+        "all_matched": false,
+        "batched_vs_single_exact_match": false,
+        "chunked_vs_unchunked_exact_match": false,
+        "chunked_schedule": {
+          "prefill_steps": 4,
+          "decode_steps": 127,
+          "chunked_prefill_steps": 4,
+          "decode_steps_with_partial_prefill": 3,
+          "max_active_sequences": 5
+        },
+        "unchunked_schedule": {
+          "prefill_steps": 1,
+          "decode_steps": 127,
+          "chunked_prefill_steps": 0,
+          "decode_steps_with_partial_prefill": 0,
+          "max_active_sequences": 5
+        },
+        "triton_recompilations": 0,
+        "watched_kernels": 5
+      },
+      "failure": {
+        "type": "RuntimeError",
+        "error": "Remote benchmark exited 1: 066) INFO 11-26 16:06:49 [cuda.py:585] Using backend AttentionBackendEnum.FLASH_ATTN for vit attention\n(MainProcess pid=23066) INFO 11-26 16:06:49 [mm_encoder_attention.py:372] Using AttentionBackendEnum.FLASH_ATTN for MMEncoderAttention.\n(MainProcess pid=23066) INFO 11-26 16:06:49 [quant_config.py:79] DeepSeek V4 expert_dtype resolved to 'fp4'\n(MainProcess pid=23066) INFO 11-26 16:06:49 [__init__.py:929] Using FlashInferCutlassMxfp8LinearKernel for MXFP8 GEMM\n(MainProcess pid=23066) INFO 11-26 16:06:49 [attention.py:158] Using DeepSeek's fp8_ds_mla KV cache format.\n(MainProcess pid=23066) INFO 11-26 16:06:49 [mxfp4.py:721] Using 'DEEPGEMM_MXFP4' Mxfp4 MoE backend.\n(MainProcess pid=23066) INFO 11-26 16:06:50 [attention.py:1252] Using FP8 indexer cache for Lightning Indexer.\n(MainProcess pid=23070) INFO 11-26 16:06:54 [engram.py:431] Built engram token map (129280 -> 99092 ids) for layers (1, 14)\n(MainProcess pid=23068) INFO 11-26 16:06:54 [engram.py:431] Built engram token map (129280 -> 99092 ids) for layers (1, 14)\n(MainProcess pid=23072) INFO 11-26 16:06:54 [engram.py:431] Built engram token map (129280 -> 99092 ids) for layers (1, 14)\n(MainProcess pid=23073) INFO 11-26 16:06:54 [engram.py:431] Built engram token map (129280 -> 99092 ids) for layers (1, 14)\n(MainProcess pid=23071) INFO 11-26 16:06:54 [engram.py:431] Built engram token map (129280 -> 99092 ids) for layers (1, 14)\n(MainProcess pid=23066) INFO 11-26 16:06:54 [engram.py:431] Built engram token map (129280 -> 99092 ids) for layers (1, 14)\n(MainProcess pid=23069) INFO 11-26 16:06:54 [engram.py:431] Built engram token map (129280 -> 99092 ids) for layers (1, 14)\n(MainProcess pid=23067) INFO 11-26 16:06:54 [engram.py:431] Built engram token map (129280 -> 99092 ids) for layers (1, 14)\n(MainProcess pid=23066) WARNING 11-26 16:06:54 [compilation.py:1350] Op 'quant_fp8' not present in model, enabling with '+quant_fp8' has no effect\n(MainProcess pid=23066) INFO 11-26 16:06:54 [weight_utils.py:1063] Filesystem type for checkpoints: XFS. Checkpoint size: 475.25 GiB. Available RAM: 939.71 GiB.\n(MainProcess pid=23066) INFO 11-26 16:06:54 [weight_utils.py:1086] Auto-prefetch is disabled because the filesystem (XFS) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.\n(MainProcess pid=23066) INFO 11-26 16:07:15 [default_loader.py:484] Loading weights took 20.68 seconds\n(MainProcess pid=23066) INFO 11-26 16:07:15 [__init__.py:929] Using EmulationMxfp8LinearKernel for MXFP8 GEMM\n(MainProcess pid=23066) INFO 11-26 16:07:35 [indexer.py:896] DSA indexer decode path: use_flattening=False supports_varlen=False (next_n=1, use_fp4_cache=False)\n(MainProcess pid=23066) INFO 11-26 16:07:35 [kernel_warmup.py:94] Warming up ll_bf16 router GEMM kernels for shapes: ((5120, 384),).\n(MainProcess pid=23066) INFO 11-26 16:07:36 [deep_gemm.py:197] deep_gemm not found in site-packages, trying vendored vllm.third_party.deep_gemm\n(MainProcess pid=23066) INFO 11-26 16:07:37 [deep_gemm.py:224] DeepGEMM PDL enabled on vllm.third_party.deep_gemm.\n[DeepSeekV41StepRunner] ready: max_model_len=32768 kv_pages=2560 buckets=[1, 2, 4, 8, 10, 12, 16, 20, 24, 32, 48, 64, 96, 128] b12x=on(moe=40,lin=210/7,prep_ms=13880) mega_gate=on(40/17,min_m=1) dsa_decode=on(cg_max_seq=16384) p2p=PXB(pxb_shm=on) shm_ar_warm=8987 shm_ag_warm=444 nccl_large_warm=0 nccl_fallback_warm=0\nrank 4: IndexError: index 256 is out of bounds for axis 1 with size 256\nrank 3: IndexError: index 256 is out of bounds for axis 1 with size 256\nrank 1: IndexError: index 256 is out of bounds for axis 1 with size 256\nrank 6: IndexError: index 256 is out of bounds for axis 1 with size 256\nrank 0: IndexError: index 256 is out of bounds for axis 1 with size 256\nrank 5: IndexError: index 256 is out of bounds for axis 1 with size 256\nrank 7: IndexError: index 256 is out of bounds for axis 1 with size 256\nrank 2: IndexError: index 256 is out of bounds for axis 1 with size 256"
+      }
+    },
+    "g0006-606c82ae": {
+      "hot-prescreen": {
+        "passed": true,
+        "geomean_speedup": 1.1314,
+        "summary": "dsa_8k_r1:0.993x(424.5->427.6us), dsa_16k_r1:1.152x(872.7->757.8us), dsa_16k_r2:1.267x(1083.1->855.0us)"
+      },
+      "hot-prescreen-decision": {
+        "passed": true,
+        "gain": 0.13139999999999996,
+        "metric_delta": "hot_prescreen[dsa_8k_r1:0.993x(424.5->427.6us), dsa_16k_r1:1.152x(872.7->757.8us), dsa_16k_r2:1.267x(1083.1->855.0us)]",
+        "reasons": []
+      },
+      "screen-decision": {
+        "passed": false,
+        "gain": -0.003104079659510206,
+        "metric_delta": "screen[ctx16k_c8:-0.52% (50.1 tok/s), ctx8k_c2:-0.10% (96.0 tok/s)]",
+        "reasons": [
+          "screen geomean gain -0.31% below required min_screen_gain +0.50%"
+        ]
+      },
+      "screen-parity": {
+        "git_sha": "unknown",
+        "vllm_version": "0.31.0",
+        "max_prefill_chunk": 24,
+        "all_matched": false,
+        "batched_vs_single_exact_match": false,
+        "chunked_vs_unchunked_exact_match": false,
+        "chunked_schedule": {
+          "prefill_steps": 4,
+          "decode_steps": 127,
+          "chunked_prefill_steps": 4,
+          "decode_steps_with_partial_prefill": 3,
+          "max_active_sequences": 5
+        },
+        "unchunked_schedule": {
+          "prefill_steps": 1,
+          "decode_steps": 127,
+          "chunked_prefill_steps": 0,
+          "decode_steps_with_partial_prefill": 0,
+          "max_active_sequences": 5
+        },
+        "triton_recompilations": 0,
+        "watched_kernels": 5
+      },
+      "failure": {
+        "type": "ScreenRejectedError",
+        "error": "screen geomean gain -0.31% below required min_screen_gain +0.50%"
+      }
+    },
+    "g0007-7412f98b": {
+      "failure": {
+        "type": "RuntimeError",
+        "error": "Local gate cargo fmt exited 1"
+      }
+    },
+    "g0008-2e32ba92": {
+      "failure": {
+        "type": "RuntimeError",
+        "error": "Local gate cargo fmt exited 1"
+      }
+    },
+    "g0009-fe01dea3": {
+      "hot-prescreen": {
+        "passed": true,
+        "geomean_speedup": 1.0844,
+        "summary": "tbo_2stream:1.084x(1695.7->1563.7us)"
+      },
+      "hot-prescreen-decision": {
+        "passed": true,
+        "gain": 0.08440000000000003,
+        "metric_delta": "hot_prescreen[tbo_2stream:1.084x(1695.7->1563.7us)]",
+        "reasons": []
+      },
+      "screen-decision": {
+        "passed": true,
+        "gain": 0.01441231411178423,
+        "metric_delta": "screen[ctx16k_c8:+0.40% (50.5 tok/s), ctx8k_c2:+2.50% (98.5 tok/s)]",
+        "reasons": []
+      },
+      "screen-parity": {
+        "git_sha": "unknown",
+        "vllm_version": "0.31.0",
+        "max_prefill_chunk": 24,
+        "all_matched": false,
+        "batched_vs_single_exact_match": false,
+        "chunked_vs_unchunked_exact_match": false,
+        "chunked_schedule": {
+          "prefill_steps": 4,
+          "decode_steps": 127,
+          "chunked_prefill_steps": 4,
+          "decode_steps_with_partial_prefill": 3,
+          "max_active_sequences": 5
+        },
+        "unchunked_schedule": {
+          "prefill_steps": 1,
+          "decode_steps": 127,
+          "chunked_prefill_steps": 0,
+          "decode_steps_with_partial_prefill": 0,
+          "max_active_sequences": 5
+        },
+        "triton_recompilations": 0,
+        "watched_kernels": 5
+      },
+      "decision": {
+        "accepted": false,
+        "geomean_gain": 0.0059045280217786544,
+        "net_gate_ratio": 1.0059,
+        "paired_lcb_2se": 0.0047968838700577585,
+        "metric_delta": "geomean=+0.59% (net_gate=1.0059, lcb_2se=+0.48%) [ctx16k_c12:+0.37%(TPOT 75.44 vs 75.61ms), ctx32k_c4:+0.91%(TPOT 43.01 vs 43.13ms), ctx32k_c8:+0.60%(TPOT 86.94 vs 87.16ms), ctx8k_c16:+0.48%(TPOT 48.84 vs 49.00ms)]",
+        "reasons": [
+          "geomean throughput gain 0.59% below required minimum"
+        ]
+      },
+      "verify-parity": {
+        "git_sha": "unknown",
+        "vllm_version": "0.31.0",
+        "max_prefill_chunk": 24,
+        "all_matched": false,
+        "batched_vs_single_exact_match": false,
+        "chunked_vs_unchunked_exact_match": false,
+        "chunked_schedule": {
+          "prefill_steps": 4,
+          "decode_steps": 127,
+          "chunked_prefill_steps": 4,
+          "decode_steps_with_partial_prefill": 3,
+          "max_active_sequences": 5
+        },
+        "unchunked_schedule": {
+          "prefill_steps": 1,
+          "decode_steps": 127,
+          "chunked_prefill_steps": 0,
+          "decode_steps_with_partial_prefill": 0,
+          "max_active_sequences": 5
+        },
+        "triton_recompilations": 0,
+        "watched_kernels": 5
+      },
+      "trace-conformance": {
+        "passed": true,
+        "gate_verdict": "CONFORMANT",
+        "parity_sha256": "1129a0ae5d1972be4518b50da66693734eec0abd8ada4303e52a2a5b08caa1c1",
+        "metrics_sha256": "6615921754d5efa9131bc6ff2ecd9efdfab97435a5d0f80d1ad37ae2e164f3f8",
+        "clauses": [
+          {
+            "clause_id": "TRACE_JIT_ZERO_RECOMPILATIONS",
+            "pillar": "Determinism",
+            "verdict": "CONFORMANT",
+            "passed": true,
+            "detail": "triton_recompilations=0",
+            "witness": null
+          },
+          {
+            "clause_id": "TRACE_SCHEDULE_EXPOSURE",
+            "pillar": "Exposure",
+            "verdict": "CONFORMANT",
+            "passed": true,
+            "detail": "chunked_prefill_steps=4, decode_steps_with_partial_prefill=3",
+            "witness": null
+          },
+          {
+            "clause_id": "TRACE_BATCH_COMPOSITION_INVARIANCE",
+            "pillar": "Invariance",
+            "verdict": "CONFORMANT",
+            "passed": true,
+            "detail": "prime_squares_table 100% invariant across 3 modes; max_logit_drift=3.125 <= 8.00",
+            "witness": null
+          },
+          {
+            "clause_id": "TRACE_KV_AND_STEP_CONSERVATION",
+            "pillar": "Conservation",
+            "verdict": "CONFORMANT",
+            "passed": true,
+            "detail": "Checked 12 tier trace rows for KV zero-leakage & step bounds",
+            "witness": null
+          },
+          {
+            "clause_id": "TRACE_CUDA_GRAPH_REQUIRED",
+            "pillar": "Determinism",
+            "verdict": "NOT_APPLICABLE",
+            "passed": true,
+            "detail": "CUDA Graph fallback counters not emitted by harness",
+            "witness": null
+          },
+          {
+            "clause_id": "TRACE_SEIS_ANTI_CHEAT_INVARIANTS",
+            "pillar": "AntiCheat",
+            "verdict": "NOT_APPLICABLE",
+            "passed": true,
+            "detail": "Optional `seis_invariants` telemetry not present",
+            "witness": null
+          }
+        ],
+        "violations": []
+      },
+      "screen_tier_aggregates": [
+        {
+          "label": "ctx8k_c2",
+          "repeats": 1,
+          "output_throughput_tok_s": {
+            "mean": 98.551982,
+            "std": 0.0,
+            "min": 98.551982,
+            "max": 98.551982
+          },
+          "total_throughput_tok_s": {
+            "mean": 12713.205678,
+            "std": 0.0,
+            "min": 12713.205678,
+            "max": 12713.205678
+          },
+          "mean_ttft_ms": {
+            "mean": 938.434,
+            "std": 0.0,
+            "min": 938.434,
+            "max": 938.434
+          },
+          "median_ttft_ms": {
+            "mean": 935.056,
+            "std": 0.0,
+            "min": 935.056,
+            "max": 935.056
+          },
+          "p99_ttft_ms": {
+            "mean": 941.812,
+            "std": 0.0,
+            "min": 941.812,
+            "max": 941.812
+          },
+          "mean_submit_ttft_ms": {
+            "mean": 1589.1135,
+            "std": 0.0,
+            "min": 1589.1135,
+            "max": 1589.1135
+          },
+          "median_submit_ttft_ms": {
+            "mean": 941.812,
+            "std": 0.0,
+            "min": 941.812,
+            "max": 941.812
+          },
+          "p99_submit_ttft_ms": {
+            "mean": 2236.415,
+            "std": 0.0,
+            "min": 2236.415,
+            "max": 2236.415
+          },
+          "mean_tpot_ms": {
+            "mean": 5.7195,
+            "std": 0.0,
+            "min": 5.7195,
+            "max": 5.7195
+          },
+          "p99_tpot_ms": {
+            "mean": 5.732,
+            "std": 0.0,
+            "min": 5.732,
+            "max": 5.732
+          },
+          "p99_itl_ms": {
+            "mean": 6.681,
+            "std": 0.0,
+            "min": 6.681,
+            "max": 6.681
+          }
+        },
+        {
+          "label": "ctx16k_c8",
+          "repeats": 1,
+          "output_throughput_tok_s": {
+            "mean": 50.552912,
+            "std": 0.0,
+            "min": 50.552912,
+            "max": 50.552912
+          },
+          "total_throughput_tok_s": {
+            "mean": 12992.098365,
+            "std": 0.0,
+            "min": 12992.098365,
+            "max": 12992.098365
+          },
+          "mean_ttft_ms": {
+            "mean": 4331.23125,
+            "std": 0.0,
+            "min": 4331.23125,
+            "max": 4331.23125
+          },
+          "median_ttft_ms": {
+            "mean": 2176.217,
+            "std": 0.0,
+            "min": 2176.217,
+            "max": 2176.217
+          },
+          "p99_ttft_ms": {
+            "mean": 9926.695,
+            "std": 0.0,
+            "min": 9926.695,
+            "max": 9926.695
+          },
+          "mean_submit_ttft_ms": {
+            "mean": 11233.126188,
+            "std": 0.0,
+            "min": 11233.126188,
+            "max": 11233.126188
+          },
+          "median_submit_ttft_ms": {
+            "mean": 10052.711,
+            "std": 0.0,
+            "min": 10052.711,
+            "max": 10052.711
+          },
+          "p99_submit_ttft_ms": {
+            "mean": 18697.229,
+            "std": 0.0,
+            "min": 18697.229,
+            "max": 18697.229
+          },
+          "mean_tpot_ms": {
+            "mean": 89.730312,
+            "std": 0.0,
+            "min": 89.730312,
+            "max": 89.730312
+          },
+          "p99_tpot_ms": {
+            "mean": 141.995,
+            "std": 0.0,
+            "min": 141.995,
+            "max": 141.995
+          },
+          "p99_itl_ms": {
+            "mean": 252.855,
+            "std": 0.0,
+            "min": 252.855,
+            "max": 252.855
+          }
+        }
+      ],
+      "verify_rounds": [
+        {
+          "round": 0,
+          "baseline": [
+            {
+              "label": "ctx8k_c16",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 223.74947,
+                "std": 0.0,
+                "min": 223.74947,
+                "max": 223.74947
+              },
+              "total_throughput_tok_s": {
+                "mean": 14543.715565,
+                "std": 0.0,
+                "min": 14543.715565,
+                "max": 14543.715565
+              },
+              "mean_ttft_ms": {
+                "mean": 2887.581938,
+                "std": 0.0,
+                "min": 2887.581938,
+                "max": 2887.581938
+              },
+              "median_ttft_ms": {
+                "mean": 1438.309,
+                "std": 0.0,
+                "min": 1438.309,
+                "max": 1438.309
+              },
+              "p99_ttft_ms": {
+                "mean": 7775.471,
+                "std": 0.0,
+                "min": 7775.471,
+                "max": 7775.471
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 9017.111344,
+                "std": 0.0,
+                "min": 9017.111344,
+                "max": 9017.111344
+              },
+              "median_submit_ttft_ms": {
+                "mean": 7905.724,
+                "std": 0.0,
+                "min": 7905.724,
+                "max": 7905.724
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 16640.535,
+                "std": 0.0,
+                "min": 16640.535,
+                "max": 16640.535
+              },
+              "mean_tpot_ms": {
+                "mean": 48.818094,
+                "std": 0.0,
+                "min": 48.818094,
+                "max": 48.818094
+              },
+              "p99_tpot_ms": {
+                "mean": 62.768,
+                "std": 0.0,
+                "min": 62.768,
+                "max": 62.768
+              },
+              "p99_itl_ms": {
+                "mean": 248.472,
+                "std": 0.0,
+                "min": 248.472,
+                "max": 248.472
+              }
+            },
+            {
+              "label": "ctx16k_c12",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 100.061763,
+                "std": 0.0,
+                "min": 100.061763,
+                "max": 100.061763
+              },
+              "total_throughput_tok_s": {
+                "mean": 12907.967465,
+                "std": 0.0,
+                "min": 12907.967465,
+                "max": 12907.967465
+              },
+              "mean_ttft_ms": {
+                "mean": 5516.512208,
+                "std": 0.0,
+                "min": 5516.512208,
+                "max": 5516.512208
+              },
+              "median_ttft_ms": {
+                "mean": 2447.951,
+                "std": 0.0,
+                "min": 2447.951,
+                "max": 2447.951
+              },
+              "p99_ttft_ms": {
+                "mean": 14015.685,
+                "std": 0.0,
+                "min": 14015.685,
+                "max": 14015.685
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 15940.435042,
+                "std": 0.0,
+                "min": 15940.435042,
+                "max": 15940.435042
+              },
+              "median_submit_ttft_ms": {
+                "mean": 14150.792,
+                "std": 0.0,
+                "min": 14150.792,
+                "max": 14150.792
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 27733.601,
+                "std": 0.0,
+                "min": 27733.601,
+                "max": 27733.601
+              },
+              "mean_tpot_ms": {
+                "mean": 75.590292,
+                "std": 0.0,
+                "min": 75.590292,
+                "max": 75.590292
+              },
+              "p99_tpot_ms": {
+                "mean": 109.88,
+                "std": 0.0,
+                "min": 109.88,
+                "max": 109.88
+              },
+              "p99_itl_ms": {
+                "mean": 253.201,
+                "std": 0.0,
+                "min": 253.201,
+                "max": 253.201
+              }
+            },
+            {
+              "label": "ctx32k_c4",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 48.176691,
+                "std": 0.0,
+                "min": 48.176691,
+                "max": 48.176691
+              },
+              "total_throughput_tok_s": {
+                "mean": 12381.409676,
+                "std": 0.0,
+                "min": 12381.409676,
+                "max": 12381.409676
+              },
+              "mean_ttft_ms": {
+                "mean": 5071.435875,
+                "std": 0.0,
+                "min": 5071.435875,
+                "max": 5071.435875
+              },
+              "median_ttft_ms": {
+                "mean": 4040.614,
+                "std": 0.0,
+                "min": 4040.614,
+                "max": 4040.614
+              },
+              "p99_ttft_ms": {
+                "mean": 8041.607,
+                "std": 0.0,
+                "min": 8041.607,
+                "max": 8041.607
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 11305.365875,
+                "std": 0.0,
+                "min": 11305.365875,
+                "max": 11305.365875
+              },
+              "median_submit_ttft_ms": {
+                "mean": 8170.019,
+                "std": 0.0,
+                "min": 8170.019,
+                "max": 8170.019
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 18421.527,
+                "std": 0.0,
+                "min": 18421.527,
+                "max": 18421.527
+              },
+              "mean_tpot_ms": {
+                "mean": 43.007,
+                "std": 0.0,
+                "min": 43.007,
+                "max": 43.007
+              },
+              "p99_tpot_ms": {
+                "mean": 51.002,
+                "std": 0.0,
+                "min": 51.002,
+                "max": 51.002
+              },
+              "p99_itl_ms": {
+                "mean": 261.589,
+                "std": 0.0,
+                "min": 261.589,
+                "max": 261.589
+              }
+            },
+            {
+              "label": "ctx32k_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 55.101748,
+                "std": 0.0,
+                "min": 55.101748,
+                "max": 55.101748
+              },
+              "total_throughput_tok_s": {
+                "mean": 14161.149127,
+                "std": 0.0,
+                "min": 14161.149127,
+                "max": 14161.149127
+              },
+              "mean_ttft_ms": {
+                "mean": 7235.5715,
+                "std": 0.0,
+                "min": 7235.5715,
+                "max": 7235.5715
+              },
+              "median_ttft_ms": {
+                "mean": 4284.784,
+                "std": 0.0,
+                "min": 4284.784,
+                "max": 4284.784
+              },
+              "p99_ttft_ms": {
+                "mean": 16240.681,
+                "std": 0.0,
+                "min": 16240.681,
+                "max": 16240.681
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 19283.565687,
+                "std": 0.0,
+                "min": 19283.565687,
+                "max": 19283.565687
+              },
+              "median_submit_ttft_ms": {
+                "mean": 16379.924,
+                "std": 0.0,
+                "min": 16379.924,
+                "max": 16379.924
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 34259.14,
+                "std": 0.0,
+                "min": 34259.14,
+                "max": 34259.14
+              },
+              "mean_tpot_ms": {
+                "mean": 87.235375,
+                "std": 0.0,
+                "min": 87.235375,
+                "max": 87.235375
+              },
+              "p99_tpot_ms": {
+                "mean": 109.731,
+                "std": 0.0,
+                "min": 109.731,
+                "max": 109.731
+              },
+              "p99_itl_ms": {
+                "mean": 264.346,
+                "std": 0.0,
+                "min": 264.346,
+                "max": 264.346
+              }
+            }
+          ],
+          "candidate": [
+            {
+              "label": "ctx8k_c16",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 224.356414,
+                "std": 0.0,
+                "min": 224.356414,
+                "max": 224.356414
+              },
+              "total_throughput_tok_s": {
+                "mean": 14583.166937,
+                "std": 0.0,
+                "min": 14583.166937,
+                "max": 14583.166937
+              },
+              "mean_ttft_ms": {
+                "mean": 2868.646688,
+                "std": 0.0,
+                "min": 2868.646688,
+                "max": 2868.646688
+              },
+              "median_ttft_ms": {
+                "mean": 1438.649,
+                "std": 0.0,
+                "min": 1438.649,
+                "max": 1438.649
+              },
+              "p99_ttft_ms": {
+                "mean": 7734.727,
+                "std": 0.0,
+                "min": 7734.727,
+                "max": 7734.727
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 8981.989469,
+                "std": 0.0,
+                "min": 8981.989469,
+                "max": 8981.989469
+              },
+              "median_submit_ttft_ms": {
+                "mean": 7864.94,
+                "std": 0.0,
+                "min": 7864.94,
+                "max": 7864.94
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 16606.55,
+                "std": 0.0,
+                "min": 16606.55,
+                "max": 16606.55
+              },
+              "mean_tpot_ms": {
+                "mean": 48.777031,
+                "std": 0.0,
+                "min": 48.777031,
+                "max": 48.777031
+              },
+              "p99_tpot_ms": {
+                "mean": 62.768,
+                "std": 0.0,
+                "min": 62.768,
+                "max": 62.768
+              },
+              "p99_itl_ms": {
+                "mean": 248.177,
+                "std": 0.0,
+                "min": 248.177,
+                "max": 248.177
+              }
+            },
+            {
+              "label": "ctx16k_c12",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 100.41504,
+                "std": 0.0,
+                "min": 100.41504,
+                "max": 100.41504
+              },
+              "total_throughput_tok_s": {
+                "mean": 12953.540139,
+                "std": 0.0,
+                "min": 12953.540139,
+                "max": 12953.540139
+              },
+              "mean_ttft_ms": {
+                "mean": 5491.345833,
+                "std": 0.0,
+                "min": 5491.345833,
+                "max": 5491.345833
+              },
+              "median_ttft_ms": {
+                "mean": 2445.383,
+                "std": 0.0,
+                "min": 2445.383,
+                "max": 2445.383
+              },
+              "p99_ttft_ms": {
+                "mean": 13968.578,
+                "std": 0.0,
+                "min": 13968.578,
+                "max": 13968.578
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 15880.748042,
+                "std": 0.0,
+                "min": 15880.748042,
+                "max": 15880.748042
+              },
+              "median_submit_ttft_ms": {
+                "mean": 14103.97,
+                "std": 0.0,
+                "min": 14103.97,
+                "max": 14103.97
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 27659.039,
+                "std": 0.0,
+                "min": 27659.039,
+                "max": 27659.039
+              },
+              "mean_tpot_ms": {
+                "mean": 75.376833,
+                "std": 0.0,
+                "min": 75.376833,
+                "max": 75.376833
+              },
+              "p99_tpot_ms": {
+                "mean": 109.95,
+                "std": 0.0,
+                "min": 109.95,
+                "max": 109.95
+              },
+              "p99_itl_ms": {
+                "mean": 253.236,
+                "std": 0.0,
+                "min": 253.236,
+                "max": 253.236
+              }
+            },
+            {
+              "label": "ctx32k_c4",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 48.537638,
+                "std": 0.0,
+                "min": 48.537638,
+                "max": 48.537638
+              },
+              "total_throughput_tok_s": {
+                "mean": 12474.172938,
+                "std": 0.0,
+                "min": 12474.172938,
+                "max": 12474.172938
+              },
+              "mean_ttft_ms": {
+                "mean": 4992.265,
+                "std": 0.0,
+                "min": 4992.265,
+                "max": 4992.265
+              },
+              "median_ttft_ms": {
+                "mean": 4006.312,
+                "std": 0.0,
+                "min": 4006.312,
+                "max": 4006.312
+              },
+              "p99_ttft_ms": {
+                "mean": 7885.991,
+                "std": 0.0,
+                "min": 7885.991,
+                "max": 7885.991
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 11152.782375,
+                "std": 0.0,
+                "min": 11152.782375,
+                "max": 11152.782375
+              },
+              "median_submit_ttft_ms": {
+                "mean": 8014.607,
+                "std": 0.0,
+                "min": 8014.607,
+                "max": 8014.607
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 18267.017,
+                "std": 0.0,
+                "min": 18267.017,
+                "max": 18267.017
+              },
+              "mean_tpot_ms": {
+                "mean": 43.00925,
+                "std": 0.0,
+                "min": 43.00925,
+                "max": 43.00925
+              },
+              "p99_tpot_ms": {
+                "mean": 50.939,
+                "std": 0.0,
+                "min": 50.939,
+                "max": 50.939
+              },
+              "p99_itl_ms": {
+                "mean": 261.13,
+                "std": 0.0,
+                "min": 261.13,
+                "max": 261.13
+              }
+            },
+            {
+              "label": "ctx32k_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 55.518375,
+                "std": 0.0,
+                "min": 55.518375,
+                "max": 55.518375
+              },
+              "total_throughput_tok_s": {
+                "mean": 14268.22246,
+                "std": 0.0,
+                "min": 14268.22246,
+                "max": 14268.22246
+              },
+              "mean_ttft_ms": {
+                "mean": 7150.99575,
+                "std": 0.0,
+                "min": 7150.99575,
+                "max": 7150.99575
+              },
+              "median_ttft_ms": {
+                "mean": 4283.125,
+                "std": 0.0,
+                "min": 4283.125,
+                "max": 4283.125
+              },
+              "p99_ttft_ms": {
+                "mean": 16069.087,
+                "std": 0.0,
+                "min": 16069.087,
+                "max": 16069.087
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 19099.2045,
+                "std": 0.0,
+                "min": 19099.2045,
+                "max": 19099.2045
+              },
+              "median_submit_ttft_ms": {
+                "mean": 16208.761,
+                "std": 0.0,
+                "min": 16208.761,
+                "max": 16208.761
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 34043.846,
+                "std": 0.0,
+                "min": 34043.846,
+                "max": 34043.846
+              },
+              "mean_tpot_ms": {
+                "mean": 86.85125,
+                "std": 0.0,
+                "min": 86.85125,
+                "max": 86.85125
+              },
+              "p99_tpot_ms": {
+                "mean": 109.431,
+                "std": 0.0,
+                "min": 109.431,
+                "max": 109.431
+              },
+              "p99_itl_ms": {
+                "mean": 263.372,
+                "std": 0.0,
+                "min": 263.372,
+                "max": 263.372
+              }
+            }
+          ]
+        },
+        {
+          "round": 1,
+          "baseline": [
+            {
+              "label": "ctx8k_c16",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 222.879807,
+                "std": 0.0,
+                "min": 222.879807,
+                "max": 222.879807
+              },
+              "total_throughput_tok_s": {
+                "mean": 14487.187461,
+                "std": 0.0,
+                "min": 14487.187461,
+                "max": 14487.187461
+              },
+              "mean_ttft_ms": {
+                "mean": 2889.327469,
+                "std": 0.0,
+                "min": 2889.327469,
+                "max": 2889.327469
+              },
+              "median_ttft_ms": {
+                "mean": 1439.13,
+                "std": 0.0,
+                "min": 1439.13,
+                "max": 1439.13
+              },
+              "p99_ttft_ms": {
+                "mean": 7781.075,
+                "std": 0.0,
+                "min": 7781.075,
+                "max": 7781.075
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 9052.901313,
+                "std": 0.0,
+                "min": 9052.901313,
+                "max": 9052.901313
+              },
+              "median_submit_ttft_ms": {
+                "mean": 7911.431,
+                "std": 0.0,
+                "min": 7911.431,
+                "max": 7911.431
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 16708.574,
+                "std": 0.0,
+                "min": 16708.574,
+                "max": 16708.574
+              },
+              "mean_tpot_ms": {
+                "mean": 49.084031,
+                "std": 0.0,
+                "min": 49.084031,
+                "max": 49.084031
+              },
+              "p99_tpot_ms": {
+                "mean": 63.274,
+                "std": 0.0,
+                "min": 63.274,
+                "max": 63.274
+              },
+              "p99_itl_ms": {
+                "mean": 248.769,
+                "std": 0.0,
+                "min": 248.769,
+                "max": 248.769
+              }
+            },
+            {
+              "label": "ctx16k_c12",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 100.052176,
+                "std": 0.0,
+                "min": 100.052176,
+                "max": 100.052176
+              },
+              "total_throughput_tok_s": {
+                "mean": 12906.73066,
+                "std": 0.0,
+                "min": 12906.73066,
+                "max": 12906.73066
+              },
+              "mean_ttft_ms": {
+                "mean": 5514.046875,
+                "std": 0.0,
+                "min": 5514.046875,
+                "max": 5514.046875
+              },
+              "median_ttft_ms": {
+                "mean": 2446.633,
+                "std": 0.0,
+                "min": 2446.633,
+                "max": 2446.633
+              },
+              "p99_ttft_ms": {
+                "mean": 14010.884,
+                "std": 0.0,
+                "min": 14010.884,
+                "max": 14010.884
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 15936.236125,
+                "std": 0.0,
+                "min": 15936.236125,
+                "max": 15936.236125
+              },
+              "median_submit_ttft_ms": {
+                "mean": 14145.961,
+                "std": 0.0,
+                "min": 14145.961,
+                "max": 14145.961
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 27729.639,
+                "std": 0.0,
+                "min": 27729.639,
+                "max": 27729.639
+              },
+              "mean_tpot_ms": {
+                "mean": 75.608292,
+                "std": 0.0,
+                "min": 75.608292,
+                "max": 75.608292
+              },
+              "p99_tpot_ms": {
+                "mean": 109.863,
+                "std": 0.0,
+                "min": 109.863,
+                "max": 109.863
+              },
+              "p99_itl_ms": {
+                "mean": 253.246,
+                "std": 0.0,
+                "min": 253.246,
+                "max": 253.246
+              }
+            },
+            {
+              "label": "ctx32k_c4",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 48.104275,
+                "std": 0.0,
+                "min": 48.104275,
+                "max": 48.104275
+              },
+              "total_throughput_tok_s": {
+                "mean": 12362.798681,
+                "std": 0.0,
+                "min": 12362.798681,
+                "max": 12362.798681
+              },
+              "mean_ttft_ms": {
+                "mean": 5070.681125,
+                "std": 0.0,
+                "min": 5070.681125,
+                "max": 5070.681125
+              },
+              "median_ttft_ms": {
+                "mean": 4038.79,
+                "std": 0.0,
+                "min": 4038.79,
+                "max": 4038.79
+              },
+              "p99_ttft_ms": {
+                "mean": 8039.782,
+                "std": 0.0,
+                "min": 8039.782,
+                "max": 8039.782
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 11309.810625,
+                "std": 0.0,
+                "min": 11309.810625,
+                "max": 11309.810625
+              },
+              "median_submit_ttft_ms": {
+                "mean": 8168.315,
+                "std": 0.0,
+                "min": 8168.315,
+                "max": 8168.315
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 18432.616,
+                "std": 0.0,
+                "min": 18432.616,
+                "max": 18432.616
+              },
+              "mean_tpot_ms": {
+                "mean": 43.126,
+                "std": 0.0,
+                "min": 43.126,
+                "max": 43.126
+              },
+              "p99_tpot_ms": {
+                "mean": 51.091,
+                "std": 0.0,
+                "min": 51.091,
+                "max": 51.091
+              },
+              "p99_itl_ms": {
+                "mean": 261.724,
+                "std": 0.0,
+                "min": 261.724,
+                "max": 261.724
+              }
+            },
+            {
+              "label": "ctx32k_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 55.143771,
+                "std": 0.0,
+                "min": 55.143771,
+                "max": 55.143771
+              },
+              "total_throughput_tok_s": {
+                "mean": 14171.949241,
+                "std": 0.0,
+                "min": 14171.949241,
+                "max": 14171.949241
+              },
+              "mean_ttft_ms": {
+                "mean": 7235.1845,
+                "std": 0.0,
+                "min": 7235.1845,
+                "max": 7235.1845
+              },
+              "median_ttft_ms": {
+                "mean": 4287.283,
+                "std": 0.0,
+                "min": 4287.283,
+                "max": 4287.283
+              },
+              "p99_ttft_ms": {
+                "mean": 16240.368,
+                "std": 0.0,
+                "min": 16240.368,
+                "max": 16240.368
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 19282.823938,
+                "std": 0.0,
+                "min": 19282.823938,
+                "max": 19282.823938
+              },
+              "median_submit_ttft_ms": {
+                "mean": 16379.591,
+                "std": 0.0,
+                "min": 16379.591,
+                "max": 16379.591
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 34254.924,
+                "std": 0.0,
+                "min": 34254.924,
+                "max": 34254.924
+              },
+              "mean_tpot_ms": {
+                "mean": 87.145625,
+                "std": 0.0,
+                "min": 87.145625,
+                "max": 87.145625
+              },
+              "p99_tpot_ms": {
+                "mean": 109.722,
+                "std": 0.0,
+                "min": 109.722,
+                "max": 109.722
+              },
+              "p99_itl_ms": {
+                "mean": 264.323,
+                "std": 0.0,
+                "min": 264.323,
+                "max": 264.323
+              }
+            }
+          ],
+          "candidate": [
+            {
+              "label": "ctx8k_c16",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 224.17611,
+                "std": 0.0,
+                "min": 224.17611,
+                "max": 224.17611
+              },
+              "total_throughput_tok_s": {
+                "mean": 14571.447156,
+                "std": 0.0,
+                "min": 14571.447156,
+                "max": 14571.447156
+              },
+              "mean_ttft_ms": {
+                "mean": 2869.069562,
+                "std": 0.0,
+                "min": 2869.069562,
+                "max": 2869.069562
+              },
+              "median_ttft_ms": {
+                "mean": 1439.119,
+                "std": 0.0,
+                "min": 1439.119,
+                "max": 1439.119
+              },
+              "p99_ttft_ms": {
+                "mean": 7735.389,
+                "std": 0.0,
+                "min": 7735.389,
+                "max": 7735.389
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 8997.284438,
+                "std": 0.0,
+                "min": 8997.284438,
+                "max": 8997.284438
+              },
+              "median_submit_ttft_ms": {
+                "mean": 7865.705,
+                "std": 0.0,
+                "min": 7865.705,
+                "max": 7865.705
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 16638.671,
+                "std": 0.0,
+                "min": 16638.671,
+                "max": 16638.671
+              },
+              "mean_tpot_ms": {
+                "mean": 48.83525,
+                "std": 0.0,
+                "min": 48.83525,
+                "max": 48.83525
+              },
+              "p99_tpot_ms": {
+                "mean": 62.999,
+                "std": 0.0,
+                "min": 62.999,
+                "max": 62.999
+              },
+              "p99_itl_ms": {
+                "mean": 248.175,
+                "std": 0.0,
+                "min": 248.175,
+                "max": 248.175
+              }
+            },
+            {
+              "label": "ctx16k_c12",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 100.479122,
+                "std": 0.0,
+                "min": 100.479122,
+                "max": 100.479122
+              },
+              "total_throughput_tok_s": {
+                "mean": 12961.806792,
+                "std": 0.0,
+                "min": 12961.806792,
+                "max": 12961.806792
+              },
+              "mean_ttft_ms": {
+                "mean": 5472.045333,
+                "std": 0.0,
+                "min": 5472.045333,
+                "max": 5472.045333
+              },
+              "median_ttft_ms": {
+                "mean": 2449.982,
+                "std": 0.0,
+                "min": 2449.982,
+                "max": 2449.982
+              },
+              "p99_ttft_ms": {
+                "mean": 13921.377,
+                "std": 0.0,
+                "min": 13921.377,
+                "max": 13921.377
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 15843.486125,
+                "std": 0.0,
+                "min": 15843.486125,
+                "max": 15843.486125
+              },
+              "median_submit_ttft_ms": {
+                "mean": 14057.806,
+                "std": 0.0,
+                "min": 14057.806,
+                "max": 14057.806
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 27629.443,
+                "std": 0.0,
+                "min": 27629.443,
+                "max": 27629.443
+              },
+              "mean_tpot_ms": {
+                "mean": 75.444958,
+                "std": 0.0,
+                "min": 75.444958,
+                "max": 75.444958
+              },
+              "p99_tpot_ms": {
+                "mean": 109.63,
+                "std": 0.0,
+                "min": 109.63,
+                "max": 109.63
+              },
+              "p99_itl_ms": {
+                "mean": 253.683,
+                "std": 0.0,
+                "min": 253.683,
+                "max": 253.683
+              }
+            },
+            {
+              "label": "ctx32k_c4",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 48.537364,
+                "std": 0.0,
+                "min": 48.537364,
+                "max": 48.537364
+              },
+              "total_throughput_tok_s": {
+                "mean": 12474.10251,
+                "std": 0.0,
+                "min": 12474.10251,
+                "max": 12474.10251
+              },
+              "mean_ttft_ms": {
+                "mean": 4993.365625,
+                "std": 0.0,
+                "min": 4993.365625,
+                "max": 4993.365625
+              },
+              "median_ttft_ms": {
+                "mean": 4007.199,
+                "std": 0.0,
+                "min": 4007.199,
+                "max": 4007.199
+              },
+              "p99_ttft_ms": {
+                "mean": 7888.344,
+                "std": 0.0,
+                "min": 7888.344,
+                "max": 7888.344
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 11150.632375,
+                "std": 0.0,
+                "min": 11150.632375,
+                "max": 11150.632375
+              },
+              "median_submit_ttft_ms": {
+                "mean": 8017.103,
+                "std": 0.0,
+                "min": 8017.103,
+                "max": 8017.103
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 18261.343,
+                "std": 0.0,
+                "min": 18261.343,
+                "max": 18261.343
+              },
+              "mean_tpot_ms": {
+                "mean": 43.0045,
+                "std": 0.0,
+                "min": 43.0045,
+                "max": 43.0045
+              },
+              "p99_tpot_ms": {
+                "mean": 50.975,
+                "std": 0.0,
+                "min": 50.975,
+                "max": 50.975
+              },
+              "p99_itl_ms": {
+                "mean": 261.211,
+                "std": 0.0,
+                "min": 261.211,
+                "max": 261.211
+              }
+            },
+            {
+              "label": "ctx32k_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 55.473351,
+                "std": 0.0,
+                "min": 55.473351,
+                "max": 55.473351
+              },
+              "total_throughput_tok_s": {
+                "mean": 14256.651295,
+                "std": 0.0,
+                "min": 14256.651295,
+                "max": 14256.651295
+              },
+              "mean_ttft_ms": {
+                "mean": 7153.9475,
+                "std": 0.0,
+                "min": 7153.9475,
+                "max": 7153.9475
+              },
+              "median_ttft_ms": {
+                "mean": 4283.882,
+                "std": 0.0,
+                "min": 4283.882,
+                "max": 4283.882
+              },
+              "p99_ttft_ms": {
+                "mean": 16075.965,
+                "std": 0.0,
+                "min": 16075.965,
+                "max": 16075.965
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 19108.990813,
+                "std": 0.0,
+                "min": 19108.990813,
+                "max": 19108.990813
+              },
+              "median_submit_ttft_ms": {
+                "mean": 16215.525,
+                "std": 0.0,
+                "min": 16215.525,
+                "max": 16215.525
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 34062.627,
+                "std": 0.0,
+                "min": 34062.627,
+                "max": 34062.627
+              },
+              "mean_tpot_ms": {
+                "mean": 86.944187,
+                "std": 0.0,
+                "min": 86.944187,
+                "max": 86.944187
+              },
+              "p99_tpot_ms": {
+                "mean": 109.497,
+                "std": 0.0,
+                "min": 109.497,
+                "max": 109.497
+              },
+              "p99_itl_ms": {
+                "mean": 263.792,
+                "std": 0.0,
+                "min": 263.792,
+                "max": 263.792
+              }
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "baseline": [
+            {
+              "label": "ctx8k_c16",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 223.10958,
+                "std": 0.0,
+                "min": 223.10958,
+                "max": 223.10958
+              },
+              "total_throughput_tok_s": {
+                "mean": 14502.122672,
+                "std": 0.0,
+                "min": 14502.122672,
+                "max": 14502.122672
+              },
+              "mean_ttft_ms": {
+                "mean": 2890.009312,
+                "std": 0.0,
+                "min": 2890.009312,
+                "max": 2890.009312
+              },
+              "median_ttft_ms": {
+                "mean": 1439.62,
+                "std": 0.0,
+                "min": 1439.62,
+                "max": 1439.62
+              },
+              "p99_ttft_ms": {
+                "mean": 7784.075,
+                "std": 0.0,
+                "min": 7784.075,
+                "max": 7784.075
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 9047.095812,
+                "std": 0.0,
+                "min": 9047.095812,
+                "max": 9047.095812
+              },
+              "median_submit_ttft_ms": {
+                "mean": 7914.461,
+                "std": 0.0,
+                "min": 7914.461,
+                "max": 7914.461
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 16698.15,
+                "std": 0.0,
+                "min": 16698.15,
+                "max": 16698.15
+              },
+              "mean_tpot_ms": {
+                "mean": 49.004438,
+                "std": 0.0,
+                "min": 49.004438,
+                "max": 49.004438
+              },
+              "p99_tpot_ms": {
+                "mean": 63.16,
+                "std": 0.0,
+                "min": 63.16,
+                "max": 63.16
+              },
+              "p99_itl_ms": {
+                "mean": 249.487,
+                "std": 0.0,
+                "min": 249.487,
+                "max": 249.487
+              }
+            },
+            {
+              "label": "ctx16k_c12",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 100.006672,
+                "std": 0.0,
+                "min": 100.006672,
+                "max": 100.006672
+              },
+              "total_throughput_tok_s": {
+                "mean": 12900.860694,
+                "std": 0.0,
+                "min": 12900.860694,
+                "max": 12900.860694
+              },
+              "mean_ttft_ms": {
+                "mean": 5515.267208,
+                "std": 0.0,
+                "min": 5515.267208,
+                "max": 5515.267208
+              },
+              "median_ttft_ms": {
+                "mean": 2450.073,
+                "std": 0.0,
+                "min": 2450.073,
+                "max": 2450.073
+              },
+              "p99_ttft_ms": {
+                "mean": 14012.45,
+                "std": 0.0,
+                "min": 14012.45,
+                "max": 14012.45
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 15941.032333,
+                "std": 0.0,
+                "min": 15941.032333,
+                "max": 15941.032333
+              },
+              "median_submit_ttft_ms": {
+                "mean": 14147.742,
+                "std": 0.0,
+                "min": 14147.742,
+                "max": 14147.742
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 27738.127,
+                "std": 0.0,
+                "min": 27738.127,
+                "max": 27738.127
+              },
+              "mean_tpot_ms": {
+                "mean": 75.651083,
+                "std": 0.0,
+                "min": 75.651083,
+                "max": 75.651083
+              },
+              "p99_tpot_ms": {
+                "mean": 109.893,
+                "std": 0.0,
+                "min": 109.893,
+                "max": 109.893
+              },
+              "p99_itl_ms": {
+                "mean": 253.607,
+                "std": 0.0,
+                "min": 253.607,
+                "max": 253.607
+              }
+            },
+            {
+              "label": "ctx32k_c4",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 48.067817,
+                "std": 0.0,
+                "min": 48.067817,
+                "max": 48.067817
+              },
+              "total_throughput_tok_s": {
+                "mean": 12353.429093,
+                "std": 0.0,
+                "min": 12353.429093,
+                "max": 12353.429093
+              },
+              "mean_ttft_ms": {
+                "mean": 5071.4535,
+                "std": 0.0,
+                "min": 5071.4535,
+                "max": 5071.4535
+              },
+              "median_ttft_ms": {
+                "mean": 4038.157,
+                "std": 0.0,
+                "min": 4038.157,
+                "max": 4038.157
+              },
+              "p99_ttft_ms": {
+                "mean": 8040.162,
+                "std": 0.0,
+                "min": 8040.162,
+                "max": 8040.162
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 11319.033875,
+                "std": 0.0,
+                "min": 11319.033875,
+                "max": 11319.033875
+              },
+              "median_submit_ttft_ms": {
+                "mean": 8168.532,
+                "std": 0.0,
+                "min": 8168.532,
+                "max": 8168.532
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 18451.068,
+                "std": 0.0,
+                "min": 18451.068,
+                "max": 18451.068
+              },
+              "mean_tpot_ms": {
+                "mean": 43.191,
+                "std": 0.0,
+                "min": 43.191,
+                "max": 43.191
+              },
+              "p99_tpot_ms": {
+                "mean": 51.135,
+                "std": 0.0,
+                "min": 51.135,
+                "max": 51.135
+              },
+              "p99_itl_ms": {
+                "mean": 261.018,
+                "std": 0.0,
+                "min": 261.018,
+                "max": 261.018
+              }
+            },
+            {
+              "label": "ctx32k_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 55.138406,
+                "std": 0.0,
+                "min": 55.138406,
+                "max": 55.138406
+              },
+              "total_throughput_tok_s": {
+                "mean": 14170.570341,
+                "std": 0.0,
+                "min": 14170.570341,
+                "max": 14170.570341
+              },
+              "mean_ttft_ms": {
+                "mean": 7234.6975,
+                "std": 0.0,
+                "min": 7234.6975,
+                "max": 7234.6975
+              },
+              "median_ttft_ms": {
+                "mean": 4285.696,
+                "std": 0.0,
+                "min": 4285.696,
+                "max": 4285.696
+              },
+              "p99_ttft_ms": {
+                "mean": 16240.827,
+                "std": 0.0,
+                "min": 16240.827,
+                "max": 16240.827
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 19284.470937,
+                "std": 0.0,
+                "min": 19284.470937,
+                "max": 19284.470937
+              },
+              "median_submit_ttft_ms": {
+                "mean": 16380.03,
+                "std": 0.0,
+                "min": 16380.03,
+                "max": 16380.03
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 34260.807,
+                "std": 0.0,
+                "min": 34260.807,
+                "max": 34260.807
+              },
+              "mean_tpot_ms": {
+                "mean": 87.163062,
+                "std": 0.0,
+                "min": 87.163062,
+                "max": 87.163062
+              },
+              "p99_tpot_ms": {
+                "mean": 109.764,
+                "std": 0.0,
+                "min": 109.764,
+                "max": 109.764
+              },
+              "p99_itl_ms": {
+                "mean": 264.007,
+                "std": 0.0,
+                "min": 264.007,
+                "max": 264.007
+              }
+            }
+          ],
+          "candidate": [
+            {
+              "label": "ctx8k_c16",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 223.643354,
+                "std": 0.0,
+                "min": 223.643354,
+                "max": 223.643354
+              },
+              "total_throughput_tok_s": {
+                "mean": 14536.81804,
+                "std": 0.0,
+                "min": 14536.81804,
+                "max": 14536.81804
+              },
+              "mean_ttft_ms": {
+                "mean": 2867.585281,
+                "std": 0.0,
+                "min": 2867.585281,
+                "max": 2867.585281
+              },
+              "median_ttft_ms": {
+                "mean": 1437.706,
+                "std": 0.0,
+                "min": 1437.706,
+                "max": 1437.706
+              },
+              "p99_ttft_ms": {
+                "mean": 7732.841,
+                "std": 0.0,
+                "min": 7732.841,
+                "max": 7732.841
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 9001.785344,
+                "std": 0.0,
+                "min": 9001.785344,
+                "max": 9001.785344
+              },
+              "median_submit_ttft_ms": {
+                "mean": 7863.454,
+                "std": 0.0,
+                "min": 7863.454,
+                "max": 7863.454
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 16647.529,
+                "std": 0.0,
+                "min": 16647.529,
+                "max": 16647.529
+              },
+              "mean_tpot_ms": {
+                "mean": 49.009031,
+                "std": 0.0,
+                "min": 49.009031,
+                "max": 49.009031
+              },
+              "p99_tpot_ms": {
+                "mean": 63.106,
+                "std": 0.0,
+                "min": 63.106,
+                "max": 63.106
+              },
+              "p99_itl_ms": {
+                "mean": 247.951,
+                "std": 0.0,
+                "min": 247.951,
+                "max": 247.951
+              }
+            },
+            {
+              "label": "ctx16k_c12",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 100.394003,
+                "std": 0.0,
+                "min": 100.394003,
+                "max": 100.394003
+              },
+              "total_throughput_tok_s": {
+                "mean": 12950.826426,
+                "std": 0.0,
+                "min": 12950.826426,
+                "max": 12950.826426
+              },
+              "mean_ttft_ms": {
+                "mean": 5473.456542,
+                "std": 0.0,
+                "min": 5473.456542,
+                "max": 5473.456542
+              },
+              "median_ttft_ms": {
+                "mean": 2446.98,
+                "std": 0.0,
+                "min": 2446.98,
+                "max": 2446.98
+              },
+              "p99_ttft_ms": {
+                "mean": 13926.746,
+                "std": 0.0,
+                "min": 13926.746,
+                "max": 13926.746
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 15852.117417,
+                "std": 0.0,
+                "min": 15852.117417,
+                "max": 15852.117417
+              },
+              "median_submit_ttft_ms": {
+                "mean": 14062.097,
+                "std": 0.0,
+                "min": 14062.097,
+                "max": 14062.097
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 27637.368,
+                "std": 0.0,
+                "min": 27637.368,
+                "max": 27637.368
+              },
+              "mean_tpot_ms": {
+                "mean": 75.527375,
+                "std": 0.0,
+                "min": 75.527375,
+                "max": 75.527375
+              },
+              "p99_tpot_ms": {
+                "mean": 109.789,
+                "std": 0.0,
+                "min": 109.789,
+                "max": 109.789
+              },
+              "p99_itl_ms": {
+                "mean": 253.132,
+                "std": 0.0,
+                "min": 253.132,
+                "max": 253.132
+              }
+            },
+            {
+              "label": "ctx32k_c4",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 48.477952,
+                "std": 0.0,
+                "min": 48.477952,
+                "max": 48.477952
+              },
+              "total_throughput_tok_s": {
+                "mean": 12458.833551,
+                "std": 0.0,
+                "min": 12458.833551,
+                "max": 12458.833551
+              },
+              "mean_ttft_ms": {
+                "mean": 4987.59525,
+                "std": 0.0,
+                "min": 4987.59525,
+                "max": 4987.59525
+              },
+              "median_ttft_ms": {
+                "mean": 4008.98,
+                "std": 0.0,
+                "min": 4008.98,
+                "max": 4008.98
+              },
+              "p99_ttft_ms": {
+                "mean": 7876.089,
+                "std": 0.0,
+                "min": 7876.089,
+                "max": 7876.089
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 11148.864875,
+                "std": 0.0,
+                "min": 11148.864875,
+                "max": 11148.864875
+              },
+              "median_submit_ttft_ms": {
+                "mean": 8005.095,
+                "std": 0.0,
+                "min": 8005.095,
+                "max": 8005.095
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 18270.713,
+                "std": 0.0,
+                "min": 18270.713,
+                "max": 18270.713
+              },
+              "mean_tpot_ms": {
+                "mean": 43.143125,
+                "std": 0.0,
+                "min": 43.143125,
+                "max": 43.143125
+              },
+              "p99_tpot_ms": {
+                "mean": 51.117,
+                "std": 0.0,
+                "min": 51.117,
+                "max": 51.117
+              },
+              "p99_itl_ms": {
+                "mean": 261.509,
+                "std": 0.0,
+                "min": 261.509,
+                "max": 261.509
+              }
+            },
+            {
+              "label": "ctx32k_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 55.438071,
+                "std": 0.0,
+                "min": 55.438071,
+                "max": 55.438071
+              },
+              "total_throughput_tok_s": {
+                "mean": 14247.584324,
+                "std": 0.0,
+                "min": 14247.584324,
+                "max": 14247.584324
+              },
+              "mean_ttft_ms": {
+                "mean": 7150.5315,
+                "std": 0.0,
+                "min": 7150.5315,
+                "max": 7150.5315
+              },
+              "median_ttft_ms": {
+                "mean": 4281.6,
+                "std": 0.0,
+                "min": 4281.6,
+                "max": 4281.6
+              },
+              "p99_ttft_ms": {
+                "mean": 16068.057,
+                "std": 0.0,
+                "min": 16068.057,
+                "max": 16068.057
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 19109.238187,
+                "std": 0.0,
+                "min": 19109.238187,
+                "max": 19109.238187
+              },
+              "median_submit_ttft_ms": {
+                "mean": 16207.505,
+                "std": 0.0,
+                "min": 16207.505,
+                "max": 16207.505
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 34065.708,
+                "std": 0.0,
+                "min": 34065.708,
+                "max": 34065.708
+              },
+              "mean_tpot_ms": {
+                "mean": 87.047375,
+                "std": 0.0,
+                "min": 87.047375,
+                "max": 87.047375
+              },
+              "p99_tpot_ms": {
+                "mean": 109.602,
+                "std": 0.0,
+                "min": 109.602,
+                "max": 109.602
+              },
+              "p99_itl_ms": {
+                "mean": 263.629,
+                "std": 0.0,
+                "min": 263.629,
+                "max": 263.629
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "g0010-8c4c252e": {
+      "hot-prescreen": {
+        "passed": true,
+        "geomean_speedup": 1.0583,
+        "summary": "tbo_2stream:1.058x(1710.1->1616.0us)"
+      },
+      "hot-prescreen-decision": {
+        "passed": true,
+        "gain": 0.05830000000000002,
+        "metric_delta": "hot_prescreen[tbo_2stream:1.058x(1710.1->1616.0us)]",
+        "reasons": []
+      },
+      "screen-decision": {
+        "passed": true,
+        "gain": 0.016792118696121294,
+        "metric_delta": "screen[ctx16k_c8:+0.70% (50.7 tok/s), ctx8k_c2:+2.67% (98.7 tok/s)]",
+        "reasons": []
+      },
+      "screen-parity": {
+        "git_sha": "unknown",
+        "vllm_version": "0.31.0",
+        "max_prefill_chunk": 24,
+        "all_matched": false,
+        "batched_vs_single_exact_match": false,
+        "chunked_vs_unchunked_exact_match": false,
+        "chunked_schedule": {
+          "prefill_steps": 4,
+          "decode_steps": 127,
+          "chunked_prefill_steps": 4,
+          "decode_steps_with_partial_prefill": 3,
+          "max_active_sequences": 5
+        },
+        "unchunked_schedule": {
+          "prefill_steps": 1,
+          "decode_steps": 127,
+          "chunked_prefill_steps": 0,
+          "decode_steps_with_partial_prefill": 0,
+          "max_active_sequences": 5
+        },
+        "triton_recompilations": 0,
+        "watched_kernels": 5
+      },
+      "decision": {
+        "accepted": false,
+        "geomean_gain": 0.003272237154556823,
+        "net_gate_ratio": 1.0033,
+        "paired_lcb_2se": 0.002572294872894942,
+        "metric_delta": "geomean=+0.33% (net_gate=1.0033, lcb_2se=+0.26%) [ctx16k_c12:+0.16%(TPOT 75.65 vs 75.52ms), ctx32k_c4:+0.48%(TPOT 43.22 vs 43.02ms), ctx32k_c8:+0.33%(TPOT 87.11 vs 87.02ms), ctx8k_c16:+0.35%(TPOT 49.03 vs 49.12ms)]",
+        "reasons": [
+          "geomean throughput gain 0.33% below required minimum"
+        ]
+      },
+      "verify-parity": {
+        "git_sha": "unknown",
+        "vllm_version": "0.31.0",
+        "max_prefill_chunk": 24,
+        "all_matched": false,
+        "batched_vs_single_exact_match": false,
+        "chunked_vs_unchunked_exact_match": false,
+        "chunked_schedule": {
+          "prefill_steps": 4,
+          "decode_steps": 127,
+          "chunked_prefill_steps": 4,
+          "decode_steps_with_partial_prefill": 3,
+          "max_active_sequences": 5
+        },
+        "unchunked_schedule": {
+          "prefill_steps": 1,
+          "decode_steps": 127,
+          "chunked_prefill_steps": 0,
+          "decode_steps_with_partial_prefill": 0,
+          "max_active_sequences": 5
+        },
+        "triton_recompilations": 0,
+        "watched_kernels": 5
+      },
+      "trace-conformance": {
+        "passed": true,
+        "gate_verdict": "CONFORMANT",
+        "parity_sha256": "767ae79160a895985c84d6e2d90f977bd837bf4caf264d0b981cefc6bf4d5c30",
+        "metrics_sha256": "64251e50a60f45c8f1e9e0beda021bb9fa1b3444ea6cd14c5e0c77715dbe2882",
+        "clauses": [
+          {
+            "clause_id": "TRACE_JIT_ZERO_RECOMPILATIONS",
+            "pillar": "Determinism",
+            "verdict": "CONFORMANT",
+            "passed": true,
+            "detail": "triton_recompilations=0",
+            "witness": null
+          },
+          {
+            "clause_id": "TRACE_SCHEDULE_EXPOSURE",
+            "pillar": "Exposure",
+            "verdict": "CONFORMANT",
+            "passed": true,
+            "detail": "chunked_prefill_steps=4, decode_steps_with_partial_prefill=3",
+            "witness": null
+          },
+          {
+            "clause_id": "TRACE_BATCH_COMPOSITION_INVARIANCE",
+            "pillar": "Invariance",
+            "verdict": "CONFORMANT",
+            "passed": true,
+            "detail": "prime_squares_table 100% invariant across 3 modes; max_logit_drift=2.250 <= 8.00",
+            "witness": null
+          },
+          {
+            "clause_id": "TRACE_KV_AND_STEP_CONSERVATION",
+            "pillar": "Conservation",
+            "verdict": "CONFORMANT",
+            "passed": true,
+            "detail": "Checked 12 tier trace rows for KV zero-leakage & step bounds",
+            "witness": null
+          },
+          {
+            "clause_id": "TRACE_CUDA_GRAPH_REQUIRED",
+            "pillar": "Determinism",
+            "verdict": "NOT_APPLICABLE",
+            "passed": true,
+            "detail": "CUDA Graph fallback counters not emitted by harness",
+            "witness": null
+          },
+          {
+            "clause_id": "TRACE_SEIS_ANTI_CHEAT_INVARIANTS",
+            "pillar": "AntiCheat",
+            "verdict": "NOT_APPLICABLE",
+            "passed": true,
+            "detail": "Optional `seis_invariants` telemetry not present",
+            "witness": null
+          }
+        ],
+        "violations": []
+      },
+      "screen_tier_aggregates": [
+        {
+          "label": "ctx8k_c2",
+          "repeats": 1,
+          "output_throughput_tok_s": {
+            "mean": 98.721011,
+            "std": 0.0,
+            "min": 98.721011,
+            "max": 98.721011
+          },
+          "total_throughput_tok_s": {
+            "mean": 12735.010359,
+            "std": 0.0,
+            "min": 12735.010359,
+            "max": 12735.010359
+          },
+          "mean_ttft_ms": {
+            "mean": 935.7465,
+            "std": 0.0,
+            "min": 935.7465,
+            "max": 935.7465
+          },
+          "median_ttft_ms": {
+            "mean": 934.537,
+            "std": 0.0,
+            "min": 934.537,
+            "max": 934.537
+          },
+          "p99_ttft_ms": {
+            "mean": 936.956,
+            "std": 0.0,
+            "min": 936.956,
+            "max": 936.956
+          },
+          "mean_submit_ttft_ms": {
+            "mean": 1584.2245,
+            "std": 0.0,
+            "min": 1584.2245,
+            "max": 1584.2245
+          },
+          "median_submit_ttft_ms": {
+            "mean": 936.956,
+            "std": 0.0,
+            "min": 936.956,
+            "max": 936.956
+          },
+          "p99_submit_ttft_ms": {
+            "mean": 2231.493,
+            "std": 0.0,
+            "min": 2231.493,
+            "max": 2231.493
+          },
+          "mean_tpot_ms": {
+            "mean": 5.727,
+            "std": 0.0,
+            "min": 5.727,
+            "max": 5.727
+          },
+          "p99_tpot_ms": {
+            "mean": 5.74,
+            "std": 0.0,
+            "min": 5.74,
+            "max": 5.74
+          },
+          "p99_itl_ms": {
+            "mean": 6.544,
+            "std": 0.0,
+            "min": 6.544,
+            "max": 6.544
+          }
+        },
+        {
+          "label": "ctx16k_c8",
+          "repeats": 1,
+          "output_throughput_tok_s": {
+            "mean": 50.704835,
+            "std": 0.0,
+            "min": 50.704835,
+            "max": 50.704835
+          },
+          "total_throughput_tok_s": {
+            "mean": 13031.142552,
+            "std": 0.0,
+            "min": 13031.142552,
+            "max": 13031.142552
+          },
+          "mean_ttft_ms": {
+            "mean": 4323.45625,
+            "std": 0.0,
+            "min": 4323.45625,
+            "max": 4323.45625
+          },
+          "median_ttft_ms": {
+            "mean": 2173.484,
+            "std": 0.0,
+            "min": 2173.484,
+            "max": 2173.484
+          },
+          "p99_ttft_ms": {
+            "mean": 9908.887,
+            "std": 0.0,
+            "min": 9908.887,
+            "max": 9908.887
+          },
+          "mean_submit_ttft_ms": {
+            "mean": 11205.144937,
+            "std": 0.0,
+            "min": 11205.144937,
+            "max": 11205.144937
+          },
+          "median_submit_ttft_ms": {
+            "mean": 10034.574,
+            "std": 0.0,
+            "min": 10034.574,
+            "max": 10034.574
+          },
+          "p99_submit_ttft_ms": {
+            "mean": 18650.216,
+            "std": 0.0,
+            "min": 18650.216,
+            "max": 18650.216
+          },
+          "mean_tpot_ms": {
+            "mean": 89.393,
+            "std": 0.0,
+            "min": 89.393,
+            "max": 89.393
+          },
+          "p99_tpot_ms": {
+            "mean": 141.51,
+            "std": 0.0,
+            "min": 141.51,
+            "max": 141.51
+          },
+          "p99_itl_ms": {
+            "mean": 252.004,
+            "std": 0.0,
+            "min": 252.004,
+            "max": 252.004
+          }
+        }
+      ],
+      "verify_rounds": [
+        {
+          "round": 0,
+          "baseline": [
+            {
+              "label": "ctx8k_c16",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 222.748078,
+                "std": 0.0,
+                "min": 222.748078,
+                "max": 222.748078
+              },
+              "total_throughput_tok_s": {
+                "mean": 14478.625038,
+                "std": 0.0,
+                "min": 14478.625038,
+                "max": 14478.625038
+              },
+              "mean_ttft_ms": {
+                "mean": 2890.725375,
+                "std": 0.0,
+                "min": 2890.725375,
+                "max": 2890.725375
+              },
+              "median_ttft_ms": {
+                "mean": 1441.209,
+                "std": 0.0,
+                "min": 1441.209,
+                "max": 1441.209
+              },
+              "p99_ttft_ms": {
+                "mean": 7783.017,
+                "std": 0.0,
+                "min": 7783.017,
+                "max": 7783.017
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 9058.152219,
+                "std": 0.0,
+                "min": 9058.152219,
+                "max": 9058.152219
+              },
+              "median_submit_ttft_ms": {
+                "mean": 7914.233,
+                "std": 0.0,
+                "min": 7914.233,
+                "max": 7914.233
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 16720.511,
+                "std": 0.0,
+                "min": 16720.511,
+                "max": 16720.511
+              },
+              "mean_tpot_ms": {
+                "mean": 49.124781,
+                "std": 0.0,
+                "min": 49.124781,
+                "max": 49.124781
+              },
+              "p99_tpot_ms": {
+                "mean": 63.327,
+                "std": 0.0,
+                "min": 63.327,
+                "max": 63.327
+              },
+              "p99_itl_ms": {
+                "mean": 248.996,
+                "std": 0.0,
+                "min": 248.996,
+                "max": 248.996
+              }
+            },
+            {
+              "label": "ctx16k_c12",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 100.119131,
+                "std": 0.0,
+                "min": 100.119131,
+                "max": 100.119131
+              },
+              "total_throughput_tok_s": {
+                "mean": 12915.367853,
+                "std": 0.0,
+                "min": 12915.367853,
+                "max": 12915.367853
+              },
+              "mean_ttft_ms": {
+                "mean": 5516.878667,
+                "std": 0.0,
+                "min": 5516.878667,
+                "max": 5516.878667
+              },
+              "median_ttft_ms": {
+                "mean": 2448.804,
+                "std": 0.0,
+                "min": 2448.804,
+                "max": 2448.804
+              },
+              "p99_ttft_ms": {
+                "mean": 14015.498,
+                "std": 0.0,
+                "min": 14015.498,
+                "max": 14015.498
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 15938.319792,
+                "std": 0.0,
+                "min": 15938.319792,
+                "max": 15938.319792
+              },
+              "median_submit_ttft_ms": {
+                "mean": 14150.687,
+                "std": 0.0,
+                "min": 14150.687,
+                "max": 14150.687
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 27728.345,
+                "std": 0.0,
+                "min": 27728.345,
+                "max": 27728.345
+              },
+              "mean_tpot_ms": {
+                "mean": 75.522292,
+                "std": 0.0,
+                "min": 75.522292,
+                "max": 75.522292
+              },
+              "p99_tpot_ms": {
+                "mean": 109.838,
+                "std": 0.0,
+                "min": 109.838,
+                "max": 109.838
+              },
+              "p99_itl_ms": {
+                "mean": 253.245,
+                "std": 0.0,
+                "min": 253.245,
+                "max": 253.245
+              }
+            },
+            {
+              "label": "ctx32k_c4",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 48.161477,
+                "std": 0.0,
+                "min": 48.161477,
+                "max": 48.161477
+              },
+              "total_throughput_tok_s": {
+                "mean": 12377.499625,
+                "std": 0.0,
+                "min": 12377.499625,
+                "max": 12377.499625
+              },
+              "mean_ttft_ms": {
+                "mean": 5072.7205,
+                "std": 0.0,
+                "min": 5072.7205,
+                "max": 5072.7205
+              },
+              "median_ttft_ms": {
+                "mean": 4040.952,
+                "std": 0.0,
+                "min": 4040.952,
+                "max": 4040.952
+              },
+              "p99_ttft_ms": {
+                "mean": 8045.099,
+                "std": 0.0,
+                "min": 8045.099,
+                "max": 8045.099
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 11310.02575,
+                "std": 0.0,
+                "min": 11310.02575,
+                "max": 11310.02575
+              },
+              "median_submit_ttft_ms": {
+                "mean": 8173.512,
+                "std": 0.0,
+                "min": 8173.512,
+                "max": 8173.512
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 18429.508,
+                "std": 0.0,
+                "min": 18429.508,
+                "max": 18429.508
+              },
+              "mean_tpot_ms": {
+                "mean": 43.022,
+                "std": 0.0,
+                "min": 43.022,
+                "max": 43.022
+              },
+              "p99_tpot_ms": {
+                "mean": 51.0,
+                "std": 0.0,
+                "min": 51.0,
+                "max": 51.0
+              },
+              "p99_itl_ms": {
+                "mean": 261.479,
+                "std": 0.0,
+                "min": 261.479,
+                "max": 261.479
+              }
+            },
+            {
+              "label": "ctx32k_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 55.198817,
+                "std": 0.0,
+                "min": 55.198817,
+                "max": 55.198817
+              },
+              "total_throughput_tok_s": {
+                "mean": 14186.095934,
+                "std": 0.0,
+                "min": 14186.095934,
+                "max": 14186.095934
+              },
+              "mean_ttft_ms": {
+                "mean": 7234.28225,
+                "std": 0.0,
+                "min": 7234.28225,
+                "max": 7234.28225
+              },
+              "median_ttft_ms": {
+                "mean": 4286.433,
+                "std": 0.0,
+                "min": 4286.433,
+                "max": 4286.433
+              },
+              "p99_ttft_ms": {
+                "mean": 16239.499,
+                "std": 0.0,
+                "min": 16239.499,
+                "max": 16239.499
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 19276.591062,
+                "std": 0.0,
+                "min": 19276.591062,
+                "max": 19276.591062
+              },
+              "median_submit_ttft_ms": {
+                "mean": 16379.624,
+                "std": 0.0,
+                "min": 16379.624,
+                "max": 16379.624
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 34244.625,
+                "std": 0.0,
+                "min": 34244.625,
+                "max": 34244.625
+              },
+              "mean_tpot_ms": {
+                "mean": 87.024438,
+                "std": 0.0,
+                "min": 87.024438,
+                "max": 87.024438
+              },
+              "p99_tpot_ms": {
+                "mean": 109.662,
+                "std": 0.0,
+                "min": 109.662,
+                "max": 109.662
+              },
+              "p99_itl_ms": {
+                "mean": 263.936,
+                "std": 0.0,
+                "min": 263.936,
+                "max": 263.936
+              }
+            }
+          ],
+          "candidate": [
+            {
+              "label": "ctx8k_c16",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 223.317026,
+                "std": 0.0,
+                "min": 223.317026,
+                "max": 223.317026
+              },
+              "total_throughput_tok_s": {
+                "mean": 14515.606718,
+                "std": 0.0,
+                "min": 14515.606718,
+                "max": 14515.606718
+              },
+              "mean_ttft_ms": {
+                "mean": 2870.677875,
+                "std": 0.0,
+                "min": 2870.677875,
+                "max": 2870.677875
+              },
+              "median_ttft_ms": {
+                "mean": 1440.517,
+                "std": 0.0,
+                "min": 1440.517,
+                "max": 1440.517
+              },
+              "p99_ttft_ms": {
+                "mean": 7739.166,
+                "std": 0.0,
+                "min": 7739.166,
+                "max": 7739.166
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 9000.132344,
+                "std": 0.0,
+                "min": 9000.132344,
+                "max": 9000.132344
+              },
+              "median_submit_ttft_ms": {
+                "mean": 7869.452,
+                "std": 0.0,
+                "min": 7869.452,
+                "max": 7869.452
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 16643.386,
+                "std": 0.0,
+                "min": 16643.386,
+                "max": 16643.386
+              },
+              "mean_tpot_ms": {
+                "mean": 49.088094,
+                "std": 0.0,
+                "min": 49.088094,
+                "max": 49.088094
+              },
+              "p99_tpot_ms": {
+                "mean": 63.028,
+                "std": 0.0,
+                "min": 63.028,
+                "max": 63.028
+              },
+              "p99_itl_ms": {
+                "mean": 248.531,
+                "std": 0.0,
+                "min": 248.531,
+                "max": 248.531
+              }
+            },
+            {
+              "label": "ctx16k_c12",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 100.36268,
+                "std": 0.0,
+                "min": 100.36268,
+                "max": 100.36268
+              },
+              "total_throughput_tok_s": {
+                "mean": 12946.785714,
+                "std": 0.0,
+                "min": 12946.785714,
+                "max": 12946.785714
+              },
+              "mean_ttft_ms": {
+                "mean": 5472.132042,
+                "std": 0.0,
+                "min": 5472.132042,
+                "max": 5472.132042
+              },
+              "median_ttft_ms": {
+                "mean": 2447.785,
+                "std": 0.0,
+                "min": 2447.785,
+                "max": 2447.785
+              },
+              "p99_ttft_ms": {
+                "mean": 13922.816,
+                "std": 0.0,
+                "min": 13922.816,
+                "max": 13922.816
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 15846.678292,
+                "std": 0.0,
+                "min": 15846.678292,
+                "max": 15846.678292
+              },
+              "median_submit_ttft_ms": {
+                "mean": 14058.15,
+                "std": 0.0,
+                "min": 14058.15,
+                "max": 14058.15
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 27634.796,
+                "std": 0.0,
+                "min": 27634.796,
+                "max": 27634.796
+              },
+              "mean_tpot_ms": {
+                "mean": 75.560875,
+                "std": 0.0,
+                "min": 75.560875,
+                "max": 75.560875
+              },
+              "p99_tpot_ms": {
+                "mean": 109.659,
+                "std": 0.0,
+                "min": 109.659,
+                "max": 109.659
+              },
+              "p99_itl_ms": {
+                "mean": 253.973,
+                "std": 0.0,
+                "min": 253.973,
+                "max": 253.973
+              }
+            },
+            {
+              "label": "ctx32k_c4",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 48.386088,
+                "std": 0.0,
+                "min": 48.386088,
+                "max": 48.386088
+              },
+              "total_throughput_tok_s": {
+                "mean": 12435.22452,
+                "std": 0.0,
+                "min": 12435.22452,
+                "max": 12435.22452
+              },
+              "mean_ttft_ms": {
+                "mean": 4999.934625,
+                "std": 0.0,
+                "min": 4999.934625,
+                "max": 4999.934625
+              },
+              "median_ttft_ms": {
+                "mean": 4011.476,
+                "std": 0.0,
+                "min": 4011.476,
+                "max": 4011.476
+              },
+              "p99_ttft_ms": {
+                "mean": 7897.791,
+                "std": 0.0,
+                "min": 7897.791,
+                "max": 7897.791
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 11174.25525,
+                "std": 0.0,
+                "min": 11174.25525,
+                "max": 11174.25525
+              },
+              "median_submit_ttft_ms": {
+                "mean": 8026.57,
+                "std": 0.0,
+                "min": 8026.57,
+                "max": 8026.57
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 18302.533,
+                "std": 0.0,
+                "min": 18302.533,
+                "max": 18302.533
+              },
+              "mean_tpot_ms": {
+                "mean": 43.2015,
+                "std": 0.0,
+                "min": 43.2015,
+                "max": 43.2015
+              },
+              "p99_tpot_ms": {
+                "mean": 51.191,
+                "std": 0.0,
+                "min": 51.191,
+                "max": 51.191
+              },
+              "p99_itl_ms": {
+                "mean": 261.948,
+                "std": 0.0,
+                "min": 261.948,
+                "max": 261.948
+              }
+            },
+            {
+              "label": "ctx32k_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 55.3778,
+                "std": 0.0,
+                "min": 55.3778,
+                "max": 55.3778
+              },
+              "total_throughput_tok_s": {
+                "mean": 14232.094513,
+                "std": 0.0,
+                "min": 14232.094513,
+                "max": 14232.094513
+              },
+              "mean_ttft_ms": {
+                "mean": 7162.70475,
+                "std": 0.0,
+                "min": 7162.70475,
+                "max": 7162.70475
+              },
+              "median_ttft_ms": {
+                "mean": 4285.859,
+                "std": 0.0,
+                "min": 4285.859,
+                "max": 4285.859
+              },
+              "p99_ttft_ms": {
+                "mean": 16093.65,
+                "std": 0.0,
+                "min": 16093.65,
+                "max": 16093.65
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 19137.956063,
+                "std": 0.0,
+                "min": 19137.956063,
+                "max": 19137.956063
+              },
+              "median_submit_ttft_ms": {
+                "mean": 16233.386,
+                "std": 0.0,
+                "min": 16233.386,
+                "max": 16233.386
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 34111.032,
+                "std": 0.0,
+                "min": 34111.032,
+                "max": 34111.032
+              },
+              "mean_tpot_ms": {
+                "mean": 87.106,
+                "std": 0.0,
+                "min": 87.106,
+                "max": 87.106
+              },
+              "p99_tpot_ms": {
+                "mean": 109.708,
+                "std": 0.0,
+                "min": 109.708,
+                "max": 109.708
+              },
+              "p99_itl_ms": {
+                "mean": 263.893,
+                "std": 0.0,
+                "min": 263.893,
+                "max": 263.893
+              }
+            }
+          ]
+        },
+        {
+          "round": 1,
+          "baseline": [
+            {
+              "label": "ctx8k_c16",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 223.102865,
+                "std": 0.0,
+                "min": 223.102865,
+                "max": 223.102865
+              },
+              "total_throughput_tok_s": {
+                "mean": 14501.686194,
+                "std": 0.0,
+                "min": 14501.686194,
+                "max": 14501.686194
+              },
+              "mean_ttft_ms": {
+                "mean": 2888.444594,
+                "std": 0.0,
+                "min": 2888.444594,
+                "max": 2888.444594
+              },
+              "median_ttft_ms": {
+                "mean": 1439.384,
+                "std": 0.0,
+                "min": 1439.384,
+                "max": 1439.384
+              },
+              "p99_ttft_ms": {
+                "mean": 7778.359,
+                "std": 0.0,
+                "min": 7778.359,
+                "max": 7778.359
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 9034.134125,
+                "std": 0.0,
+                "min": 9034.134125,
+                "max": 9034.134125
+              },
+              "median_submit_ttft_ms": {
+                "mean": 7908.799,
+                "std": 0.0,
+                "min": 7908.799,
+                "max": 7908.799
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 16673.489,
+                "std": 0.0,
+                "min": 16673.489,
+                "max": 16673.489
+              },
+              "mean_tpot_ms": {
+                "mean": 49.02875,
+                "std": 0.0,
+                "min": 49.02875,
+                "max": 49.02875
+              },
+              "p99_tpot_ms": {
+                "mean": 63.023,
+                "std": 0.0,
+                "min": 63.023,
+                "max": 63.023
+              },
+              "p99_itl_ms": {
+                "mean": 248.524,
+                "std": 0.0,
+                "min": 248.524,
+                "max": 248.524
+              }
+            },
+            {
+              "label": "ctx16k_c12",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 100.172438,
+                "std": 0.0,
+                "min": 100.172438,
+                "max": 100.172438
+              },
+              "total_throughput_tok_s": {
+                "mean": 12922.24444,
+                "std": 0.0,
+                "min": 12922.24444,
+                "max": 12922.24444
+              },
+              "mean_ttft_ms": {
+                "mean": 5513.965667,
+                "std": 0.0,
+                "min": 5513.965667,
+                "max": 5513.965667
+              },
+              "median_ttft_ms": {
+                "mean": 2447.515,
+                "std": 0.0,
+                "min": 2447.515,
+                "max": 2447.515
+              },
+              "p99_ttft_ms": {
+                "mean": 14011.591,
+                "std": 0.0,
+                "min": 14011.591,
+                "max": 14011.591
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 15928.542,
+                "std": 0.0,
+                "min": 15928.542,
+                "max": 15928.542
+              },
+              "median_submit_ttft_ms": {
+                "mean": 14146.712,
+                "std": 0.0,
+                "min": 14146.712,
+                "max": 14146.712
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 27713.347,
+                "std": 0.0,
+                "min": 27713.347,
+                "max": 27713.347
+              },
+              "mean_tpot_ms": {
+                "mean": 75.481167,
+                "std": 0.0,
+                "min": 75.481167,
+                "max": 75.481167
+              },
+              "p99_tpot_ms": {
+                "mean": 109.746,
+                "std": 0.0,
+                "min": 109.746,
+                "max": 109.746
+              },
+              "p99_itl_ms": {
+                "mean": 254.177,
+                "std": 0.0,
+                "min": 254.177,
+                "max": 254.177
+              }
+            },
+            {
+              "label": "ctx32k_c4",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 48.197268,
+                "std": 0.0,
+                "min": 48.197268,
+                "max": 48.197268
+              },
+              "total_throughput_tok_s": {
+                "mean": 12386.697983,
+                "std": 0.0,
+                "min": 12386.697983,
+                "max": 12386.697983
+              },
+              "mean_ttft_ms": {
+                "mean": 5070.555625,
+                "std": 0.0,
+                "min": 5070.555625,
+                "max": 5070.555625
+              },
+              "median_ttft_ms": {
+                "mean": 4040.109,
+                "std": 0.0,
+                "min": 4040.109,
+                "max": 4040.109
+              },
+              "p99_ttft_ms": {
+                "mean": 8040.077,
+                "std": 0.0,
+                "min": 8040.077,
+                "max": 8040.077
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 11302.985125,
+                "std": 0.0,
+                "min": 11302.985125,
+                "max": 11302.985125
+              },
+              "median_submit_ttft_ms": {
+                "mean": 8168.479,
+                "std": 0.0,
+                "min": 8168.479,
+                "max": 8168.479
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 18417.519,
+                "std": 0.0,
+                "min": 18417.519,
+                "max": 18417.519
+              },
+              "mean_tpot_ms": {
+                "mean": 42.977,
+                "std": 0.0,
+                "min": 42.977,
+                "max": 42.977
+              },
+              "p99_tpot_ms": {
+                "mean": 50.959,
+                "std": 0.0,
+                "min": 50.959,
+                "max": 50.959
+              },
+              "p99_itl_ms": {
+                "mean": 261.212,
+                "std": 0.0,
+                "min": 261.212,
+                "max": 261.212
+              }
+            },
+            {
+              "label": "ctx32k_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 55.217838,
+                "std": 0.0,
+                "min": 55.217838,
+                "max": 55.217838
+              },
+              "total_throughput_tok_s": {
+                "mean": 14190.984416,
+                "std": 0.0,
+                "min": 14190.984416,
+                "max": 14190.984416
+              },
+              "mean_ttft_ms": {
+                "mean": 7233.538312,
+                "std": 0.0,
+                "min": 7233.538312,
+                "max": 7233.538312
+              },
+              "median_ttft_ms": {
+                "mean": 4285.185,
+                "std": 0.0,
+                "min": 4285.185,
+                "max": 4285.185
+              },
+              "p99_ttft_ms": {
+                "mean": 16237.041,
+                "std": 0.0,
+                "min": 16237.041,
+                "max": 16237.041
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 19273.9895,
+                "std": 0.0,
+                "min": 19273.9895,
+                "max": 19273.9895
+              },
+              "median_submit_ttft_ms": {
+                "mean": 16376.511,
+                "std": 0.0,
+                "min": 16376.511,
+                "max": 16376.511
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 34237.857,
+                "std": 0.0,
+                "min": 34237.857,
+                "max": 34237.857
+              },
+              "mean_tpot_ms": {
+                "mean": 86.990562,
+                "std": 0.0,
+                "min": 86.990562,
+                "max": 86.990562
+              },
+              "p99_tpot_ms": {
+                "mean": 109.627,
+                "std": 0.0,
+                "min": 109.627,
+                "max": 109.627
+              },
+              "p99_itl_ms": {
+                "mean": 263.792,
+                "std": 0.0,
+                "min": 263.792,
+                "max": 263.792
+              }
+            }
+          ],
+          "candidate": [
+            {
+              "label": "ctx8k_c16",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 223.517867,
+                "std": 0.0,
+                "min": 223.517867,
+                "max": 223.517867
+              },
+              "total_throughput_tok_s": {
+                "mean": 14528.661358,
+                "std": 0.0,
+                "min": 14528.661358,
+                "max": 14528.661358
+              },
+              "mean_ttft_ms": {
+                "mean": 2868.731094,
+                "std": 0.0,
+                "min": 2868.731094,
+                "max": 2868.731094
+              },
+              "median_ttft_ms": {
+                "mean": 1437.818,
+                "std": 0.0,
+                "min": 1437.818,
+                "max": 1437.818
+              },
+              "p99_ttft_ms": {
+                "mean": 7736.755,
+                "std": 0.0,
+                "min": 7736.755,
+                "max": 7736.755
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 9011.920344,
+                "std": 0.0,
+                "min": 9011.920344,
+                "max": 9011.920344
+              },
+              "median_submit_ttft_ms": {
+                "mean": 7867.305,
+                "std": 0.0,
+                "min": 7867.305,
+                "max": 7867.305
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 16665.984,
+                "std": 0.0,
+                "min": 16665.984,
+                "max": 16665.984
+              },
+              "mean_tpot_ms": {
+                "mean": 49.030062,
+                "std": 0.0,
+                "min": 49.030062,
+                "max": 49.030062
+              },
+              "p99_tpot_ms": {
+                "mean": 63.226,
+                "std": 0.0,
+                "min": 63.226,
+                "max": 63.226
+              },
+              "p99_itl_ms": {
+                "mean": 248.308,
+                "std": 0.0,
+                "min": 248.308,
+                "max": 248.308
+              }
+            },
+            {
+              "label": "ctx16k_c12",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 100.278078,
+                "std": 0.0,
+                "min": 100.278078,
+                "max": 100.278078
+              },
+              "total_throughput_tok_s": {
+                "mean": 12935.872107,
+                "std": 0.0,
+                "min": 12935.872107,
+                "max": 12935.872107
+              },
+              "mean_ttft_ms": {
+                "mean": 5472.821958,
+                "std": 0.0,
+                "min": 5472.821958,
+                "max": 5472.821958
+              },
+              "median_ttft_ms": {
+                "mean": 2446.562,
+                "std": 0.0,
+                "min": 2446.562,
+                "max": 2446.562
+              },
+              "p99_ttft_ms": {
+                "mean": 13921.03,
+                "std": 0.0,
+                "min": 13921.03,
+                "max": 13921.03
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 15857.325167,
+                "std": 0.0,
+                "min": 15857.325167,
+                "max": 15857.325167
+              },
+              "median_submit_ttft_ms": {
+                "mean": 14056.115,
+                "std": 0.0,
+                "min": 14056.115,
+                "max": 14056.115
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 27650.902,
+                "std": 0.0,
+                "min": 27650.902,
+                "max": 27650.902
+              },
+              "mean_tpot_ms": {
+                "mean": 75.652083,
+                "std": 0.0,
+                "min": 75.652083,
+                "max": 75.652083
+              },
+              "p99_tpot_ms": {
+                "mean": 109.828,
+                "std": 0.0,
+                "min": 109.828,
+                "max": 109.828
+              },
+              "p99_itl_ms": {
+                "mean": 253.358,
+                "std": 0.0,
+                "min": 253.358,
+                "max": 253.358
+              }
+            },
+            {
+              "label": "ctx32k_c4",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 48.408625,
+                "std": 0.0,
+                "min": 48.408625,
+                "max": 48.408625
+              },
+              "total_throughput_tok_s": {
+                "mean": 12441.016588,
+                "std": 0.0,
+                "min": 12441.016588,
+                "max": 12441.016588
+              },
+              "mean_ttft_ms": {
+                "mean": 4992.179875,
+                "std": 0.0,
+                "min": 4992.179875,
+                "max": 4992.179875
+              },
+              "median_ttft_ms": {
+                "mean": 4008.429,
+                "std": 0.0,
+                "min": 4008.429,
+                "max": 4008.429
+              },
+              "p99_ttft_ms": {
+                "mean": 7885.777,
+                "std": 0.0,
+                "min": 7885.777,
+                "max": 7885.777
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 11163.09275,
+                "std": 0.0,
+                "min": 11163.09275,
+                "max": 11163.09275
+              },
+              "median_submit_ttft_ms": {
+                "mean": 8014.629,
+                "std": 0.0,
+                "min": 8014.629,
+                "max": 8014.629
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 18290.304,
+                "std": 0.0,
+                "min": 18290.304,
+                "max": 18290.304
+              },
+              "mean_tpot_ms": {
+                "mean": 43.2225,
+                "std": 0.0,
+                "min": 43.2225,
+                "max": 43.2225
+              },
+              "p99_tpot_ms": {
+                "mean": 51.181,
+                "std": 0.0,
+                "min": 51.181,
+                "max": 51.181
+              },
+              "p99_itl_ms": {
+                "mean": 261.355,
+                "std": 0.0,
+                "min": 261.355,
+                "max": 261.355
+              }
+            },
+            {
+              "label": "ctx32k_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 55.409791,
+                "std": 0.0,
+                "min": 55.409791,
+                "max": 55.409791
+              },
+              "total_throughput_tok_s": {
+                "mean": 14240.316405,
+                "std": 0.0,
+                "min": 14240.316405,
+                "max": 14240.316405
+              },
+              "mean_ttft_ms": {
+                "mean": 7153.398063,
+                "std": 0.0,
+                "min": 7153.398063,
+                "max": 7153.398063
+              },
+              "median_ttft_ms": {
+                "mean": 4281.139,
+                "std": 0.0,
+                "min": 4281.139,
+                "max": 4281.139
+              },
+              "p99_ttft_ms": {
+                "mean": 16075.581,
+                "std": 0.0,
+                "min": 16075.581,
+                "max": 16075.581
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 19117.148562,
+                "std": 0.0,
+                "min": 19117.148562,
+                "max": 19117.148562
+              },
+              "median_submit_ttft_ms": {
+                "mean": 16216.058,
+                "std": 0.0,
+                "min": 16216.058,
+                "max": 16216.058
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 34078.179,
+                "std": 0.0,
+                "min": 34078.179,
+                "max": 34078.179
+              },
+              "mean_tpot_ms": {
+                "mean": 87.086375,
+                "std": 0.0,
+                "min": 87.086375,
+                "max": 87.086375
+              },
+              "p99_tpot_ms": {
+                "mean": 109.66,
+                "std": 0.0,
+                "min": 109.66,
+                "max": 109.66
+              },
+              "p99_itl_ms": {
+                "mean": 263.424,
+                "std": 0.0,
+                "min": 263.424,
+                "max": 263.424
+              }
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "baseline": [
+            {
+              "label": "ctx8k_c16",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 222.179282,
+                "std": 0.0,
+                "min": 222.179282,
+                "max": 222.179282
+              },
+              "total_throughput_tok_s": {
+                "mean": 14441.653361,
+                "std": 0.0,
+                "min": 14441.653361,
+                "max": 14441.653361
+              },
+              "mean_ttft_ms": {
+                "mean": 2890.662469,
+                "std": 0.0,
+                "min": 2890.662469,
+                "max": 2890.662469
+              },
+              "median_ttft_ms": {
+                "mean": 1440.347,
+                "std": 0.0,
+                "min": 1440.347,
+                "max": 1440.347
+              },
+              "p99_ttft_ms": {
+                "mean": 7783.093,
+                "std": 0.0,
+                "min": 7783.093,
+                "max": 7783.093
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 9051.698062,
+                "std": 0.0,
+                "min": 9051.698062,
+                "max": 9051.698062
+              },
+              "median_submit_ttft_ms": {
+                "mean": 7913.603,
+                "std": 0.0,
+                "min": 7913.603,
+                "max": 7913.603
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 16706.85,
+                "std": 0.0,
+                "min": 16706.85,
+                "max": 16706.85
+              },
+              "mean_tpot_ms": {
+                "mean": 49.292656,
+                "std": 0.0,
+                "min": 49.292656,
+                "max": 49.292656
+              },
+              "p99_tpot_ms": {
+                "mean": 63.223,
+                "std": 0.0,
+                "min": 63.223,
+                "max": 63.223
+              },
+              "p99_itl_ms": {
+                "mean": 248.905,
+                "std": 0.0,
+                "min": 248.905,
+                "max": 248.905
+              }
+            },
+            {
+              "label": "ctx16k_c12",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 99.984466,
+                "std": 0.0,
+                "min": 99.984466,
+                "max": 99.984466
+              },
+              "total_throughput_tok_s": {
+                "mean": 12897.996154,
+                "std": 0.0,
+                "min": 12897.996154,
+                "max": 12897.996154
+              },
+              "mean_ttft_ms": {
+                "mean": 5521.248542,
+                "std": 0.0,
+                "min": 5521.248542,
+                "max": 5521.248542
+              },
+              "median_ttft_ms": {
+                "mean": 2449.92,
+                "std": 0.0,
+                "min": 2449.92,
+                "max": 2449.92
+              },
+              "p99_ttft_ms": {
+                "mean": 14026.12,
+                "std": 0.0,
+                "min": 14026.12,
+                "max": 14026.12
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 15954.293208,
+                "std": 0.0,
+                "min": 15954.293208,
+                "max": 15954.293208
+              },
+              "median_submit_ttft_ms": {
+                "mean": 14161.384,
+                "std": 0.0,
+                "min": 14161.384,
+                "max": 14161.384
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 27754.936,
+                "std": 0.0,
+                "min": 27754.936,
+                "max": 27754.936
+              },
+              "mean_tpot_ms": {
+                "mean": 75.639417,
+                "std": 0.0,
+                "min": 75.639417,
+                "max": 75.639417
+              },
+              "p99_tpot_ms": {
+                "mean": 109.999,
+                "std": 0.0,
+                "min": 109.999,
+                "max": 109.999
+              },
+              "p99_itl_ms": {
+                "mean": 253.1,
+                "std": 0.0,
+                "min": 253.1,
+                "max": 253.1
+              }
+            },
+            {
+              "label": "ctx32k_c4",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 48.150236,
+                "std": 0.0,
+                "min": 48.150236,
+                "max": 48.150236
+              },
+              "total_throughput_tok_s": {
+                "mean": 12374.610649,
+                "std": 0.0,
+                "min": 12374.610649,
+                "max": 12374.610649
+              },
+              "mean_ttft_ms": {
+                "mean": 5073.014875,
+                "std": 0.0,
+                "min": 5073.014875,
+                "max": 5073.014875
+              },
+              "median_ttft_ms": {
+                "mean": 4041.514,
+                "std": 0.0,
+                "min": 4041.514,
+                "max": 4041.514
+              },
+              "p99_ttft_ms": {
+                "mean": 8043.848,
+                "std": 0.0,
+                "min": 8043.848,
+                "max": 8043.848
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 11309.084625,
+                "std": 0.0,
+                "min": 11309.084625,
+                "max": 11309.084625
+              },
+              "median_submit_ttft_ms": {
+                "mean": 8172.322,
+                "std": 0.0,
+                "min": 8172.322,
+                "max": 8172.322
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 18427.926,
+                "std": 0.0,
+                "min": 18427.926,
+                "max": 18427.926
+              },
+              "mean_tpot_ms": {
+                "mean": 43.038375,
+                "std": 0.0,
+                "min": 43.038375,
+                "max": 43.038375
+              },
+              "p99_tpot_ms": {
+                "mean": 51.019,
+                "std": 0.0,
+                "min": 51.019,
+                "max": 51.019
+              },
+              "p99_itl_ms": {
+                "mean": 261.387,
+                "std": 0.0,
+                "min": 261.387,
+                "max": 261.387
+              }
+            },
+            {
+              "label": "ctx32k_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 55.16426,
+                "std": 0.0,
+                "min": 55.16426,
+                "max": 55.16426
+              },
+              "total_throughput_tok_s": {
+                "mean": 14177.214922,
+                "std": 0.0,
+                "min": 14177.214922,
+                "max": 14177.214922
+              },
+              "mean_ttft_ms": {
+                "mean": 7236.381125,
+                "std": 0.0,
+                "min": 7236.381125,
+                "max": 7236.381125
+              },
+              "median_ttft_ms": {
+                "mean": 4289.321,
+                "std": 0.0,
+                "min": 4289.321,
+                "max": 4289.321
+              },
+              "p99_ttft_ms": {
+                "mean": 16240.943,
+                "std": 0.0,
+                "min": 16240.943,
+                "max": 16240.943
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 19281.850813,
+                "std": 0.0,
+                "min": 19281.850813,
+                "max": 19281.850813
+              },
+              "median_submit_ttft_ms": {
+                "mean": 16381.334,
+                "std": 0.0,
+                "min": 16381.334,
+                "max": 16381.334
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 34258.552,
+                "std": 0.0,
+                "min": 34258.552,
+                "max": 34258.552
+              },
+              "mean_tpot_ms": {
+                "mean": 87.096625,
+                "std": 0.0,
+                "min": 87.096625,
+                "max": 87.096625
+              },
+              "p99_tpot_ms": {
+                "mean": 109.669,
+                "std": 0.0,
+                "min": 109.669,
+                "max": 109.669
+              },
+              "p99_itl_ms": {
+                "mean": 264.212,
+                "std": 0.0,
+                "min": 264.212,
+                "max": 264.212
+              }
+            }
+          ],
+          "candidate": [
+            {
+              "label": "ctx8k_c16",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 223.859769,
+                "std": 0.0,
+                "min": 223.859769,
+                "max": 223.859769
+              },
+              "total_throughput_tok_s": {
+                "mean": 14550.885016,
+                "std": 0.0,
+                "min": 14550.885016,
+                "max": 14550.885016
+              },
+              "mean_ttft_ms": {
+                "mean": 2869.546719,
+                "std": 0.0,
+                "min": 2869.546719,
+                "max": 2869.546719
+              },
+              "median_ttft_ms": {
+                "mean": 1438.137,
+                "std": 0.0,
+                "min": 1438.137,
+                "max": 1438.137
+              },
+              "p99_ttft_ms": {
+                "mean": 7737.959,
+                "std": 0.0,
+                "min": 7737.959,
+                "max": 7737.959
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 8991.626531,
+                "std": 0.0,
+                "min": 8991.626531,
+                "max": 8991.626531
+              },
+              "median_submit_ttft_ms": {
+                "mean": 7868.54,
+                "std": 0.0,
+                "min": 7868.54,
+                "max": 7868.54
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 16625.204,
+                "std": 0.0,
+                "min": 16625.204,
+                "max": 16625.204
+              },
+              "mean_tpot_ms": {
+                "mean": 48.920469,
+                "std": 0.0,
+                "min": 48.920469,
+                "max": 48.920469
+              },
+              "p99_tpot_ms": {
+                "mean": 62.905,
+                "std": 0.0,
+                "min": 62.905,
+                "max": 62.905
+              },
+              "p99_itl_ms": {
+                "mean": 248.637,
+                "std": 0.0,
+                "min": 248.637,
+                "max": 248.637
+              }
+            },
+            {
+              "label": "ctx16k_c12",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 100.160007,
+                "std": 0.0,
+                "min": 100.160007,
+                "max": 100.160007
+              },
+              "total_throughput_tok_s": {
+                "mean": 12920.640886,
+                "std": 0.0,
+                "min": 12920.640886,
+                "max": 12920.640886
+              },
+              "mean_ttft_ms": {
+                "mean": 5469.067833,
+                "std": 0.0,
+                "min": 5469.067833,
+                "max": 5469.067833
+              },
+              "median_ttft_ms": {
+                "mean": 2446.951,
+                "std": 0.0,
+                "min": 2446.951,
+                "max": 2446.951
+              },
+              "p99_ttft_ms": {
+                "mean": 13915.072,
+                "std": 0.0,
+                "min": 13915.072,
+                "max": 13915.072
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 15845.611625,
+                "std": 0.0,
+                "min": 15845.611625,
+                "max": 15845.611625
+              },
+              "median_submit_ttft_ms": {
+                "mean": 14050.331,
+                "std": 0.0,
+                "min": 14050.331,
+                "max": 14050.331
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 27634.348,
+                "std": 0.0,
+                "min": 27634.348,
+                "max": 27634.348
+              },
+              "mean_tpot_ms": {
+                "mean": 75.797875,
+                "std": 0.0,
+                "min": 75.797875,
+                "max": 75.797875
+              },
+              "p99_tpot_ms": {
+                "mean": 109.753,
+                "std": 0.0,
+                "min": 109.753,
+                "max": 109.753
+              },
+              "p99_itl_ms": {
+                "mean": 252.805,
+                "std": 0.0,
+                "min": 252.805,
+                "max": 252.805
+              }
+            },
+            {
+              "label": "ctx32k_c4",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 48.156985,
+                "std": 0.0,
+                "min": 48.156985,
+                "max": 48.156985
+              },
+              "total_throughput_tok_s": {
+                "mean": 12376.345041,
+                "std": 0.0,
+                "min": 12376.345041,
+                "max": 12376.345041
+              },
+              "mean_ttft_ms": {
+                "mean": 4994.118,
+                "std": 0.0,
+                "min": 4994.118,
+                "max": 4994.118
+              },
+              "median_ttft_ms": {
+                "mean": 4008.009,
+                "std": 0.0,
+                "min": 4008.009,
+                "max": 4008.009
+              },
+              "p99_ttft_ms": {
+                "mean": 7889.78,
+                "std": 0.0,
+                "min": 7889.78,
+                "max": 7889.78
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 11189.527,
+                "std": 0.0,
+                "min": 11189.527,
+                "max": 11189.527
+              },
+              "median_submit_ttft_ms": {
+                "mean": 8018.211,
+                "std": 0.0,
+                "min": 8018.211,
+                "max": 8018.211
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 18338.184,
+                "std": 0.0,
+                "min": 18338.184,
+                "max": 18338.184
+              },
+              "mean_tpot_ms": {
+                "mean": 43.6285,
+                "std": 0.0,
+                "min": 43.6285,
+                "max": 43.6285
+              },
+              "p99_tpot_ms": {
+                "mean": 51.569,
+                "std": 0.0,
+                "min": 51.569,
+                "max": 51.569
+              },
+              "p99_itl_ms": {
+                "mean": 261.112,
+                "std": 0.0,
+                "min": 261.112,
+                "max": 261.112
+              }
+            },
+            {
+              "label": "ctx32k_c8",
+              "repeats": 1,
+              "output_throughput_tok_s": {
+                "mean": 55.254225,
+                "std": 0.0,
+                "min": 55.254225,
+                "max": 55.254225
+              },
+              "total_throughput_tok_s": {
+                "mean": 14200.335797,
+                "std": 0.0,
+                "min": 14200.335797,
+                "max": 14200.335797
+              },
+              "mean_ttft_ms": {
+                "mean": 7152.86225,
+                "std": 0.0,
+                "min": 7152.86225,
+                "max": 7152.86225
+              },
+              "median_ttft_ms": {
+                "mean": 4283.053,
+                "std": 0.0,
+                "min": 4283.053,
+                "max": 4283.053
+              },
+              "p99_ttft_ms": {
+                "mean": 16072.995,
+                "std": 0.0,
+                "min": 16072.995,
+                "max": 16072.995
+              },
+              "mean_submit_ttft_ms": {
+                "mean": 19134.69575,
+                "std": 0.0,
+                "min": 19134.69575,
+                "max": 19134.69575
+              },
+              "median_submit_ttft_ms": {
+                "mean": 16212.616,
+                "std": 0.0,
+                "min": 16212.616,
+                "max": 16212.616
+              },
+              "p99_submit_ttft_ms": {
+                "mean": 34113.776,
+                "std": 0.0,
+                "min": 34113.776,
+                "max": 34113.776
+              },
+              "mean_tpot_ms": {
+                "mean": 87.449687,
+                "std": 0.0,
+                "min": 87.449687,
+                "max": 87.449687
+              },
+              "p99_tpot_ms": {
+                "mean": 109.944,
+                "std": 0.0,
+                "min": 109.944,
+                "max": 109.944
+              },
+              "p99_itl_ms": {
+                "mean": 263.71,
+                "std": 0.0,
+                "min": 263.71,
+                "max": 263.71
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "longctx_tp8_baseline_screen": [
+    {
+      "label": "ctx8k_c2",
+      "repeats": 1,
+      "output_throughput_tok_s": {
+        "mean": 96.150224,
+        "std": 0.0,
+        "min": 96.150224,
+        "max": 96.150224
+      },
+      "total_throughput_tok_s": {
+        "mean": 12403.378879,
+        "std": 0.0,
+        "min": 12403.378879,
+        "max": 12403.378879
+      },
+      "mean_ttft_ms": {
+        "mean": 970.674,
+        "std": 0.0,
+        "min": 970.674,
+        "max": 970.674
+      },
+      "median_ttft_ms": {
+        "mean": 970.424,
+        "std": 0.0,
+        "min": 970.424,
+        "max": 970.424
+      },
+      "p99_ttft_ms": {
+        "mean": 970.924,
+        "std": 0.0,
+        "min": 970.924,
+        "max": 970.924
+      },
+      "mean_submit_ttft_ms": {
+        "mean": 1636.601,
+        "std": 0.0,
+        "min": 1636.601,
+        "max": 1636.601
+      },
+      "median_submit_ttft_ms": {
+        "mean": 970.924,
+        "std": 0.0,
+        "min": 970.924,
+        "max": 970.924
+      },
+      "p99_submit_ttft_ms": {
+        "mean": 2302.278,
+        "std": 0.0,
+        "min": 2302.278,
+        "max": 2302.278
+      },
+      "mean_tpot_ms": {
+        "mean": 5.7225,
+        "std": 0.0,
+        "min": 5.7225,
+        "max": 5.7225
+      },
+      "p99_tpot_ms": {
+        "mean": 5.729,
+        "std": 0.0,
+        "min": 5.729,
+        "max": 5.729
+      },
+      "p99_itl_ms": {
+        "mean": 6.612,
+        "std": 0.0,
+        "min": 6.612,
+        "max": 6.612
+      }
+    },
+    {
+      "label": "ctx16k_c8",
+      "repeats": 1,
+      "output_throughput_tok_s": {
+        "mean": 50.348339,
+        "std": 0.0,
+        "min": 50.348339,
+        "max": 50.348339
+      },
+      "total_throughput_tok_s": {
+        "mean": 12939.523239,
+        "std": 0.0,
+        "min": 12939.523239,
+        "max": 12939.523239
+      },
+      "mean_ttft_ms": {
+        "mean": 4372.632937,
+        "std": 0.0,
+        "min": 4372.632937,
+        "max": 4372.632937
+      },
+      "median_ttft_ms": {
+        "mean": 2178.303,
+        "std": 0.0,
+        "min": 2178.303,
+        "max": 2178.303
+      },
+      "p99_ttft_ms": {
+        "mean": 10011.31,
+        "std": 0.0,
+        "min": 10011.31,
+        "max": 10011.31
+      },
+      "mean_submit_ttft_ms": {
+        "mean": 11313.779688,
+        "std": 0.0,
+        "min": 11313.779688,
+        "max": 11313.779688
+      },
+      "median_submit_ttft_ms": {
+        "mean": 10137.098,
+        "std": 0.0,
+        "min": 10137.098,
+        "max": 10137.098
+      },
+      "p99_submit_ttft_ms": {
+        "mean": 18779.658,
+        "std": 0.0,
+        "min": 18779.658,
+        "max": 18779.658
+      },
+      "mean_tpot_ms": {
+        "mean": 89.743313,
+        "std": 0.0,
+        "min": 89.743313,
+        "max": 89.743313
+      },
+      "p99_tpot_ms": {
+        "mean": 142.018,
+        "std": 0.0,
+        "min": 142.018,
+        "max": 142.018
+      },
+      "p99_itl_ms": {
+        "mean": 252.661,
+        "std": 0.0,
+        "min": 252.661,
+        "max": 252.661
+      }
+    }
+  ]
+}
