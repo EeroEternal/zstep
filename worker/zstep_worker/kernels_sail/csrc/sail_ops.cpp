@@ -12,6 +12,14 @@ torch::Tensor alloc_ipc_buffer_cuda(int64_t bytes, torch::Tensor out_ptr_u64);
 std::uintptr_t open_ipc_handle_cuda(torch::Tensor handle_u8);
 void close_ipc_handle_cuda(std::uintptr_t ptr);
 void free_ipc_buffer_cuda(std::uintptr_t ptr);
+void launch_bmm_bf16_f32_nt_cuda(
+    const void* a_bf16_ptr,
+    const void* b_bf16_ptr,
+    float* c_f32_ptr,
+    int batch,
+    int m,
+    int n,
+    int k);
 
 void launch_icn_allreduce_bf16_cuda(
     const void* input_ptr,
@@ -286,6 +294,153 @@ void launch_engram_lookup_dequant_cuda(
     int64_t vocab_start_idx,
     int64_t vocab_end_idx,
     int64_t pad_compressed_id,
+    std::uintptr_t stream_handle);
+
+void launch_mhc_pre_rmsnorm_quant_bf16_cuda(
+    const void* x_ptr,
+    const float* pre_mix_ptr,
+    const void* norm_weight_ptr,
+    void* normed_out_ptr,
+    void* quant_out_ptr,
+    int64_t rows,
+    int dim,
+    int write_normed,
+    float norm_eps,
+    std::uintptr_t stream_handle);
+
+void launch_fused_qkv_a_epilogue_bf16_cuda(
+    const void* qkv_a_ptr,
+    const void* q_norm_w_ptr,
+    const void* kv_norm_w_ptr,
+    const float* cos_sin_ptr,
+    const int32_t* positions_ptr,
+    const int64_t* swa_write_slots_ptr,
+    void* qr_unquant_out_ptr,
+    void* qr_quant_out_ptr,
+    void* kv_arena_ptr,
+    int64_t rows,
+    int q_rank,
+    int kv_dim,
+    int rope_dim,
+    int write_qr_unquant,
+    int64_t layer_swa_base,
+    float eps,
+    std::uintptr_t stream_handle);
+
+void launch_fused_q_idx_epilogue_bf16_cuda(
+    const void* q_and_idx_ptr,
+    const float* cos_sin_ptr,
+    const int32_t* positions_ptr,
+    void* q_out_ptr,
+    void* q_idx_out_ptr,
+    int64_t rows,
+    std::uintptr_t stream_handle);
+
+void launch_fused_inv_rope_act_quant_bf16_cuda(
+    void* attn_o_ptr,
+    const float* cos_sin_ptr,
+    const int32_t* positions_ptr,
+    int64_t rows,
+    int num_heads,
+    int head_dim,
+    int rope_dim,
+    std::uintptr_t stream_handle);
+
+void launch_moe_gather_tile_inputs_bf16_cuda(
+    const void* x_ptr,
+    const int32_t* sorted_pair_ids_ptr,
+    const int32_t* num_valid_tiles_ptr,
+    void* tile_a_ptr,
+    int tile_offset,
+    int chunk_tiles,
+    int block_m,
+    int top_k,
+    int hidden_dim,
+    std::uintptr_t stream_handle);
+
+void launch_dequant_mxfp4_tiles_bf16_cuda(
+    const uint8_t* w_packed_ptr,
+    const uint8_t* w_scale_ptr,
+    const int32_t* expert_ids_ptr,
+    const int32_t* num_valid_tiles_ptr,
+    void* out_bf16_ptr,
+    int tile_offset,
+    int chunk_tiles,
+    int n_rows,
+    int k_cols,
+    std::uintptr_t stream_handle);
+
+void launch_moe_tile_swiglu_quant_bf16_cuda(
+    const void* tile_gu_ptr,
+    const int32_t* sorted_pair_ids_ptr,
+    const int32_t* num_valid_tiles_ptr,
+    const float* topk_weights_ptr,
+    void* tile_inter_out_ptr,
+    int tile_offset,
+    int chunk_tiles,
+    int block_m,
+    int inter_dim,
+    float swiglu_limit,
+    int do_ue8m0,
+    std::uintptr_t stream_handle);
+
+void launch_moe_scatter_tile_outputs_bf16_cuda(
+    const void* tile_dn_ptr,
+    const int32_t* sorted_pair_ids_ptr,
+    const int32_t* num_valid_tiles_ptr,
+    void* pair_out_ptr,
+    int tile_offset,
+    int chunk_tiles,
+    int block_m,
+    int hidden_dim,
+    std::uintptr_t stream_handle);
+
+void launch_moe_combine_pairs_shared_bf16_cuda(
+    const void* pair_out_ptr,
+    const void* shared_out_ptr,
+    void* out_ptr,
+    int rows,
+    int top_k,
+    int hidden_dim,
+    std::uintptr_t stream_handle);
+
+void launch_engram_gated_residual_bf16_cuda(
+    void* h_stream_ptr,
+    const void* kv_proj_ptr,
+    const float* qk_prod_ptr,
+    int rows,
+    int hidden_size,
+    float norm_eps,
+    std::uintptr_t stream_handle);
+
+void launch_indexer_paged_score_bf16_cuda(
+    const void* q_idx_ptr,
+    const void* w_idx_ptr,
+    const void* k_cache_ptr,
+    const int32_t* mla_bt_ptr,
+    const int64_t* row_seq_ids_ptr,
+    const int32_t* positions_ptr,
+    float* scores_out_ptr,
+    int rows,
+    float weight_scale,
+    int compress_ratio,
+    int lat_pp,
+    int bt_width,
+    int eff_max_c,
+    std::uintptr_t stream_handle);
+
+void launch_indexer_topk512_slots_cuda(
+    const float* scores_red_ptr,
+    const int32_t* mla_bt_ptr,
+    const int64_t* row_seq_ids_ptr,
+    const int32_t* positions_ptr,
+    int32_t* shared_full_topk_ptr,
+    int rows,
+    int compress_ratio,
+    int lat_pp,
+    int bt_width,
+    int eff_max_c,
+    int mla_arena_base,
     std::uintptr_t stream_handle);
 
 void launch_sparse_attn_tp8_bf16_cuda(
@@ -960,5 +1115,348 @@ void launch_sparse_attn_tp8_bf16(
         rows,
         max_topk,
         static_cast<float>(sm_scale),
+        stream_handle);
+}
+
+void launch_mhc_pre_rmsnorm_quant_bf16(
+    torch::Tensor x,
+    torch::Tensor pre_mix,
+    torch::Tensor norm_weight,
+    torch::Tensor normed_out,
+    torch::Tensor quant_out,
+    int64_t write_normed,
+    double norm_eps,
+    std::uintptr_t stream_handle) {
+    const int64_t rows = x.size(0);
+    const int dim = static_cast<int>(x.size(-1));
+    if (rows <= 0) return;
+    TORCH_CHECK(dim % 32 == 0, "dim must be divisible by 32");
+    launch_mhc_pre_rmsnorm_quant_bf16_cuda(
+        x.data_ptr(),
+        pre_mix.data_ptr<float>(),
+        norm_weight.data_ptr(),
+        write_normed ? normed_out.data_ptr() : nullptr,
+        quant_out.data_ptr(),
+        rows,
+        dim,
+        static_cast<int>(write_normed),
+        static_cast<float>(norm_eps),
+        stream_handle);
+}
+
+void launch_fused_qkv_a_epilogue_bf16(
+    torch::Tensor qkv_a,
+    torch::Tensor q_norm_w,
+    torch::Tensor kv_norm_w,
+    torch::Tensor cos_sin,
+    torch::Tensor positions,
+    torch::Tensor swa_write_slots,
+    torch::Tensor qr_unquant_out,
+    torch::Tensor qr_quant_out,
+    torch::Tensor kv_arena,
+    int64_t rope_dim,
+    int64_t write_qr_unquant,
+    int64_t layer_swa_base,
+    double eps,
+    std::uintptr_t stream_handle) {
+    const int64_t rows = qkv_a.size(0);
+    if (rows <= 0) return;
+    const int q_rank = static_cast<int>(q_norm_w.numel());
+    const int kv_dim = static_cast<int>(kv_norm_w.numel());
+    TORCH_CHECK(qkv_a.size(1) == q_rank + kv_dim && kv_dim == 512, "invalid qkv_a dims");
+    launch_fused_qkv_a_epilogue_bf16_cuda(
+        qkv_a.data_ptr(),
+        q_norm_w.data_ptr(),
+        kv_norm_w.data_ptr(),
+        cos_sin.data_ptr<float>(),
+        positions.data_ptr<int32_t>(),
+        swa_write_slots.data_ptr<int64_t>(),
+        write_qr_unquant ? qr_unquant_out.data_ptr() : nullptr,
+        qr_quant_out.data_ptr(),
+        kv_arena.data_ptr(),
+        rows,
+        q_rank,
+        kv_dim,
+        static_cast<int>(rope_dim),
+        static_cast<int>(write_qr_unquant),
+        layer_swa_base,
+        static_cast<float>(eps),
+        stream_handle);
+}
+
+void launch_fused_q_idx_epilogue_bf16(
+    torch::Tensor q_and_idx,
+    torch::Tensor cos_sin,
+    torch::Tensor positions,
+    torch::Tensor q_out,
+    torch::Tensor q_idx_out,
+    std::uintptr_t stream_handle) {
+    const int64_t rows = q_and_idx.size(0);
+    if (rows <= 0) return;
+    TORCH_CHECK(q_and_idx.size(1) == 4608, "q_and_idx must have 4608 cols");
+    launch_fused_q_idx_epilogue_bf16_cuda(
+        q_and_idx.data_ptr(),
+        cos_sin.data_ptr<float>(),
+        positions.data_ptr<int32_t>(),
+        q_out.data_ptr(),
+        q_idx_out.data_ptr(),
+        rows,
+        stream_handle);
+}
+
+void launch_fused_inv_rope_act_quant_bf16(
+    torch::Tensor attn_o,
+    torch::Tensor cos_sin,
+    torch::Tensor positions,
+    int64_t rope_dim,
+    std::uintptr_t stream_handle) {
+    const int64_t rows = attn_o.size(0);
+    if (rows <= 0) return;
+    TORCH_CHECK(attn_o.dim() == 3 && attn_o.is_contiguous(), "contiguous 3D attn_o required");
+    launch_fused_inv_rope_act_quant_bf16_cuda(
+        attn_o.data_ptr(),
+        cos_sin.data_ptr<float>(),
+        positions.data_ptr<int32_t>(),
+        rows,
+        static_cast<int>(attn_o.size(1)),
+        static_cast<int>(attn_o.size(2)),
+        static_cast<int>(rope_dim),
+        stream_handle);
+}
+
+void launch_moe_gather_tile_inputs_bf16(
+    torch::Tensor x,
+    torch::Tensor sorted_pair_ids,
+    torch::Tensor num_valid_tiles,
+    torch::Tensor tile_a_out,
+    int64_t tile_offset,
+    int64_t chunk_tiles,
+    int64_t block_m,
+    int64_t top_k,
+    std::uintptr_t stream_handle) {
+    if (chunk_tiles <= 0) return;
+    const int hidden_dim = static_cast<int>(x.size(1));
+    TORCH_CHECK(hidden_dim % 8 == 0, "hidden_dim must be divisible by 8");
+    launch_moe_gather_tile_inputs_bf16_cuda(
+        x.data_ptr(),
+        sorted_pair_ids.data_ptr<int32_t>(),
+        num_valid_tiles.data_ptr<int32_t>(),
+        tile_a_out.data_ptr(),
+        static_cast<int>(tile_offset),
+        static_cast<int>(chunk_tiles),
+        static_cast<int>(block_m),
+        static_cast<int>(top_k),
+        hidden_dim,
+        stream_handle);
+}
+
+void launch_dequant_mxfp4_tiles_bf16(
+    torch::Tensor w_packed,
+    torch::Tensor w_scale,
+    torch::Tensor expert_ids,
+    torch::Tensor num_valid_tiles,
+    torch::Tensor out_bf16,
+    int64_t tile_offset,
+    int64_t chunk_tiles,
+    std::uintptr_t stream_handle) {
+    if (chunk_tiles <= 0) return;
+    const int n_rows = static_cast<int>(w_packed.size(1));
+    const int k_cols = static_cast<int>(w_packed.size(2) * 2);
+    launch_dequant_mxfp4_tiles_bf16_cuda(
+        w_packed.data_ptr<uint8_t>(),
+        w_scale.data_ptr<uint8_t>(),
+        expert_ids.data_ptr<int32_t>(),
+        num_valid_tiles.data_ptr<int32_t>(),
+        out_bf16.data_ptr(),
+        static_cast<int>(tile_offset),
+        static_cast<int>(chunk_tiles),
+        n_rows,
+        k_cols,
+        stream_handle);
+}
+
+void launch_moe_tile_swiglu_quant_bf16(
+    torch::Tensor tile_gu,
+    torch::Tensor sorted_pair_ids,
+    torch::Tensor num_valid_tiles,
+    torch::Tensor topk_weights,
+    torch::Tensor tile_inter_out,
+    int64_t tile_offset,
+    int64_t chunk_tiles,
+    int64_t block_m,
+    double swiglu_limit,
+    int64_t do_ue8m0,
+    std::uintptr_t stream_handle) {
+    if (chunk_tiles <= 0) return;
+    TORCH_CHECK(tile_gu.scalar_type() == at::kFloat, "tile_gu must be float32");
+    const int inter_dim = static_cast<int>(tile_inter_out.size(-1));
+    launch_moe_tile_swiglu_quant_bf16_cuda(
+        tile_gu.data_ptr<float>(),
+        sorted_pair_ids.data_ptr<int32_t>(),
+        num_valid_tiles.data_ptr<int32_t>(),
+        topk_weights.data_ptr<float>(),
+        tile_inter_out.data_ptr(),
+        static_cast<int>(tile_offset),
+        static_cast<int>(chunk_tiles),
+        static_cast<int>(block_m),
+        inter_dim,
+        static_cast<float>(swiglu_limit),
+        static_cast<int>(do_ue8m0),
+        stream_handle);
+}
+
+void launch_bmm_bf16_f32_nt(
+    torch::Tensor a_bf16,
+    torch::Tensor b_bf16,
+    torch::Tensor c_f32) {
+    TORCH_CHECK(
+        a_bf16.dim() == 3 && b_bf16.dim() == 3 && c_f32.dim() == 3 &&
+            a_bf16.is_contiguous() && b_bf16.is_contiguous() && c_f32.is_contiguous(),
+        "contiguous 3D tensors required for launch_bmm_bf16_f32_nt");
+    TORCH_CHECK(
+        a_bf16.scalar_type() == at::kBFloat16 &&
+            b_bf16.scalar_type() == at::kBFloat16 &&
+            c_f32.scalar_type() == at::kFloat,
+        "expected BF16 inputs and FP32 output");
+    const int batch = static_cast<int>(a_bf16.size(0));
+    if (batch <= 0) return;
+    const int m = static_cast<int>(a_bf16.size(1));
+    const int k = static_cast<int>(a_bf16.size(2));
+    const int n = static_cast<int>(b_bf16.size(1));
+    TORCH_CHECK(
+        b_bf16.size(0) == batch && b_bf16.size(2) == k &&
+            c_f32.size(0) == batch && c_f32.size(1) == m && c_f32.size(2) == n,
+        "shape mismatch in launch_bmm_bf16_f32_nt");
+    launch_bmm_bf16_f32_nt_cuda(
+        a_bf16.data_ptr(),
+        b_bf16.data_ptr(),
+        c_f32.data_ptr<float>(),
+        batch,
+        m,
+        n,
+        k);
+}
+
+void launch_moe_scatter_tile_outputs_bf16(
+    torch::Tensor tile_dn,
+    torch::Tensor sorted_pair_ids,
+    torch::Tensor num_valid_tiles,
+    torch::Tensor pair_out,
+    int64_t tile_offset,
+    int64_t chunk_tiles,
+    int64_t block_m,
+    std::uintptr_t stream_handle) {
+    if (chunk_tiles <= 0) return;
+    const int hidden_dim = static_cast<int>(pair_out.size(1));
+    launch_moe_scatter_tile_outputs_bf16_cuda(
+        tile_dn.data_ptr(),
+        sorted_pair_ids.data_ptr<int32_t>(),
+        num_valid_tiles.data_ptr<int32_t>(),
+        pair_out.data_ptr(),
+        static_cast<int>(tile_offset),
+        static_cast<int>(chunk_tiles),
+        static_cast<int>(block_m),
+        hidden_dim,
+        stream_handle);
+}
+
+void launch_moe_combine_pairs_shared_bf16(
+    torch::Tensor pair_out,
+    torch::Tensor shared_out,
+    torch::Tensor out,
+    int64_t top_k,
+    std::uintptr_t stream_handle) {
+    const int rows = static_cast<int>(out.size(0));
+    if (rows <= 0) return;
+    const int hidden_dim = static_cast<int>(out.size(1));
+    launch_moe_combine_pairs_shared_bf16_cuda(
+        pair_out.data_ptr(),
+        shared_out.data_ptr(),
+        out.data_ptr(),
+        rows,
+        static_cast<int>(top_k),
+        hidden_dim,
+        stream_handle);
+}
+
+void launch_engram_gated_residual_bf16(
+    torch::Tensor h_stream,
+    torch::Tensor kv_proj,
+    torch::Tensor qk_prod,
+    double norm_eps,
+    std::uintptr_t stream_handle) {
+    const int rows = static_cast<int>(h_stream.size(0));
+    if (rows <= 0) return;
+    const int hidden_size = static_cast<int>(h_stream.size(2));
+    launch_engram_gated_residual_bf16_cuda(
+        h_stream.data_ptr(),
+        kv_proj.data_ptr(),
+        qk_prod.data_ptr<float>(),
+        rows,
+        hidden_size,
+        static_cast<float>(norm_eps),
+        stream_handle);
+}
+
+void launch_indexer_paged_score_bf16(
+    torch::Tensor q_idx,
+    torch::Tensor w_idx,
+    torch::Tensor k_cache,
+    torch::Tensor mla_bt,
+    torch::Tensor row_seq_ids,
+    torch::Tensor positions,
+    torch::Tensor scores_out,
+    double weight_scale,
+    int64_t compress_ratio,
+    int64_t lat_pp,
+    int64_t bt_width,
+    int64_t eff_max_c,
+    std::uintptr_t stream_handle) {
+    const int rows = static_cast<int>(q_idx.size(0));
+    if (rows <= 0 || eff_max_c <= 0) return;
+    launch_indexer_paged_score_bf16_cuda(
+        q_idx.data_ptr(),
+        w_idx.data_ptr(),
+        k_cache.data_ptr(),
+        mla_bt.data_ptr<int32_t>(),
+        row_seq_ids.data_ptr<int64_t>(),
+        positions.data_ptr<int32_t>(),
+        scores_out.data_ptr<float>(),
+        rows,
+        static_cast<float>(weight_scale),
+        static_cast<int>(compress_ratio),
+        static_cast<int>(lat_pp),
+        static_cast<int>(bt_width),
+        static_cast<int>(eff_max_c),
+        stream_handle);
+}
+
+void launch_indexer_topk512_slots(
+    torch::Tensor scores_red,
+    torch::Tensor mla_bt,
+    torch::Tensor row_seq_ids,
+    torch::Tensor positions,
+    torch::Tensor shared_full_topk,
+    int64_t compress_ratio,
+    int64_t lat_pp,
+    int64_t bt_width,
+    int64_t eff_max_c,
+    int64_t mla_arena_base,
+    std::uintptr_t stream_handle) {
+    const int rows = static_cast<int>(scores_red.size(0));
+    if (rows <= 0) return;
+    TORCH_CHECK(eff_max_c >= 0 && eff_max_c <= 2048, "eff_max_c must be <= 2048");
+    launch_indexer_topk512_slots_cuda(
+        scores_red.data_ptr<float>(),
+        mla_bt.data_ptr<int32_t>(),
+        row_seq_ids.data_ptr<int64_t>(),
+        positions.data_ptr<int32_t>(),
+        shared_full_topk.data_ptr<int32_t>(),
+        rows,
+        static_cast<int>(compress_ratio),
+        static_cast<int>(lat_pp),
+        static_cast<int>(bt_width),
+        static_cast<int>(eff_max_c),
+        static_cast<int>(mla_arena_base),
         stream_handle);
 }

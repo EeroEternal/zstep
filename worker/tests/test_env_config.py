@@ -150,8 +150,12 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
 def test_worker_runtime_config_sail_policy_and_env_precedence(tmp_path) -> None:
     policy_file = tmp_path / "approved-sail-policy.json"
     policy_file.write_text(
-        '{"ar_blocks": 16, "ar_threads": 128, "moe_gemv_max_rows": 32, '
-        '"sparse_attn_backend": "hggc_tp8"}',
+        '{"ar_blocks": 16, "ar_threads": 128, "moe_gemv_max_rows": 64, '
+        '"moe_prefill_backend": "dequant_acblas", '
+        '"sparse_attn_backend": "hggc_tp8", '
+        '"qkv_fusion_mode": "fused_qkv_epilogue", '
+        '"engram_indexer_backend": "fused_hggc", '
+        '"lm_head_dtype": "bf16"}',
         encoding="utf-8",
     )
     cfg = WorkerRuntimeConfig.from_env(
@@ -164,12 +168,18 @@ def test_worker_runtime_config_sail_policy_and_env_precedence(tmp_path) -> None:
     assert cfg.backend == "sail"
     assert cfg.sail_ar_blocks == 24
     assert cfg.sail_ar_threads == 128
-    assert cfg.sail_moe_gemv_max_rows == 32
+    assert cfg.sail_moe_gemv_max_rows == 64
+    assert cfg.sail_moe_prefill_backend == "dequant_acblas"
     assert cfg.sail_sparse_attn_backend == "hggc_tp8"
     assert cfg.sail_mhc_split_k == 1
     assert cfg.sail_mhc_fused_max_rows == 16
+    assert cfg.sail_qkv_fusion_mode == "fused_qkv_epilogue"
+    assert cfg.sail_engram_indexer_backend == "fused_hggc"
+    assert cfg.sail_lm_head_dtype == "bf16"
     assert (
-        "sail=sail(ar=24x128,os=131072,pccl=67108864,moe_gemv<=32@256,bm=32w4,attn=hggc_tp8,mhc=1r16)"
+        "sail=sail(ar=24x128,os=131072,pccl=67108864,moe_gemv<=64@256,"
+        "bm=32w4:dequant_acblas,attn=hggc_tp8,mhc=1r16,"
+        "qkv=fused_qkv_epilogue,ei=fused_hggc,head=bf16)"
         in cfg.format_log_line()
     )
 

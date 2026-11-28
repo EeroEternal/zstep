@@ -522,6 +522,178 @@ def mhc_pre_rmsnorm(
     return normed_out
 
 
+def mhc_pre_rmsnorm_quant(
+    x: torch.Tensor,
+    pre_mix: torch.Tensor,
+    norm_weight: torch.Tensor,
+    *,
+    normed_out: torch.Tensor,
+    quant_out: torch.Tensor,
+    write_normed: bool = True,
+    norm_eps: float = 1.0e-20,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ext = get_sail_ops_extension()
+    stream_handle = torch.cuda.current_stream(x.device).cuda_stream
+    ext.launch_mhc_pre_rmsnorm_quant_bf16(
+        x,
+        pre_mix,
+        norm_weight,
+        normed_out,
+        quant_out,
+        1 if write_normed else 0,
+        float(norm_eps),
+        stream_handle,
+    )
+    return normed_out, quant_out
+
+
+def fused_qkv_a_epilogue(
+    qkv_a: torch.Tensor,
+    q_norm_w: torch.Tensor,
+    kv_norm_w: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions_i32: torch.Tensor,
+    swa_write_slots: torch.Tensor,
+    *,
+    qr_unquant_out: torch.Tensor,
+    qr_quant_out: torch.Tensor,
+    kv_arena: torch.Tensor,
+    layer_swa_base: int,
+    rope_dim: int = 64,
+    write_qr_unquant: bool = False,
+    eps: float = 1.0e-20,
+) -> None:
+    ext = get_sail_ops_extension()
+    stream_handle = torch.cuda.current_stream(qkv_a.device).cuda_stream
+    ext.launch_fused_qkv_a_epilogue_bf16(
+        qkv_a,
+        q_norm_w,
+        kv_norm_w,
+        cos_sin,
+        positions_i32,
+        swa_write_slots,
+        qr_unquant_out,
+        qr_quant_out,
+        kv_arena.view(-1, kv_arena.shape[-1]),
+        rope_dim,
+        1 if write_qr_unquant else 0,
+        int(layer_swa_base),
+        float(eps),
+        stream_handle,
+    )
+
+
+def fused_q_idx_epilogue(
+    q_and_idx: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions_i32: torch.Tensor,
+    *,
+    q_out: torch.Tensor,
+    q_idx_out: torch.Tensor,
+) -> None:
+    ext = get_sail_ops_extension()
+    stream_handle = torch.cuda.current_stream(q_and_idx.device).cuda_stream
+    ext.launch_fused_q_idx_epilogue_bf16(
+        q_and_idx, cos_sin, positions_i32, q_out, q_idx_out, stream_handle
+    )
+
+
+def fused_inv_rope_act_quant(
+    attn_o: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions_i32: torch.Tensor,
+    *,
+    rope_dim: int = 64,
+) -> torch.Tensor:
+    ext = get_sail_ops_extension()
+    stream_handle = torch.cuda.current_stream(attn_o.device).cuda_stream
+    ext.launch_fused_inv_rope_act_quant_bf16(
+        attn_o, cos_sin, positions_i32, rope_dim, stream_handle
+    )
+    return attn_o
+
+
+def engram_gated_residual(
+    h_stream: torch.Tensor,
+    kv_proj: torch.Tensor,
+    qk_prod_f32: torch.Tensor,
+    *,
+    norm_eps: float = 1.0e-20,
+) -> torch.Tensor:
+    ext = get_sail_ops_extension()
+    stream_handle = torch.cuda.current_stream(h_stream.device).cuda_stream
+    ext.launch_engram_gated_residual_bf16(
+        h_stream, kv_proj, qk_prod_f32, float(norm_eps), stream_handle
+    )
+    return h_stream
+
+
+def indexer_paged_score(
+    q_idx: torch.Tensor,
+    w_idx: torch.Tensor,
+    k_cache: torch.Tensor,
+    mla_bt: torch.Tensor,
+    row_seq_ids: torch.Tensor,
+    positions_i32: torch.Tensor,
+    *,
+    scores_out: torch.Tensor,
+    weight_scale: float,
+    compress_ratio: int,
+    lat_pp: int,
+    bt_width: int,
+    eff_max_c: int,
+) -> torch.Tensor:
+    ext = get_sail_ops_extension()
+    stream_handle = torch.cuda.current_stream(q_idx.device).cuda_stream
+    ext.launch_indexer_paged_score_bf16(
+        q_idx,
+        w_idx,
+        k_cache,
+        mla_bt,
+        row_seq_ids,
+        positions_i32,
+        scores_out,
+        float(weight_scale),
+        int(compress_ratio),
+        int(lat_pp),
+        int(bt_width),
+        int(eff_max_c),
+        stream_handle,
+    )
+    return scores_out
+
+
+def indexer_topk512_slots(
+    scores_red: torch.Tensor,
+    mla_bt: torch.Tensor,
+    row_seq_ids: torch.Tensor,
+    positions_i32: torch.Tensor,
+    *,
+    shared_full_topk: torch.Tensor,
+    compress_ratio: int,
+    lat_pp: int,
+    bt_width: int,
+    eff_max_c: int,
+    mla_arena_base: int,
+) -> torch.Tensor:
+    ext = get_sail_ops_extension()
+    stream_handle = torch.cuda.current_stream(scores_red.device).cuda_stream
+    ext.launch_indexer_topk512_slots(
+        scores_red,
+        mla_bt,
+        row_seq_ids,
+        positions_i32,
+        shared_full_topk,
+        int(compress_ratio),
+        int(lat_pp),
+        int(bt_width),
+        int(eff_max_c),
+        int(mla_arena_base),
+        stream_handle,
+    )
+    return shared_full_topk
+
+
 def mhc_post(
     sub_out: torch.Tensor,
     residual: torch.Tensor,
@@ -534,6 +706,39 @@ def mhc_post(
     stream_handle = torch.cuda.current_stream(sub_out.device).cuda_stream
     ext.launch_mhc_post_bf16(sub_out, residual, post_mix, comb_mix, out, stream_handle)
     return out
+
+
+_DEQ_W_FALLBACK_CACHE: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_dequant_acblas_scratch(
+    dev: torch.device,
+    chunk_t: int,
+    max_bm: int,
+    inter_per_rank: int,
+    hidden_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    key = dev.index or 0
+    cached = _DEQ_W_FALLBACK_CACHE.get(key)
+    req_w = chunk_t * (2 * inter_per_rank) * hidden_dim
+    req_a = chunk_t * max_bm * hidden_dim
+    req_gu = chunk_t * max_bm * (2 * inter_per_rank)
+    req_i = chunk_t * max_bm * inter_per_rank
+    if (
+        cached is None
+        or cached[0].numel() < req_w
+        or cached[1].numel() < req_a
+        or cached[2].numel() < req_gu
+        or cached[3].numel() < req_i
+    ):
+        cached = (
+            torch.zeros((req_w,), dtype=torch.bfloat16, device=dev),
+            torch.zeros((req_a,), dtype=torch.bfloat16, device=dev),
+            torch.zeros((req_gu,), dtype=torch.float32, device=dev),
+            torch.zeros((req_i,), dtype=torch.bfloat16, device=dev),
+        )
+        _DEQ_W_FALLBACK_CACHE[key] = cached
+    return cached
 
 
 def dsv41_moe_tp8_forward(
@@ -562,10 +767,16 @@ def dsv41_moe_tp8_forward(
     pair_out_buf: torch.Tensor,
     moe_out_buf: torch.Tensor,
     act_quant_x_buf: torch.Tensor | None = None,
+    x_quant_precomputed: torch.Tensor | None = None,
+    deq_w_buf: torch.Tensor | None = None,
+    tile_a_buf: torch.Tensor | None = None,
+    tile_gu_buf: torch.Tensor | None = None,
+    tile_inter_buf: torch.Tensor | None = None,
     gemv_max_rows: int = 16,
     gemv_threads: int = 256,
     block_m: int = 32,
     num_warps: int = 4,
+    prefill_backend: str = "triton_grouped",
 ) -> torch.Tensor:
     """TP=8 routed MXFP4 + shared BF16 MoE forward (returns unreduced local BF16 sum)."""
     rows, hidden_dim = x.shape
@@ -583,7 +794,10 @@ def dsv41_moe_tp8_forward(
         r_logits, gate_bias, t_weights, t_ids, top_k, float(route_scale), stream_handle
     )
 
-    if act_quant_x_buf is not None:
+    do_ue8m0 = act_quant_x_buf is not None or x_quant_precomputed is not None
+    if x_quant_precomputed is not None:
+        x_in = x_quant_precomputed[:rows]
+    elif act_quant_x_buf is not None:
         x_in = act_quant_ue8m0(x, out=act_quant_x_buf[:rows])
     else:
         x_in = x
@@ -596,13 +810,13 @@ def dsv41_moe_tp8_forward(
         sh_gu,
         sh_act,
         float(swiglu_limit),
-        1 if act_quant_x_buf is not None else 0,
+        1 if do_ue8m0 else 0,
         stream_handle,
     )
     sh_out = shared_out_buf[:rows]
     torch.matmul(sh_act, shared_w2_bf16.t(), out=sh_out)
 
-    # 3. Routed MXFP4 experts: HGGC fused W4-LUT GEMV for decode/verify vs Triton AIU Tensor-Core GEMM for prefill
+    # 3. Routed MXFP4 experts
     out = moe_out_buf[:rows]
     num_pairs = rows * top_k
     inter = moe_inter_buf[:num_pairs]
@@ -618,7 +832,7 @@ def dsv41_moe_tp8_forward(
             gemv_threads,
             stream_handle,
         )
-        if act_quant_x_buf is not None:
+        if do_ue8m0:
             inplace_act_quant_ue8m0(inter)
         ext.launch_mxfp4_moe_gemv_down_combine(
             inter,
@@ -630,6 +844,108 @@ def dsv41_moe_tp8_forward(
             top_k,
             gemv_threads,
             stream_handle,
+        )
+    elif prefill_backend == "dequant_acblas" and not torch.cuda.is_current_stream_capturing():
+        eff_bm = 64 if rows >= 1024 else (32 if rows >= 256 else block_m)
+        max_tiles = (num_pairs + eff_bm - 1) // eff_bm + num_experts
+        ext.launch_moe_align_block_size(
+            t_ids.view(-1),
+            sorted_pair_ids_buf[: max_tiles * eff_bm],
+            expert_ids_per_tile_buf[:max_tiles],
+            num_valid_tiles_buf,
+            num_experts,
+            eff_bm,
+            stream_handle,
+        )
+        upper_tiles = min(
+            max_tiles,
+            min(num_experts, num_pairs) + max(0, num_pairs - num_experts) // eff_bm,
+        )
+        chunk_t = 64
+        if (
+            deq_w_buf is None
+            or tile_a_buf is None
+            or tile_gu_buf is None
+            or tile_gu_buf.dtype != torch.float32
+            or tile_inter_buf is None
+        ):
+            deq_w_buf, tile_a_buf, tile_gu_buf, tile_inter_buf = _get_dequant_acblas_scratch(
+                x.device, chunk_t, 64, inter_per_rank, hidden_dim
+            )
+        p_out = pair_out_buf[:num_pairs]
+        w13_rows = 2 * inter_per_rank
+        for t_off in range(0, upper_tiles, chunk_t):
+            ct = min(chunk_t, upper_tiles - t_off)
+            ta_v = tile_a_buf.view(-1)[: ct * eff_bm * hidden_dim].view(ct, eff_bm, hidden_dim)
+            dw13_v = deq_w_buf.view(-1)[: ct * w13_rows * hidden_dim].view(
+                ct, w13_rows, hidden_dim
+            )
+            tgu_v = tile_gu_buf.view(-1)[: ct * eff_bm * w13_rows].view(ct, eff_bm, w13_rows)
+            ti_v = tile_inter_buf.view(-1)[: ct * eff_bm * inter_per_rank].view(
+                ct, eff_bm, inter_per_rank
+            )
+            dw2_v = deq_w_buf.view(-1)[: ct * hidden_dim * inter_per_rank].view(
+                ct, hidden_dim, inter_per_rank
+            )
+
+            ext.launch_moe_gather_tile_inputs_bf16(
+                x_in,
+                sorted_pair_ids_buf,
+                num_valid_tiles_buf,
+                ta_v,
+                t_off,
+                ct,
+                eff_bm,
+                top_k,
+                stream_handle,
+            )
+            ext.launch_dequant_mxfp4_tiles_bf16(
+                experts_w13_packed,
+                experts_w13_scale,
+                expert_ids_per_tile_buf,
+                num_valid_tiles_buf,
+                dw13_v,
+                t_off,
+                ct,
+                stream_handle,
+            )
+            ext.launch_bmm_bf16_f32_nt(ta_v, dw13_v, tgu_v)
+            ext.launch_moe_tile_swiglu_quant_bf16(
+                tgu_v,
+                sorted_pair_ids_buf,
+                num_valid_tiles_buf,
+                t_weights.view(-1),
+                ti_v,
+                t_off,
+                ct,
+                eff_bm,
+                float(swiglu_limit),
+                1 if do_ue8m0 else 0,
+                stream_handle,
+            )
+            ext.launch_dequant_mxfp4_tiles_bf16(
+                experts_w2_packed,
+                experts_w2_scale,
+                expert_ids_per_tile_buf,
+                num_valid_tiles_buf,
+                dw2_v,
+                t_off,
+                ct,
+                stream_handle,
+            )
+            torch.bmm(ti_v, dw2_v.transpose(1, 2), out=ta_v)
+            ext.launch_moe_scatter_tile_outputs_bf16(
+                ta_v,
+                sorted_pair_ids_buf,
+                num_valid_tiles_buf,
+                p_out,
+                t_off,
+                ct,
+                eff_bm,
+                stream_handle,
+            )
+        ext.launch_moe_combine_pairs_shared_bf16(
+            p_out, sh_out, out, top_k, stream_handle
         )
     else:
         max_tiles = (num_pairs + block_m - 1) // block_m + num_experts
@@ -662,7 +978,7 @@ def dsv41_moe_tp8_forward(
             BLOCK_N=block_n_gu,
             num_warps=num_warps,
         )
-        if act_quant_x_buf is not None:
+        if do_ue8m0:
             inplace_act_quant_ue8m0(inter)
         block_n_dn = 64
         p_out = pair_out_buf[:num_pairs]

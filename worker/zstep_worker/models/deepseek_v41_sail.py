@@ -323,6 +323,7 @@ class _SailOperatorObserver:
         "mhc_mixes",
         "attn_qkv_o_proj",
         "engram_compressor_indexer",
+        "lm_head",
     )
 
     def __init__(self, out_path: str, rank: int, world_size: int) -> None:
@@ -438,6 +439,7 @@ class _CompressorWeights:
     norm_weight: torch.Tensor
     wkv_weight: torch.Tensor  # FP32 for cr=2, BF16 for cr=1
     wgate_weight: torch.Tensor | None  # FP32 for cr=2, None for cr=1
+    wkv_gate_f32: torch.Tensor | None = None  # [1024, 5120] FP32 for cr=2
 
 
 @dataclass
@@ -481,10 +483,12 @@ class _LayerWeights:
     hc_ffn_base_f32: torch.Tensor
     hc_ffn_scale_f32: torch.Tensor
     attn_sink_f32: torch.Tensor  # [8] FP32
-    wq_a_bf16: torch.Tensor  # [1280, 5120] BF16
+    wqkv_a_bf16: torch.Tensor  # [1792, 5120] BF16 (`cat([wq_a, wkv], dim=0)`)
+    wq_a_bf16: torch.Tensor  # [1280, 5120] BF16 view
     q_norm_weight: torch.Tensor  # [1280] BF16
     wq_b_bf16: torch.Tensor  # [4096, 1280] BF16
-    wkv_bf16: torch.Tensor  # [512, 5120] BF16
+    wq_b_with_idx_bf16: torch.Tensor | None  # [4608, 1280] BF16 on Indexer layers
+    wkv_bf16: torch.Tensor  # [512, 5120] BF16 view
     kv_norm_weight: torch.Tensor  # [512] BF16
     wo_a_bf16: torch.Tensor  # [1024, 4096] BF16
     wo_b_bf16: torch.Tensor  # [5120, 1024] BF16
@@ -579,6 +583,12 @@ class DeepSeekV41SailDSparkDrafter:
 
         self.markov_vec_buf = torch.zeros(
             (max_b, runner.dspark_markov_rank), dtype=torch.float32, device=dev
+        )
+        self.markov_vec_bf16_buf = torch.zeros(
+            (max_b, runner.dspark_markov_rank), dtype=torch.bfloat16, device=dev
+        )
+        self.base_logits_bf16_buf = torch.zeros(
+            (max_rows, self.vpr), dtype=torch.bfloat16, device=dev
         )
         self.step_logits_buf = torch.zeros((max_b, self.vpr), dtype=torch.float32, device=dev)
         self.step_logits_bf16_buf = torch.zeros(
@@ -705,42 +715,76 @@ class DeepSeekV41SailDSparkDrafter:
                 sinkhorn_iters=runner.hc_sinkhorn_iters,
             )
             x_norm = runner.normed_buf[:rows]
-            sail_ops.mhc_pre_rmsnorm(
-                h_cur,
-                pm_cur,
-                stage.attn_norm_weight,
-                normed_out=x_norm,
-                norm_eps=runner.norm_eps,
-            )
-
-            # DSpark bidirectional draft attention (`128` context slots + `k` scratch slots -> `256`)
-            q_in = sail_ops.act_quant_ue8m0(x_norm, out=runner.act_quant_buf[:rows])
-            qr = runner.qr_buf[:rows]
-            torch.matmul(q_in, stage.wq_a_bf16.t(), out=qr)
-            sail_ops.rmsnorm_bf16(qr, stage.q_norm_weight, eps=runner.norm_eps, out=qr)
-            sail_ops.inplace_act_quant_ue8m0(qr)
-            q_flat = runner.q_buf[:rows].view(rows, -1)
-            torch.matmul(qr, stage.wq_b_bf16.t(), out=q_flat)
-            q = q_flat.view(rows, 8, 512)
-            sail_ops.apply_rope_inplace(
-                q, runner.swa_cos_sin_gpu, pos_i32, rope_dim=64, inverse=False
-            )
-
-            dkv = runner.kv_buf[:rows]
-            torch.matmul(q_in, stage.wkv_bf16.t(), out=dkv)
-            sail_ops.rmsnorm_bf16(dkv, stage.kv_norm_weight, eps=runner.norm_eps, out=dkv)
-            sail_ops.apply_rope_inplace(
-                dkv.unsqueeze(1), runner.swa_cos_sin_gpu, pos_i32, rope_dim=64, inverse=False
-            )
-            sail_ops.inplace_act_quant_ue8m0(dkv)
-
+            fused_qkv = runner.qkv_fusion_mode == "fused_qkv_epilogue"
             scratch_base = runner.dspark_scratch_arena_base[stage_idx]
             scratch_slots = (
                 scratch_base
                 + runner.arange_seqs_i64[:b, None] * 8
                 + self._k_offs[None, :].to(torch.int64)
             ).reshape(-1)
-            runner.kv_arena.view(-1, 512).index_copy_(0, scratch_slots, dkv)
+
+            if fused_qkv:
+                _, q_in = sail_ops.mhc_pre_rmsnorm_quant(
+                    h_cur,
+                    pm_cur,
+                    stage.attn_norm_weight,
+                    normed_out=x_norm,
+                    quant_out=runner.act_quant_buf[:rows],
+                    write_normed=False,
+                    norm_eps=runner.norm_eps,
+                )
+                qkv_a = runner.qkv_a_buf[:rows]
+                torch.matmul(q_in, stage.wqkv_a_bf16.t(), out=qkv_a)
+                qr_q = runner.qr_quant_buf[:rows]
+                sail_ops.fused_qkv_a_epilogue(
+                    qkv_a,
+                    stage.q_norm_weight,
+                    stage.kv_norm_weight,
+                    runner.swa_cos_sin_gpu,
+                    pos_i32,
+                    scratch_slots,
+                    qr_unquant_out=runner.qr_buf[:rows],
+                    qr_quant_out=qr_q,
+                    kv_arena=runner.kv_arena,
+                    layer_swa_base=0,
+                    rope_dim=64,
+                    write_qr_unquant=False,
+                    eps=runner.norm_eps,
+                )
+                q_flat = runner.q_buf[:rows].view(rows, -1)
+                torch.matmul(qr_q, stage.wq_b_bf16.t(), out=q_flat)
+                q = q_flat.view(rows, 8, 512)
+                sail_ops.apply_rope_inplace(
+                    q, runner.swa_cos_sin_gpu, pos_i32, rope_dim=64, inverse=False
+                )
+            else:
+                sail_ops.mhc_pre_rmsnorm(
+                    h_cur,
+                    pm_cur,
+                    stage.attn_norm_weight,
+                    normed_out=x_norm,
+                    norm_eps=runner.norm_eps,
+                )
+                q_in = sail_ops.act_quant_ue8m0(x_norm, out=runner.act_quant_buf[:rows])
+                qr = runner.qr_buf[:rows]
+                torch.matmul(q_in, stage.wq_a_bf16.t(), out=qr)
+                sail_ops.rmsnorm_bf16(qr, stage.q_norm_weight, eps=runner.norm_eps, out=qr)
+                sail_ops.inplace_act_quant_ue8m0(qr)
+                q_flat = runner.q_buf[:rows].view(rows, -1)
+                torch.matmul(qr, stage.wq_b_bf16.t(), out=q_flat)
+                q = q_flat.view(rows, 8, 512)
+                sail_ops.apply_rope_inplace(
+                    q, runner.swa_cos_sin_gpu, pos_i32, rope_dim=64, inverse=False
+                )
+
+                dkv = runner.kv_buf[:rows]
+                torch.matmul(q_in, stage.wkv_bf16.t(), out=dkv)
+                sail_ops.rmsnorm_bf16(dkv, stage.kv_norm_weight, eps=runner.norm_eps, out=dkv)
+                sail_ops.apply_rope_inplace(
+                    dkv.unsqueeze(1), runner.swa_cos_sin_gpu, pos_i32, rope_dim=64, inverse=False
+                )
+                sail_ops.inplace_act_quant_ue8m0(dkv)
+                runner.kv_arena.view(-1, 512).index_copy_(0, scratch_slots, dkv)
 
             topk_view = self.draft_topk_buf[:rows]
             topk_3d = topk_view.view(b, k, 256)
@@ -772,11 +816,17 @@ class DeepSeekV41SailDSparkDrafter:
                 sm_scale=runner.sm_scale,
                 backend=runner.sparse_attn_backend,
             )
-            sail_ops.apply_rope_inplace(
-                attn_o, runner.swa_cos_sin_gpu, pos_i32, rope_dim=64, inverse=True
-            )
-            o_flat = attn_o.view(rows, 4096)
-            sail_ops.inplace_act_quant_ue8m0(o_flat)
+            if fused_qkv:
+                sail_ops.fused_inv_rope_act_quant(
+                    attn_o, runner.swa_cos_sin_gpu, pos_i32, rope_dim=64
+                )
+                o_flat = attn_o.view(rows, 4096)
+            else:
+                sail_ops.apply_rope_inplace(
+                    attn_o, runner.swa_cos_sin_gpu, pos_i32, rope_dim=64, inverse=True
+                )
+                o_flat = attn_o.view(rows, 4096)
+                sail_ops.inplace_act_quant_ue8m0(o_flat)
             o_lora = runner.o_lora_buf[:rows]
             torch.matmul(o_flat, stage.wo_a_bf16.t(), out=o_lora)
             sail_ops.inplace_act_quant_ue8m0(o_lora)
@@ -805,13 +855,26 @@ class DeepSeekV41SailDSparkDrafter:
                 hc_eps=runner.hc_eps,
                 sinkhorn_iters=runner.hc_sinkhorn_iters,
             )
-            sail_ops.mhc_pre_rmsnorm(
-                h_nxt,
-                attn_pre,
-                stage.ffn_norm_weight,
-                normed_out=x_norm,
-                norm_eps=runner.norm_eps,
-            )
+            if fused_qkv:
+                sail_ops.mhc_pre_rmsnorm_quant(
+                    h_nxt,
+                    attn_pre,
+                    stage.ffn_norm_weight,
+                    normed_out=x_norm,
+                    quant_out=runner.act_quant_buf[:rows],
+                    write_normed=True,
+                    norm_eps=runner.norm_eps,
+                )
+                moe_xq_pre = runner.act_quant_buf[:rows]
+            else:
+                sail_ops.mhc_pre_rmsnorm(
+                    h_nxt,
+                    attn_pre,
+                    stage.ffn_norm_weight,
+                    normed_out=x_norm,
+                    norm_eps=runner.norm_eps,
+                )
+                moe_xq_pre = None
             moe_local = sail_ops.dsv41_moe_tp8_forward(
                 x_norm,
                 gate_weight=stage.gate_weight_f32,
@@ -837,10 +900,16 @@ class DeepSeekV41SailDSparkDrafter:
                 pair_out_buf=runner.pair_out_buf,
                 moe_out_buf=runner.sub_local_buf,
                 act_quant_x_buf=runner.act_quant_buf,
+                x_quant_precomputed=moe_xq_pre,
+                deq_w_buf=runner.moe_deq_w_buf,
+                tile_a_buf=runner.moe_tile_a_buf,
+                tile_gu_buf=runner.moe_tile_gu_buf,
+                tile_inter_buf=runner.moe_tile_inter_buf,
                 gemv_max_rows=runner.moe_gemv_max_rows,
                 gemv_threads=runner.moe_gemv_threads,
                 block_m=runner.moe_block_m,
                 num_warps=runner.moe_num_warps,
+                prefill_backend=runner.moe_prefill_backend,
             )
             moe_red = runner.sub_red_buf[:rows]
             runner.icn_comm.all_reduce_bf16(moe_local, output=moe_red)
@@ -855,34 +924,55 @@ class DeepSeekV41SailDSparkDrafter:
             normed_out=head_hidden,
             norm_eps=runner.norm_eps,
         )
-        base_logits = runner.logits_f32_buf[:rows]
-        torch.matmul(head_hidden.float(), runner.head_weight_f32.t(), out=base_logits)
-        base_3d = base_logits.view(b, k, self.vpr)
-
-        step_f32 = self.step_logits_buf[:b]
         step_bf16 = self.step_logits_bf16_buf[:b]
-        m_vec = self.markov_vec_buf[:b]
-        w2_t = runner.dspark_markov_head_f32_t
         local_vals = runner.local_top2_vals_buf[:b]
         local_ids = runner.local_top2_ids_buf[:b]
         prev_tok = self.draft_tokens_gpu[0:rows:k].to(torch.int64).clamp(
             min=0, max=runner.vocab_size - 1
         )
-        for s_idx in range(k):
-            torch.index_select(runner.dspark_markov_embed_f32, 0, prev_tok, out=m_vec)
-            torch.addmm(base_3d[:, s_idx, :], m_vec, w2_t, out=step_f32)
-            step_bf16.copy_(step_f32.to(torch.bfloat16))
-            runner.icn_comm.gather_top2_from_logits(
-                step_bf16,
-                local_top2_vals_buf=local_vals,
-                local_top2_ids_buf=local_ids,
-                out_tokens=self.draft_out_tokens_gpu[s_idx, :b],
-                out_logprob_bits=self.draft_out_logprobs_gpu[s_idx, :b],
-                vocab_per_rank=self.vpr,
-            )
-            prev_tok = self.draft_out_tokens_gpu[s_idx, :b, 0].to(torch.int64).clamp(
-                min=0, max=runner.vocab_size - 1
-            )
+        if runner.lm_head_dtype == "bf16":
+            base_bf16 = self.base_logits_bf16_buf[:rows]
+            torch.matmul(head_hidden, runner.head_weight_bf16.t(), out=base_bf16)
+            base_bf16_3d = base_bf16.view(b, k, self.vpr)
+            m_vec_bf16 = self.markov_vec_bf16_buf[:b]
+            w2_bf16_t = runner.dspark_markov_head_bf16_t
+            for s_idx in range(k):
+                torch.index_select(runner.dspark_markov_embed_bf16, 0, prev_tok, out=m_vec_bf16)
+                torch.addmm(base_bf16_3d[:, s_idx, :], m_vec_bf16, w2_bf16_t, out=step_bf16)
+                runner.icn_comm.gather_top2_from_logits(
+                    step_bf16,
+                    local_top2_vals_buf=local_vals,
+                    local_top2_ids_buf=local_ids,
+                    out_tokens=self.draft_out_tokens_gpu[s_idx, :b],
+                    out_logprob_bits=self.draft_out_logprobs_gpu[s_idx, :b],
+                    vocab_per_rank=self.vpr,
+                )
+                prev_tok = self.draft_out_tokens_gpu[s_idx, :b, 0].to(torch.int64).clamp(
+                    min=0, max=runner.vocab_size - 1
+                )
+        else:
+            assert runner.head_weight_f32 is not None
+            base_logits = runner.logits_f32_buf[:rows]
+            torch.matmul(head_hidden.float(), runner.head_weight_f32.t(), out=base_logits)
+            base_3d = base_logits.view(b, k, self.vpr)
+            step_f32 = self.step_logits_buf[:b]
+            m_vec = self.markov_vec_buf[:b]
+            w2_t = runner.dspark_markov_head_f32_t
+            for s_idx in range(k):
+                torch.index_select(runner.dspark_markov_embed_f32, 0, prev_tok, out=m_vec)
+                torch.addmm(base_3d[:, s_idx, :], m_vec, w2_t, out=step_f32)
+                step_bf16.copy_(step_f32.to(torch.bfloat16))
+                runner.icn_comm.gather_top2_from_logits(
+                    step_bf16,
+                    local_top2_vals_buf=local_vals,
+                    local_top2_ids_buf=local_ids,
+                    out_tokens=self.draft_out_tokens_gpu[s_idx, :b],
+                    out_logprob_bits=self.draft_out_logprobs_gpu[s_idx, :b],
+                    vocab_per_rank=self.vpr,
+                )
+                prev_tok = self.draft_out_tokens_gpu[s_idx, :b, 0].to(torch.int64).clamp(
+                    min=0, max=runner.vocab_size - 1
+                )
 
     @torch.inference_mode()
     def capture_graphs(self, graph_pool: Any, capture_stream: torch.cuda.Stream) -> None:
@@ -1208,9 +1298,13 @@ class DeepSeekV41SailStepRunner:
         self.moe_gemv_threads = int(self.runtime_config.sail_moe_gemv_threads)
         self.moe_block_m = int(self.runtime_config.sail_moe_block_m)
         self.moe_num_warps = int(self.runtime_config.sail_moe_num_warps)
+        self.moe_prefill_backend = self.runtime_config.sail_moe_prefill_backend
         self.sparse_attn_backend = self.runtime_config.sail_sparse_attn_backend
         self.mhc_split_k = int(self.runtime_config.sail_mhc_split_k)
         self.mhc_fused_max_rows = int(self.runtime_config.sail_mhc_fused_max_rows)
+        self.qkv_fusion_mode = self.runtime_config.sail_qkv_fusion_mode
+        self.engram_indexer_backend = self.runtime_config.sail_engram_indexer_backend
+        self.lm_head_dtype = self.runtime_config.sail_lm_head_dtype
         ar_blocks = int(self.runtime_config.sail_ar_blocks or allreduce_blocks)
         ar_threads = int(self.runtime_config.sail_ar_threads or allreduce_threads)
 
@@ -1627,9 +1721,14 @@ class DeepSeekV41SailStepRunner:
         self.final_norm_weight = self._pinned_to_gpu(
             loaded_cpu.pop("norm.weight"), dtype=torch.bfloat16
         )
-        self.head_weight_f32 = self._pinned_to_gpu(
-            loaded_cpu.pop("head.weight"), dtype=torch.float32
+        head_cpu = loaded_cpu.pop("head.weight")
+        self.head_weight_bf16 = self._pinned_to_gpu(head_cpu, dtype=torch.bfloat16)
+        self.head_weight_f32: torch.Tensor | None = (
+            self._pinned_to_gpu(head_cpu, dtype=torch.float32)
+            if self.lm_head_dtype == "fp32"
+            else None
         )
+        del head_cpu
 
         def _build_layer(prefix: str, lid: int, arena_idx: int, top_k: int) -> _LayerWeights:
             is_backbone = lid < self.num_layers
@@ -1646,25 +1745,29 @@ class DeepSeekV41SailStepRunner:
                     loaded_cpu.pop(f"{prefix}.attn.compressor.norm.weight"),
                     dtype=torch.bfloat16,
                 )
-                wkv_dt = torch.float32 if cr > 1 else torch.bfloat16
-                cwkv = self._pinned_to_gpu(
-                    loaded_cpu.pop(f"{prefix}.attn.compressor.wkv.weight"),
-                    dtype=wkv_dt,
-                )
-                cwgate = (
-                    self._pinned_to_gpu(
-                        loaded_cpu.pop(f"{prefix}.attn.compressor.wgate.weight"),
+                if cr > 1:
+                    cwkv_cpu = loaded_cpu.pop(f"{prefix}.attn.compressor.wkv.weight")
+                    cwgate_cpu = loaded_cpu.pop(f"{prefix}.attn.compressor.wgate.weight")
+                    cwkv_gate = self._pinned_to_gpu(
+                        torch.cat([cwkv_cpu.float(), cwgate_cpu.float()], dim=0),
                         dtype=torch.float32,
                     )
-                    if cr > 1
-                    else None
-                )
+                    cwkv = cwkv_gate[: self.head_dim]
+                    cwgate = cwkv_gate[self.head_dim :]
+                else:
+                    cwkv = self._pinned_to_gpu(
+                        loaded_cpu.pop(f"{prefix}.attn.compressor.wkv.weight"),
+                        dtype=torch.bfloat16,
+                    )
+                    cwgate = None
+                    cwkv_gate = None
                 comp_w = _CompressorWeights(
                     compress_ratio=cr,
                     comp_idx=comp_idx_map[lid],
                     norm_weight=cn,
                     wkv_weight=cwkv,
                     wgate_weight=cwgate,
+                    wkv_gate_f32=cwkv_gate,
                 )
 
             idx_w: _IndexerWeights | None = None
@@ -1753,6 +1856,31 @@ class DeepSeekV41SailStepRunner:
             )
             w13_p, w13_s, w2_p, w2_s = exp_buffers[prefix]
 
+            wq_a_tmp = self._dequant_fp8_block32_gpu(
+                loaded_cpu.pop(f"{prefix}.attn.wq_a.weight"),
+                loaded_cpu.pop(f"{prefix}.attn.wq_a.scale"),
+            )
+            wkv_tmp = self._dequant_fp8_block32_gpu(
+                loaded_cpu.pop(f"{prefix}.attn.wkv.weight"),
+                loaded_cpu.pop(f"{prefix}.attn.wkv.scale"),
+            )
+            wqkv_a_cat = torch.cat([wq_a_tmp, wkv_tmp], dim=0).contiguous()
+            del wq_a_tmp, wkv_tmp
+
+            wq_b_tmp = self._dequant_fp8_block32_gpu(
+                loaded_cpu.pop(f"{prefix}.attn.wq_b.weight"),
+                loaded_cpu.pop(f"{prefix}.attn.wq_b.scale"),
+            )
+            if idx_w is not None:
+                wq_b_cat = torch.cat([wq_b_tmp, idx_w.wq_b_bf16], dim=0).contiguous()
+                del wq_b_tmp
+                wq_b_view = wq_b_cat[:4096]
+                idx_w.wq_b_bf16 = wq_b_cat[4096:]
+                wq_b_with_idx: torch.Tensor | None = wq_b_cat
+            else:
+                wq_b_view = wq_b_tmp
+                wq_b_with_idx = None
+
             return _LayerWeights(
                 layer_id=lid,
                 arena_swa_layer_idx=arena_idx,
@@ -1783,21 +1911,14 @@ class DeepSeekV41SailStepRunner:
                 attn_sink_f32=self._pinned_to_gpu(
                     loaded_cpu.pop(f"{prefix}.attn.attn_sink"), dtype=torch.float32
                 ),
-                wq_a_bf16=self._dequant_fp8_block32_gpu(
-                    loaded_cpu.pop(f"{prefix}.attn.wq_a.weight"),
-                    loaded_cpu.pop(f"{prefix}.attn.wq_a.scale"),
-                ),
+                wqkv_a_bf16=wqkv_a_cat,
+                wq_a_bf16=wqkv_a_cat[: self.q_lora_rank],
                 q_norm_weight=self._pinned_to_gpu(
                     loaded_cpu.pop(f"{prefix}.attn.q_norm.weight"), dtype=torch.bfloat16
                 ),
-                wq_b_bf16=self._dequant_fp8_block32_gpu(
-                    loaded_cpu.pop(f"{prefix}.attn.wq_b.weight"),
-                    loaded_cpu.pop(f"{prefix}.attn.wq_b.scale"),
-                ),
-                wkv_bf16=self._dequant_fp8_block32_gpu(
-                    loaded_cpu.pop(f"{prefix}.attn.wkv.weight"),
-                    loaded_cpu.pop(f"{prefix}.attn.wkv.scale"),
-                ),
+                wq_b_bf16=wq_b_view,
+                wq_b_with_idx_bf16=wq_b_with_idx,
+                wkv_bf16=wqkv_a_cat[self.q_lora_rank :],
                 kv_norm_weight=self._pinned_to_gpu(
                     loaded_cpu.pop(f"{prefix}.attn.kv_norm.weight"), dtype=torch.bfloat16
                 ),
@@ -1856,10 +1977,16 @@ class DeepSeekV41SailStepRunner:
             self.dspark_markov_embed_f32 = self._pinned_to_gpu(
                 loaded_cpu.pop(f"{last_m}.markov_head.embed.weight"), dtype=torch.float32
             )
+            self.dspark_markov_embed_bf16 = self.dspark_markov_embed_f32.to(
+                torch.bfloat16
+            ).contiguous()
             mk_head = self._pinned_to_gpu(
                 loaded_cpu.pop(f"{last_m}.markov_head.head.weight"), dtype=torch.float32
             )
             self.dspark_markov_head_f32_t = mk_head.t().contiguous()
+            self.dspark_markov_head_bf16_t = (
+                self.dspark_markov_head_f32_t.to(torch.bfloat16).contiguous()
+            )
         torch.cuda.synchronize(self.device)
 
         loaded_cpu.clear()
@@ -2033,6 +2160,13 @@ class DeepSeekV41SailStepRunner:
         self.qr_quant_buf = torch.zeros(
             (max_t, self.q_lora_rank), dtype=torch.bfloat16, device=dev
         )
+        self.qkv_a_buf = torch.zeros(
+            (max_t, self.q_lora_rank + self.head_dim), dtype=torch.bfloat16, device=dev
+        )
+        self.q_and_idx_buf = torch.zeros((max_t, 4608), dtype=torch.bfloat16, device=dev)
+        self.comp_kv_gate_buf = torch.zeros(
+            (max_t, 2 * self.head_dim), dtype=torch.float32, device=dev
+        )
         self.q_buf = torch.zeros((max_t, 8, self.head_dim), dtype=torch.bfloat16, device=dev)
         self.kv_buf = torch.zeros((max_t, self.head_dim), dtype=torch.bfloat16, device=dev)
         self.attn_out_buf = torch.zeros(
@@ -2088,6 +2222,26 @@ class DeepSeekV41SailStepRunner:
         self.pair_out_buf = torch.zeros(
             (max_pairs, self.hidden_size), dtype=torch.bfloat16, device=dev
         )
+        if self.moe_prefill_backend == "dequant_acblas":
+            self.moe_deq_w_buf: torch.Tensor | None = torch.zeros(
+                (64, 2 * self.inter_per_rank, self.hidden_size),
+                dtype=torch.bfloat16,
+                device=dev,
+            )
+            self.moe_tile_a_buf: torch.Tensor | None = torch.zeros(
+                (64, 64, self.hidden_size), dtype=torch.bfloat16, device=dev
+            )
+            self.moe_tile_gu_buf: torch.Tensor | None = torch.zeros(
+                (64, 64, 2 * self.inter_per_rank), dtype=torch.float32, device=dev
+            )
+            self.moe_tile_inter_buf: torch.Tensor | None = torch.zeros(
+                (64, 64, self.inter_per_rank), dtype=torch.bfloat16, device=dev
+            )
+        else:
+            self.moe_deq_w_buf = None
+            self.moe_tile_a_buf = None
+            self.moe_tile_gu_buf = None
+            self.moe_tile_inter_buf = None
 
         # Sparse attention & Indexer workspaces
         self.swa_only_topk_buf = torch.full((max_t, 128), -1, dtype=torch.int32, device=dev)
@@ -2267,19 +2421,24 @@ class DeepSeekV41SailStepRunner:
         sail_ops.inplace_act_quant_ue8m0(red_emb)
         kv_proj = self.engram_kv_buf[:rows]
         torch.matmul(red_emb, eng.wkv_bf16.t(), out=kv_proj)
-        key_f32 = kv_proj[:, : 4 * self.hidden_size].float().view(rows, 4, self.hidden_size)
-        val_f32 = kv_proj[:, 4 * self.hidden_size :].float().unsqueeze(1)
-        h_f32 = h_stream.float()
-        rstd = torch.rsqrt(h_f32.square().mean(-1) + self.norm_eps) * torch.rsqrt(
-            key_f32.square().mean(-1) + self.norm_eps
-        )
-        dot = (
-            (h_f32 * eng.qk_prod_f32.unsqueeze(0) * key_f32).sum(-1)
-            * rstd
-            * (self.hidden_size**-0.5)
-        )
-        gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1.0e-6).sqrt(), dot))
-        h_stream.copy_((h_f32 + gate.unsqueeze(-1) * val_f32).to(torch.bfloat16))
+        if self.engram_indexer_backend == "fused_hggc":
+            sail_ops.engram_gated_residual(
+                h_stream, kv_proj, eng.qk_prod_f32, norm_eps=self.norm_eps
+            )
+        else:
+            key_f32 = kv_proj[:, : 4 * self.hidden_size].float().view(rows, 4, self.hidden_size)
+            val_f32 = kv_proj[:, 4 * self.hidden_size :].float().unsqueeze(1)
+            h_f32 = h_stream.float()
+            rstd = torch.rsqrt(h_f32.square().mean(-1) + self.norm_eps) * torch.rsqrt(
+                key_f32.square().mean(-1) + self.norm_eps
+            )
+            dot = (
+                (h_f32 * eng.qk_prod_f32.unsqueeze(0) * key_f32).sum(-1)
+                * rstd
+                * (self.hidden_size**-0.5)
+            )
+            gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1.0e-6).sqrt(), dot))
+            h_stream.copy_((h_f32 + gate.unsqueeze(-1) * val_f32).to(torch.bfloat16))
         self.observer.end(ev_e2)
 
     def _run_compressor_and_indexer(
@@ -2295,6 +2454,8 @@ class DeepSeekV41SailStepRunner:
         qsl_np: np.ndarray | None,
         seq_lens_np: np.ndarray | None,
         candidates_mask: torch.Tensor | None,
+        q_idx_ready: bool = False,
+        cached_k_seq: dict[tuple[int, int], torch.Tensor] | None = None,
     ) -> torch.Tensor | None:
         """Run optional `Compressor` (`kv_source`) + `Indexer` (`index_source`), updating
         `self.shared_full_topk_buf[:rows, 128:640]` and returning updated `candidates_mask`."""
@@ -2304,6 +2465,7 @@ class DeepSeekV41SailStepRunner:
         pos_i32 = self.positions_gpu[:rows]
         mla_pages = self.mla_write_pages_gpu[:rows]
         valid_write = mla_pages > 0
+        fused_ei = self.engram_indexer_backend == "fused_hggc"
 
         # 1. Compressor (`layers 2, 8, 14` have `cr=2`; `layer 20` has `cr=1`)
         comp = lw.compressor
@@ -2326,8 +2488,14 @@ class DeepSeekV41SailStepRunner:
             else:
                 assert comp.wgate_weight is not None
                 x_f32 = x_norm.float()
-                c_kv = torch.matmul(x_f32, comp.wkv_weight.t())
-                c_sc = torch.matmul(x_f32, comp.wgate_weight.t())
+                if fused_ei and comp.wkv_gate_f32 is not None:
+                    kv_gate = self.comp_kv_gate_buf[:rows]
+                    torch.matmul(x_f32, comp.wkv_gate_f32.t(), out=kv_gate)
+                    c_kv = kv_gate[:, : self.head_dim]
+                    c_sc = kv_gate[:, self.head_dim :]
+                else:
+                    c_kv = torch.matmul(x_f32, comp.wkv_weight.t())
+                    c_sc = torch.matmul(x_f32, comp.wgate_weight.t())
                 c_slots = self.row_comp_slots_gpu[:rows]
                 ring_idx = ((pos_i32 // 2) & 7).to(torch.int64)
                 is_even = ((pos_i32 & 1) == 0) & valid_write
@@ -2470,29 +2638,25 @@ class DeepSeekV41SailStepRunner:
             self.shared_full_topk_buf[:rows, 128:] = -1
             return None if idx.is_candidate_source else candidates_mask
 
-        qr_q = self.qr_quant_buf[:rows]
-        qr_q.copy_(qr_unquant)
-        sail_ops.inplace_act_quant_ue8m0(qr_q)
-        q_idx_flat = self.idx_q_buf[:rows].view(rows, -1)
-        torch.matmul(qr_q, idx.wq_b_bf16.t(), out=q_idx_flat)
-        q_idx = q_idx_flat.view(rows, self.index_local_heads, self.index_head_dim)
-        sail_ops.apply_rope_inplace(
-            q_idx, self.comp_cos_sin_gpu, pos_i32, rope_dim=64, inverse=False
-        )
-        sail_ops.inplace_fp4_quant(q_idx, block_size=32, is_e4m3_scale=False)
+        if q_idx_ready:
+            q_idx = self.idx_q_buf[:rows]
+        else:
+            qr_q = self.qr_quant_buf[:rows]
+            qr_q.copy_(qr_unquant)
+            sail_ops.inplace_act_quant_ue8m0(qr_q)
+            q_idx_flat = self.idx_q_buf[:rows].view(rows, -1)
+            torch.matmul(qr_q, idx.wq_b_bf16.t(), out=q_idx_flat)
+            q_idx = q_idx_flat.view(rows, self.index_local_heads, self.index_head_dim)
+            sail_ops.apply_rope_inplace(
+                q_idx, self.comp_cos_sin_gpu, pos_i32, rope_dim=64, inverse=False
+            )
+            sail_ops.inplace_fp4_quant(q_idx, block_size=32, is_e4m3_scale=False)
 
         w_idx = self.idx_weights_buf[:rows]
         torch.matmul(x_norm, idx.weights_proj_bf16.t(), out=w_idx)
-        w_scaled_f32 = w_idx.float() * self.index_weight_scale
 
         pages_needed = min(self.bt_width, (max_c + lat_pp - 1) // lat_pp)
         eff_max_c = min(max_c, pages_needed * lat_pp)
-        k_pages = self.indexer_k_cache[kv_src].index_select(
-            0, self.mla_bt_gpu[:num_seqs, :pages_needed].reshape(-1).to(torch.int64)
-        )
-        k_seq = k_pages.view(num_seqs, pages_needed * lat_pp, self.index_head_dim)[
-            :, :eff_max_c, :
-        ]
 
         max_score_elems = self.idx_scores_local_buf.numel()
         if rows * eff_max_c <= max_score_elems:
@@ -2506,40 +2670,89 @@ class DeepSeekV41SailStepRunner:
             scores_local = torch.empty((rows, eff_max_c), dtype=torch.float32, device=self.device)
             scores_red = torch.empty((rows, eff_max_c), dtype=torch.float32, device=self.device)
 
-        if uniform_width >= 1:
-            q_bmm = q_idx.view(
-                num_seqs, uniform_width * self.index_local_heads, self.index_head_dim
-            )
-            raw_sc = torch.bmm(q_bmm, k_seq.transpose(1, 2)).view(
-                rows, self.index_local_heads, eff_max_c
-            )
-            torch.sum(
-                raw_sc.float().relu_() * w_scaled_f32.unsqueeze(-1),
-                dim=1,
-                out=scores_local,
+        if fused_ei:
+            sail_ops.indexer_paged_score(
+                q_idx,
+                w_idx,
+                self.indexer_k_cache[kv_src],
+                self.mla_bt_gpu[:num_seqs],
+                self.row_seq_ids_gpu[:rows],
+                pos_i32,
+                scores_out=scores_local,
+                weight_scale=self.index_weight_scale,
+                compress_ratio=cr,
+                lat_pp=lat_pp,
+                bt_width=self.bt_width,
+                eff_max_c=eff_max_c,
             )
         else:
-            assert qsl_np is not None and seq_lens_np is not None
-            scores_local.zero_()
-            for s_i in range(num_seqs):
-                s_beg = int(qsl_np[s_i])
-                s_end = int(qsl_np[s_i + 1])
-                if s_end <= s_beg:
-                    continue
-                s_c = min(eff_max_c, int(seq_lens_np[s_i]) // cr)
-                if s_c <= 0:
-                    continue
-                q_sub = q_idx[s_beg:s_end].reshape(-1, self.index_head_dim)
-                raw_sub = torch.matmul(q_sub, k_seq[s_i, :s_c].t()).view(
-                    s_end - s_beg, self.index_local_heads, s_c
+            w_scaled_f32 = w_idx.float() * self.index_weight_scale
+            cache_key = (kv_src, eff_max_c)
+            if (
+                cached_k_seq is not None
+                and comp is None
+                and cache_key in cached_k_seq
+            ):
+                k_seq = cached_k_seq[cache_key]
+            else:
+                k_pages = self.indexer_k_cache[kv_src].index_select(
+                    0, self.mla_bt_gpu[:num_seqs, :pages_needed].reshape(-1).to(torch.int64)
                 )
-                scores_local[s_beg:s_end, :s_c] = (
-                    raw_sub.float().relu_() * w_scaled_f32[s_beg:s_end].unsqueeze(-1)
-                ).sum(dim=1)
+                k_seq = k_pages.view(num_seqs, pages_needed * lat_pp, self.index_head_dim)[
+                    :, :eff_max_c, :
+                ]
+                if cached_k_seq is not None:
+                    cached_k_seq[cache_key] = k_seq
+
+            if uniform_width >= 1:
+                q_bmm = q_idx.view(
+                    num_seqs, uniform_width * self.index_local_heads, self.index_head_dim
+                )
+                raw_sc = torch.bmm(q_bmm, k_seq.transpose(1, 2)).view(
+                    rows, self.index_local_heads, eff_max_c
+                )
+                torch.sum(
+                    raw_sc.float().relu_() * w_scaled_f32.unsqueeze(-1),
+                    dim=1,
+                    out=scores_local,
+                )
+            else:
+                assert qsl_np is not None and seq_lens_np is not None
+                scores_local.zero_()
+                for s_i in range(num_seqs):
+                    s_beg = int(qsl_np[s_i])
+                    s_end = int(qsl_np[s_i + 1])
+                    if s_end <= s_beg:
+                        continue
+                    s_c = min(eff_max_c, int(seq_lens_np[s_i]) // cr)
+                    if s_c <= 0:
+                        continue
+                    q_sub = q_idx[s_beg:s_end].reshape(-1, self.index_head_dim)
+                    raw_sub = torch.matmul(q_sub, k_seq[s_i, :s_c].t()).view(
+                        s_end - s_beg, self.index_local_heads, s_c
+                    )
+                    scores_local[s_beg:s_end, :s_c] = (
+                        raw_sub.float().relu_() * w_scaled_f32[s_beg:s_end].unsqueeze(-1)
+                    ).sum(dim=1)
 
         ev_ar = self.observer.begin("icn_allreduce")
         self.icn_comm.all_reduce_f32(scores_local, output=scores_red)
         self.observer.end(ev_ar)
+
+        if fused_ei and eff_max_c <= 2048:
+            sail_ops.indexer_topk512_slots(
+                scores_red,
+                self.mla_bt_gpu[:num_seqs],
+                self.row_seq_ids_gpu[:rows],
+                pos_i32,
+                shared_full_topk=self.shared_full_topk_buf[:rows],
+                compress_ratio=cr,
+                lat_pp=lat_pp,
+                bt_width=self.bt_width,
+                eff_max_c=eff_max_c,
+                mla_arena_base=self.mla_arena_base[kv_src],
+            )
+            return None if idx.is_candidate_source else candidates_mask
 
         comp_lens = (pos_i32 + 1) // cr
         c_offs = self._comp_arange_gpu[:eff_max_c]
@@ -2549,7 +2762,7 @@ class DeepSeekV41SailStepRunner:
         if idx.is_candidate_source:
             num_blk = (eff_max_c + self.candidate_block_size - 1) // self.candidate_block_size
             if num_blk <= self.candidate_topk_blocks:
-                candidates_mask = reachable
+                candidates_mask = None
             else:
                 pad_c = (-eff_max_c) % self.candidate_block_size
                 sc_pad = (
@@ -2626,7 +2839,9 @@ class DeepSeekV41SailStepRunner:
         swa_write_base = self.swa_write_slots_gpu[:rows]
 
         candidates_mask: torch.Tensor | None = None
+        cached_k_seq: dict[tuple[int, int], torch.Tensor] = {}
         dspark_slot_idx = 0
+        fused_qkv = self.qkv_fusion_mode == "fused_qkv_epilogue"
 
         for lid, lw in enumerate(self.layers):
             h_cur = self.h_stream_buf[0][:rows]
@@ -2670,42 +2885,97 @@ class DeepSeekV41SailStepRunner:
                 sinkhorn_iters=self.hc_sinkhorn_iters,
             )
             x_norm = self.normed_buf[:rows]
-            sail_ops.mhc_pre_rmsnorm(
-                h_cur,
-                pm_cur,
-                lw.attn_norm_weight,
-                normed_out=x_norm,
-                norm_eps=self.norm_eps,
-            )
+            need_x_norm = lw.compressor is not None or lw.indexer is not None
+            if fused_qkv:
+                sail_ops.mhc_pre_rmsnorm_quant(
+                    h_cur,
+                    pm_cur,
+                    lw.attn_norm_weight,
+                    normed_out=x_norm,
+                    quant_out=self.act_quant_buf[:rows],
+                    write_normed=need_x_norm,
+                    norm_eps=self.norm_eps,
+                )
+            else:
+                sail_ops.mhc_pre_rmsnorm(
+                    h_cur,
+                    pm_cur,
+                    lw.attn_norm_weight,
+                    normed_out=x_norm,
+                    norm_eps=self.norm_eps,
+                )
             self.observer.end(ev_m)
 
             ev_qkv = self.observer.begin("attn_qkv_o_proj")
             cos_sin = self.comp_cos_sin_gpu if lw.compress_ratio > 0 else self.swa_cos_sin_gpu
-            q_in = sail_ops.act_quant_ue8m0(x_norm, out=self.act_quant_buf[:rows])
-
-            qr = self.qr_buf[:rows]
-            torch.matmul(q_in, lw.wq_a_bf16.t(), out=qr)
-            sail_ops.rmsnorm_bf16(qr, lw.q_norm_weight, eps=self.norm_eps, out=qr)
-
-            # Write SWA KV into `kv_arena` BEFORE `qr` is quantized in-place (`Indexer` uses unquantized `qr`!)
-            wkv_out = self.kv_buf[:rows]
-            torch.matmul(q_in, lw.wkv_bf16.t(), out=wkv_out)
-            sail_ops.rmsnorm_bf16(wkv_out, lw.kv_norm_weight, eps=self.norm_eps, out=wkv_out)
-            sail_ops.apply_rope_inplace(
-                wkv_out.unsqueeze(1), cos_sin, pos_i32, rope_dim=64, inverse=False
-            )
-            sail_ops.inplace_act_quant_ue8m0(wkv_out)
             layer_swa_base = self.swa_arena_base[lw.arena_swa_layer_idx]
-            self.kv_arena.view(-1, self.head_dim).index_copy_(
-                0, layer_swa_base + swa_write_base, wkv_out
-            )
+            qr = self.qr_buf[:rows]
+            q_idx_ready = False
 
-            # Build Query (`[rows, 8, 512]`) using `qr_quant_buf` so `qr` stays clean for `Indexer`!
-            qr_for_q = sail_ops.act_quant_ue8m0(qr, out=self.qr_quant_buf[:rows])
-            q_flat = self.q_buf[:rows].view(rows, -1)
-            torch.matmul(qr_for_q, lw.wq_b_bf16.t(), out=q_flat)
-            q = q_flat.view(rows, 8, self.head_dim)
-            sail_ops.apply_rope_inplace(q, cos_sin, pos_i32, rope_dim=64, inverse=False)
+            if fused_qkv:
+                q_in = self.act_quant_buf[:rows]
+                qkv_a = self.qkv_a_buf[:rows]
+                torch.matmul(q_in, lw.wqkv_a_bf16.t(), out=qkv_a)
+                qr_for_q = self.qr_quant_buf[:rows]
+                sail_ops.fused_qkv_a_epilogue(
+                    qkv_a,
+                    lw.q_norm_weight,
+                    lw.kv_norm_weight,
+                    cos_sin,
+                    pos_i32,
+                    swa_write_base,
+                    qr_unquant_out=qr,
+                    qr_quant_out=qr_for_q,
+                    kv_arena=self.kv_arena,
+                    layer_swa_base=layer_swa_base,
+                    rope_dim=64,
+                    write_qr_unquant=False,
+                    eps=self.norm_eps,
+                )
+                if lw.wq_b_with_idx_bf16 is not None:
+                    q_and_idx = self.q_and_idx_buf[:rows]
+                    torch.matmul(qr_for_q, lw.wq_b_with_idx_bf16.t(), out=q_and_idx)
+                    q = self.q_buf[:rows]
+                    sail_ops.fused_q_idx_epilogue(
+                        q_and_idx,
+                        cos_sin,
+                        pos_i32,
+                        q_out=q,
+                        q_idx_out=self.idx_q_buf[:rows],
+                    )
+                    q_idx_ready = True
+                else:
+                    q_flat = self.q_buf[:rows].view(rows, -1)
+                    torch.matmul(qr_for_q, lw.wq_b_bf16.t(), out=q_flat)
+                    q = q_flat.view(rows, 8, self.head_dim)
+                    sail_ops.apply_rope_inplace(
+                        q, cos_sin, pos_i32, rope_dim=64, inverse=False
+                    )
+            else:
+                q_in = (
+                    self.act_quant_buf[:rows]
+                    if fused_qkv
+                    else sail_ops.act_quant_ue8m0(x_norm, out=self.act_quant_buf[:rows])
+                )
+                torch.matmul(q_in, lw.wq_a_bf16.t(), out=qr)
+                sail_ops.rmsnorm_bf16(qr, lw.q_norm_weight, eps=self.norm_eps, out=qr)
+
+                wkv_out = self.kv_buf[:rows]
+                torch.matmul(q_in, lw.wkv_bf16.t(), out=wkv_out)
+                sail_ops.rmsnorm_bf16(wkv_out, lw.kv_norm_weight, eps=self.norm_eps, out=wkv_out)
+                sail_ops.apply_rope_inplace(
+                    wkv_out.unsqueeze(1), cos_sin, pos_i32, rope_dim=64, inverse=False
+                )
+                sail_ops.inplace_act_quant_ue8m0(wkv_out)
+                self.kv_arena.view(-1, self.head_dim).index_copy_(
+                    0, layer_swa_base + swa_write_base, wkv_out
+                )
+
+                qr_for_q = sail_ops.act_quant_ue8m0(qr, out=self.qr_quant_buf[:rows])
+                q_flat = self.q_buf[:rows].view(rows, -1)
+                torch.matmul(qr_for_q, lw.wq_b_bf16.t(), out=q_flat)
+                q = q_flat.view(rows, 8, self.head_dim)
+                sail_ops.apply_rope_inplace(q, cos_sin, pos_i32, rope_dim=64, inverse=False)
             self.observer.end(ev_qkv)
 
             layer_swa_topk = torch.where(valid_swa, layer_swa_base + base_swa_win_slots, -1)
@@ -2726,6 +2996,8 @@ class DeepSeekV41SailStepRunner:
                         qsl_np=qsl_np,
                         seq_lens_np=seq_lens_np,
                         candidates_mask=candidates_mask,
+                        q_idx_ready=q_idx_ready,
+                        cached_k_seq=cached_k_seq,
                     )
                     self.observer.end(ev_ci)
                 self.shared_full_topk_buf[:rows, :128].copy_(layer_swa_topk)
@@ -2749,9 +3021,13 @@ class DeepSeekV41SailStepRunner:
             self.observer.end(ev_sa)
 
             ev_o = self.observer.begin("attn_qkv_o_proj")
-            sail_ops.apply_rope_inplace(attn_o, cos_sin, pos_i32, rope_dim=64, inverse=True)
-            o_flat = attn_o.view(rows, 4096)
-            sail_ops.inplace_act_quant_ue8m0(o_flat)
+            if fused_qkv:
+                sail_ops.fused_inv_rope_act_quant(attn_o, cos_sin, pos_i32, rope_dim=64)
+                o_flat = attn_o.view(rows, 4096)
+            else:
+                sail_ops.apply_rope_inplace(attn_o, cos_sin, pos_i32, rope_dim=64, inverse=True)
+                o_flat = attn_o.view(rows, 4096)
+                sail_ops.inplace_act_quant_ue8m0(o_flat)
             o_lora = self.o_lora_buf[:rows]
             torch.matmul(o_flat, lw.wo_a_bf16.t(), out=o_lora)
             sail_ops.inplace_act_quant_ue8m0(o_lora)
@@ -2787,18 +3063,29 @@ class DeepSeekV41SailStepRunner:
                 hc_eps=self.hc_eps,
                 sinkhorn_iters=self.hc_sinkhorn_iters,
             )
-            sail_ops.mhc_pre_rmsnorm(
-                h_mid,
-                attn_pre,
-                lw.ffn_norm_weight,
-                normed_out=x_norm,
-                norm_eps=self.norm_eps,
-            )
+            if fused_qkv:
+                sail_ops.mhc_pre_rmsnorm_quant(
+                    h_mid,
+                    attn_pre,
+                    lw.ffn_norm_weight,
+                    normed_out=x_norm,
+                    quant_out=self.act_quant_buf[:rows],
+                    write_normed=True,
+                    norm_eps=self.norm_eps,
+                )
+                moe_xq_pre = self.act_quant_buf[:rows]
+            else:
+                sail_ops.mhc_pre_rmsnorm(
+                    h_mid,
+                    attn_pre,
+                    lw.ffn_norm_weight,
+                    normed_out=x_norm,
+                    norm_eps=self.norm_eps,
+                )
+                moe_xq_pre = None
             self.observer.end(ev_mp)
 
-            # `rows <= 32` is the decode / verify / batch-decode regime governed by `mxfp4_moe_decode`
-            # (`moe_gemv_max_rows` up to 32 + `moe_gemv_threads`); `rows > 32` is `mxfp4_moe_prefill`.
-            moe_fam = "mxfp4_moe_decode" if rows <= 32 else "mxfp4_moe_prefill"
+            moe_fam = "mxfp4_moe_decode" if rows <= 128 else "mxfp4_moe_prefill"
             ev_moe = self.observer.begin(moe_fam)
             moe_local = sail_ops.dsv41_moe_tp8_forward(
                 x_norm,
@@ -2825,10 +3112,16 @@ class DeepSeekV41SailStepRunner:
                 pair_out_buf=self.pair_out_buf,
                 moe_out_buf=self.sub_local_buf,
                 act_quant_x_buf=self.act_quant_buf,
+                x_quant_precomputed=moe_xq_pre,
+                deq_w_buf=self.moe_deq_w_buf,
+                tile_a_buf=self.moe_tile_a_buf,
+                tile_gu_buf=self.moe_tile_gu_buf,
+                tile_inter_buf=self.moe_tile_inter_buf,
                 gemv_max_rows=self.moe_gemv_max_rows,
                 gemv_threads=self.moe_gemv_threads,
                 block_m=self.moe_block_m,
                 num_warps=self.moe_num_warps,
+                prefill_backend=self.moe_prefill_backend,
             )
             self.observer.end(ev_moe)
 
@@ -2870,11 +3163,17 @@ class DeepSeekV41SailStepRunner:
         all_ranks: bool,
         return_local_logits: bool = False,
     ) -> torch.Tensor | None:
+        ev_head = self.observer.begin("lm_head")
         sel = hidden if sample_rows is None else hidden.index_select(0, sample_rows)
-        logits_f32 = self.logits_f32_buf[:num_sample]
-        torch.matmul(sel.float(), self.head_weight_f32.t(), out=logits_f32)
         logits_bf16 = self.logits_bf16_buf[:num_sample]
-        logits_bf16.copy_(logits_f32.to(torch.bfloat16))
+        if self.lm_head_dtype == "bf16":
+            torch.matmul(sel, self.head_weight_bf16.t(), out=logits_bf16)
+        else:
+            assert self.head_weight_f32 is not None
+            logits_f32 = self.logits_f32_buf[:num_sample]
+            torch.matmul(sel.float(), self.head_weight_f32.t(), out=logits_f32)
+            logits_bf16.copy_(logits_f32.to(torch.bfloat16))
+        self.observer.end(ev_head)
         self.icn_comm.gather_top2_from_logits(
             logits_bf16,
             local_top2_vals_buf=self.local_top2_vals_buf[:num_sample],
@@ -3291,14 +3590,22 @@ class DeepSeekV41SailStepRunner:
 
             self.decode_graphs[bucket].replay()
             if is_sampling:
-                local_f32 = self.logits_f32_buf[:num_seqs]
-                torch.matmul(
-                    self.decode_hidden_gpu[:num_seqs].float(),
-                    self.head_weight_f32.t(),
-                    out=local_f32,
-                )
                 local_bf16 = self.logits_bf16_buf[:num_seqs]
-                local_bf16.copy_(local_f32.to(torch.bfloat16))
+                if self.lm_head_dtype == "bf16":
+                    torch.matmul(
+                        self.decode_hidden_gpu[:num_seqs],
+                        self.head_weight_bf16.t(),
+                        out=local_bf16,
+                    )
+                else:
+                    assert self.head_weight_f32 is not None
+                    local_f32 = self.logits_f32_buf[:num_seqs]
+                    torch.matmul(
+                        self.decode_hidden_gpu[:num_seqs].float(),
+                        self.head_weight_f32.t(),
+                        out=local_f32,
+                    )
+                    local_bf16.copy_(local_f32.to(torch.bfloat16))
                 self._apply_stochastic_sampling(
                     plan,
                     local_bf16,

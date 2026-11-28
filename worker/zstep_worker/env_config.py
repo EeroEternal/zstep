@@ -28,6 +28,16 @@ VALID_SAIL_BACKENDS: frozenset[str] = frozenset({"auto", "sail", "sm120"})
 VALID_SAIL_SPARSE_ATTN_BACKENDS: frozenset[str] = frozenset(
     {"auto", "flash_mla", "triton_tp8", "hggc_tp8"}
 )
+VALID_SAIL_MOE_PREFILL_BACKENDS: frozenset[str] = frozenset(
+    {"triton_grouped", "dequant_acblas"}
+)
+VALID_SAIL_QKV_FUSION_MODES: frozenset[str] = frozenset(
+    {"separate", "fused_qkv_epilogue"}
+)
+VALID_SAIL_ENGRAM_INDEXER_BACKENDS: frozenset[str] = frozenset(
+    {"eager_py", "fused_hggc"}
+)
+VALID_SAIL_LM_HEAD_DTYPES: frozenset[str] = frozenset({"fp32", "bf16"})
 DEFAULT_MIN_PXB_BI_GBPS: float = 25.0
 
 
@@ -188,9 +198,13 @@ class WorkerRuntimeConfig:
     sail_moe_gemv_threads: int = 256
     sail_moe_block_m: int = 32
     sail_moe_num_warps: int = 4
+    sail_moe_prefill_backend: str = "triton_grouped"
     sail_sparse_attn_backend: str = "auto"
     sail_mhc_split_k: int = 1
     sail_mhc_fused_max_rows: int = 16
+    sail_qkv_fusion_mode: str = "separate"
+    sail_engram_indexer_backend: str = "eager_py"
+    sail_lm_head_dtype: str = "fp32"
     sail_observe_path: str = ""
 
     @classmethod
@@ -427,6 +441,38 @@ class WorkerRuntimeConfig:
         )
         if not 0 <= sail_mhc_fused_max_rows <= 4096:
             raise ValueError("sail_mhc_fused_max_rows must be in 0..=4096")
+        sail_moe_prefill_backend = _sail_str(
+            "ZSTEP_SAIL_MOE_PREFILL_BACKEND", "moe_prefill_backend", "triton_grouped"
+        ).lower()
+        if sail_moe_prefill_backend not in VALID_SAIL_MOE_PREFILL_BACKENDS:
+            raise ValueError(
+                f"Unsupported ZSTEP_SAIL_MOE_PREFILL_BACKEND={sail_moe_prefill_backend!r}; "
+                f"expected one of {sorted(VALID_SAIL_MOE_PREFILL_BACKENDS)}"
+            )
+        sail_qkv_fusion_mode = _sail_str(
+            "ZSTEP_SAIL_QKV_FUSION_MODE", "qkv_fusion_mode", "separate"
+        ).lower()
+        if sail_qkv_fusion_mode not in VALID_SAIL_QKV_FUSION_MODES:
+            raise ValueError(
+                f"Unsupported ZSTEP_SAIL_QKV_FUSION_MODE={sail_qkv_fusion_mode!r}; "
+                f"expected one of {sorted(VALID_SAIL_QKV_FUSION_MODES)}"
+            )
+        sail_engram_indexer_backend = _sail_str(
+            "ZSTEP_SAIL_ENGRAM_INDEXER_BACKEND", "engram_indexer_backend", "eager_py"
+        ).lower()
+        if sail_engram_indexer_backend not in VALID_SAIL_ENGRAM_INDEXER_BACKENDS:
+            raise ValueError(
+                f"Unsupported ZSTEP_SAIL_ENGRAM_INDEXER_BACKEND={sail_engram_indexer_backend!r}; "
+                f"expected one of {sorted(VALID_SAIL_ENGRAM_INDEXER_BACKENDS)}"
+            )
+        sail_lm_head_dtype = _sail_str(
+            "ZSTEP_SAIL_LM_HEAD_DTYPE", "lm_head_dtype", "fp32"
+        ).lower()
+        if sail_lm_head_dtype not in VALID_SAIL_LM_HEAD_DTYPES:
+            raise ValueError(
+                f"Unsupported ZSTEP_SAIL_LM_HEAD_DTYPE={sail_lm_head_dtype!r}; "
+                f"expected one of {sorted(VALID_SAIL_LM_HEAD_DTYPES)}"
+            )
         sail_observe_path = env.get("ZSTEP_SAIL_OBSERVE_PATH", "").strip()
 
         return cls(
@@ -510,9 +556,13 @@ class WorkerRuntimeConfig:
             sail_moe_gemv_threads=sail_moe_gemv_threads,
             sail_moe_block_m=sail_moe_block_m,
             sail_moe_num_warps=sail_moe_num_warps,
+            sail_moe_prefill_backend=sail_moe_prefill_backend,
             sail_sparse_attn_backend=sail_sparse_attn_backend,
             sail_mhc_split_k=sail_mhc_split_k,
             sail_mhc_fused_max_rows=sail_mhc_fused_max_rows,
+            sail_qkv_fusion_mode=sail_qkv_fusion_mode,
+            sail_engram_indexer_backend=sail_engram_indexer_backend,
+            sail_lm_head_dtype=sail_lm_head_dtype,
             sail_observe_path=sail_observe_path,
         )
 
@@ -545,7 +595,9 @@ class WorkerRuntimeConfig:
             f"sail={self.backend}(ar={self.sail_ar_blocks}x{self.sail_ar_threads},"
             f"os={self.sail_ar_oneshot_max_bytes},pccl={self.sail_ar_pccl_min_bytes},"
             f"moe_gemv<={self.sail_moe_gemv_max_rows}@{self.sail_moe_gemv_threads},"
-            f"bm={self.sail_moe_block_m}w{self.sail_moe_num_warps},"
+            f"bm={self.sail_moe_block_m}w{self.sail_moe_num_warps}:{self.sail_moe_prefill_backend},"
             f"attn={self.sail_sparse_attn_backend},"
-            f"mhc={self.sail_mhc_split_k}r{self.sail_mhc_fused_max_rows})"
+            f"mhc={self.sail_mhc_split_k}r{self.sail_mhc_fused_max_rows},"
+            f"qkv={self.sail_qkv_fusion_mode},ei={self.sail_engram_indexer_backend},"
+            f"head={self.sail_lm_head_dtype})"
         )
