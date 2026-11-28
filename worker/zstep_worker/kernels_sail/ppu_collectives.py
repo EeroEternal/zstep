@@ -11,6 +11,7 @@ size-aware fallback to `PCCL` (`dist.all_reduce`) for large non-graphed prefill 
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import math
 import mmap
@@ -499,19 +500,15 @@ class PpuIcnCollectives:
             return
         if abort:
             self.signal_abort()
-        try:
+        with contextlib.suppress(BaseException):
             torch.cuda.synchronize(self.device)
-        except BaseException:
-            pass
         for peer, ptr in enumerate(self._peer_ipc_ptrs_host):
             if peer != self.rank and ptr != 0:
                 self._ext.close_ipc_handle(ptr)
         self._peer_ipc_ptrs_host.clear()
         if not abort and dist.is_initialized():
-            try:
+            with contextlib.suppress(BaseException):
                 dist.barrier(group=self.exchange_group)
-            except BaseException:
-                pass
         if self._my_ipc_ptr != 0:
             self._ext.free_ipc_buffer(self._my_ipc_ptr)
             self._my_ipc_ptr = 0

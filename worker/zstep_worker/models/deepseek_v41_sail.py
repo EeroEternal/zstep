@@ -640,7 +640,7 @@ class DeepSeekV41SailDSparkDrafter:
         q_in = sail_ops.act_quant_ue8m0(mx, out=runner.act_quant_buf[:n_ctx])
         pos_i32 = self.ctx_positions_gpu[:n_ctx]
         base_s = self.ctx_swa_slots_gpu[:n_ctx]
-        for stage_idx, stage in enumerate(runner.mtp_layers):
+        for stage in runner.mtp_layers:
             kv = runner.kv_buf[:n_ctx]
             torch.matmul(q_in, stage.wkv_bf16.t(), out=kv)
             sail_ops.rmsnorm_bf16(kv, stage.kv_norm_weight, eps=runner.norm_eps, out=kv)
