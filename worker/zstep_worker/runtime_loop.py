@@ -364,18 +364,41 @@ class RuntimeLoop:
         try:
             self.model_type = _probe_model_type(args.model_dir)
             if args.model_dir and self.model_type == "deepseek_v41":
-                from zstep_worker.models.deepseek_v41 import DeepSeekV41StepRunner
+                import torch
 
-                self.runner = DeepSeekV41StepRunner(
-                    model_dir=Path(args.model_dir),
-                    rank=args.rank,
-                    bridge=self.bridge,
-                    dist_init_file=args.dist_init_file,
-                    allreduce_name=args.allreduce_name,
-                    allreduce_blocks=args.allreduce_blocks,
-                    allreduce_threads=args.allreduce_threads,
-                    num_kv_pages=args.num_kv_pages,
-                )
+                use_sail = self.runtime_config.backend == "sail"
+                if self.runtime_config.backend == "auto":
+                    cap = torch.cuda.get_device_capability(args.rank)
+                    use_sail = cap != (12, 0)
+                if use_sail:
+                    from zstep_worker.models.deepseek_v41_sail import (
+                        DeepSeekV41SailStepRunner,
+                    )
+
+                    self.runner = DeepSeekV41SailStepRunner(
+                        model_dir=Path(args.model_dir),
+                        rank=args.rank,
+                        bridge=self.bridge,
+                        dist_init_file=args.dist_init_file,
+                        allreduce_name=args.allreduce_name,
+                        allreduce_blocks=args.allreduce_blocks,
+                        allreduce_threads=args.allreduce_threads,
+                        num_kv_pages=args.num_kv_pages,
+                        runtime_config=self.runtime_config,
+                    )
+                else:
+                    from zstep_worker.models.deepseek_v41 import DeepSeekV41StepRunner
+
+                    self.runner = DeepSeekV41StepRunner(
+                        model_dir=Path(args.model_dir),
+                        rank=args.rank,
+                        bridge=self.bridge,
+                        dist_init_file=args.dist_init_file,
+                        allreduce_name=args.allreduce_name,
+                        allreduce_blocks=args.allreduce_blocks,
+                        allreduce_threads=args.allreduce_threads,
+                        num_kv_pages=args.num_kv_pages,
+                    )
             elif args.model_dir:
                 from zstep_worker.models.qwen35_moe import Qwen35MoeStepRunner
 
@@ -490,21 +513,24 @@ class RuntimeLoop:
         os.eventfd_write(self.args.done_fd, 1)
 
         watched_kernels: list[tuple[str, object]] = []
-        try:
-            from zstep_worker.kernels_sm120.moe_router import dsv41_sqrt_softplus_topk_kernel
-            from zstep_worker.kernels_sm120.norm_quant import (
-                rmsnorm_quantize_mxfp8_group32_kernel,
-            )
+        if getattr(self.runner, "backend_name", "") != "sail":
+            try:
+                from zstep_worker.kernels_sm120.moe_router import (
+                    dsv41_sqrt_softplus_topk_kernel,
+                )
+                from zstep_worker.kernels_sm120.norm_quant import (
+                    rmsnorm_quantize_mxfp8_group32_kernel,
+                )
 
-            watched_kernels.extend(
-                [
-                    ("norm_mxfp8", rmsnorm_quantize_mxfp8_group32_kernel),
-                    ("router_dsv41", dsv41_sqrt_softplus_topk_kernel),
-                ]
-            )
-        except ModuleNotFoundError:
-            if self.args.model_dir or isinstance(self.runner, MicroStep):
-                raise
+                watched_kernels.extend(
+                    [
+                        ("norm_mxfp8", rmsnorm_quantize_mxfp8_group32_kernel),
+                        ("router_dsv41", dsv41_sqrt_softplus_topk_kernel),
+                    ]
+                )
+            except ModuleNotFoundError:
+                if self.args.model_dir or isinstance(self.runner, MicroStep):
+                    raise
         if self.args.model_dir and self.model_type == "deepseek_v41":
             extra_watched = getattr(self.runner, "watched_triton_kernels", None)
             if callable(extra_watched):
@@ -543,16 +569,26 @@ class RuntimeLoop:
         gc.disable()
         try:
             with ExitStack() as stack:
-                spies = [
-                    (
-                        name,
-                        stack.enter_context(
-                            patch.object(kernel, "_do_compile", wraps=kernel._do_compile)
-                        ),
-                    )
-                    for name, kernel in watched_kernels
-                ]
-                watched_count = len(spies)
+                spies: list[tuple[str, object]] = []
+                cache_baselines: list[tuple[str, object, int]] = []
+                for name, kernel in watched_kernels:
+                    if hasattr(kernel, "_do_compile"):
+                        spies.append(
+                            (
+                                name,
+                                stack.enter_context(
+                                    patch.object(
+                                        kernel, "_do_compile", wraps=kernel._do_compile
+                                    )
+                                ),
+                            )
+                        )
+                    elif hasattr(kernel, "device_caches"):
+                        init_len = sum(
+                            len(dc[0]) for dc in kernel.device_caches.values()
+                        )
+                        cache_baselines.append((name, kernel, init_len))
+                watched_count = len(spies) + len(cache_baselines)
                 pipelined = callable(getattr(self.runner, "launch", None)) and callable(
                     getattr(self.runner, "finish", None)
                 )
@@ -580,7 +616,14 @@ class RuntimeLoop:
                                 f"{pending[0]} was still pending"
                             )
                         self._prefill_runahead.drain()
-                        recompiled_count = sum(spy.call_count for _, spy in spies)
+                        recompiled_count = sum(spy.call_count for _, spy in spies) + sum(
+                            max(
+                                0,
+                                sum(len(dc[0]) for dc in krn.device_caches.values())
+                                - base_len,
+                            )
+                            for _, krn, base_len in cache_baselines
+                        )
                         if self._is_result_rank:
                             self.bridge.result(header.step_id).write(
                                 step_id=header.step_id,

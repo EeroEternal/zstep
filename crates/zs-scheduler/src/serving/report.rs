@@ -282,6 +282,19 @@ where
     overrides
 }
 
+fn parse_clock_mhz(raw: &str, kind: &str, line: &str) -> Result<u32> {
+    let trimmed = raw.trim();
+    if matches!(
+        trimmed,
+        "[N/A]" | "N/A" | "[Not Supported]" | "Not Supported" | "-"
+    ) {
+        return Ok(0);
+    }
+    trimmed.parse::<u32>().map_err(|error| {
+        EngineError::Protocol(format!("invalid {kind} clock in `{line}`: {error}"))
+    })
+}
+
 impl BenchmarkProvenance {
     pub fn capture(
         seed: u64,
@@ -292,15 +305,17 @@ impl BenchmarkProvenance {
     ) -> Result<Self> {
         let git_commit = zs_wire::resolve_git_sha(true).map_err(EngineError::Protocol)?;
 
-        let gpu_output = Command::new("nvidia-smi")
-            .args([
-                "--query-gpu=driver_version,clocks.current.graphics,clocks.current.memory",
-                "--format=csv,noheader,nounits",
-            ])
-            .output()?;
+        let query_args = [
+            "--query-gpu=driver_version,clocks.current.graphics,clocks.current.memory",
+            "--format=csv,noheader,nounits",
+        ];
+        let gpu_output = match Command::new("nvidia-smi").args(query_args).output() {
+            Ok(output) => output,
+            Err(_) => Command::new("ppu-smi").args(query_args).output()?,
+        };
         if !gpu_output.status.success() {
             return Err(EngineError::Protocol(
-                "nvidia-smi failed while capturing provenance".to_owned(),
+                "nvidia-smi/ppu-smi failed while capturing provenance".to_owned(),
             ));
         }
         let gpu_csv = String::from_utf8(gpu_output.stdout).map_err(|error| {
@@ -317,12 +332,8 @@ impl BenchmarkProvenance {
                 )));
             }
             driver_versions.push(fields[0].to_owned());
-            gpu_graphics_clocks_mhz.push(fields[1].parse::<u32>().map_err(|error| {
-                EngineError::Protocol(format!("invalid graphics clock in `{line}`: {error}"))
-            })?);
-            gpu_mem_clocks_mhz.push(fields[2].parse::<u32>().map_err(|error| {
-                EngineError::Protocol(format!("invalid memory clock in `{line}`: {error}"))
-            })?);
+            gpu_graphics_clocks_mhz.push(parse_clock_mhz(fields[1], "graphics", line)?);
+            gpu_mem_clocks_mhz.push(parse_clock_mhz(fields[2], "memory", line)?);
         }
         let nvidia_driver_version = driver_versions.first().cloned().ok_or_else(|| {
             EngineError::Protocol("nvidia-smi returned no GPU provenance rows".to_owned())
