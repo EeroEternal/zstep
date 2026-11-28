@@ -47,7 +47,7 @@ def get_sail_ops_extension():
     global _SAIL_EXT
     if _SAIL_EXT is None:
         _SAIL_EXT = load_inline(
-            name="zstep_sail_ops_v5_ext",
+            name="zstep_sail_ops_v8_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -59,6 +59,7 @@ def get_sail_ops_extension():
                 "close_ipc_handle",
                 "free_ipc_buffer",
                 "launch_icn_allreduce_bf16",
+                "launch_icn_allreduce_mhc_post_bf16",
                 "launch_icn_allreduce_f32",
                 "launch_icn_allgather_bf16",
                 "launch_local_top2_bf16",
@@ -68,7 +69,9 @@ def get_sail_ops_extension():
                 "launch_rmsnorm_bf16",
                 "launch_mhc_fused_mixes_bf16",
                 "launch_mhc_fused_mixes_splitk_bf16",
+                "launch_mhc_vec_single_splitk_bf16",
                 "launch_mhc_sinkhorn_from_proj",
+                "launch_mhc_sinkhorn_ozaki_vec",
                 "launch_mhc_pre_rmsnorm_bf16",
                 "launch_mhc_pre_rmsnorm_quant_bf16",
                 "launch_mhc_post_bf16",
@@ -87,14 +90,19 @@ def get_sail_ops_extension():
                 "launch_moe_gather_tile_inputs_bf16",
                 "launch_dequant_mxfp4_tiles_bf16",
                 "launch_bmm_bf16_f32_nt",
+                "launch_gemm_bf16_f32_nt",
                 "launch_moe_tile_swiglu_quant_bf16",
                 "launch_moe_scatter_tile_outputs_bf16",
                 "launch_moe_combine_pairs_shared_bf16",
                 "launch_engram_lookup_dequant",
                 "launch_engram_gated_residual_bf16",
+                "launch_compressor_cr2_fused",
                 "launch_indexer_paged_score_bf16",
                 "launch_indexer_topk512_slots",
                 "launch_sparse_attn_tp8_bf16",
+                "launch_sparse_attn_tp8_reduce",
+                "launch_dspark_sail_verify_prep",
+                "launch_fused_mtp_ctx_kv_epilogue_bf16",
             ],
             extra_cflags=["-O3"],
             extra_cuda_cflags=["-O3"],
@@ -193,12 +201,26 @@ class PpuIcnCollectives:
             TOP2_HEADER_BYTES + NUM_RING_SLOTS * MAX_RANKS * (self.max_top2_rows * 2) * 8,
             65536,
         )
-        self.total_ipc_bytes: int = self.top2_region_off + top2_bytes
+        # Dedicated isolated 4-slot small-payload BF16 AllReduce ring (`<= 64 KiB`, `8 x 256`)
+        # so `M <= 6` decode/verify avoids 64-block cross-PPU flag contention with zero slot hazard.
+        self.small_ar_max_bytes: int = 65536
+        small_inbox = _align_up(self.small_ar_max_bytes, 4096)
+        self.bf16_small_ar_slot_stride: int = 2 * MAX_RANKS * small_inbox
+        self.bf16_small_ar_region_off: int = self.top2_region_off + top2_bytes
+        bf16_small_ar_bytes = _align_up(
+            IPC_REGION_HEADER_BYTES + NUM_RING_SLOTS * self.bf16_small_ar_slot_stride, 65536
+        )
+        self.small_blocks: int = min(self.blocks, 8)
+        self.small_threads: int = min(self.threads, 256)
+        self.total_ipc_bytes: int = self.bf16_small_ar_region_off + bf16_small_ar_bytes
 
         try:
             self._init_abort_shm()
             self._init_icn_p2p_ipc()
             self.bf16_ar_control: torch.Tensor = torch.zeros(
+                MAX_BLOCKS, dtype=torch.int64, device=device
+            )
+            self.bf16_small_ar_control: torch.Tensor = torch.zeros(
                 MAX_BLOCKS, dtype=torch.int64, device=device
             )
             self.f32_ar_control: torch.Tensor = torch.zeros(
@@ -284,6 +306,9 @@ class PpuIcnCollectives:
         self.bf16_ar_peer_ptrs: torch.Tensor = _pinned_i64(
             [p + self.bf16_ar_region_off for p in base_ptrs]
         )
+        self.bf16_small_ar_peer_ptrs: torch.Tensor = _pinned_i64(
+            [p + self.bf16_small_ar_region_off for p in base_ptrs]
+        )
         self.f32_ar_peer_ptrs: torch.Tensor = _pinned_i64(
             [p + self.bf16_ar_region_off * 0 + self.f32_ar_region_off for p in base_ptrs]
         )
@@ -333,7 +358,7 @@ class PpuIcnCollectives:
                 f"BF16 AllReduce numel={numel} exceeds ICNLink IPC capacity "
                 f"{self.max_bf16_ar_elements} without PCCL fallback"
             )
-        stream_handle = torch.cuda.current_stream(self.device).cuda_stream
+        stream_handle = cur_stream.cuda_stream
         self._ext.launch_icn_allreduce_bf16(
             input_,
             out,
@@ -346,6 +371,72 @@ class PpuIcnCollectives:
             self.world_size,
             self.blocks,
             self.threads,
+            stream_handle,
+        )
+        self.icn_bf16_ar_calls += 1
+        return out
+
+    def all_reduce_mhc_post_bf16(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        comb_mix: torch.Tensor,
+        *,
+        out: torch.Tensor,
+        scratch_red: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fused TP=8 BF16 AllReduce + 4-stream `mhc_post` update (`CUDA-Graph` & `PCCL` safe)."""
+        if self._closed:
+            raise RuntimeError("PpuIcnCollectives is closed")
+        numel = input_.numel()
+        if numel == 0:
+            return out
+        nbytes = numel * 2
+        cur_stream = torch.cuda.current_stream(self.device)
+        capturing = torch.cuda.is_current_stream_capturing()
+        on_default_stream = (
+            cur_stream.cuda_stream == torch.cuda.default_stream(self.device).cuda_stream
+        )
+        stream_handle = cur_stream.cuda_stream
+        if (
+            not capturing
+            and on_default_stream
+            and self.pccl_group is not None
+            and (nbytes >= self.pccl_min_bytes or numel > self.max_bf16_ar_elements)
+        ):
+            red = scratch_red[: input_.shape[0]]
+            if red.data_ptr() != input_.data_ptr():
+                red.copy_(input_)
+            dist.all_reduce(red, group=self.pccl_group)
+            self.pccl_ar_calls += 1
+            self._ext.launch_mhc_post_bf16(
+                red, residual, post_mix, comb_mix, out, stream_handle | 1
+            )
+            return out
+        if nbytes > self.oneshot_max_bytes or numel > self.max_bf16_ar_elements:
+            red = scratch_red[: input_.shape[0]]
+            self.all_reduce_bf16(input_, output=red)
+            self._ext.launch_mhc_post_bf16(
+                red, residual, post_mix, comb_mix, out, stream_handle | 1
+            )
+            return out
+        use_small = nbytes <= self.small_ar_max_bytes and self.blocks > 8
+        self._ext.launch_icn_allreduce_mhc_post_bf16(
+            input_,
+            residual,
+            post_mix,
+            comb_mix,
+            out,
+            self.bf16_small_ar_control if use_small else self.bf16_ar_control,
+            self.bf16_small_ar_peer_ptrs if use_small else self.bf16_ar_peer_ptrs,
+            self._abort_dev_ptr,
+            self.bf16_small_ar_slot_stride if use_small else self.bf16_ar_slot_stride,
+            self.oneshot_max_bytes,
+            self.rank,
+            self.world_size,
+            self.small_blocks if use_small else self.blocks,
+            self.small_threads if use_small else self.threads,
             stream_handle,
         )
         self.icn_bf16_ar_calls += 1
