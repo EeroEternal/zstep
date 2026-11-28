@@ -287,3 +287,24 @@ def test_export_nebula_bundle_sail_and_sm120(tmp_path) -> None:
         text = (repo_root / "deploy" / "docker" / name).read_text(encoding="utf-8")
         assert 'ENTRYPOINT ["zs-server"]' in text
         assert "ZSTEP_WORKER_ROOT=/opt/zstep/worker" in text
+
+
+def test_sail_runtime_config_single_source_of_truth() -> None:
+    from zstep_worker.sail_config import SailRuntimeConfig
+
+    env = {
+        "ZSTEP_BACKEND": "sail",
+        "ZSTEP_SAIL_AR_BLOCKS": "64",
+        "ZSTEP_SAIL_AR_FUSE_MHC_POST": "1",
+        "ZSTEP_SAIL_MOE_ROUTER_MODE": "ozaki_fast_fp4",
+        "ZSTEP_SAIL_MHC_BACKEND": "vec_1pass_ozaki",
+    }
+    cfg = WorkerRuntimeConfig.from_env(env)
+    assert cfg.sail == SailRuntimeConfig.from_env(env)
+    policy_map = SailRuntimeConfig.policy_env_map()
+    assert policy_map["ar_blocks"] == "ZSTEP_SAIL_AR_BLOCKS"
+    assert policy_map["ar_fuse_mhc_post"] == "ZSTEP_SAIL_AR_FUSE_MHC_POST"
+    assert policy_map["moe_router_mode"] == "ZSTEP_SAIL_MOE_ROUTER_MODE"
+    assert policy_map["mhc_backend"] == "ZSTEP_SAIL_MHC_BACKEND"
+    assert "policy_path" not in policy_map
+    assert "observe_path" not in policy_map

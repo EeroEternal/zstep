@@ -14,6 +14,18 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import os
 
+from zstep_worker.sail_config import (
+    VALID_SAIL_BACKENDS as VALID_SAIL_BACKENDS,
+    VALID_SAIL_ENGRAM_INDEXER_BACKENDS as VALID_SAIL_ENGRAM_INDEXER_BACKENDS,
+    VALID_SAIL_LM_HEAD_DTYPES as VALID_SAIL_LM_HEAD_DTYPES,
+    VALID_SAIL_MHC_BACKENDS as VALID_SAIL_MHC_BACKENDS,
+    VALID_SAIL_MOE_PREFILL_BACKENDS as VALID_SAIL_MOE_PREFILL_BACKENDS,
+    VALID_SAIL_MOE_ROUTER_MODES as VALID_SAIL_MOE_ROUTER_MODES,
+    VALID_SAIL_QKV_FUSION_MODES as VALID_SAIL_QKV_FUSION_MODES,
+    VALID_SAIL_SPARSE_ATTN_BACKENDS as VALID_SAIL_SPARSE_ATTN_BACKENDS,
+    SailRuntimeConfig as SailRuntimeConfig,
+)
+
 VALID_SPEC_METHODS: frozenset[str] = frozenset({"none", "ngram", "dspark", "mtp"})
 VALID_P2P_MODES: frozenset[str] = frozenset(
     {"auto", "0", "off", "false", "disable", "disabled", "force"}
@@ -24,24 +36,6 @@ VALID_QWEN_GDN_DECODE_MODES: tuple[str, ...] = (
     "split_2op",
     "split_3op",
 )
-VALID_SAIL_BACKENDS: frozenset[str] = frozenset({"auto", "sail", "sm120"})
-VALID_SAIL_SPARSE_ATTN_BACKENDS: frozenset[str] = frozenset(
-    {"auto", "flash_mla", "triton_tp8", "triton_splitk", "hggc_tp8"}
-)
-VALID_SAIL_MOE_PREFILL_BACKENDS: frozenset[str] = frozenset(
-    {"triton_grouped", "dequant_acblas"}
-)
-VALID_SAIL_MOE_ROUTER_MODES: frozenset[str] = frozenset(
-    {"fp32", "ozaki_bf16", "ozaki_fast_fp4"}
-)
-VALID_SAIL_MHC_BACKENDS: frozenset[str] = frozenset({"legacy_2pass", "vec_1pass_ozaki"})
-VALID_SAIL_QKV_FUSION_MODES: frozenset[str] = frozenset(
-    {"separate", "fused_qkv_epilogue"}
-)
-VALID_SAIL_ENGRAM_INDEXER_BACKENDS: frozenset[str] = frozenset(
-    {"eager_py", "fused_hggc", "fused_hggc_ozaki"}
-)
-VALID_SAIL_LM_HEAD_DTYPES: frozenset[str] = frozenset({"fp32", "bf16"})
 VALID_KV_DRAM_CODECS: frozenset[str] = frozenset({"none", "rans_gpu", "lossless"})
 VALID_NVFP4_ACT_MODES: frozenset[str] = frozenset({"a4", "a8"})
 DEFAULT_MIN_PXB_BI_GBPS: float = 25.0
@@ -388,144 +382,7 @@ class WorkerRuntimeConfig:
                 f"Unsupported ZSTEP_BACKEND={backend!r}; "
                 f"expected one of {sorted(VALID_SAIL_BACKENDS)}"
             )
-        sail_policy_path = env.get("ZSTEP_SAIL_POLICY_PATH", "").strip()
-        policy_defaults: dict[str, object] = {}
-        if sail_policy_path:
-            import json
-            from pathlib import Path
-
-            raw_policy = json.loads(
-                Path(sail_policy_path).read_text(encoding="utf-8")
-            )
-            if not isinstance(raw_policy, dict):
-                raise ValueError("ZSTEP_SAIL_POLICY_PATH must contain a JSON object")
-            policy_defaults = raw_policy
-
-        def _sail_int(env_key: str, policy_key: str, fallback: int) -> int:
-            if env.get(env_key, "").strip():
-                return env_int(env_key, fallback, environ=env)
-            if policy_key in policy_defaults:
-                val = policy_defaults[policy_key]
-                if isinstance(val, bool) or not isinstance(val, int):
-                    raise ValueError(f"Policy field {policy_key!r} must be an integer")
-                return val
-            return fallback
-
-        def _sail_str(env_key: str, policy_key: str, fallback: str) -> str:
-            raw_val = env.get(env_key, "").strip()
-            if raw_val:
-                return raw_val
-            if policy_key in policy_defaults:
-                val = policy_defaults[policy_key]
-                if not isinstance(val, str):
-                    raise ValueError(f"Policy field {policy_key!r} must be a string")
-                return val.strip() or fallback
-            return fallback
-
-        sail_ar_blocks = _sail_int("ZSTEP_SAIL_AR_BLOCKS", "ar_blocks", 8)
-        if not 1 <= sail_ar_blocks <= 64:
-            raise ValueError(f"sail_ar_blocks must be in 1..=64 (got {sail_ar_blocks})")
-        sail_ar_threads = _sail_int("ZSTEP_SAIL_AR_THREADS", "ar_threads", 256)
-        if sail_ar_threads not in (64, 128, 256, 512):
-            raise ValueError(
-                f"sail_ar_threads must be 64, 128, 256, or 512 (got {sail_ar_threads})"
-            )
-        sail_ar_oneshot_max_bytes = _sail_int(
-            "ZSTEP_SAIL_AR_ONESHOT_MAX_BYTES", "ar_oneshot_max_bytes", 131072
-        )
-        if sail_ar_oneshot_max_bytes < 0:
-            raise ValueError("sail_ar_oneshot_max_bytes must be >= 0")
-        sail_ar_pccl_min_bytes = _sail_int(
-            "ZSTEP_SAIL_AR_PCCL_MIN_BYTES", "ar_pccl_min_bytes", 67108864
-        )
-        if sail_ar_pccl_min_bytes < 0:
-            raise ValueError("sail_ar_pccl_min_bytes must be >= 0")
-        sail_moe_gemv_max_rows = _sail_int(
-            "ZSTEP_SAIL_MOE_GEMV_MAX_ROWS", "moe_gemv_max_rows", 16
-        )
-        if not 0 <= sail_moe_gemv_max_rows <= 256:
-            raise ValueError("sail_moe_gemv_max_rows must be in 0..=256")
-        sail_moe_gemv_threads = _sail_int(
-            "ZSTEP_SAIL_MOE_GEMV_THREADS", "moe_gemv_threads", 256
-        )
-        if sail_moe_gemv_threads not in (128, 256, 512):
-            raise ValueError("sail_moe_gemv_threads must be 128, 256, or 512")
-        sail_moe_block_m = _sail_int("ZSTEP_SAIL_MOE_BLOCK_M", "moe_block_m", 32)
-        if sail_moe_block_m not in (16, 32, 64):
-            raise ValueError("sail_moe_block_m must be 16, 32, or 64")
-        sail_moe_num_warps = _sail_int("ZSTEP_SAIL_MOE_NUM_WARPS", "moe_num_warps", 4)
-        if sail_moe_num_warps not in (2, 4, 8):
-            raise ValueError("sail_moe_num_warps must be 2, 4, or 8")
-        sail_sparse_attn_backend = _sail_str(
-            "ZSTEP_SAIL_SPARSE_ATTN_BACKEND", "sparse_attn_backend", "auto"
-        ).lower()
-        if sail_sparse_attn_backend not in VALID_SAIL_SPARSE_ATTN_BACKENDS:
-            raise ValueError(
-                f"Unsupported ZSTEP_SAIL_SPARSE_ATTN_BACKEND={sail_sparse_attn_backend!r}; "
-                f"expected one of {sorted(VALID_SAIL_SPARSE_ATTN_BACKENDS)}"
-            )
-        sail_mhc_split_k = _sail_int("ZSTEP_SAIL_MHC_SPLIT_K", "mhc_split_k", 1)
-        if sail_mhc_split_k not in (1, 2, 4, 8, 16):
-            raise ValueError("sail_mhc_split_k must be 1, 2, 4, 8, or 16")
-        sail_mhc_fused_max_rows = _sail_int(
-            "ZSTEP_SAIL_MHC_FUSED_MAX_ROWS", "mhc_fused_max_rows", 16
-        )
-        if not 0 <= sail_mhc_fused_max_rows <= 4096:
-            raise ValueError("sail_mhc_fused_max_rows must be in 0..=4096")
-        sail_moe_prefill_backend = _sail_str(
-            "ZSTEP_SAIL_MOE_PREFILL_BACKEND", "moe_prefill_backend", "triton_grouped"
-        ).lower()
-        if sail_moe_prefill_backend not in VALID_SAIL_MOE_PREFILL_BACKENDS:
-            raise ValueError(
-                f"Unsupported ZSTEP_SAIL_MOE_PREFILL_BACKEND={sail_moe_prefill_backend!r}; "
-                f"expected one of {sorted(VALID_SAIL_MOE_PREFILL_BACKENDS)}"
-            )
-        sail_qkv_fusion_mode = _sail_str(
-            "ZSTEP_SAIL_QKV_FUSION_MODE", "qkv_fusion_mode", "separate"
-        ).lower()
-        if sail_qkv_fusion_mode not in VALID_SAIL_QKV_FUSION_MODES:
-            raise ValueError(
-                f"Unsupported ZSTEP_SAIL_QKV_FUSION_MODE={sail_qkv_fusion_mode!r}; "
-                f"expected one of {sorted(VALID_SAIL_QKV_FUSION_MODES)}"
-            )
-        sail_engram_indexer_backend = _sail_str(
-            "ZSTEP_SAIL_ENGRAM_INDEXER_BACKEND", "engram_indexer_backend", "eager_py"
-        ).lower()
-        if sail_engram_indexer_backend not in VALID_SAIL_ENGRAM_INDEXER_BACKENDS:
-            raise ValueError(
-                f"Unsupported ZSTEP_SAIL_ENGRAM_INDEXER_BACKEND={sail_engram_indexer_backend!r}; "
-                f"expected one of {sorted(VALID_SAIL_ENGRAM_INDEXER_BACKENDS)}"
-            )
-        sail_lm_head_dtype = _sail_str(
-            "ZSTEP_SAIL_LM_HEAD_DTYPE", "lm_head_dtype", "fp32"
-        ).lower()
-        if sail_lm_head_dtype not in VALID_SAIL_LM_HEAD_DTYPES:
-            raise ValueError(
-                f"Unsupported ZSTEP_SAIL_LM_HEAD_DTYPE={sail_lm_head_dtype!r}; "
-                f"expected one of {sorted(VALID_SAIL_LM_HEAD_DTYPES)}"
-            )
-        sail_ar_fuse_mhc_post = _sail_int(
-            "ZSTEP_SAIL_AR_FUSE_MHC_POST", "ar_fuse_mhc_post", 0
-        )
-        if sail_ar_fuse_mhc_post not in (0, 1):
-            raise ValueError("sail_ar_fuse_mhc_post must be 0 or 1")
-        sail_moe_router_mode = _sail_str(
-            "ZSTEP_SAIL_MOE_ROUTER_MODE", "moe_router_mode", "fp32"
-        ).lower()
-        if sail_moe_router_mode not in VALID_SAIL_MOE_ROUTER_MODES:
-            raise ValueError(
-                f"Unsupported ZSTEP_SAIL_MOE_ROUTER_MODE={sail_moe_router_mode!r}; "
-                f"expected one of {sorted(VALID_SAIL_MOE_ROUTER_MODES)}"
-            )
-        sail_mhc_backend = _sail_str(
-            "ZSTEP_SAIL_MHC_BACKEND", "mhc_backend", "legacy_2pass"
-        ).lower()
-        if sail_mhc_backend not in VALID_SAIL_MHC_BACKENDS:
-            raise ValueError(
-                f"Unsupported ZSTEP_SAIL_MHC_BACKEND={sail_mhc_backend!r}; "
-                f"expected one of {sorted(VALID_SAIL_MHC_BACKENDS)}"
-            )
-        sail_observe_path = env.get("ZSTEP_SAIL_OBSERVE_PATH", "").strip()
+        sail = SailRuntimeConfig.from_env(env)
 
         return cls(
             spec_method=spec_method,
@@ -602,26 +459,52 @@ class WorkerRuntimeConfig:
             qwen_enable_fused_gdn=parse_qwen_fused_gdn_enabled(env),
             qwen_gdn_decode_mode=parse_qwen_gdn_decode_mode(env),
             backend=backend,
-            sail_policy_path=sail_policy_path,
-            sail_ar_blocks=sail_ar_blocks,
-            sail_ar_threads=sail_ar_threads,
-            sail_ar_oneshot_max_bytes=sail_ar_oneshot_max_bytes,
-            sail_ar_pccl_min_bytes=sail_ar_pccl_min_bytes,
-            sail_moe_gemv_max_rows=sail_moe_gemv_max_rows,
-            sail_moe_gemv_threads=sail_moe_gemv_threads,
-            sail_moe_block_m=sail_moe_block_m,
-            sail_moe_num_warps=sail_moe_num_warps,
-            sail_moe_prefill_backend=sail_moe_prefill_backend,
-            sail_sparse_attn_backend=sail_sparse_attn_backend,
-            sail_mhc_split_k=sail_mhc_split_k,
-            sail_mhc_fused_max_rows=sail_mhc_fused_max_rows,
-            sail_qkv_fusion_mode=sail_qkv_fusion_mode,
-            sail_engram_indexer_backend=sail_engram_indexer_backend,
-            sail_lm_head_dtype=sail_lm_head_dtype,
-            sail_ar_fuse_mhc_post=sail_ar_fuse_mhc_post,
-            sail_moe_router_mode=sail_moe_router_mode,
-            sail_mhc_backend=sail_mhc_backend,
-            sail_observe_path=sail_observe_path,
+            sail_policy_path=sail.policy_path,
+            sail_ar_blocks=sail.ar_blocks,
+            sail_ar_threads=sail.ar_threads,
+            sail_ar_oneshot_max_bytes=sail.ar_oneshot_max_bytes,
+            sail_ar_pccl_min_bytes=sail.ar_pccl_min_bytes,
+            sail_moe_gemv_max_rows=sail.moe_gemv_max_rows,
+            sail_moe_gemv_threads=sail.moe_gemv_threads,
+            sail_moe_block_m=sail.moe_block_m,
+            sail_moe_num_warps=sail.moe_num_warps,
+            sail_moe_prefill_backend=sail.moe_prefill_backend,
+            sail_sparse_attn_backend=sail.sparse_attn_backend,
+            sail_mhc_split_k=sail.mhc_split_k,
+            sail_mhc_fused_max_rows=sail.mhc_fused_max_rows,
+            sail_qkv_fusion_mode=sail.qkv_fusion_mode,
+            sail_engram_indexer_backend=sail.engram_indexer_backend,
+            sail_lm_head_dtype=sail.lm_head_dtype,
+            sail_ar_fuse_mhc_post=sail.ar_fuse_mhc_post,
+            sail_moe_router_mode=sail.moe_router_mode,
+            sail_mhc_backend=sail.mhc_backend,
+            sail_observe_path=sail.observe_path,
+        )
+
+    @property
+    def sail(self) -> SailRuntimeConfig:
+        """Structured view of SAIL backend runtime settings."""
+        return SailRuntimeConfig(
+            policy_path=self.sail_policy_path,
+            ar_blocks=self.sail_ar_blocks,
+            ar_threads=self.sail_ar_threads,
+            ar_oneshot_max_bytes=self.sail_ar_oneshot_max_bytes,
+            ar_pccl_min_bytes=self.sail_ar_pccl_min_bytes,
+            moe_gemv_max_rows=self.sail_moe_gemv_max_rows,
+            moe_gemv_threads=self.sail_moe_gemv_threads,
+            moe_block_m=self.sail_moe_block_m,
+            moe_num_warps=self.sail_moe_num_warps,
+            moe_prefill_backend=self.sail_moe_prefill_backend,
+            sparse_attn_backend=self.sail_sparse_attn_backend,
+            mhc_split_k=self.sail_mhc_split_k,
+            mhc_fused_max_rows=self.sail_mhc_fused_max_rows,
+            qkv_fusion_mode=self.sail_qkv_fusion_mode,
+            engram_indexer_backend=self.sail_engram_indexer_backend,
+            lm_head_dtype=self.sail_lm_head_dtype,
+            ar_fuse_mhc_post=self.sail_ar_fuse_mhc_post,
+            moe_router_mode=self.sail_moe_router_mode,
+            mhc_backend=self.sail_mhc_backend,
+            observe_path=self.sail_observe_path,
         )
 
     def effective_shm_max_ar_numel(self, default_numel: int) -> int:
@@ -653,15 +536,5 @@ class WorkerRuntimeConfig:
             f"kv_codec={self.kv_dram_codec} "
             f"vmm_arena={int(self.enable_vmm_peer_arena)} "
             f"nvfp4_act={self.nvfp4_act_mode} "
-            f"sail={self.backend}(ar={self.sail_ar_blocks}x{self.sail_ar_threads},"
-            f"os={self.sail_ar_oneshot_max_bytes},pccl={self.sail_ar_pccl_min_bytes},"
-            f"moe_gemv<={self.sail_moe_gemv_max_rows}@{self.sail_moe_gemv_threads},"
-            f"bm={self.sail_moe_block_m}w{self.sail_moe_num_warps}:{self.sail_moe_prefill_backend},"
-            f"attn={self.sail_sparse_attn_backend},"
-            f"mhc={self.sail_mhc_split_k}r{self.sail_mhc_fused_max_rows},"
-            f"qkv={self.sail_qkv_fusion_mode},ei={self.sail_engram_indexer_backend},"
-            f"head={self.sail_lm_head_dtype}) "
-            f"sail_v4=(fmp={self.sail_ar_fuse_mhc_post},"
-            f"rtr={self.sail_moe_router_mode},"
-            f"mhc_bk={self.sail_mhc_backend})"
+            f"{self.sail.format_log_fragment(self.backend)}"
         )

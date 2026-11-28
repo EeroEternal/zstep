@@ -25,27 +25,9 @@ if str(WORKER_DIR) not in sys.path:
     sys.path.insert(0, str(WORKER_DIR))
 
 from zstep_worker.env_config import WorkerRuntimeConfig  # noqa: E402
+from zstep_worker.sail_config import SailRuntimeConfig  # noqa: E402
 
-SAIL_POLICY_TO_ENV: dict[str, str] = {
-    "ar_blocks": "ZSTEP_SAIL_AR_BLOCKS",
-    "ar_threads": "ZSTEP_SAIL_AR_THREADS",
-    "ar_oneshot_max_bytes": "ZSTEP_SAIL_AR_ONESHOT_MAX_BYTES",
-    "ar_pccl_min_bytes": "ZSTEP_SAIL_AR_PCCL_MIN_BYTES",
-    "moe_gemv_max_rows": "ZSTEP_SAIL_MOE_GEMV_MAX_ROWS",
-    "moe_gemv_threads": "ZSTEP_SAIL_MOE_GEMV_THREADS",
-    "moe_block_m": "ZSTEP_SAIL_MOE_BLOCK_M",
-    "moe_num_warps": "ZSTEP_SAIL_MOE_NUM_WARPS",
-    "moe_prefill_backend": "ZSTEP_SAIL_MOE_PREFILL_BACKEND",
-    "sparse_attn_backend": "ZSTEP_SAIL_SPARSE_ATTN_BACKEND",
-    "mhc_split_k": "ZSTEP_SAIL_MHC_SPLIT_K",
-    "mhc_fused_max_rows": "ZSTEP_SAIL_MHC_FUSED_MAX_ROWS",
-    "qkv_fusion_mode": "ZSTEP_SAIL_QKV_FUSION_MODE",
-    "engram_indexer_backend": "ZSTEP_SAIL_ENGRAM_INDEXER_BACKEND",
-    "lm_head_dtype": "ZSTEP_SAIL_LM_HEAD_DTYPE",
-    "ar_fuse_mhc_post": "ZSTEP_SAIL_AR_FUSE_MHC_POST",
-    "moe_router_mode": "ZSTEP_SAIL_MOE_ROUTER_MODE",
-    "mhc_backend": "ZSTEP_SAIL_MHC_BACKEND",
-}
+SAIL_POLICY_TO_ENV: dict[str, str] = SailRuntimeConfig.policy_env_map()
 
 SAIL_POLICY_METADATA_KEYS: frozenset[str] = frozenset({"version"})
 
@@ -64,7 +46,7 @@ def policy_to_env_map(
         raise ValueError(f"Unsupported backend {backend!r}; expected one of {sorted(BACKEND_DOCKERFILE)}")
 
     env_map: dict[str, str] = {
-        "ZSTEP_BACKEND": "cuda" if backend == "sm120" else "sail",
+        "ZSTEP_BACKEND": "sm120" if backend == "sm120" else "sail",
     }
     if policy_path is None:
         WorkerRuntimeConfig.from_env(env_map)
