@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "zstep-worker"
 version = "1.0.0"
-description = "Explicit sm_120 step GPU worker for zstep (NVIDIA RTX 5090 / RTX 6000D)"
+description = "Explicit step GPU worker for zstep (NVIDIA SM120 & T-Head PPU-ZW810E SAIL)"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 # Keep core dependencies CPU-light so SHM layout parity, P2P topology, speculative
@@ -33,6 +33,7 @@ include = ["zstep_worker*"]
 
 [tool.setuptools.package-data]
 "zstep_worker.kernels_sm120" = ["csrc/*.cpp", "csrc/*.cu", "csrc/*.cuh"]
+"zstep_worker.kernels_sail" = ["csrc/*.cpp", "csrc/*.cu", "csrc/*.cuh"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

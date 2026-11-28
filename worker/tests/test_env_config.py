@@ -215,3 +215,60 @@ def test_worker_runtime_config_rejects_invalid_values(
 ) -> None:
     with pytest.raises(ValueError, match=match):
         WorkerRuntimeConfig.from_env(env)
+
+
+def test_export_nebula_bundle_sail_and_sm120(tmp_path) -> None:
+    import importlib.util
+    import json
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    script_path = repo_root / "scripts" / "export_nebula_bundle.py"
+    spec = importlib.util.spec_from_file_location("export_nebula_bundle", script_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    sail_policy = repo_root / "docs" / "benchmarks" / "sail_zw810e_dsv41_approved_policy.json"
+    out_sail = tmp_path / "sail_bundle"
+    written = mod.export_bundle(
+        backend="sail",
+        image="zstep:sail-zw810e-gen3",
+        model_uid="deepseek-v4.1-flash",
+        model_dir="/model/DeepSeek-V4.1-Flash",
+        output_dir=out_sail,
+        policy_path=sail_policy,
+        world_size=8,
+        speculative_method="dspark",
+        num_speculative_tokens=5,
+    )
+    assert written["policy_env"].is_file()
+    assert written["nebula_deployment"].is_file()
+    assert written["docker_build"].is_file()
+
+    deployment = json.loads(written["nebula_deployment"].read_text(encoding="utf-8"))
+    assert deployment["engine_type"] == "zstep"
+    assert deployment["docker_image"] == "zstep:sail-zw810e-gen3"
+    assert deployment["env"]["ZSTEP_BACKEND"] == "sail"
+    assert deployment["env"]["ZSTEP_SAIL_AR_BLOCKS"] == "64"
+    assert "--speculative-method" in deployment["extra_args"]
+    assert "dspark" in deployment["extra_args"]
+
+    # Reject unknown SAIL policy keys
+    bad_policy = tmp_path / "bad.json"
+    bad_policy.write_text(json.dumps({"not_a_sail_key": 1}), encoding="utf-8")
+    with pytest.raises(ValueError, match="Unknown SAIL policy keys"):
+        mod.export_bundle(
+            backend="sail",
+            image="zstep:bad",
+            model_uid="m",
+            model_dir="/model/m",
+            output_dir=tmp_path / "bad_out",
+            policy_path=bad_policy,
+        )
+
+    # Verify Dockerfiles expose Nebula-compatible entrypoint and worker root
+    for name in ("Dockerfile.sm120", "Dockerfile.sail"):
+        text = (repo_root / "deploy" / "docker" / name).read_text(encoding="utf-8")
+        assert 'ENTRYPOINT ["zs-server"]' in text
+        assert "ZSTEP_WORKER_ROOT=/opt/zstep/worker" in text
