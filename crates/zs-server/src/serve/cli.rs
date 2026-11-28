@@ -665,7 +665,13 @@ impl ServeArgs {
     pub fn resolved_num_kv_pages(&self) -> u32 {
         self.num_kv_pages.unwrap_or_else(|| {
             let base = if is_deepseek_v41_dir(&self.model_dir) {
-                if self.decoupled_swa_default_enabled() {
+                if self.world_size <= 4 {
+                    if self.decoupled_swa_default_enabled() {
+                        2_048.0
+                    } else {
+                        1_024.0
+                    }
+                } else if self.decoupled_swa_default_enabled() {
                     10_240.0
                 } else if self.speculative.method == SpeculativeMethod::Dspark {
                     2_560.0

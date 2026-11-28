@@ -140,3 +140,62 @@ def test_host_dram_kv_tier_rejects_non_contiguous_buffer() -> None:
             num_dram_blocks=2,
             device=torch.device("cpu"),
         )
+
+
+def test_host_dram_kv_tier_lossless_multi_plane_codec_0ulp_and_crc32_guard() -> None:
+    from zstep_worker.kernels_sm120.kv_rans_codec import (
+        decode_lossless_kv_packet,
+        encode_lossless_kv_packet,
+    )
+
+    # Realistic 128-row DSv41 584B compound KV page: structured FP8 latent + BF16 RoPE + scales
+    torch.manual_seed(20261128)
+    page = torch.zeros((4, 128, 584), dtype=torch.uint8)
+    # Simulated FP8 E4M3 Gaussian latent (clustered exponents around 120..128)
+    fp8_vals = (torch.randn((4, 128, 512), dtype=torch.bfloat16) * 0.25).to(
+        torch.float8_e4m3fn
+    )
+    page[:, :, :512] = fp8_vals.view(torch.uint8)
+    page[:, :, 512:520] = 125  # UE8M0 / E4M3 block scales
+    rope_bf16 = (torch.randn((4, 128, 32), dtype=torch.bfloat16) * 0.5).view(torch.uint8)
+    page[:, :, 520:584] = rope_bf16
+    expected_b1 = page[1].clone()
+
+    tier = HostDramKvTier(
+        [page],
+        total_hbm_blocks=4,
+        num_dram_blocks=2,
+        device=torch.device("cpu"),
+        codec="lossless",
+    )
+    tier.execute_transfers(
+        np.array([1], dtype=np.int32),
+        np.array([0], dtype=np.int32),
+        np.array([KV_TRANSFER_DIR_D2H], dtype=np.int32),
+        1,
+    )
+    assert tier.offload_ops == 1
+    assert tier.compression_ratio > 1.25
+    assert tier.last_batch_mode == "lossless_zkv1"
+
+    page[1].zero_()
+    page[3].zero_()
+    tier.execute_transfers(
+        np.array([3], dtype=np.int32),
+        np.array([0], dtype=np.int32),
+        np.array([KV_TRANSFER_DIR_H2D], dtype=np.int32),
+        1,
+    )
+    assert tier.reload_ops == 1
+    assert tier.crc32_verified_blocks == 1
+    assert torch.equal(page[3], expected_b1)  # Exact 0-ULP bit-for-bit equality
+
+    # Verify IEEE 802.3 CRC32 rejects single-bit corruption
+    raw = bytes(expected_b1.numpy().tobytes())
+    pkt, stats = encode_lossless_kv_packet(raw, rows=128, row_stride=584)
+    assert stats.compression_ratio > 1.25
+    assert decode_lossless_kv_packet(pkt, rows=128, row_stride=584) == raw
+    corrupted = bytearray(pkt)
+    corrupted[-1] ^= 0x01
+    with pytest.raises(ValueError, match="CRC32|Error"):
+        decode_lossless_kv_packet(bytes(corrupted), rows=128, row_stride=584)

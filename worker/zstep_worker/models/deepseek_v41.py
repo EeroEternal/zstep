@@ -43,6 +43,12 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from zstep_worker.cuda_driver import (
+    DEFAULT_VMM_BASE_VA,
+    DEFAULT_VMM_RANK_STRIDE,
+    VmmAllocationHandle,
+    load_cuda_driver,
+)
 from zstep_worker.kernels_sm120.b12x_dsv41 import (
     SM120_DSA_CANDIDATE_COVER_TOKENS,
     B12xPrepareSummary,
@@ -50,6 +56,7 @@ from zstep_worker.kernels_sm120.b12x_dsv41 import (
     close_b12x_dsv41_model,
     flush_sm120_mhc_before_ar,
     install_b12x_dsv41_quant_patches,
+    install_mxfp4_engram_patches,
     install_sm120_dsa_indexer_patches,
     is_sm120_dsa_decode_available,
     prepare_b12x_dsv41_model,
@@ -353,6 +360,7 @@ def apply_vllm_sm120_dsv41_patches() -> None:
     idx_builder_cls.__init__ = _patched_idx_builder_init
     idx_builder_cls.build = _patched_idx_builder_build
     install_b12x_dsv41_quant_patches()
+    install_mxfp4_engram_patches()
     install_sm120_dsa_indexer_patches()
 
 
@@ -510,6 +518,7 @@ class DeepSeekV41StepRunner:
         self.dspark_drafter: Any | None = None
         self._last_verify_bt_sig: tuple[int, tuple[int, ...]] | None = None
         self.dram_kv_tier: HostDramKvTier | None = None
+        self.vmm_peer_arena: VmmAllocationHandle | None = None
         self._builder_groups: list[_AttnBuilderGroup] = []
 
         try:
@@ -553,9 +562,9 @@ class DeepSeekV41StepRunner:
         self.bridge: ShmBridge = bridge
         self.geometry = bridge.superblock.geometry
         self.world_size: int = self.geometry.world_size
-        if self.world_size != 8:
+        if self.world_size not in (4, 8):
             raise ValueError(
-                f"DeepSeekV41StepRunner requires world_size=8, got world_size={self.world_size}"
+                f"DeepSeekV41StepRunner requires world_size in (4, 8), got world_size={self.world_size}"
             )
         self.pp_size: int = self.runtime_config.pipeline_parallel_size
         if self.pp_size not in (1, 2) or (self.world_size % self.pp_size) != 0:
@@ -1395,7 +1404,18 @@ class DeepSeekV41StepRunner:
                 device=self.device,
                 numa_node=numa_node,
                 enable_driver_batch_memcpy=self.runtime_config.enable_driver_batch_memcpy,
+                codec=self.runtime_config.kv_dram_codec,
             )
+        if self.runtime_config.enable_vmm_peer_arena:
+            cu_drv = load_cuda_driver()
+            if cu_drv is not None and cu_drv.has_vmm_ops:
+                peers = tuple(r for r in range(self.world_size) if r != self.rank)
+                self.vmm_peer_arena = cu_drv.vmm_alloc_and_map_fixed_va(
+                    device_id=int(self.device.index),
+                    size_bytes=32 * 1024 * 1024,
+                    target_va=DEFAULT_VMM_BASE_VA + self.rank * DEFAULT_VMM_RANK_STRIDE,
+                    peer_device_ids=peers,
+                )
         self._sm_h2d: SmH2dCopier = SmH2dCopier(
             enabled=self.dram_kv_tier is not None and self.runtime_config.enable_sm_h2d
         )
@@ -4832,6 +4852,11 @@ class DeepSeekV41StepRunner:
             self.dspark_drafter.close()
         if self.dram_kv_tier is not None:
             self.dram_kv_tier.close()
+        if self.vmm_peer_arena is not None:
+            cu_drv = load_cuda_driver()
+            if cu_drv is not None:
+                cu_drv.vmm_free(self.vmm_peer_arena)
+            self.vmm_peer_arena = None
         close_b12x_dsv41_model(getattr(self, "dspark_model", None))
         close_b12x_dsv41_model(getattr(self, "model", None))
         self.dspark_model = None
@@ -4878,6 +4903,11 @@ class DeepSeekV41StepRunner:
             self.dspark_drafter.close()
         if self.dram_kv_tier is not None:
             self.dram_kv_tier.close()
+        if self.vmm_peer_arena is not None:
+            cu_drv = load_cuda_driver()
+            if cu_drv is not None:
+                cu_drv.vmm_free(self.vmm_peer_arena)
+            self.vmm_peer_arena = None
         close_b12x_dsv41_model(getattr(self, "dspark_model", None))
         close_b12x_dsv41_model(getattr(self, "model", None))
         self.dspark_model = None

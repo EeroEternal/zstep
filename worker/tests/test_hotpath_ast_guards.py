@@ -329,6 +329,7 @@ def test_sm120_csrc_sources_have_balanced_delimiters_and_bound_entrypoints() -> 
     specs = (
         ("kernels_sm120/shm_allreduce.py", CSRC_DIR / "shm_allreduce.cpp", CSRC_DIR / "shm_allreduce_kernels.cu"),
         ("kernels_sm120/qwen35_ops.py", CSRC_DIR / "qwen35_ops.cpp", CSRC_DIR / "qwen35_ops_kernels.cu"),
+        ("kernels_sm120/kv_rans_codec.py", CSRC_DIR / "kv_rans_codec.cpp", CSRC_DIR / "kv_rans_codec_kernels.cu"),
         ("kernels_sail/ppu_collectives.py", sail_csrc_dir / "sail_ops.cpp", sail_csrc_dir / "sail_ops_kernels.cu"),
     )
     decl_re = re.compile(r"\b(?:void|int64_t|std::uintptr_t|torch::Tensor)\s+([A-Za-z0-9_]+_cuda)\s*\(")

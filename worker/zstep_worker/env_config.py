@@ -42,6 +42,8 @@ VALID_SAIL_ENGRAM_INDEXER_BACKENDS: frozenset[str] = frozenset(
     {"eager_py", "fused_hggc", "fused_hggc_ozaki"}
 )
 VALID_SAIL_LM_HEAD_DTYPES: frozenset[str] = frozenset({"fp32", "bf16"})
+VALID_KV_DRAM_CODECS: frozenset[str] = frozenset({"none", "rans_gpu", "lossless"})
+VALID_NVFP4_ACT_MODES: frozenset[str] = frozenset({"a4", "a8"})
 DEFAULT_MIN_PXB_BI_GBPS: float = 25.0
 
 
@@ -145,9 +147,11 @@ class WorkerRuntimeConfig:
     max_model_len: int = 32768
     num_recurrent_checkpoints: int = 0
     dram_kv_blocks: int = 0
+    kv_dram_codec: str = "none"
     swa_kv_pages: int = 0
     enable_sm_h2d: bool = True
     enable_driver_batch_memcpy: bool = True
+    enable_vmm_peer_arena: bool = False
     prefill_runahead_depth: int = 2
     disable_verify_graphs: bool = False
     disable_draft_graphs: bool = False
@@ -186,6 +190,7 @@ class WorkerRuntimeConfig:
     b12x_compat_dir: str = ""
     b12x_cache_dir: str | None = None
     b12x_autotune: bool = True
+    nvfp4_act_mode: str = "a4"
 
     # Qwen3.5 Gated DeltaNet
     qwen_enable_fused_gdn: bool = True
@@ -246,12 +251,23 @@ class WorkerRuntimeConfig:
         dram_kv_blocks = env_int("ZSTEP_DRAM_KV_BLOCKS", 0, environ=env)
         if dram_kv_blocks < 0:
             raise ValueError(f"ZSTEP_DRAM_KV_BLOCKS must be >= 0 (got {dram_kv_blocks})")
+        kv_dram_codec = (
+            env.get("ZSTEP_KV_DRAM_CODEC", "none").strip().lower() or "none"
+        )
+        if kv_dram_codec not in VALID_KV_DRAM_CODECS:
+            raise ValueError(
+                f"Unsupported ZSTEP_KV_DRAM_CODEC={kv_dram_codec!r}; "
+                f"expected one of {sorted(VALID_KV_DRAM_CODECS)}"
+            )
         swa_kv_pages = env_int("ZSTEP_SWA_KV_PAGES", 0, environ=env)
         if swa_kv_pages < 0:
             raise ValueError(f"ZSTEP_SWA_KV_PAGES must be >= 0 (got {swa_kv_pages})")
         enable_sm_h2d = env_flag("ZSTEP_ENABLE_SM_H2D", default=True, environ=env)
         enable_driver_batch_memcpy = env_flag(
             "ZSTEP_ENABLE_DRIVER_BATCH_MEMCPY", default=True, environ=env
+        )
+        enable_vmm_peer_arena = env_flag(
+            "ZSTEP_ENABLE_VMM_PEER_ARENA", default=False, environ=env
         )
         prefill_runahead_depth = env_int("ZSTEP_PREFILL_RUNAHEAD_DEPTH", 2, environ=env)
         if prefill_runahead_depth < 0:
@@ -357,6 +373,14 @@ class WorkerRuntimeConfig:
             if raw_cache_dir is not None and raw_cache_dir.strip()
             else None
         )
+        nvfp4_act_mode = (
+            env.get("ZSTEP_NVFP4_ACT_MODE", "a4").strip().lower() or "a4"
+        )
+        if nvfp4_act_mode not in VALID_NVFP4_ACT_MODES:
+            raise ValueError(
+                f"Unsupported ZSTEP_NVFP4_ACT_MODE={nvfp4_act_mode!r}; "
+                f"expected one of {sorted(VALID_NVFP4_ACT_MODES)}"
+            )
 
         backend = env.get("ZSTEP_BACKEND", "auto").strip().lower() or "auto"
         if backend not in VALID_SAIL_BACKENDS:
@@ -509,9 +533,11 @@ class WorkerRuntimeConfig:
             max_model_len=max_model_len,
             num_recurrent_checkpoints=num_recurrent_checkpoints,
             dram_kv_blocks=dram_kv_blocks,
+            kv_dram_codec=kv_dram_codec,
             swa_kv_pages=swa_kv_pages,
             enable_sm_h2d=enable_sm_h2d,
             enable_driver_batch_memcpy=enable_driver_batch_memcpy,
+            enable_vmm_peer_arena=enable_vmm_peer_arena,
             prefill_runahead_depth=prefill_runahead_depth,
             disable_verify_graphs=env_flag(
                 "ZSTEP_DISABLE_VERIFY_GRAPHS", default=False, environ=env
@@ -572,6 +598,7 @@ class WorkerRuntimeConfig:
             b12x_compat_dir=env.get("ZSTEP_B12X_COMPAT_DIR", "").strip(),
             b12x_cache_dir=b12x_cache_dir,
             b12x_autotune=env_flag("ZSTEP_B12X_AUTOTUNE", default=True, environ=env),
+            nvfp4_act_mode=nvfp4_act_mode,
             qwen_enable_fused_gdn=parse_qwen_fused_gdn_enabled(env),
             qwen_gdn_decode_mode=parse_qwen_gdn_decode_mode(env),
             backend=backend,
@@ -623,6 +650,9 @@ class WorkerRuntimeConfig:
             f"draft_graphs={int(not self.disable_draft_graphs)} "
             f"prefill_runahead={self.prefill_runahead_depth} "
             f"driver_batch_memcpy={int(self.enable_driver_batch_memcpy)} "
+            f"kv_codec={self.kv_dram_codec} "
+            f"vmm_arena={int(self.enable_vmm_peer_arena)} "
+            f"nvfp4_act={self.nvfp4_act_mode} "
             f"sail={self.backend}(ar={self.sail_ar_blocks}x{self.sail_ar_threads},"
             f"os={self.sail_ar_oneshot_max_bytes},pccl={self.sail_ar_pccl_min_bytes},"
             f"moe_gemv<={self.sail_moe_gemv_max_rows}@{self.sail_moe_gemv_threads},"
