@@ -335,13 +335,152 @@ def _triton_sparse_attn_tp8_kernel(
     tl.store(out_ptrs, out_tile, mask=valid_h[:, None])
 
 
+@triton.jit
+def _triton_sparse_attn_fast_kernel(
+    q_ptr,
+    kv_arena_ptr,
+    attn_sink_ptr,
+    topk_idxs_ptr,
+    out_ptr,
+    max_topk,
+    sm_scale,
+    BLOCK_K: tl.constexpr,
+):
+    """Paged sparse MQA with empty-block (`slots < 0`) early-skip for causal prefill & cr=2."""
+    row = tl.program_id(0)
+    offs_h16 = tl.arange(0, 16)
+    valid_h = offs_h16 < 8
+    safe_h = tl.where(valid_h, offs_h16, 0)
+    offs_d = tl.arange(0, 512)
+
+    q_ptrs = q_ptr + (row.to(tl.int64) * 8 + safe_h[:, None]) * 512 + offs_d[None, :]
+    q_tile = tl.load(q_ptrs, mask=valid_h[:, None], other=0.0).to(tl.bfloat16)
+    sink = tl.load(attn_sink_ptr + safe_h, mask=valid_h, other=-1.0e30).to(tl.float32)
+
+    m_i = tl.full((16,), -1.0e30, dtype=tl.float32)
+    l_i = tl.zeros((16,), dtype=tl.float32)
+    acc_o = tl.zeros((16, 512), dtype=tl.float32)
+
+    offs_t = tl.arange(0, BLOCK_K)
+    for t_base in range(0, max_topk, BLOCK_K):
+        t_idx = t_base + offs_t
+        in_range = t_idx < max_topk
+        slots = tl.load(
+            topk_idxs_ptr + row.to(tl.int64) * max_topk + t_idx,
+            mask=in_range,
+            other=-1,
+        )
+        if tl.max(slots, axis=0) >= 0:
+            valid_t = in_range & (slots >= 0)
+            safe_slots = tl.where(valid_t, slots, 0).to(tl.int64)
+            kv_tile = tl.load(
+                kv_arena_ptr + safe_slots[:, None] * 512 + offs_d[None, :],
+                mask=valid_t[:, None],
+                other=0.0,
+            ).to(tl.bfloat16)
+            scores = tl.dot(q_tile, tl.trans(kv_tile)) * sm_scale
+            scores = tl.where(valid_t[None, :], scores, -float("inf"))
+            block_max = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, block_max)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc_o = acc_o * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv_tile)
+            m_i = m_new
+
+    has_any = m_i > -1.0e29
+    safe_m = tl.where(has_any, m_i, 0.0)
+    denom = l_i + tl.exp(sink - safe_m)
+    inv_denom = tl.where(has_any & (denom > 0.0), 1.0 / denom, 0.0)
+    out_tile = (acc_o * inv_denom[:, None]).to(tl.bfloat16)
+    out_ptrs = out_ptr + (row.to(tl.int64) * 8 + safe_h[:, None]) * 512 + offs_d[None, :]
+    tl.store(out_ptrs, out_tile, mask=valid_h[:, None])
+
+
+@triton.jit
+def _triton_sparse_attn_splitk_stage1_kernel(
+    q_ptr,
+    kv_arena_ptr,
+    topk_idxs_ptr,
+    partial_acc_ptr,
+    partial_m_ptr,
+    partial_l_ptr,
+    max_topk,
+    split_k,
+    sm_scale,
+    BLOCK_K: tl.constexpr,
+):
+    """Flash-Decoding Split-K Stage-1 on AIU Tensor Cores (`grid = (rows, split_k)`)."""
+    row = tl.program_id(0)
+    sp = tl.program_id(1)
+    offs_h16 = tl.arange(0, 16)
+    valid_h = offs_h16 < 8
+    safe_h = tl.where(valid_h, offs_h16, 0)
+    offs_d = tl.arange(0, 512)
+
+    chunk_blocks = tl.cdiv(tl.cdiv(max_topk, BLOCK_K), split_k)
+    t_start = sp * chunk_blocks * BLOCK_K
+    t_end = tl.minimum(max_topk, t_start + chunk_blocks * BLOCK_K)
+
+    m_i = tl.full((16,), -1.0e30, dtype=tl.float32)
+    l_i = tl.zeros((16,), dtype=tl.float32)
+    acc_o = tl.zeros((16, 512), dtype=tl.float32)
+
+    if t_start < t_end:
+        q_ptrs = q_ptr + (row.to(tl.int64) * 8 + safe_h[:, None]) * 512 + offs_d[None, :]
+        q_tile = tl.load(q_ptrs, mask=valid_h[:, None], other=0.0).to(tl.bfloat16)
+        offs_t = tl.arange(0, BLOCK_K)
+        for t_base in range(t_start, t_end, BLOCK_K):
+            t_idx = t_base + offs_t
+            in_range = t_idx < t_end
+            slots = tl.load(
+                topk_idxs_ptr + row.to(tl.int64) * max_topk + t_idx,
+                mask=in_range,
+                other=-1,
+            )
+            valid_t = in_range & (slots >= 0)
+            safe_slots = tl.where(valid_t, slots, 0).to(tl.int64)
+            kv_tile = tl.load(
+                kv_arena_ptr + safe_slots[:, None] * 512 + offs_d[None, :],
+                mask=valid_t[:, None],
+                other=0.0,
+            ).to(tl.bfloat16)
+            scores = tl.dot(q_tile, tl.trans(kv_tile)) * sm_scale
+            scores = tl.where(valid_t[None, :], scores, -float("inf"))
+            block_max = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, block_max)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc_o = acc_o * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv_tile)
+            m_i = m_new
+
+    base_part = (row.to(tl.int64) * split_k + sp) * 8
+    tl.store(partial_m_ptr + base_part + safe_h, m_i, mask=valid_h)
+    tl.store(partial_l_ptr + base_part + safe_h, l_i, mask=valid_h)
+    tl.store(
+        partial_acc_ptr + (base_part + safe_h[:, None]) * 512 + offs_d[None, :],
+        acc_o,
+        mask=valid_h[:, None],
+    )
+
+
 def watched_sail_triton_kernels() -> list[tuple[str, object]]:
     return [
         ("sail_moe_gate_up", _mxfp4_moe_grouped_gate_up_kernel),
         ("sail_moe_down", _mxfp4_moe_grouped_down_kernel),
         ("sail_moe_combine", _moe_combine_pairs_and_shared_kernel),
         ("sail_sparse_attn_tp8", _triton_sparse_attn_tp8_kernel),
+        ("sail_sparse_attn_splitk", _triton_sparse_attn_splitk_stage1_kernel),
     ]
+
+
+def make_ozaki2_bf16(w_f32: torch.Tensor) -> torch.Tensor:
+    """Split an FP32 `[N, K]` weight matrix into `[2 * N, K]` BF16 (`w_hi`, `w_lo`) for exact FP32 TC GEMM."""
+    wf = w_f32.float()
+    w_hi = wf.to(torch.bfloat16)
+    w_lo = (wf - w_hi.float()).to(torch.bfloat16)
+    return torch.cat([w_hi, w_lo], dim=0).contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -424,8 +563,12 @@ def mhc_mixes_sinkhorn(
     comb_out: torch.Tensor,
     raw_proj_buf: torch.Tensor | None = None,
     split_k_part_buf: torch.Tensor | None = None,
+    split_k_counters_buf: torch.Tensor | None = None,
+    hc_fn_ozaki_bf16: torch.Tensor | None = None,
+    ozaki_proj_buf: torch.Tensor | None = None,
     split_k: int = 1,
     fused_max_rows: int = 16,
+    backend: str = "legacy_2pass",
     norm_eps: float = 1.0e-20,
     hc_eps: float = 1.0e-6,
     sinkhorn_iters: int = 20,
@@ -433,6 +576,74 @@ def mhc_mixes_sinkhorn(
     rows = x.shape[0]
     ext = get_sail_ops_extension()
     stream_handle = torch.cuda.current_stream(x.device).cuda_stream
+    if backend == "vec_1pass_ozaki":
+        # For large prefill (`rows > 256`), Tensor-Core Ozaki 2xBF16->FP32 beats SIMT even if
+        # `fused_max_rows` was set to 4096 under legacy_2pass!
+        vec_max_rows = min(fused_max_rows, 256)
+        if rows <= vec_max_rows:
+            eff_sk = split_k
+            while eff_sk > 1 and rows * eff_sk > 512:
+                eff_sk //= 2
+            if (
+                eff_sk > 1
+                and (
+                    split_k_part_buf is None
+                    or split_k_part_buf.numel() < rows * eff_sk * 25
+                    or split_k_counters_buf is None
+                    or split_k_counters_buf.numel() < rows
+                )
+            ):
+                eff_sk = 1
+            dummy_part = pre_out if split_k_part_buf is None else split_k_part_buf
+            dummy_cnt = (
+                torch.zeros((max(1, rows),), dtype=torch.int32, device=x.device)
+                if (split_k_counters_buf is None and eff_sk > 1)
+                else (
+                    split_k_counters_buf
+                    if split_k_counters_buf is not None
+                    else torch.empty((0,), dtype=torch.int32, device=x.device)
+                )
+            )
+            ext.launch_mhc_vec_single_splitk_bf16(
+                x,
+                hc_fn_f32,
+                hc_scale,
+                hc_base,
+                dummy_part,
+                dummy_cnt,
+                pre_out,
+                post_out,
+                comb_out,
+                eff_sk,
+                float(norm_eps),
+                float(hc_eps),
+                sinkhorn_iters,
+                stream_handle,
+            )
+            return pre_out, post_out, comb_out
+
+        if hc_fn_ozaki_bf16 is not None:
+            oz_proj = (
+                ozaki_proj_buf[:rows]
+                if (ozaki_proj_buf is not None and ozaki_proj_buf.shape[0] >= rows)
+                else torch.empty((rows, 48), dtype=torch.float32, device=x.device)
+            )
+            ext.launch_gemm_bf16_f32_nt(x.view(rows, -1), hc_fn_ozaki_bf16, oz_proj)
+            ext.launch_mhc_sinkhorn_ozaki_vec(
+                x,
+                oz_proj,
+                hc_scale,
+                hc_base,
+                pre_out,
+                post_out,
+                comb_out,
+                float(norm_eps),
+                float(hc_eps),
+                sinkhorn_iters,
+                stream_handle,
+            )
+            return pre_out, post_out, comb_out
+
     if rows <= fused_max_rows:
         eff_sk = split_k
         while eff_sk > 1 and rows * eff_sk > 256:
@@ -708,6 +919,132 @@ def mhc_post(
     return out
 
 
+def compressor_cr2_fused(
+    x_norm: torch.Tensor,
+    *,
+    wkv_gate_f32: torch.Tensor,
+    wkv_gate_ozaki_bf16: torch.Tensor | None,
+    use_ozaki: bool,
+    kv_gate_f32_buf: torch.Tensor,
+    ozaki_buf: torch.Tensor | None,
+    comp_state: torch.Tensor,
+    positions_i32: torch.Tensor,
+    mla_write_pages: torch.Tensor,
+    row_comp_slots: torch.Tensor,
+    row_seq_ids: torch.Tensor,
+    qsl_gpu: torch.Tensor,
+    norm_weight: torch.Tensor,
+    latent_out: torch.Tensor,
+    group_pos_out: torch.Tensor,
+    mla_in_page_slots_out: torch.Tensor,
+    uniform_width: int,
+    lat_pp: int,
+    norm_eps: float = 1.0e-20,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rows = x_norm.shape[0]
+    ext = get_sail_ops_extension()
+    stream_handle = torch.cuda.current_stream(x_norm.device).cuda_stream
+    if use_ozaki and wkv_gate_ozaki_bf16 is not None:
+        oz_out = (
+            ozaki_buf[:rows]
+            if (ozaki_buf is not None and ozaki_buf.shape[0] >= rows)
+            else torch.empty((rows, 2048), dtype=torch.float32, device=x_norm.device)
+        )
+        ext.launch_gemm_bf16_f32_nt(x_norm, wkv_gate_ozaki_bf16, oz_out)
+        proj_buf = oz_out
+        is_ozaki2 = 1
+    else:
+        kv_g = kv_gate_f32_buf[:rows]
+        torch.matmul(x_norm.float(), wkv_gate_f32.t(), out=kv_g)
+        proj_buf = kv_g
+        is_ozaki2 = 0
+    ext.launch_compressor_cr2_fused(
+        proj_buf,
+        is_ozaki2,
+        comp_state,
+        positions_i32,
+        mla_write_pages,
+        row_comp_slots,
+        row_seq_ids,
+        qsl_gpu,
+        norm_weight,
+        latent_out,
+        group_pos_out,
+        mla_in_page_slots_out,
+        int(uniform_width),
+        int(lat_pp),
+        float(norm_eps),
+        stream_handle,
+    )
+    return latent_out, group_pos_out, mla_in_page_slots_out
+
+
+def dspark_verify_prep(
+    out_top2_tokens: torch.Tensor,
+    verify_token_ids: torch.Tensor,
+    verify_positions: torch.Tensor,
+    verify_swa_slots: torch.Tensor,
+    seq_meta: torch.Tensor,
+    *,
+    out_acc_lens: torch.Tensor,
+    ctx_swa_slots: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    draft_positions: torch.Tensor,
+    draft_last_ctx_pos: torch.Tensor,
+    b: int,
+    width: int,
+    k: int,
+    noise_token_id: int,
+) -> None:
+    ext = get_sail_ops_extension()
+    stream_handle = torch.cuda.current_stream(out_top2_tokens.device).cuda_stream
+    ext.launch_dspark_sail_verify_prep(
+        out_top2_tokens,
+        verify_token_ids,
+        verify_positions,
+        verify_swa_slots,
+        seq_meta,
+        out_acc_lens,
+        ctx_swa_slots,
+        draft_tokens,
+        draft_positions,
+        draft_last_ctx_pos,
+        int(b),
+        int(width),
+        int(k),
+        int(noise_token_id),
+        stream_handle,
+    )
+
+
+def fused_mtp_ctx_kv_epilogue(
+    kv_in: torch.Tensor,
+    kv_norm_w: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions_i32: torch.Tensor,
+    ctx_swa_slots: torch.Tensor,
+    *,
+    kv_arena: torch.Tensor,
+    layer_swa_base: int,
+    rope_dim: int = 64,
+    eps: float = 1.0e-20,
+) -> None:
+    ext = get_sail_ops_extension()
+    stream_handle = torch.cuda.current_stream(kv_in.device).cuda_stream
+    ext.launch_fused_mtp_ctx_kv_epilogue_bf16(
+        kv_in,
+        kv_norm_w,
+        cos_sin,
+        positions_i32,
+        ctx_swa_slots,
+        kv_arena.view(-1, kv_arena.shape[-1]),
+        int(rope_dim),
+        int(layer_swa_base),
+        float(eps),
+        stream_handle,
+    )
+
+
 _DEQ_W_FALLBACK_CACHE: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
 
@@ -772,6 +1109,9 @@ def dsv41_moe_tp8_forward(
     tile_a_buf: torch.Tensor | None = None,
     tile_gu_buf: torch.Tensor | None = None,
     tile_inter_buf: torch.Tensor | None = None,
+    gate_weight_ozaki_bf16: torch.Tensor | None = None,
+    router_ozaki_buf: torch.Tensor | None = None,
+    router_mode: str = "fp32",
     gemv_max_rows: int = 16,
     gemv_threads: int = 256,
     block_m: int = 32,
@@ -785,9 +1125,19 @@ def dsv41_moe_tp8_forward(
     ext = get_sail_ops_extension()
     stream_handle = torch.cuda.current_stream(x.device).cuda_stream
 
-    # 1. Router logits (FP32 exact match to `linear(x.float(), gate.weight.float())`) + Top-K
-    r_logits = router_logits_buf.view(-1)[: rows * num_experts].view(rows, num_experts)
-    torch.matmul(x.float(), gate_weight.t(), out=r_logits)
+    # 1. Router logits (`fp32` exact or `ozaki_bf16` / `ozaki_fast_fp4` 2xBF16->FP32 Tensor Core) + Top-K
+    fast_fp4 = router_mode == "ozaki_fast_fp4"
+    use_ozaki_rtr = router_mode in ("ozaki_bf16", "ozaki_fast_fp4")
+    if use_ozaki_rtr and gate_weight_ozaki_bf16 is not None:
+        r_logits = (
+            router_ozaki_buf.view(-1)[: rows * 2 * num_experts].view(rows, 2 * num_experts)
+            if (router_ozaki_buf is not None and router_ozaki_buf.numel() >= rows * 2 * num_experts)
+            else torch.empty((rows, 2 * num_experts), dtype=torch.float32, device=x.device)
+        )
+        ext.launch_gemm_bf16_f32_nt(x, gate_weight_ozaki_bf16, r_logits)
+    else:
+        r_logits = router_logits_buf.view(-1)[: rows * num_experts].view(rows, num_experts)
+        torch.matmul(x.float(), gate_weight.t(), out=r_logits)
     t_weights = topk_weights_buf.view(-1)[: rows * top_k].view(rows, top_k)
     t_ids = topk_ids_buf.view(-1)[: rows * top_k].view(rows, top_k)
     ext.launch_dsv41_router_topk(
@@ -820,6 +1170,7 @@ def dsv41_moe_tp8_forward(
     out = moe_out_buf[:rows]
     num_pairs = rows * top_k
     inter = moe_inter_buf[:num_pairs]
+    gemv_thr_arg = -gemv_threads if fast_fp4 else gemv_threads
     if rows <= gemv_max_rows:
         ext.launch_mxfp4_moe_gemv_gate_up(
             x_in,
@@ -829,7 +1180,7 @@ def dsv41_moe_tp8_forward(
             t_weights,
             inter,
             float(swiglu_limit),
-            gemv_threads,
+            gemv_thr_arg,
             stream_handle,
         )
         if do_ue8m0:
@@ -842,10 +1193,12 @@ def dsv41_moe_tp8_forward(
             sh_out,
             out,
             top_k,
-            gemv_threads,
+            gemv_thr_arg,
             stream_handle,
         )
-    elif prefill_backend == "dequant_acblas" and not torch.cuda.is_current_stream_capturing():
+    elif prefill_backend == "dequant_acblas" and (
+        not torch.cuda.is_current_stream_capturing() or deq_w_buf is not None
+    ):
         eff_bm = 64 if rows >= 1024 else (32 if rows >= 256 else block_m)
         max_tiles = (num_pairs + eff_bm - 1) // eff_bm + num_experts
         ext.launch_moe_align_block_size(
@@ -876,6 +1229,7 @@ def dsv41_moe_tp8_forward(
         w13_rows = 2 * inter_per_rank
         for t_off in range(0, upper_tiles, chunk_t):
             ct = min(chunk_t, upper_tiles - t_off)
+            deq_ct_arg = ct
             ta_v = tile_a_buf.view(-1)[: ct * eff_bm * hidden_dim].view(ct, eff_bm, hidden_dim)
             dw13_v = deq_w_buf.view(-1)[: ct * w13_rows * hidden_dim].view(
                 ct, w13_rows, hidden_dim
@@ -906,7 +1260,7 @@ def dsv41_moe_tp8_forward(
                 num_valid_tiles_buf,
                 dw13_v,
                 t_off,
-                ct,
+                deq_ct_arg,
                 stream_handle,
             )
             ext.launch_bmm_bf16_f32_nt(ta_v, dw13_v, tgu_v)
@@ -930,7 +1284,7 @@ def dsv41_moe_tp8_forward(
                 num_valid_tiles_buf,
                 dw2_v,
                 t_off,
-                ct,
+                deq_ct_arg,
                 stream_handle,
             )
             torch.bmm(ti_v, dw2_v.transpose(1, 2), out=ta_v)
@@ -1063,6 +1417,52 @@ def sparse_attn_tp8_forward(
             torch.zeros_like(lse_nat),
         )
         out.copy_((out_pad[:, :8, :].float() * scale_sink.unsqueeze(-1)).to(torch.bfloat16))
+        return out
+
+    if eff_backend == "triton_splitk":
+        if rows <= 32 and max_topk >= 256:
+            sk = 8 if rows <= 8 else 4
+            if (
+                partial_acc.shape[0] >= rows * sk * 8
+                and partial_m.numel() >= rows * sk * 8
+                and partial_l.numel() >= rows * sk * 8
+            ):
+                ext = get_sail_ops_extension()
+                stream_handle = torch.cuda.current_stream(q.device).cuda_stream
+                _triton_sparse_attn_splitk_stage1_kernel[(rows, sk)](
+                    q,
+                    kv_arena,
+                    topk_idxs,
+                    partial_acc,
+                    partial_m,
+                    partial_l,
+                    max_topk,
+                    sk,
+                    float(sm_scale),
+                    BLOCK_K=64,
+                    num_warps=4,
+                )
+                ext.launch_sparse_attn_tp8_reduce(
+                    partial_acc,
+                    partial_m,
+                    partial_l,
+                    attn_sink,
+                    out,
+                    sk,
+                    stream_handle,
+                )
+                return out
+        _triton_sparse_attn_tp8_kernel[(rows,)](
+            q,
+            kv_arena,
+            attn_sink,
+            topk_idxs,
+            out,
+            max_topk,
+            float(sm_scale),
+            BLOCK_K=64,
+            num_warps=4,
+        )
         return out
 
     if eff_backend == "triton_tp8":

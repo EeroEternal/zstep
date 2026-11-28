@@ -21,6 +21,124 @@ void launch_bmm_bf16_f32_nt_cuda(
     int n,
     int k);
 
+void launch_gemm_bf16_f32_nt_cuda(
+    const void* a_bf16_ptr,
+    const void* b_bf16_ptr,
+    float* c_f32_ptr,
+    int m,
+    int n,
+    int k);
+
+void launch_icn_allreduce_mhc_post_bf16_cuda(
+    const void* input_ptr,
+    const void* residual_ptr,
+    const float* post_mix_ptr,
+    const float* comb_mix_ptr,
+    void* out_ptr,
+    uint64_t* control_ptr,
+    const std::uintptr_t* peer_ipc_ptrs,
+    std::uintptr_t abort_dev_ptr,
+    int64_t slot_stride_bytes,
+    int64_t oneshot_max_bytes,
+    int64_t num_vecs,
+    int vecs_per_row,
+    int rank,
+    int world_size,
+    int blocks,
+    int threads,
+    std::uintptr_t stream_handle);
+
+void launch_mhc_vec_single_splitk_bf16_cuda(
+    const void* x_ptr,
+    const float* hc_fn_ptr,
+    const float* hc_scale_ptr,
+    const float* hc_base_ptr,
+    float* partial_out_ptr,
+    int32_t* splitk_counters_ptr,
+    float* pre_out_ptr,
+    float* post_out_ptr,
+    float* comb_out_ptr,
+    int64_t rows,
+    int split_k,
+    float norm_eps,
+    float hc_eps,
+    int sinkhorn_iters,
+    std::uintptr_t stream_handle);
+
+void launch_mhc_sinkhorn_ozaki_vec_cuda(
+    const void* x_ptr,
+    const float* ozaki_proj_ptr,
+    const float* hc_scale_ptr,
+    const float* hc_base_ptr,
+    float* pre_out_ptr,
+    float* post_out_ptr,
+    float* comb_out_ptr,
+    int64_t rows,
+    float norm_eps,
+    float hc_eps,
+    int sinkhorn_iters,
+    std::uintptr_t stream_handle);
+
+void launch_compressor_cr2_fused_cuda(
+    const float* kv_gate_ptr,
+    int is_ozaki2,
+    float* comp_state_ptr,
+    const int32_t* positions_ptr,
+    const int64_t* mla_write_pages_ptr,
+    const int64_t* row_comp_slots_ptr,
+    const int64_t* row_seq_ids_ptr,
+    const int32_t* qsl_ptr,
+    const void* norm_weight_ptr,
+    void* latent_out_ptr,
+    int32_t* group_pos_out_ptr,
+    int64_t* mla_in_page_slots_out_ptr,
+    int rows,
+    int uniform_width,
+    int lat_pp,
+    float norm_eps,
+    std::uintptr_t stream_handle);
+
+void launch_sparse_attn_tp8_reduce_cuda(
+    const float* partial_acc_ptr,
+    const float* partial_m_ptr,
+    const float* partial_l_ptr,
+    const float* attn_sink_ptr,
+    void* out_ptr,
+    int rows,
+    int split_k,
+    std::uintptr_t stream_handle);
+
+void launch_dspark_sail_verify_prep_cuda(
+    const int32_t* out_top2_tokens_ptr,
+    const int32_t* verify_token_ids_ptr,
+    const int32_t* verify_positions_ptr,
+    const int64_t* verify_swa_slots_ptr,
+    const int64_t* seq_meta_ptr,
+    int32_t* out_acc_lens_ptr,
+    int64_t* ctx_swa_slots_ptr,
+    int32_t* draft_tokens_ptr,
+    int32_t* draft_positions_ptr,
+    int32_t* draft_last_ctx_pos_ptr,
+    int b,
+    int width,
+    int k,
+    int32_t noise_token_id,
+    std::uintptr_t stream_handle);
+
+void launch_fused_mtp_ctx_kv_epilogue_bf16_cuda(
+    const void* kv_in_ptr,
+    const void* kv_norm_w_ptr,
+    const float* cos_sin_ptr,
+    const int32_t* positions_ptr,
+    const int64_t* ctx_swa_slots_ptr,
+    void* kv_arena_ptr,
+    int rows,
+    int kv_dim,
+    int rope_dim,
+    int64_t layer_swa_base,
+    float eps,
+    std::uintptr_t stream_handle);
+
 void launch_icn_allreduce_bf16_cuda(
     const void* input_ptr,
     void* output_ptr,
@@ -845,6 +963,8 @@ void launch_mhc_post_bf16(
     const int64_t rows = sub_out.size(0);
     const int dim = static_cast<int>(sub_out.size(-1));
     if (rows <= 0) return;
+    const bool use_vec = (stream_handle & 1ULL) != 0ULL;
+    const std::uintptr_t clean_stream = stream_handle & ~static_cast<std::uintptr_t>(1ULL);
     launch_mhc_post_bf16_cuda(
         sub_out.data_ptr(),
         residual.data_ptr(),
@@ -852,8 +972,8 @@ void launch_mhc_post_bf16(
         comb_mix.data_ptr<float>(),
         out.data_ptr(),
         rows,
-        dim,
-        stream_handle);
+        use_vec ? (-dim) : dim,
+        clean_stream);
 }
 
 void launch_inplace_act_quant_ue8m0_bf16(
@@ -956,9 +1076,21 @@ void launch_dsv41_router_topk(
     double route_scale,
     std::uintptr_t stream_handle) {
     const int64_t rows = logits.size(0);
-    const int num_experts = static_cast<int>(logits.size(1));
+    const int num_experts = static_cast<int>(bias.numel());
     if (rows <= 0) return;
-    const int is_bf16 = (logits.scalar_type() == at::kBFloat16) ? 1 : 0;
+    int logits_mode = 0;
+    if (logits.scalar_type() == at::kBFloat16) {
+        TORCH_CHECK(logits.size(1) == num_experts, "BF16 router logits dim mismatch");
+        logits_mode = 1;
+    } else if (logits.size(1) == 2 * num_experts) {
+        TORCH_CHECK(logits.scalar_type() == at::kFloat, "Ozaki2 router logits must be FP32");
+        logits_mode = 2;
+    } else {
+        TORCH_CHECK(
+            logits.scalar_type() == at::kFloat && logits.size(1) == num_experts,
+            "FP32 router logits dim mismatch");
+        logits_mode = 0;
+    }
     launch_dsv41_router_topk_cuda(
         logits.data_ptr(),
         bias.data_ptr<float>(),
@@ -968,7 +1100,7 @@ void launch_dsv41_router_topk(
         num_experts,
         static_cast<int>(top_k),
         static_cast<float>(route_scale),
-        is_bf16,
+        logits_mode,
         stream_handle);
 }
 
@@ -1259,7 +1391,7 @@ void launch_dequant_mxfp4_tiles_bf16(
     int64_t tile_offset,
     int64_t chunk_tiles,
     std::uintptr_t stream_handle) {
-    if (chunk_tiles <= 0) return;
+    if (chunk_tiles == 0) return;
     const int n_rows = static_cast<int>(w_packed.size(1));
     const int k_cols = static_cast<int>(w_packed.size(2) * 2);
     launch_dequant_mxfp4_tiles_bf16_cuda(
@@ -1458,5 +1590,297 @@ void launch_indexer_topk512_slots(
         static_cast<int>(bt_width),
         static_cast<int>(eff_max_c),
         static_cast<int>(mla_arena_base),
+        stream_handle);
+}
+
+void launch_gemm_bf16_f32_nt(
+    torch::Tensor a_bf16,
+    torch::Tensor b_bf16,
+    torch::Tensor c_f32) {
+    TORCH_CHECK(
+        a_bf16.dim() == 2 && b_bf16.dim() == 2 && c_f32.dim() == 2 &&
+            a_bf16.is_contiguous() && b_bf16.is_contiguous() && c_f32.is_contiguous(),
+        "contiguous 2D tensors required for launch_gemm_bf16_f32_nt");
+    TORCH_CHECK(
+        a_bf16.scalar_type() == at::kBFloat16 &&
+            b_bf16.scalar_type() == at::kBFloat16 &&
+            c_f32.scalar_type() == at::kFloat,
+        "expected BF16 inputs and FP32 output");
+    const int m = static_cast<int>(a_bf16.size(0));
+    if (m <= 0) return;
+    const int k = static_cast<int>(a_bf16.size(1));
+    const int n = static_cast<int>(b_bf16.size(0));
+    TORCH_CHECK(
+        b_bf16.size(1) == k && c_f32.size(0) == m && c_f32.size(1) == n,
+        "shape mismatch in launch_gemm_bf16_f32_nt");
+    launch_gemm_bf16_f32_nt_cuda(
+        a_bf16.data_ptr(),
+        b_bf16.data_ptr(),
+        c_f32.data_ptr<float>(),
+        m,
+        n,
+        k);
+}
+
+void launch_icn_allreduce_mhc_post_bf16(
+    torch::Tensor input,
+    torch::Tensor residual,
+    torch::Tensor post_mix,
+    torch::Tensor comb_mix,
+    torch::Tensor out,
+    torch::Tensor control,
+    torch::Tensor peer_ipc_ptrs,
+    std::uintptr_t abort_dev_ptr,
+    int64_t slot_stride_bytes,
+    int64_t oneshot_max_bytes,
+    int64_t rank,
+    int64_t world_size,
+    int64_t blocks,
+    int64_t threads,
+    std::uintptr_t stream_handle) {
+    TORCH_CHECK(
+        input.is_cuda() && residual.is_cuda() && out.is_cuda(),
+        "input/residual/out must be CUDA tensors");
+    TORCH_CHECK(
+        input.scalar_type() == at::kBFloat16 &&
+            residual.scalar_type() == at::kBFloat16 &&
+            out.scalar_type() == at::kBFloat16,
+        "BF16 required");
+    TORCH_CHECK(
+        input.is_contiguous() && residual.is_contiguous() &&
+            post_mix.is_contiguous() && comb_mix.is_contiguous() && out.is_contiguous(),
+        "contiguous tensors required");
+    const int64_t rows = input.size(0);
+    if (rows <= 0) return;
+    const int dim = static_cast<int>(input.size(-1));
+    TORCH_CHECK(dim % 8 == 0, "dim must be divisible by 8");
+    TORCH_CHECK(
+        residual.numel() == rows * 4 * dim && out.numel() == rows * 4 * dim,
+        "residual/out shape mismatch");
+    TORCH_CHECK(blocks >= 1 && blocks <= 64, "blocks out of range");
+    launch_icn_allreduce_mhc_post_bf16_cuda(
+        input.data_ptr(),
+        residual.data_ptr(),
+        post_mix.data_ptr<float>(),
+        comb_mix.data_ptr<float>(),
+        out.data_ptr(),
+        reinterpret_cast<uint64_t*>(control.data_ptr<int64_t>()),
+        reinterpret_cast<const std::uintptr_t*>(peer_ipc_ptrs.data_ptr<int64_t>()),
+        abort_dev_ptr,
+        slot_stride_bytes,
+        oneshot_max_bytes,
+        input.numel() / 8,
+        dim / 8,
+        static_cast<int>(rank),
+        static_cast<int>(world_size),
+        static_cast<int>(blocks),
+        static_cast<int>(threads),
+        stream_handle);
+}
+
+void launch_mhc_vec_single_splitk_bf16(
+    torch::Tensor x,
+    torch::Tensor hc_fn,
+    torch::Tensor hc_scale,
+    torch::Tensor hc_base,
+    torch::Tensor partial_out,
+    torch::Tensor splitk_counters,
+    torch::Tensor pre_out,
+    torch::Tensor post_out,
+    torch::Tensor comb_out,
+    int64_t split_k,
+    double norm_eps,
+    double hc_eps,
+    int64_t sinkhorn_iters,
+    std::uintptr_t stream_handle) {
+    const int64_t rows = x.size(0);
+    if (rows <= 0) return;
+    TORCH_CHECK(
+        split_k == 1 || split_k == 2 || split_k == 4 || split_k == 8 || split_k == 16,
+        "split_k must be 1, 2, 4, 8, or 16");
+    if (split_k > 1) {
+        TORCH_CHECK(partial_out.numel() >= rows * split_k * 25, "partial_out buffer too small");
+        TORCH_CHECK(
+            splitk_counters.scalar_type() == at::kInt && splitk_counters.numel() >= rows,
+            "splitk_counters int32 buffer too small");
+    }
+    launch_mhc_vec_single_splitk_bf16_cuda(
+        x.data_ptr(),
+        hc_fn.data_ptr<float>(),
+        hc_scale.data_ptr<float>(),
+        hc_base.data_ptr<float>(),
+        partial_out.data_ptr<float>(),
+        split_k > 1 ? splitk_counters.data_ptr<int32_t>() : nullptr,
+        pre_out.data_ptr<float>(),
+        post_out.data_ptr<float>(),
+        comb_out.data_ptr<float>(),
+        rows,
+        static_cast<int>(split_k),
+        static_cast<float>(norm_eps),
+        static_cast<float>(hc_eps),
+        static_cast<int>(sinkhorn_iters),
+        stream_handle);
+}
+
+void launch_mhc_sinkhorn_ozaki_vec(
+    torch::Tensor x,
+    torch::Tensor ozaki_proj,
+    torch::Tensor hc_scale,
+    torch::Tensor hc_base,
+    torch::Tensor pre_out,
+    torch::Tensor post_out,
+    torch::Tensor comb_out,
+    double norm_eps,
+    double hc_eps,
+    int64_t sinkhorn_iters,
+    std::uintptr_t stream_handle) {
+    const int64_t rows = x.size(0);
+    if (rows <= 0) return;
+    TORCH_CHECK(
+        ozaki_proj.scalar_type() == at::kFloat && ozaki_proj.size(1) == 48,
+        "ozaki_proj must be [rows, 48] FP32");
+    launch_mhc_sinkhorn_ozaki_vec_cuda(
+        x.data_ptr(),
+        ozaki_proj.data_ptr<float>(),
+        hc_scale.data_ptr<float>(),
+        hc_base.data_ptr<float>(),
+        pre_out.data_ptr<float>(),
+        post_out.data_ptr<float>(),
+        comb_out.data_ptr<float>(),
+        rows,
+        static_cast<float>(norm_eps),
+        static_cast<float>(hc_eps),
+        static_cast<int>(sinkhorn_iters),
+        stream_handle);
+}
+
+void launch_compressor_cr2_fused(
+    torch::Tensor kv_gate,
+    int64_t is_ozaki2,
+    torch::Tensor comp_state,
+    torch::Tensor positions,
+    torch::Tensor mla_write_pages,
+    torch::Tensor row_comp_slots,
+    torch::Tensor row_seq_ids,
+    torch::Tensor qsl_gpu,
+    torch::Tensor norm_weight,
+    torch::Tensor latent_out,
+    torch::Tensor group_pos_out,
+    torch::Tensor mla_in_page_slots_out,
+    int64_t uniform_width,
+    int64_t lat_pp,
+    double norm_eps,
+    std::uintptr_t stream_handle) {
+    const int rows = static_cast<int>(kv_gate.size(0));
+    if (rows <= 0) return;
+    TORCH_CHECK(
+        kv_gate.scalar_type() == at::kFloat && comp_state.scalar_type() == at::kFloat,
+        "kv_gate and comp_state must be FP32");
+    TORCH_CHECK(
+        kv_gate.size(1) == (is_ozaki2 ? 2048 : 1024),
+        "kv_gate column count mismatch");
+    launch_compressor_cr2_fused_cuda(
+        kv_gate.data_ptr<float>(),
+        static_cast<int>(is_ozaki2),
+        comp_state.data_ptr<float>(),
+        positions.data_ptr<int32_t>(),
+        mla_write_pages.data_ptr<int64_t>(),
+        row_comp_slots.data_ptr<int64_t>(),
+        row_seq_ids.data_ptr<int64_t>(),
+        qsl_gpu.numel() > 0 ? qsl_gpu.data_ptr<int32_t>() : nullptr,
+        norm_weight.data_ptr(),
+        latent_out.data_ptr(),
+        group_pos_out.data_ptr<int32_t>(),
+        mla_in_page_slots_out.data_ptr<int64_t>(),
+        rows,
+        static_cast<int>(uniform_width),
+        static_cast<int>(lat_pp),
+        static_cast<float>(norm_eps),
+        stream_handle);
+}
+
+void launch_sparse_attn_tp8_reduce(
+    torch::Tensor partial_acc,
+    torch::Tensor partial_m,
+    torch::Tensor partial_l,
+    torch::Tensor attn_sink,
+    torch::Tensor out,
+    int64_t split_k,
+    std::uintptr_t stream_handle) {
+    const int rows = static_cast<int>(out.size(0));
+    if (rows <= 0) return;
+    launch_sparse_attn_tp8_reduce_cuda(
+        partial_acc.data_ptr<float>(),
+        partial_m.data_ptr<float>(),
+        partial_l.data_ptr<float>(),
+        attn_sink.data_ptr<float>(),
+        out.data_ptr(),
+        rows,
+        static_cast<int>(split_k),
+        stream_handle);
+}
+
+void launch_dspark_sail_verify_prep(
+    torch::Tensor out_top2_tokens,
+    torch::Tensor verify_token_ids,
+    torch::Tensor verify_positions,
+    torch::Tensor verify_swa_slots,
+    torch::Tensor seq_meta,
+    torch::Tensor out_acc_lens,
+    torch::Tensor ctx_swa_slots,
+    torch::Tensor draft_tokens,
+    torch::Tensor draft_positions,
+    torch::Tensor draft_last_ctx_pos,
+    int64_t b,
+    int64_t width,
+    int64_t k,
+    int64_t noise_token_id,
+    std::uintptr_t stream_handle) {
+    if (b <= 0) return;
+    launch_dspark_sail_verify_prep_cuda(
+        out_top2_tokens.data_ptr<int32_t>(),
+        verify_token_ids.data_ptr<int32_t>(),
+        verify_positions.data_ptr<int32_t>(),
+        verify_swa_slots.data_ptr<int64_t>(),
+        seq_meta.data_ptr<int64_t>(),
+        out_acc_lens.data_ptr<int32_t>(),
+        ctx_swa_slots.data_ptr<int64_t>(),
+        draft_tokens.data_ptr<int32_t>(),
+        draft_positions.data_ptr<int32_t>(),
+        draft_last_ctx_pos.data_ptr<int32_t>(),
+        static_cast<int>(b),
+        static_cast<int>(width),
+        static_cast<int>(k),
+        static_cast<int32_t>(noise_token_id),
+        stream_handle);
+}
+
+void launch_fused_mtp_ctx_kv_epilogue_bf16(
+    torch::Tensor kv_in,
+    torch::Tensor kv_norm_w,
+    torch::Tensor cos_sin,
+    torch::Tensor positions,
+    torch::Tensor ctx_swa_slots,
+    torch::Tensor kv_arena,
+    int64_t rope_dim,
+    int64_t layer_swa_base,
+    double eps,
+    std::uintptr_t stream_handle) {
+    const int rows = static_cast<int>(kv_in.size(0));
+    if (rows <= 0) return;
+    const int kv_dim = static_cast<int>(kv_norm_w.numel());
+    TORCH_CHECK(kv_in.size(1) == kv_dim && kv_dim == 512, "invalid mtp kv_in dims");
+    launch_fused_mtp_ctx_kv_epilogue_bf16_cuda(
+        kv_in.data_ptr(),
+        kv_norm_w.data_ptr(),
+        cos_sin.data_ptr<float>(),
+        positions.data_ptr<int32_t>(),
+        ctx_swa_slots.data_ptr<int64_t>(),
+        kv_arena.data_ptr(),
+        rows,
+        kv_dim,
+        static_cast<int>(rope_dim),
+        layer_swa_base,
+        static_cast<float>(eps),
         stream_handle);
 }

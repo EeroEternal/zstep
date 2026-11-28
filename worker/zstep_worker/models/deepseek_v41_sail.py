@@ -440,6 +440,7 @@ class _CompressorWeights:
     wkv_weight: torch.Tensor  # FP32 for cr=2, BF16 for cr=1
     wgate_weight: torch.Tensor | None  # FP32 for cr=2, None for cr=1
     wkv_gate_f32: torch.Tensor | None = None  # [1024, 5120] FP32 for cr=2
+    wkv_gate_ozaki_bf16: torch.Tensor | None = None  # [2048, 5120] BF16 for cr=2
 
 
 @dataclass
@@ -504,6 +505,9 @@ class _LayerWeights:
     experts_w2_packed: torch.Tensor  # [E, 5120, 144] uint8
     experts_w2_scale: torch.Tensor  # [E, 5120, 9] uint8
     top_k: int
+    hc_attn_fn_ozaki_bf16: torch.Tensor | None = None
+    hc_ffn_fn_ozaki_bf16: torch.Tensor | None = None
+    gate_weight_ozaki_bf16: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -519,11 +523,21 @@ class _SailSpecVerifyContext:
 
 
 @dataclass(frozen=True)
+class _SailFusedSpecRoundContext:
+    num_seqs: int
+    width: int
+    max_ctx: int
+    seq_slots_np: np.ndarray
+    pos_starts_np: np.ndarray
+
+
+@dataclass(frozen=True)
 class _SailLaunchedStep:
     parity: int
     num_out: int
     sample_slots_out: list[int]
     spec_ctx: _SailSpecVerifyContext | None = None
+    fused_spec_ctx: _SailFusedSpecRoundContext | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -599,10 +613,81 @@ class DeepSeekV41SailDSparkDrafter:
         self.draft_out_tokens_cpu = torch.zeros((k, max_b), dtype=torch.int32, pin_memory=True)
         self._draft_out_tokens_np = self.draft_out_tokens_cpu.numpy()
 
+        # Fused zero-host-stall verify+draft staging buffers (double-buffered D2H pinned outputs)
+        self.spec_seq_meta_cpu = torch.zeros((max_b, 2), dtype=torch.int64, pin_memory=True)
+        self.spec_seq_meta_gpu = torch.zeros((max_b, 2), dtype=torch.int64, device=dev)
+        self.spec_acc_lens_cpu = torch.zeros((2, max_b), dtype=torch.int32, pin_memory=True)
+        self.spec_acc_lens_gpu = torch.zeros((max_b,), dtype=torch.int32, device=dev)
+        self.draft_out_tokens_pinned = torch.zeros(
+            (2, k, max_b), dtype=torch.int32, pin_memory=True
+        )
+
         self._w_offs_128 = torch.arange(128, dtype=torch.int32, device=dev)
         self._k_offs = torch.arange(k, dtype=torch.int32, device=dev)
         self.draft_topk_buf = torch.full((max_rows, 256), -1, dtype=torch.int32, device=dev)
         self.draft_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.post_verify_draft_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+
+    def has_fused_post_verify_graph(self, v_bucket: int) -> bool:
+        return v_bucket in self.post_verify_draft_graphs
+
+    def store_context_kv_graphed(self, v_rows: int, main_x: torch.Tensor) -> None:
+        runner = self.runner
+        q_in = sail_ops.act_quant_ue8m0(main_x[:v_rows], out=runner.act_quant_buf[:v_rows])
+        pos_i32 = runner.positions_gpu[:v_rows]
+        ctx_s = self.ctx_swa_slots_gpu[:v_rows]
+        for stage in runner.mtp_layers:
+            kv = runner.kv_buf[:v_rows]
+            torch.matmul(q_in, stage.wkv_bf16.t(), out=kv)
+            sail_ops.fused_mtp_ctx_kv_epilogue(
+                kv,
+                stage.kv_norm_weight,
+                runner.swa_cos_sin_gpu,
+                pos_i32,
+                ctx_s,
+                kv_arena=runner.kv_arena,
+                layer_swa_base=runner.swa_arena_base[stage.arena_swa_layer_idx],
+                rope_dim=64,
+                eps=runner.norm_eps,
+            )
+
+    def build_fused_seq_results(
+        self,
+        *,
+        parity: int,
+        num_seqs: int,
+        width: int,
+        seq_slots_np: np.ndarray,
+        pos_starts_np: np.ndarray,
+        max_ctx: int,
+    ) -> list[SeqResult]:
+        k = self.num_draft_tokens
+        out_tok_np = self.runner._out_tokens_np[parity]
+        out_lp_np = self.runner._out_logprobs_np[parity]
+        acc_np = self.spec_acc_lens_cpu[parity, :num_seqs].numpy()
+        draft_tok_np = self.draft_out_tokens_pinned[parity, :, :num_seqs].numpy()
+        outputs: list[SeqResult] = []
+        for s in range(num_seqs):
+            acc = max(1, min(width, int(acc_np[s])))
+            v_base = s * width
+            accepted = [int(out_tok_np[v_base + j, 0]) for j in range(acc)]
+            logprobs = [int(out_lp_np[v_base + j, 0]) & 0xFFFF_FFFF for j in range(acc)]
+            pos_next = int(pos_starts_np[s]) + acc
+            max_k = max(0, min(k, max_ctx - pos_next))
+            next_drafts = [int(draft_tok_np[j, s]) for j in range(max_k)]
+            outputs.append(
+                SeqResult(
+                    req_slot=int(seq_slots_np[s]),
+                    accepted_token=accepted[0],
+                    accepted_logprob_bits=logprobs[0],
+                    accepted_tokens=accepted,
+                    accepted_logprobs_bits=logprobs,
+                    next_draft_tokens=next_drafts,
+                    runner_up_token=int(out_tok_np[v_base, 1]),
+                    runner_up_logprob_bits=int(out_lp_np[v_base, 1]) & 0xFFFF_FFFF,
+                )
+            )
+        return outputs
 
     def store_context_kv(
         self,
@@ -653,13 +738,17 @@ class DeepSeekV41SailDSparkDrafter:
         for stage in runner.mtp_layers:
             kv = runner.kv_buf[:n_ctx]
             torch.matmul(q_in, stage.wkv_bf16.t(), out=kv)
-            sail_ops.rmsnorm_bf16(kv, stage.kv_norm_weight, eps=runner.norm_eps, out=kv)
-            sail_ops.apply_rope_inplace(
-                kv.unsqueeze(1), runner.swa_cos_sin_gpu, pos_i32, rope_dim=64, inverse=False
+            sail_ops.fused_mtp_ctx_kv_epilogue(
+                kv,
+                stage.kv_norm_weight,
+                runner.swa_cos_sin_gpu,
+                pos_i32,
+                base_s,
+                kv_arena=runner.kv_arena,
+                layer_swa_base=runner.swa_arena_base[stage.arena_swa_layer_idx],
+                rope_dim=64,
+                eps=runner.norm_eps,
             )
-            sail_ops.inplace_act_quant_ue8m0(kv)
-            dst_slots = runner.swa_arena_base[stage.arena_swa_layer_idx] + base_s
-            runner.kv_arena.view(-1, 512).index_copy_(0, dst_slots, kv)
 
     def _run_draft_forward_and_markov(self, b: int) -> None:
         runner = self.runner
@@ -708,8 +797,12 @@ class DeepSeekV41SailDSparkDrafter:
                 comb_out=attn_comb,
                 raw_proj_buf=runner.mhc_proj_buf[:rows],
                 split_k_part_buf=runner.mhc_split_k_part_buf,
+                split_k_counters_buf=runner.mhc_split_k_counters_buf,
+                hc_fn_ozaki_bf16=stage.hc_attn_fn_ozaki_bf16,
+                ozaki_proj_buf=runner.mhc_ozaki_proj_buf,
                 split_k=runner.mhc_split_k,
                 fused_max_rows=runner.mhc_fused_max_rows,
+                backend=runner.mhc_backend,
                 norm_eps=runner.norm_eps,
                 hc_eps=runner.hc_eps,
                 sinkhorn_iters=runner.hc_sinkhorn_iters,
@@ -832,9 +925,19 @@ class DeepSeekV41SailDSparkDrafter:
             sail_ops.inplace_act_quant_ue8m0(o_lora)
             attn_local = runner.sub_local_buf[:rows]
             torch.matmul(o_lora, stage.wo_b_bf16.t(), out=attn_local)
-            attn_red = runner.sub_red_buf[:rows]
-            runner.icn_comm.all_reduce_bf16(attn_local, output=attn_red)
-            sail_ops.mhc_post(attn_red, h_cur, attn_post, attn_comb, out=h_nxt)
+            if runner.ar_fuse_mhc_post:
+                runner.icn_comm.all_reduce_mhc_post_bf16(
+                    attn_local,
+                    h_cur,
+                    attn_post,
+                    attn_comb,
+                    out=h_nxt,
+                    scratch_red=runner.sub_red_buf[:rows],
+                )
+            else:
+                attn_red = runner.sub_red_buf[:rows]
+                runner.icn_comm.all_reduce_bf16(attn_local, output=attn_red)
+                sail_ops.mhc_post(attn_red, h_cur, attn_post, attn_comb, out=h_nxt)
 
             ffn_post = runner.tmp_post_buf[:rows]
             ffn_comb = runner.tmp_comb_buf[:rows]
@@ -849,8 +952,12 @@ class DeepSeekV41SailDSparkDrafter:
                 comb_out=ffn_comb,
                 raw_proj_buf=runner.mhc_proj_buf[:rows],
                 split_k_part_buf=runner.mhc_split_k_part_buf,
+                split_k_counters_buf=runner.mhc_split_k_counters_buf,
+                hc_fn_ozaki_bf16=stage.hc_ffn_fn_ozaki_bf16,
+                ozaki_proj_buf=runner.mhc_ozaki_proj_buf,
                 split_k=runner.mhc_split_k,
                 fused_max_rows=runner.mhc_fused_max_rows,
+                backend=runner.mhc_backend,
                 norm_eps=runner.norm_eps,
                 hc_eps=runner.hc_eps,
                 sinkhorn_iters=runner.hc_sinkhorn_iters,
@@ -905,15 +1012,28 @@ class DeepSeekV41SailDSparkDrafter:
                 tile_a_buf=runner.moe_tile_a_buf,
                 tile_gu_buf=runner.moe_tile_gu_buf,
                 tile_inter_buf=runner.moe_tile_inter_buf,
+                gate_weight_ozaki_bf16=stage.gate_weight_ozaki_bf16,
+                router_ozaki_buf=runner.router_ozaki_buf,
+                router_mode=runner.moe_router_mode,
                 gemv_max_rows=runner.moe_gemv_max_rows,
                 gemv_threads=runner.moe_gemv_threads,
                 block_m=runner.moe_block_m,
                 num_warps=runner.moe_num_warps,
                 prefill_backend=runner.moe_prefill_backend,
             )
-            moe_red = runner.sub_red_buf[:rows]
-            runner.icn_comm.all_reduce_bf16(moe_local, output=moe_red)
-            sail_ops.mhc_post(moe_red, h_nxt, ffn_post, ffn_comb, out=h_cur)
+            if runner.ar_fuse_mhc_post:
+                runner.icn_comm.all_reduce_mhc_post_bf16(
+                    moe_local,
+                    h_nxt,
+                    ffn_post,
+                    ffn_comb,
+                    out=h_cur,
+                    scratch_red=runner.sub_red_buf[:rows],
+                )
+            else:
+                moe_red = runner.sub_red_buf[:rows]
+                runner.icn_comm.all_reduce_bf16(moe_local, output=moe_red)
+                sail_ops.mhc_post(moe_red, h_nxt, ffn_post, ffn_comb, out=h_cur)
 
         # Collapse final DSpark stream + norm + base logits + 5-step Markov chain
         head_hidden = runner.normed_buf[:rows]
@@ -1003,8 +1123,65 @@ class DeepSeekV41SailDSparkDrafter:
             dist.barrier(group=runner.exchange_group)
             self.draft_graphs[b] = g
 
+        if runner.runtime_config.enable_fused_spec_graph:
+            width = k + 1
+            for v_bucket, raw_mx in runner.verify_graph_main_x.items():
+                if raw_mx is None or v_bucket not in self.draft_buckets:
+                    continue
+                v_rows = v_bucket * width
+                if (
+                    v_rows > self.ctx_swa_slots_gpu.shape[0]
+                    or v_bucket > self.spec_seq_meta_gpu.shape[0]
+                ):
+                    continue
+                runner.token_ids_gpu[:v_rows].zero_()
+                runner.positions_gpu[:v_rows].copy_(
+                    torch.arange(v_rows, dtype=torch.int32, device=runner.device) % width
+                )
+                runner.swa_write_slots_gpu[:v_rows].zero_()
+                runner.out_tokens_gpu[:v_rows].zero_()
+                runner.swa_bt_gpu[:v_bucket].zero_()
+                self.spec_seq_meta_gpu[:v_bucket].zero_()
+
+                def _run_post_verify(vb: int = v_bucket, mx: torch.Tensor = raw_mx) -> None:
+                    vr = vb * width
+                    dr = vb * k
+                    self.draft_swa_bt_gpu[:vb].copy_(runner.swa_bt_gpu[:vb])
+                    sail_ops.dspark_verify_prep(
+                        runner.out_tokens_gpu[:vr],
+                        runner.token_ids_gpu[:vr],
+                        runner.positions_gpu[:vr],
+                        runner.swa_write_slots_gpu[:vr],
+                        self.spec_seq_meta_gpu[:vb],
+                        out_acc_lens=self.spec_acc_lens_gpu[:vb],
+                        ctx_swa_slots=self.ctx_swa_slots_gpu[:vr],
+                        draft_tokens=self.draft_tokens_gpu[:dr],
+                        draft_positions=self.draft_positions_gpu[:dr],
+                        draft_last_ctx_pos=self.draft_last_ctx_pos_gpu[:vb],
+                        b=vb,
+                        width=width,
+                        k=k,
+                        noise_token_id=self.noise_token_id,
+                    )
+                    self.store_context_kv_graphed(vr, mx)
+                    self._run_draft_forward_and_markov(vb)
+
+                with torch.cuda.stream(capture_stream):
+                    for _ in range(2):
+                        _run_post_verify()
+                capture_stream.synchronize()
+                dist.barrier(group=runner.exchange_group)
+
+                fg = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(fg, pool=graph_pool, stream=capture_stream):
+                    _run_post_verify()
+                capture_stream.synchronize()
+                dist.barrier(group=runner.exchange_group)
+                self.post_verify_draft_graphs[v_bucket] = fg
+
     def close(self) -> None:
         self.draft_graphs.clear()
+        self.post_verify_draft_graphs.clear()
 
     def _draft_batch(
         self,
@@ -1299,12 +1476,15 @@ class DeepSeekV41SailStepRunner:
         self.moe_block_m = int(self.runtime_config.sail_moe_block_m)
         self.moe_num_warps = int(self.runtime_config.sail_moe_num_warps)
         self.moe_prefill_backend = self.runtime_config.sail_moe_prefill_backend
+        self.moe_router_mode = self.runtime_config.sail_moe_router_mode
         self.sparse_attn_backend = self.runtime_config.sail_sparse_attn_backend
         self.mhc_split_k = int(self.runtime_config.sail_mhc_split_k)
         self.mhc_fused_max_rows = int(self.runtime_config.sail_mhc_fused_max_rows)
+        self.mhc_backend = self.runtime_config.sail_mhc_backend
         self.qkv_fusion_mode = self.runtime_config.sail_qkv_fusion_mode
         self.engram_indexer_backend = self.runtime_config.sail_engram_indexer_backend
         self.lm_head_dtype = self.runtime_config.sail_lm_head_dtype
+        self.ar_fuse_mhc_post = int(self.runtime_config.sail_ar_fuse_mhc_post)
         ar_blocks = int(self.runtime_config.sail_ar_blocks or allreduce_blocks)
         ar_threads = int(self.runtime_config.sail_ar_threads or allreduce_threads)
 
@@ -1754,6 +1934,7 @@ class DeepSeekV41SailStepRunner:
                     )
                     cwkv = cwkv_gate[: self.head_dim]
                     cwgate = cwkv_gate[self.head_dim :]
+                    cwkv_gate_oz = sail_ops.make_ozaki2_bf16(cwkv_gate)
                 else:
                     cwkv = self._pinned_to_gpu(
                         loaded_cpu.pop(f"{prefix}.attn.compressor.wkv.weight"),
@@ -1761,6 +1942,7 @@ class DeepSeekV41SailStepRunner:
                     )
                     cwgate = None
                     cwkv_gate = None
+                    cwkv_gate_oz = None
                 comp_w = _CompressorWeights(
                     compress_ratio=cr,
                     comp_idx=comp_idx_map[lid],
@@ -1768,6 +1950,7 @@ class DeepSeekV41SailStepRunner:
                     wkv_weight=cwkv,
                     wgate_weight=cwgate,
                     wkv_gate_f32=cwkv_gate,
+                    wkv_gate_ozaki_bf16=cwkv_gate_oz,
                 )
 
             idx_w: _IndexerWeights | None = None
@@ -1854,6 +2037,9 @@ class DeepSeekV41SailStepRunner:
             hc_ffn_f32 = self._pinned_to_gpu(
                 loaded_cpu.pop(f"{prefix}.hc_ffn_fn"), dtype=torch.float32
             )
+            gate_w_f32 = self._pinned_to_gpu(
+                loaded_cpu.pop(f"{prefix}.ffn.gate.weight"), dtype=torch.float32
+            )
             w13_p, w13_s, w2_p, w2_s = exp_buffers[prefix]
 
             wq_a_tmp = self._dequant_fp8_block32_gpu(
@@ -1933,9 +2119,7 @@ class DeepSeekV41SailStepRunner:
                 compressor=comp_w,
                 indexer=idx_w,
                 engram=eng_w,
-                gate_weight_f32=self._pinned_to_gpu(
-                    loaded_cpu.pop(f"{prefix}.ffn.gate.weight"), dtype=torch.float32
-                ),
+                gate_weight_f32=gate_w_f32,
                 gate_bias_f32=self._pinned_to_gpu(
                     loaded_cpu.pop(f"{prefix}.ffn.gate.bias"), dtype=torch.float32
                 ),
@@ -1946,6 +2130,9 @@ class DeepSeekV41SailStepRunner:
                 experts_w2_packed=w2_p,
                 experts_w2_scale=w2_s,
                 top_k=top_k,
+                hc_attn_fn_ozaki_bf16=sail_ops.make_ozaki2_bf16(hc_attn_f32),
+                hc_ffn_fn_ozaki_bf16=sail_ops.make_ozaki2_bf16(hc_ffn_f32),
+                gate_weight_ozaki_bf16=sail_ops.make_ozaki2_bf16(gate_w_f32),
             )
 
         self.layers: list[_LayerWeights] = [
@@ -2149,8 +2336,12 @@ class DeepSeekV41SailStepRunner:
         self.tmp_post_buf = torch.zeros((max_t, 4), dtype=torch.float32, device=dev)
         self.tmp_comb_buf = torch.zeros((max_t, 4, 4), dtype=torch.float32, device=dev)
         self.mhc_proj_buf = torch.zeros((max_t, 24), dtype=torch.float32, device=dev)
+        self.mhc_ozaki_proj_buf = torch.zeros((max_t, 48), dtype=torch.float32, device=dev)
         self.mhc_split_k_part_buf = torch.zeros(
-            (max_t * 16 * 25,), dtype=torch.float32, device=dev
+            (max(max_t, 512) * 16 * 25,), dtype=torch.float32, device=dev
+        )
+        self.mhc_split_k_counters_buf = torch.zeros(
+            (max(max_t, 512),), dtype=torch.int32, device=dev
         )
         self.normed_buf = torch.zeros((max_t, self.hidden_size), dtype=torch.bfloat16, device=dev)
         self.act_quant_buf = torch.zeros(
@@ -2167,6 +2358,11 @@ class DeepSeekV41SailStepRunner:
         self.comp_kv_gate_buf = torch.zeros(
             (max_t, 2 * self.head_dim), dtype=torch.float32, device=dev
         )
+        self.comp_ozaki_buf = torch.zeros(
+            (max_t, 4 * self.head_dim), dtype=torch.float32, device=dev
+        )
+        self.comp_group_pos_buf = torch.zeros(max_t, dtype=torch.int32, device=dev)
+        self.comp_mla_slots_buf = torch.zeros(max_t, dtype=torch.int64, device=dev)
         self.q_buf = torch.zeros((max_t, 8, self.head_dim), dtype=torch.bfloat16, device=dev)
         self.kv_buf = torch.zeros((max_t, self.head_dim), dtype=torch.bfloat16, device=dev)
         self.attn_out_buf = torch.zeros(
@@ -2198,6 +2394,9 @@ class DeepSeekV41SailStepRunner:
         max_tiles = max_pairs // 16 + self.n_routed_experts + 16
         self.router_logits_buf = torch.zeros(
             (max_t, self.n_routed_experts), dtype=torch.float32, device=dev
+        )
+        self.router_ozaki_buf = torch.zeros(
+            (max_t, 2 * self.n_routed_experts), dtype=torch.float32, device=dev
         )
         self.topk_weights_buf = torch.zeros(
             (max_t, self.num_experts_per_tok), dtype=torch.float32, device=dev
@@ -2358,22 +2557,38 @@ class DeepSeekV41SailStepRunner:
                     num_warps=self.moe_num_warps,
                 )
 
-        # Warm up `_triton_sparse_attn_tp8_kernel` across topk widths (128, 256, 640)
+        # Warm up all watched Triton sparse-attention kernels across topk widths (128, 256, 640)
         for tk_w in (128, 256, 640):
-            tk_buf = torch.full((4, tk_w), -1, dtype=torch.int32, device=self.device)
-            sail_ops.sparse_attn_tp8_forward(
-                self.q_buf[:4].zero_(),
-                self.kv_arena,
-                layer0.attn_sink_f32,
-                tk_buf,
-                out=self.attn_out_buf[:4],
-                partial_acc=self.attn_partial_acc[:256],
-                partial_m=self.attn_partial_m[:256],
-                partial_l=self.attn_partial_l[:256],
-                q_pad64_buf=self.attn_q_pad64_buf[:4],
-                sm_scale=self.sm_scale,
-                backend="triton_tp8",
-            )
+            tk_buf4 = torch.full((4, tk_w), -1, dtype=torch.int32, device=self.device)
+            for bk_w in ("triton_tp8", "triton_splitk"):
+                sail_ops.sparse_attn_tp8_forward(
+                    self.q_buf[:4].zero_(),
+                    self.kv_arena,
+                    layer0.attn_sink_f32,
+                    tk_buf4,
+                    out=self.attn_out_buf[:4],
+                    partial_acc=self.attn_partial_acc[:256],
+                    partial_m=self.attn_partial_m[:256],
+                    partial_l=self.attn_partial_l[:256],
+                    q_pad64_buf=self.attn_q_pad64_buf[:4],
+                    sm_scale=self.sm_scale,
+                    backend=bk_w,
+                )
+            if self.max_step_tokens >= 48:
+                tk_buf48 = torch.full((48, tk_w), -1, dtype=torch.int32, device=self.device)
+                sail_ops.sparse_attn_tp8_forward(
+                    self.q_buf[:48].zero_(),
+                    self.kv_arena,
+                    layer0.attn_sink_f32,
+                    tk_buf48,
+                    out=self.attn_out_buf[:48],
+                    partial_acc=self.attn_partial_acc[: 48 * 64],
+                    partial_m=self.attn_partial_m[: 48 * 64],
+                    partial_l=self.attn_partial_l[: 48 * 64],
+                    q_pad64_buf=self.attn_q_pad64_buf[:48],
+                    sm_scale=self.sm_scale,
+                    backend="triton_splitk",
+                )
         torch.cuda.synchronize(self.device)
 
     # -----------------------------------------------------------------------
@@ -2421,7 +2636,7 @@ class DeepSeekV41SailStepRunner:
         sail_ops.inplace_act_quant_ue8m0(red_emb)
         kv_proj = self.engram_kv_buf[:rows]
         torch.matmul(red_emb, eng.wkv_bf16.t(), out=kv_proj)
-        if self.engram_indexer_backend == "fused_hggc":
+        if self.engram_indexer_backend in ("fused_hggc", "fused_hggc_ozaki"):
             sail_ops.engram_gated_residual(
                 h_stream, kv_proj, eng.qk_prod_f32, norm_eps=self.norm_eps
             )
@@ -2449,6 +2664,7 @@ class DeepSeekV41SailStepRunner:
         *,
         rows: int,
         num_seqs: int,
+        qsl_gpu: torch.Tensor,
         max_seq_len_bound: int,
         uniform_width: int,
         qsl_np: np.ndarray | None,
@@ -2465,7 +2681,8 @@ class DeepSeekV41SailStepRunner:
         pos_i32 = self.positions_gpu[:rows]
         mla_pages = self.mla_write_pages_gpu[:rows]
         valid_write = mla_pages > 0
-        fused_ei = self.engram_indexer_backend == "fused_hggc"
+        fused_ei = self.engram_indexer_backend in ("fused_hggc", "fused_hggc_ozaki")
+        ozaki_ei = self.engram_indexer_backend == "fused_hggc_ozaki"
 
         # 1. Compressor (`layers 2, 8, 14` have `cr=2`; `layer 20` has `cr=1`)
         comp = lw.compressor
@@ -2484,6 +2701,28 @@ class DeepSeekV41SailStepRunner:
                     valid_write,
                     mla_pages * 128 + (pos_i32 % 128).to(torch.int64),
                     0,
+                )
+            elif ozaki_ei and comp.wkv_gate_f32 is not None:
+                latent, group_pos_i32, mla_in_page_slots = sail_ops.compressor_cr2_fused(
+                    x_norm,
+                    wkv_gate_f32=comp.wkv_gate_f32,
+                    wkv_gate_ozaki_bf16=comp.wkv_gate_ozaki_bf16,
+                    use_ozaki=True,
+                    kv_gate_f32_buf=self.comp_kv_gate_buf,
+                    ozaki_buf=self.comp_ozaki_buf,
+                    comp_state=self.comp_even_state[comp.comp_idx],
+                    positions_i32=pos_i32,
+                    mla_write_pages=mla_pages,
+                    row_comp_slots=self.row_comp_slots_gpu[:rows],
+                    row_seq_ids=self.row_seq_ids_gpu[:rows],
+                    qsl_gpu=qsl_gpu,
+                    norm_weight=comp.norm_weight,
+                    latent_out=self.kv_buf[:rows],
+                    group_pos_out=self.comp_group_pos_buf[:rows],
+                    mla_in_page_slots_out=self.comp_mla_slots_buf[:rows],
+                    uniform_width=uniform_width,
+                    lat_pp=lat_pp,
+                    norm_eps=self.norm_eps,
                 )
             else:
                 assert comp.wgate_weight is not None
@@ -2878,8 +3117,12 @@ class DeepSeekV41SailStepRunner:
                 comb_out=attn_comb,
                 raw_proj_buf=self.mhc_proj_buf[:rows],
                 split_k_part_buf=self.mhc_split_k_part_buf,
+                split_k_counters_buf=self.mhc_split_k_counters_buf,
+                hc_fn_ozaki_bf16=lw.hc_attn_fn_ozaki_bf16,
+                ozaki_proj_buf=self.mhc_ozaki_proj_buf,
                 split_k=self.mhc_split_k,
                 fused_max_rows=self.mhc_fused_max_rows,
+                backend=self.mhc_backend,
                 norm_eps=self.norm_eps,
                 hc_eps=self.hc_eps,
                 sinkhorn_iters=self.hc_sinkhorn_iters,
@@ -2991,6 +3234,7 @@ class DeepSeekV41SailStepRunner:
                         qr,
                         rows=rows,
                         num_seqs=num_seqs,
+                        qsl_gpu=qsl_gpu,
                         max_seq_len_bound=max_seq_len_bound,
                         uniform_width=uniform_width,
                         qsl_np=qsl_np,
@@ -3035,13 +3279,25 @@ class DeepSeekV41SailStepRunner:
             torch.matmul(o_lora, lw.wo_b_bf16.t(), out=attn_local)
             self.observer.end(ev_o)
 
-            ev_ar1 = self.observer.begin("icn_allreduce")
-            attn_red = self.sub_red_buf[:rows]
-            self.icn_comm.all_reduce_bf16(attn_local, output=attn_red)
-            self.observer.end(ev_ar1)
-
-            ev_mp = self.observer.begin("mhc_mixes")
-            sail_ops.mhc_post(attn_red, h_cur, attn_post, attn_comb, out=h_mid)
+            if self.ar_fuse_mhc_post:
+                ev_ar1 = self.observer.begin("icn_allreduce")
+                self.icn_comm.all_reduce_mhc_post_bf16(
+                    attn_local,
+                    h_cur,
+                    attn_post,
+                    attn_comb,
+                    out=h_mid,
+                    scratch_red=self.sub_red_buf[:rows],
+                )
+                self.observer.end(ev_ar1)
+                ev_mp = self.observer.begin("mhc_mixes")
+            else:
+                ev_ar1 = self.observer.begin("icn_allreduce")
+                attn_red = self.sub_red_buf[:rows]
+                self.icn_comm.all_reduce_bf16(attn_local, output=attn_red)
+                self.observer.end(ev_ar1)
+                ev_mp = self.observer.begin("mhc_mixes")
+                sail_ops.mhc_post(attn_red, h_cur, attn_post, attn_comb, out=h_mid)
 
             # --- FFN / MoE Sub-Block ---
             ffn_post = self.tmp_post_buf[:rows]
@@ -3057,8 +3313,12 @@ class DeepSeekV41SailStepRunner:
                 comb_out=ffn_comb,
                 raw_proj_buf=self.mhc_proj_buf[:rows],
                 split_k_part_buf=self.mhc_split_k_part_buf,
+                split_k_counters_buf=self.mhc_split_k_counters_buf,
+                hc_fn_ozaki_bf16=lw.hc_ffn_fn_ozaki_bf16,
+                ozaki_proj_buf=self.mhc_ozaki_proj_buf,
                 split_k=self.mhc_split_k,
                 fused_max_rows=self.mhc_fused_max_rows,
+                backend=self.mhc_backend,
                 norm_eps=self.norm_eps,
                 hc_eps=self.hc_eps,
                 sinkhorn_iters=self.hc_sinkhorn_iters,
@@ -3117,6 +3377,9 @@ class DeepSeekV41SailStepRunner:
                 tile_a_buf=self.moe_tile_a_buf,
                 tile_gu_buf=self.moe_tile_gu_buf,
                 tile_inter_buf=self.moe_tile_inter_buf,
+                gate_weight_ozaki_bf16=lw.gate_weight_ozaki_bf16,
+                router_ozaki_buf=self.router_ozaki_buf,
+                router_mode=self.moe_router_mode,
                 gemv_max_rows=self.moe_gemv_max_rows,
                 gemv_threads=self.moe_gemv_threads,
                 block_m=self.moe_block_m,
@@ -3125,15 +3388,28 @@ class DeepSeekV41SailStepRunner:
             )
             self.observer.end(ev_moe)
 
-            ev_ar2 = self.observer.begin("icn_allreduce")
-            moe_red = self.sub_red_buf[:rows]
-            self.icn_comm.all_reduce_bf16(moe_local, output=moe_red)
-            self.observer.end(ev_ar2)
+            if self.ar_fuse_mhc_post:
+                ev_ar2 = self.observer.begin("icn_allreduce")
+                self.icn_comm.all_reduce_mhc_post_bf16(
+                    moe_local,
+                    h_mid,
+                    ffn_post,
+                    ffn_comb,
+                    out=h_cur,
+                    scratch_red=self.sub_red_buf[:rows],
+                )
+                pm_cur.copy_(pm_nxt)
+                self.observer.end(ev_ar2)
+            else:
+                ev_ar2 = self.observer.begin("icn_allreduce")
+                moe_red = self.sub_red_buf[:rows]
+                self.icn_comm.all_reduce_bf16(moe_local, output=moe_red)
+                self.observer.end(ev_ar2)
 
-            ev_mp2 = self.observer.begin("mhc_mixes")
-            sail_ops.mhc_post(moe_red, h_mid, ffn_post, ffn_comb, out=h_cur)
-            pm_cur.copy_(pm_nxt)
-            self.observer.end(ev_mp2)
+                ev_mp2 = self.observer.begin("mhc_mixes")
+                sail_ops.mhc_post(moe_red, h_mid, ffn_post, ffn_comb, out=h_cur)
+                pm_cur.copy_(pm_nxt)
+                self.observer.end(ev_mp2)
 
         final_h = self.decode_hidden_gpu[:rows]
         sail_ops.mhc_pre_rmsnorm(
@@ -3391,6 +3667,7 @@ class DeepSeekV41SailStepRunner:
         total_tokens: int,
         width: int,
         max_seq_len: int,
+        bt_width: int | None = None,
     ) -> bool:
         num_seqs = len(q_lens)
         if num_seqs == 0 or total_tokens == 0:
@@ -3408,10 +3685,11 @@ class DeepSeekV41SailStepRunner:
         if not bool(np.all(p_min > 0)) or not bool(np.all(seq_lens_np == (p_max + 1))):
             return False
         p_max_pad = p_max + (width - q_lens).astype(np.int64)
-        return bool(
-            np.all(p_max_pad < max_seq_len)
-            and np.all((p_max_pad // 128) == (p_max // 128))
-        )
+        if not bool(np.all(p_max_pad < max_seq_len)):
+            return False
+        if bt_width is not None:
+            return bool(np.all((p_max_pad // 128) < bt_width))
+        return bool(np.all((p_max_pad // 128) == (p_max // 128)))
 
     @torch.inference_mode()
     def execute(
@@ -3477,6 +3755,7 @@ class DeepSeekV41SailStepRunner:
                 total_tokens=total_tokens,
                 width=width,
                 max_seq_len=self.decode_graph_max_seq_len,
+                bt_width=self.bt_width,
             )
         )
         use_verify_graph = (
@@ -3498,6 +3777,7 @@ class DeepSeekV41SailStepRunner:
         self.observer.drain_completed()
         self.start_events[parity].record()
         main_x_out: torch.Tensor | None = None
+        fused_spec_ctx: _SailFusedSpecRoundContext | None = None
 
         if use_decode_graph:
             bucket = select_decode_bucket(num_seqs, self.max_graph_bucket)
@@ -3709,6 +3989,23 @@ class DeepSeekV41SailStepRunner:
                 sw_c[:total_tokens] = sw_all
                 mw_c[:total_tokens] = mla_vb_all
 
+            use_fused_spec = (
+                self.dspark_drafter is not None
+                and self.runtime_config.enable_fused_spec_graph
+                and self.dspark_drafter.has_fused_post_verify_graph(v_bucket)
+            )
+            max_ctx_v = min(self.max_model_len, pt_np.shape[1] * 128)
+            if use_fused_spec:
+                assert self.dspark_drafter is not None
+                meta_np = self.dspark_drafter.spec_seq_meta_cpu[:v_bucket].numpy()
+                meta_np[:num_seqs, 0] = q_lens.astype(np.int64)
+                meta_np[:num_seqs, 1] = max_ctx_v
+                if v_bucket > num_seqs:
+                    meta_np[num_seqs:v_bucket, :] = 0
+                self.dspark_drafter.spec_seq_meta_gpu[:v_bucket].copy_(
+                    self.dspark_drafter.spec_seq_meta_cpu[:v_bucket], non_blocking=True
+                )
+
             self.mla_bt_gpu[:v_bucket].copy_(self.mla_bt_cpu[:v_bucket], non_blocking=True)
             self.swa_bt_gpu[:v_bucket].copy_(self.swa_bt_cpu[:v_bucket], non_blocking=True)
             self.lookback_gpu[:v_bucket].copy_(self.lookback_cpu[:v_bucket], non_blocking=True)
@@ -3727,24 +4024,50 @@ class DeepSeekV41SailStepRunner:
             self._h2d_done_event.record()
 
             self.verify_graphs[v_bucket].replay()
-            raw_mx = self.verify_graph_main_x.get(v_bucket)
-            if is_ragged_verify:
-                real_r = self._verify_real_rows_gpu[:total_tokens]
-                main_x_out = raw_mx.index_select(0, real_r) if raw_mx is not None else None
-                self.out_tokens_cpu[parity, :num_sample].copy_(
-                    self.out_tokens_gpu.index_select(0, real_r), non_blocking=True
-                )
-                self.out_logprobs_cpu[parity, :num_sample].copy_(
-                    self.out_logprobs_gpu.index_select(0, real_r), non_blocking=True
+            if use_fused_spec:
+                assert self.dspark_drafter is not None
+                self.dspark_drafter.post_verify_draft_graphs[v_bucket].replay()
+                if self.is_result_rank:
+                    v_copy_rows = num_seqs * width
+                    self.out_tokens_cpu[parity, :v_copy_rows].copy_(
+                        self.out_tokens_gpu[:v_copy_rows], non_blocking=True
+                    )
+                    self.out_logprobs_cpu[parity, :v_copy_rows].copy_(
+                        self.out_logprobs_gpu[:v_copy_rows], non_blocking=True
+                    )
+                    self.dspark_drafter.spec_acc_lens_cpu[parity, :num_seqs].copy_(
+                        self.dspark_drafter.spec_acc_lens_gpu[:num_seqs], non_blocking=True
+                    )
+                    self.dspark_drafter.draft_out_tokens_pinned[parity, :, :num_seqs].copy_(
+                        self.dspark_drafter.draft_out_tokens_gpu[:, :num_seqs, 0],
+                        non_blocking=True,
+                    )
+                fused_spec_ctx = _SailFusedSpecRoundContext(
+                    num_seqs=num_seqs,
+                    width=width,
+                    max_ctx=max_ctx_v,
+                    seq_slots_np=seq_slots_np.copy(),
+                    pos_starts_np=p_min.copy(),
                 )
             else:
-                main_x_out = raw_mx[:total_tokens] if raw_mx is not None else None
-                self.out_tokens_cpu[parity, :num_sample].copy_(
-                    self.out_tokens_gpu[:num_sample], non_blocking=True
-                )
-                self.out_logprobs_cpu[parity, :num_sample].copy_(
-                    self.out_logprobs_gpu[:num_sample], non_blocking=True
-                )
+                raw_mx = self.verify_graph_main_x.get(v_bucket)
+                if is_ragged_verify:
+                    real_r = self._verify_real_rows_gpu[:total_tokens]
+                    main_x_out = raw_mx.index_select(0, real_r) if raw_mx is not None else None
+                    self.out_tokens_cpu[parity, :num_sample].copy_(
+                        self.out_tokens_gpu.index_select(0, real_r), non_blocking=True
+                    )
+                    self.out_logprobs_cpu[parity, :num_sample].copy_(
+                        self.out_logprobs_gpu.index_select(0, real_r), non_blocking=True
+                    )
+                else:
+                    main_x_out = raw_mx[:total_tokens] if raw_mx is not None else None
+                    self.out_tokens_cpu[parity, :num_sample].copy_(
+                        self.out_tokens_gpu[:num_sample], non_blocking=True
+                    )
+                    self.out_logprobs_cpu[parity, :num_sample].copy_(
+                        self.out_logprobs_gpu[:num_sample], non_blocking=True
+                    )
             sample_slots_out = []
             num_out = num_sample
 
@@ -3903,7 +4226,7 @@ class DeepSeekV41SailStepRunner:
                 pt_np=pt_np.copy(),
                 main_x_out=main_x_out,
             )
-            if is_spec_step
+            if (is_spec_step and fused_spec_ctx is None)
             else None
         )
         return _SailLaunchedStep(
@@ -3911,6 +4234,7 @@ class DeepSeekV41SailStepRunner:
             num_out=num_out,
             sample_slots_out=sample_slots_out,
             spec_ctx=spec_ctx,
+            fused_spec_ctx=fused_spec_ctx,
         )
 
     @torch.inference_mode()
@@ -3922,7 +4246,18 @@ class DeepSeekV41SailStepRunner:
         p = step.parity
         self.end_events[p].synchronize()
         outputs: list[SeqResult] = []
-        if step.spec_ctx is not None:
+        if step.fused_spec_ctx is not None:
+            if self.is_result_rank and self.dspark_drafter is not None:
+                fctx = step.fused_spec_ctx
+                outputs = self.dspark_drafter.build_fused_seq_results(
+                    parity=p,
+                    num_seqs=fctx.num_seqs,
+                    width=fctx.width,
+                    seq_slots_np=fctx.seq_slots_np,
+                    pos_starts_np=fctx.pos_starts_np,
+                    max_ctx=fctx.max_ctx,
+                )
+        elif step.spec_ctx is not None:
             ctx = step.spec_ctx
             verified = verify_batch(
                 predictions=self._out_tokens_np[p][: ctx.num_sample, 0],

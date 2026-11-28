@@ -26,16 +26,20 @@ VALID_QWEN_GDN_DECODE_MODES: tuple[str, ...] = (
 )
 VALID_SAIL_BACKENDS: frozenset[str] = frozenset({"auto", "sail", "sm120"})
 VALID_SAIL_SPARSE_ATTN_BACKENDS: frozenset[str] = frozenset(
-    {"auto", "flash_mla", "triton_tp8", "hggc_tp8"}
+    {"auto", "flash_mla", "triton_tp8", "triton_splitk", "hggc_tp8"}
 )
 VALID_SAIL_MOE_PREFILL_BACKENDS: frozenset[str] = frozenset(
     {"triton_grouped", "dequant_acblas"}
 )
+VALID_SAIL_MOE_ROUTER_MODES: frozenset[str] = frozenset(
+    {"fp32", "ozaki_bf16", "ozaki_fast_fp4"}
+)
+VALID_SAIL_MHC_BACKENDS: frozenset[str] = frozenset({"legacy_2pass", "vec_1pass_ozaki"})
 VALID_SAIL_QKV_FUSION_MODES: frozenset[str] = frozenset(
     {"separate", "fused_qkv_epilogue"}
 )
 VALID_SAIL_ENGRAM_INDEXER_BACKENDS: frozenset[str] = frozenset(
-    {"eager_py", "fused_hggc"}
+    {"eager_py", "fused_hggc", "fused_hggc_ozaki"}
 )
 VALID_SAIL_LM_HEAD_DTYPES: frozenset[str] = frozenset({"fp32", "bf16"})
 DEFAULT_MIN_PXB_BI_GBPS: float = 25.0
@@ -205,6 +209,9 @@ class WorkerRuntimeConfig:
     sail_qkv_fusion_mode: str = "separate"
     sail_engram_indexer_backend: str = "eager_py"
     sail_lm_head_dtype: str = "fp32"
+    sail_ar_fuse_mhc_post: int = 0
+    sail_moe_router_mode: str = "fp32"
+    sail_mhc_backend: str = "legacy_2pass"
     sail_observe_path: str = ""
 
     @classmethod
@@ -473,6 +480,27 @@ class WorkerRuntimeConfig:
                 f"Unsupported ZSTEP_SAIL_LM_HEAD_DTYPE={sail_lm_head_dtype!r}; "
                 f"expected one of {sorted(VALID_SAIL_LM_HEAD_DTYPES)}"
             )
+        sail_ar_fuse_mhc_post = _sail_int(
+            "ZSTEP_SAIL_AR_FUSE_MHC_POST", "ar_fuse_mhc_post", 0
+        )
+        if sail_ar_fuse_mhc_post not in (0, 1):
+            raise ValueError("sail_ar_fuse_mhc_post must be 0 or 1")
+        sail_moe_router_mode = _sail_str(
+            "ZSTEP_SAIL_MOE_ROUTER_MODE", "moe_router_mode", "fp32"
+        ).lower()
+        if sail_moe_router_mode not in VALID_SAIL_MOE_ROUTER_MODES:
+            raise ValueError(
+                f"Unsupported ZSTEP_SAIL_MOE_ROUTER_MODE={sail_moe_router_mode!r}; "
+                f"expected one of {sorted(VALID_SAIL_MOE_ROUTER_MODES)}"
+            )
+        sail_mhc_backend = _sail_str(
+            "ZSTEP_SAIL_MHC_BACKEND", "mhc_backend", "legacy_2pass"
+        ).lower()
+        if sail_mhc_backend not in VALID_SAIL_MHC_BACKENDS:
+            raise ValueError(
+                f"Unsupported ZSTEP_SAIL_MHC_BACKEND={sail_mhc_backend!r}; "
+                f"expected one of {sorted(VALID_SAIL_MHC_BACKENDS)}"
+            )
         sail_observe_path = env.get("ZSTEP_SAIL_OBSERVE_PATH", "").strip()
 
         return cls(
@@ -563,6 +591,9 @@ class WorkerRuntimeConfig:
             sail_qkv_fusion_mode=sail_qkv_fusion_mode,
             sail_engram_indexer_backend=sail_engram_indexer_backend,
             sail_lm_head_dtype=sail_lm_head_dtype,
+            sail_ar_fuse_mhc_post=sail_ar_fuse_mhc_post,
+            sail_moe_router_mode=sail_moe_router_mode,
+            sail_mhc_backend=sail_mhc_backend,
             sail_observe_path=sail_observe_path,
         )
 
@@ -599,5 +630,8 @@ class WorkerRuntimeConfig:
             f"attn={self.sail_sparse_attn_backend},"
             f"mhc={self.sail_mhc_split_k}r{self.sail_mhc_fused_max_rows},"
             f"qkv={self.sail_qkv_fusion_mode},ei={self.sail_engram_indexer_backend},"
-            f"head={self.sail_lm_head_dtype})"
+            f"head={self.sail_lm_head_dtype}) "
+            f"sail_v4=(fmp={self.sail_ar_fuse_mhc_post},"
+            f"rtr={self.sail_moe_router_mode},"
+            f"mhc_bk={self.sail_mhc_backend})"
         )
