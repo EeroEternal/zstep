@@ -182,6 +182,7 @@ def test_worker_runtime_config_sail_policy_and_env_precedence(tmp_path) -> None:
         "qkv=fused_qkv_epilogue,ei=fused_hggc,head=bf16)"
         in cfg.format_log_line()
     )
+    assert "sail_v4=(fmp=0,rtr=fp32,mhc_bk=legacy_2pass)" in cfg.format_log_line()
 
 
 @pytest.mark.parametrize(
