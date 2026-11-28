@@ -2498,7 +2498,18 @@ impl ServingEngine {
         let geometry = self.coordinator.config().geometry;
         let max_seqs = geometry.max_seqs as usize;
         let max_step_tokens = geometry.max_step_tokens as usize;
-        let max_prefill_chunk = self.coordinator.config().max_prefill_chunk;
+        let decode_active_count = active
+            .iter()
+            .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
+            .count();
+        let pending_prefill_seqs =
+            (active.len() - decode_active_count).saturating_add(waiting_permitted.len());
+        let max_prefill_chunk = effective_prefill_chunk_cap(
+            decode_active_count,
+            pending_prefill_seqs,
+            self.coordinator.config().max_prefill_chunk,
+            max_step_tokens,
+        );
 
         let mut token_cursor = 0usize;
         let mut num_seqs = 0usize;
@@ -2680,12 +2691,18 @@ impl ServingEngine {
         let geometry = self.coordinator.config().geometry;
         let max_seqs = geometry.max_seqs as usize;
         let max_step_tokens = geometry.max_step_tokens as usize;
-        let max_prefill_chunk = self.coordinator.config().max_prefill_chunk;
-
         let decode_active_count = active
             .iter()
             .filter(|seq| seq.prefilled_tokens == seq.prompt_tokens.len())
             .count();
+        let pending_prefill_seqs =
+            (active.len() - decode_active_count).saturating_add(waiting_permitted.len());
+        let max_prefill_chunk = effective_prefill_chunk_cap(
+            decode_active_count,
+            pending_prefill_seqs,
+            self.coordinator.config().max_prefill_chunk,
+            max_step_tokens,
+        );
         let continued_chunk = active.iter().any(|seq| {
             seq.prefilled_tokens > seq.cached_prefix_tokens
                 && seq.prefilled_tokens < seq.prompt_tokens.len()
@@ -3481,6 +3498,20 @@ fn touch_seq_swa_window(
     let p_hi = (pos_max / page_block_tokens).min(page_ids.len() - 1);
     if p_lo <= p_hi {
         tree.touch_swa_pages(&page_ids[p_lo..=p_hi]);
+    }
+}
+
+#[inline]
+fn effective_prefill_chunk_cap(
+    decode_active_count: usize,
+    pending_prefill_seqs: usize,
+    max_prefill_chunk: usize,
+    max_step_tokens: usize,
+) -> usize {
+    if decode_active_count == 0 && pending_prefill_seqs <= 1 && max_prefill_chunk >= 2048 {
+        max_prefill_chunk.max(max_step_tokens)
+    } else {
+        max_prefill_chunk
     }
 }
 

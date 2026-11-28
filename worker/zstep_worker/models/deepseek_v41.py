@@ -779,6 +779,7 @@ class DeepSeekV41StepRunner:
             max_tokens=(8192 if self.pp_size > 1 else max(self.max_step_tokens, 8192)),
             decode_buckets=DECODE_GRAPH_BUCKETS,
             exchange_group=self.exchange_group,
+            enable_4k_linear_cap=(self.max_step_tokens > 4096),
         )
         if self.vllm_config.speculative_config is not None:
             self.vllm_config.speculative_config.num_speculative_tokens = self.num_spec_tokens
@@ -837,7 +838,12 @@ class DeepSeekV41StepRunner:
             threads=pxb_ar_threads,
             exchange_group=self.tp_cpu_group,
             enable_pxb_p2p=self.p2p_report.pxb_shm_enabled,
-            pxb_max_elements=min(ar_max_tokens, 8192) * 5120,
+            pxb_max_elements=(
+                min(ar_max_tokens, 8192)
+                if self.pp_size > 1
+                else (2048 if self.max_step_tokens > 4096 else min(ar_max_tokens, 4096))
+            )
+            * 5120,
             enable_pxb_bfp=self.runtime_config.shm_pxb_bfp_mode,
         )
         tbo_min_tok = self.runtime_config.prefill_tbo_min_tokens
@@ -864,7 +870,12 @@ class DeepSeekV41StepRunner:
                 threads=pxb_ar_threads,
                 exchange_group=self.tp_cpu_group,
                 enable_pxb_p2p=True,
-                pxb_max_elements=min(tbo_cap_tokens, 2048) * 5120,
+                pxb_max_elements=(
+                    min(tbo_cap_tokens, 4096)
+                    if self.max_step_tokens > 4096
+                    else min(tbo_cap_tokens, 2048)
+                )
+                * 5120,
                 enable_pxb_bfp=self.runtime_config.shm_pxb_bfp_mode,
             )
             self._tbo_comm_stream = torch.cuda.Stream(device=self.device, priority=-1)
@@ -2731,6 +2742,14 @@ class DeepSeekV41StepRunner:
             ([512] * 8, 0),
             ([1024] * 4, 0),
             ([2048, 2048], 0),
+            *(
+                [
+                    ([8192], 2560),
+                    ([4096, 4096], 0),
+                ]
+                if self.max_step_tokens >= 8192
+                else []
+            ),
             ([1], 2560),
             ([24], 2560),
             ([17, 24, 13], 2560),
@@ -2774,6 +2793,8 @@ class DeepSeekV41StepRunner:
                     pos_list.extend(range(rc, rc + ql))
                     s_lens.append(rc + ql)
                     is_pref_list.append(bool(ql > 1 or rc == 0))
+                if max(s_lens) > self.bt_width * 128:
+                    continue
                 if base_ctx != 0:
                     self.lookback_gpu[:n_reqs].fill_(1)
                 else:

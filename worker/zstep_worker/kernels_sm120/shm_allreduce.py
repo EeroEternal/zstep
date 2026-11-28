@@ -466,7 +466,13 @@ class HostMappedShmAllReduce(_PerRankShmRingBase):
                 self.threads,
                 self.one_shot_max_vecs,
                 self.pxb_max_vecs if self._pxb_enabled else 0,
-                self._pxb_bfp if self._pxb_enabled else 0,
+                (
+                    0
+                    if 128 * 5120 < input.numel() <= 256 * 5120
+                    else self._pxb_bfp
+                )
+                if self._pxb_enabled
+                else 0,
                 0,
                 stream_handle,
             )

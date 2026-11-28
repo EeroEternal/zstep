@@ -1,0 +1,468 @@
+{
+  "campaign": "sm120-8x6000d-round7-prefill-green-ctx-scout",
+  "world_size": 8,
+  "device_name": "NVIDIA RTX 6000D",
+  "pxb_shm_enabled": true,
+  "exp1_mla_prefill": {
+    "T=64": {
+      "swa_only": {
+        "layers": 32,
+        "vllm_us": 103.22,
+        "b12x_mg_us": 262.46,
+        "speedup": 0.393,
+        "max_abs_diff": 0.0,
+        "cos_sim": 1.0
+      },
+      "compressed_cr64": {
+        "layers": 4,
+        "vllm_us": 108.83,
+        "b12x_mg_us": 308.43,
+        "speedup": 0.353,
+        "max_abs_diff": 0.0,
+        "cos_sim": 1.0
+      },
+      "full_cr1": {
+        "layers": 4,
+        "vllm_us": 109.74,
+        "b12x_mg_us": 307.58,
+        "speedup": 0.357,
+        "max_abs_diff": 0.000244,
+        "cos_sim": 1.0
+      },
+      "sum_40l_stock_vllm_ms": 4.177,
+      "sum_40l_zstep_r6_incumbent_ms": 4.177,
+      "sum_40l_b12x_all_layers_ms": 4.177,
+      "saved_vs_r6_incumbent_ms": 0.0,
+      "speedup_vs_r6_incumbent": 1.0
+    },
+    "T=128": {
+      "swa_only": {
+        "layers": 32,
+        "vllm_us": 87.66,
+        "b12x_mg_us": 251.5,
+        "speedup": 0.349,
+        "max_abs_diff": 0.000122,
+        "cos_sim": 1.0
+      },
+      "compressed_cr64": {
+        "layers": 4,
+        "vllm_us": 93.84,
+        "b12x_mg_us": 300.67,
+        "speedup": 0.312,
+        "max_abs_diff": 0.000122,
+        "cos_sim": 1.0
+      },
+      "full_cr1": {
+        "layers": 4,
+        "vllm_us": 94.22,
+        "b12x_mg_us": 307.81,
+        "speedup": 0.306,
+        "max_abs_diff": 0.000122,
+        "cos_sim": 1.0
+      },
+      "sum_40l_stock_vllm_ms": 3.558,
+      "sum_40l_zstep_r6_incumbent_ms": 3.558,
+      "sum_40l_b12x_all_layers_ms": 3.558,
+      "saved_vs_r6_incumbent_ms": 0.0,
+      "speedup_vs_r6_incumbent": 1.0
+    },
+    "T=256": {
+      "swa_only": {
+        "layers": 32,
+        "vllm_us": 90.26,
+        "b12x_mg_us": 250.46,
+        "speedup": 0.36,
+        "max_abs_diff": 0.000488,
+        "cos_sim": 0.9999999
+      },
+      "compressed_cr64": {
+        "layers": 4,
+        "vllm_us": 102.91,
+        "b12x_mg_us": 314.96,
+        "speedup": 0.327,
+        "max_abs_diff": 0.000488,
+        "cos_sim": 1.0
+      },
+      "full_cr1": {
+        "layers": 4,
+        "vllm_us": 112.56,
+        "b12x_mg_us": 313.74,
+        "speedup": 0.359,
+        "max_abs_diff": 0.000122,
+        "cos_sim": 1.0000001
+      },
+      "sum_40l_stock_vllm_ms": 3.75,
+      "sum_40l_zstep_r6_incumbent_ms": 3.75,
+      "sum_40l_b12x_all_layers_ms": 3.75,
+      "saved_vs_r6_incumbent_ms": 0.0,
+      "speedup_vs_r6_incumbent": 1.0
+    },
+    "T=512": {
+      "swa_only": {
+        "layers": 32,
+        "vllm_us": 99.63,
+        "b12x_mg_us": 268.54,
+        "speedup": 0.371,
+        "max_abs_diff": 0.000977,
+        "cos_sim": 1.0
+      },
+      "compressed_cr64": {
+        "layers": 4,
+        "vllm_us": 120.51,
+        "b12x_mg_us": 332.7,
+        "speedup": 0.362,
+        "max_abs_diff": 0.000977,
+        "cos_sim": 1.0
+      },
+      "full_cr1": {
+        "layers": 4,
+        "vllm_us": 152.34,
+        "b12x_mg_us": 339.82,
+        "speedup": 0.448,
+        "max_abs_diff": 0.000488,
+        "cos_sim": 1.0
+      },
+      "sum_40l_stock_vllm_ms": 4.28,
+      "sum_40l_zstep_r6_incumbent_ms": 4.28,
+      "sum_40l_b12x_all_layers_ms": 4.28,
+      "saved_vs_r6_incumbent_ms": 0.0,
+      "speedup_vs_r6_incumbent": 1.0
+    },
+    "T=1024": {
+      "swa_only": {
+        "layers": 32,
+        "vllm_us": 118.67,
+        "b12x_mg_us": 282.29,
+        "speedup": 0.42,
+        "max_abs_diff": 0.000427,
+        "cos_sim": 1.0
+      },
+      "compressed_cr64": {
+        "layers": 4,
+        "vllm_us": 165.74,
+        "b12x_mg_us": 359.06,
+        "speedup": 0.462,
+        "max_abs_diff": 0.000427,
+        "cos_sim": 1.0
+      },
+      "full_cr1": {
+        "layers": 4,
+        "vllm_us": 356.27,
+        "b12x_mg_us": 426.7,
+        "speedup": 0.835,
+        "max_abs_diff": 0.000244,
+        "cos_sim": 1.0
+      },
+      "sum_40l_stock_vllm_ms": 5.886,
+      "sum_40l_zstep_r6_incumbent_ms": 6.941,
+      "sum_40l_b12x_all_layers_ms": 5.886,
+      "saved_vs_r6_incumbent_ms": 1.055,
+      "speedup_vs_r6_incumbent": 1.179
+    },
+    "T=2048": {
+      "swa_only": {
+        "layers": 32,
+        "vllm_us": 181.55,
+        "b12x_mg_us": 307.31,
+        "speedup": 0.591,
+        "max_abs_diff": 0.000488,
+        "cos_sim": 1.0
+      },
+      "compressed_cr64": {
+        "layers": 4,
+        "vllm_us": 266.08,
+        "b12x_mg_us": 409.26,
+        "speedup": 0.65,
+        "max_abs_diff": 0.000427,
+        "cos_sim": 1.0
+      },
+      "full_cr1": {
+        "layers": 4,
+        "vllm_us": 1070.75,
+        "b12x_mg_us": 1041.71,
+        "speedup": 1.028,
+        "max_abs_diff": 0.000122,
+        "cos_sim": 1.0000001
+      },
+      "sum_40l_stock_vllm_ms": 11.157,
+      "sum_40l_zstep_r6_incumbent_ms": 11.614,
+      "sum_40l_b12x_all_layers_ms": 11.041,
+      "saved_vs_r6_incumbent_ms": 0.573,
+      "speedup_vs_r6_incumbent": 1.052
+    },
+    "T=4096": {
+      "swa_only": {
+        "layers": 32,
+        "vllm_us": 326.53,
+        "b12x_mg_us": 386.4,
+        "speedup": 0.845,
+        "max_abs_diff": 0.00058,
+        "cos_sim": 0.9999999
+      },
+      "compressed_cr64": {
+        "layers": 4,
+        "vllm_us": 463.54,
+        "b12x_mg_us": 541.57,
+        "speedup": 0.856,
+        "max_abs_diff": 0.000488,
+        "cos_sim": 1.0
+      },
+      "full_cr1": {
+        "layers": 4,
+        "vllm_us": 2805.38,
+        "b12x_mg_us": 2556.72,
+        "speedup": 1.097,
+        "max_abs_diff": 0.000198,
+        "cos_sim": 1.0
+      },
+      "sum_40l_stock_vllm_ms": 23.525,
+      "sum_40l_zstep_r6_incumbent_ms": 22.842,
+      "sum_40l_b12x_all_layers_ms": 22.53,
+      "saved_vs_r6_incumbent_ms": 0.312,
+      "speedup_vs_r6_incumbent": 1.014
+    },
+    "T=8192": {
+      "swa_only": {
+        "layers": 32,
+        "vllm_us": 712.59,
+        "b12x_mg_us": 741.73,
+        "speedup": 0.961,
+        "max_abs_diff": 0.000595,
+        "cos_sim": 0.9999998
+      },
+      "compressed_cr64": {
+        "layers": 4,
+        "vllm_us": 1034.48,
+        "b12x_mg_us": 1069.39,
+        "speedup": 0.967,
+        "max_abs_diff": 0.000519,
+        "cos_sim": 1.0000001
+      },
+      "full_cr1": {
+        "layers": 4,
+        "vllm_us": 6409.78,
+        "b12x_mg_us": 5698.77,
+        "speedup": 1.125,
+        "max_abs_diff": 0.000244,
+        "cos_sim": 1.0
+      },
+      "sum_40l_stock_vllm_ms": 52.58,
+      "sum_40l_zstep_r6_incumbent_ms": 49.876,
+      "sum_40l_b12x_all_layers_ms": 49.736,
+      "saved_vs_r6_incumbent_ms": 0.14,
+      "speedup_vs_r6_incumbent": 1.003
+    }
+  },
+  "exp3_shared_expert_overlap": {
+    "M=8": {
+      "seq_us": 2136.77,
+      "overlap_us": 2166.91,
+      "speedup": 0.986,
+      "saved_us_per_layer": -30.14
+    },
+    "M=16": {
+      "seq_us": 2185.09,
+      "overlap_us": 2226.3,
+      "speedup": 0.981,
+      "saved_us_per_layer": -41.22
+    },
+    "M=32": {
+      "seq_us": 2308.61,
+      "overlap_us": 2331.2,
+      "speedup": 0.99,
+      "saved_us_per_layer": -22.59
+    },
+    "M=64": {
+      "seq_us": 2523.63,
+      "overlap_us": 2550.62,
+      "speedup": 0.989,
+      "saved_us_per_layer": -26.99
+    },
+    "M=128": {
+      "seq_us": 2519.47,
+      "overlap_us": 2549.78,
+      "speedup": 0.988,
+      "saved_us_per_layer": -30.3
+    },
+    "M=256": {
+      "seq_us": 2528.3,
+      "overlap_us": 2555.36,
+      "speedup": 0.989,
+      "saved_us_per_layer": -27.06
+    },
+    "M=512": {
+      "seq_us": 2524.51,
+      "overlap_us": 2559.68,
+      "speedup": 0.986,
+      "saved_us_per_layer": -35.17
+    },
+    "M=1024": {
+      "seq_us": 2569.38,
+      "overlap_us": 2595.18,
+      "speedup": 0.99,
+      "saved_us_per_layer": -25.81
+    },
+    "M=2048": {
+      "seq_us": 2601.7,
+      "overlap_us": 2629.15,
+      "speedup": 0.99,
+      "saved_us_per_layer": -27.46
+    },
+    "M=4096": {
+      "seq_us": 2705.57,
+      "overlap_us": 2734.75,
+      "speedup": 0.989,
+      "saved_us_per_layer": -29.18
+    }
+  },
+  "exp2_and_4_green_ctx_and_chunk_scaling": {
+    "sm_partitions": {
+      "g8": {
+        "comm_sms": 8,
+        "comp_sms": 148
+      },
+      "g16": {
+        "comm_sms": 16,
+        "comp_sms": 140
+      }
+    },
+    "chunk_2048_u1024": {
+      "r6_pxb2k_shared_156sm": {
+        "chunk_tokens": 2048,
+        "ubatch_tokens": 1024,
+        "supported": true,
+        "layer_pair_us": 5374.4,
+        "us_per_token": 2.6242,
+        "est_40layers_ms": 214.98
+      },
+      "pxb4k_shared_156sm": {
+        "chunk_tokens": 2048,
+        "ubatch_tokens": 1024,
+        "supported": true,
+        "layer_pair_us": 5405.71,
+        "us_per_token": 2.6395,
+        "est_40layers_ms": 216.23
+      },
+      "pxb4k_green_comm8_main156": {
+        "chunk_tokens": 2048,
+        "ubatch_tokens": 1024,
+        "supported": true,
+        "layer_pair_us": 5498.42,
+        "us_per_token": 2.6848,
+        "est_40layers_ms": 219.94
+      },
+      "pxb4k_green_comm16_main156": {
+        "chunk_tokens": 2048,
+        "ubatch_tokens": 1024,
+        "supported": true,
+        "layer_pair_us": 5517.9,
+        "us_per_token": 2.6943,
+        "est_40layers_ms": 220.72
+      },
+      "pxb4k_green_split_8_148": {
+        "chunk_tokens": 2048,
+        "ubatch_tokens": 1024,
+        "supported": false,
+        "error": "DSLCudaRuntimeError: "
+      },
+      "pxb4k_green_split_16_140": {
+        "chunk_tokens": 2048,
+        "ubatch_tokens": 1024,
+        "supported": false,
+        "error": "DSLCudaRuntimeError: "
+      }
+    },
+    "chunk_4096_u2048": {
+      "r6_pxb2k_shared_156sm": {
+        "chunk_tokens": 4096,
+        "ubatch_tokens": 2048,
+        "supported": true,
+        "layer_pair_us": 5786.11,
+        "us_per_token": 1.4126,
+        "est_40layers_ms": 231.44
+      },
+      "pxb4k_shared_156sm": {
+        "chunk_tokens": 4096,
+        "ubatch_tokens": 2048,
+        "supported": true,
+        "layer_pair_us": 5767.42,
+        "us_per_token": 1.4081,
+        "est_40layers_ms": 230.7
+      },
+      "pxb4k_green_comm8_main156": {
+        "chunk_tokens": 4096,
+        "ubatch_tokens": 2048,
+        "supported": true,
+        "layer_pair_us": 6730.61,
+        "us_per_token": 1.6432,
+        "est_40layers_ms": 269.22
+      },
+      "pxb4k_green_comm16_main156": {
+        "chunk_tokens": 4096,
+        "ubatch_tokens": 2048,
+        "supported": true,
+        "layer_pair_us": 6032.91,
+        "us_per_token": 1.4729,
+        "est_40layers_ms": 241.32
+      },
+      "pxb4k_green_split_8_148": {
+        "chunk_tokens": 4096,
+        "ubatch_tokens": 2048,
+        "supported": false,
+        "error": "DSLCudaRuntimeError: "
+      },
+      "pxb4k_green_split_16_140": {
+        "chunk_tokens": 4096,
+        "ubatch_tokens": 2048,
+        "supported": false,
+        "error": "DSLCudaRuntimeError: "
+      }
+    },
+    "chunk_8192_u4096": {
+      "r6_pxb2k_shared_156sm": {
+        "chunk_tokens": 8192,
+        "ubatch_tokens": 4096,
+        "supported": true,
+        "layer_pair_us": 13502.82,
+        "us_per_token": 1.6483,
+        "est_40layers_ms": 540.11
+      },
+      "pxb4k_shared_156sm": {
+        "chunk_tokens": 8192,
+        "ubatch_tokens": 4096,
+        "supported": true,
+        "layer_pair_us": 7196.64,
+        "us_per_token": 0.8785,
+        "est_40layers_ms": 287.87
+      },
+      "pxb4k_green_comm8_main156": {
+        "chunk_tokens": 8192,
+        "ubatch_tokens": 4096,
+        "supported": true,
+        "layer_pair_us": 7473.52,
+        "us_per_token": 0.9123,
+        "est_40layers_ms": 298.94
+      },
+      "pxb4k_green_comm16_main156": {
+        "chunk_tokens": 8192,
+        "ubatch_tokens": 4096,
+        "supported": true,
+        "layer_pair_us": 7727.07,
+        "us_per_token": 0.9432,
+        "est_40layers_ms": 309.08
+      },
+      "pxb4k_green_split_8_148": {
+        "chunk_tokens": 8192,
+        "ubatch_tokens": 4096,
+        "supported": false,
+        "error": "DSLCudaRuntimeError: "
+      },
+      "pxb4k_green_split_16_140": {
+        "chunk_tokens": 8192,
+        "ubatch_tokens": 4096,
+        "supported": false,
+        "error": "DSLCudaRuntimeError: "
+      }
+    }
+  }
+}

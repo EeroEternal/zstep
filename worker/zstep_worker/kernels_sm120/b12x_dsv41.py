@@ -2529,6 +2529,7 @@ def prepare_b12x_dsv41_model(
     max_tokens: int,
     decode_buckets: tuple[int, ...],
     exchange_group: dist.ProcessGroup | None = None,
+    enable_4k_linear_cap: bool = False,
 ) -> B12xPrepareSummary:
     """Compile/autotune all SM120 `b12x`, `sm12x_mega_gate` & `sm120_dsa_indexer` plans (rank 0 first)."""
     t0 = time.perf_counter()
@@ -2602,7 +2603,12 @@ def prepare_b12x_dsv41_model(
         )
 
     caps_set = set(int(b) for b in decode_buckets if int(b) > 0)
-    for extra_c in (256, 512, 1024, 2048, 3072, int(max_tokens)):
+    extra_lin_caps = (
+        (256, 512, 1024, 2048, 3072, 4096, int(max_tokens))
+        if enable_4k_linear_cap
+        else (256, 512, 1024, 2048, 3072, int(max_tokens))
+    )
+    for extra_c in extra_lin_caps:
         if 0 < extra_c <= int(max_tokens):
             caps_set.add(extra_c)
     caps_set.add(int(max_tokens))
@@ -2876,7 +2882,7 @@ def prepare_b12x_dsv41_model(
             dummy_kv = torch.zeros((16, 64 * 584), dtype=torch.uint8, device=device)
             for h_n, sw_n, iw_n, has_sink in sorted(csmla_sigs):
                 d_sink = torch.zeros((h_n,), dtype=torch.float32, device=device) if has_sink else None
-                modes = (("decode", csmla_caps), ("extend", (ext_cap,))) if (iw_n > 0 and ext_cap >= 1024) else (("decode", csmla_caps),)
+                modes = (("decode", csmla_caps), ("extend", (ext_cap,))) if (iw_n >= 2048 and ext_cap >= 2048) else (("decode", csmla_caps),)
                 for mode_s, m_caps in modes:
                     sig_plans: list[Any] = []
                     for cap in m_caps:
@@ -3207,12 +3213,12 @@ def prepare_b12x_dsv41_model(
                                         if cap_n >= rows:
                                             bd = st_p.bind(pl, scratch=sc_l, q=q.view(rows, h_n, 512), swa_indices=swa_i2, swa_lengths=swa_lens, indexed_indices=idx_i2, indexed_lengths=kw.get("extra_sparse_topk_lens"))
                                             return st_p.run(bd, swa_k_cache=swa_kv.view(-1, 64 * 584), indexed_k_cache=comp_kv.view(-1, 64 * 584) if (iw_n > 0 and comp_kv is not None) else None, sm_scale=float(kw.get("bmm1_scale", 1.0)), attn_sink=sinks, out=out.view(rows, h_n, 512))
-                            elif _b12x_prefill is not None and rows >= 1024 and iw_n > 0 and comp_kv is not None:
+                            elif _b12x_prefill is not None and rows >= 2048 and iw_n >= 2048 and comp_kv is not None:
                                 entries = dev_tbl.get((h_n, int(swa_i2.shape[1]), iw_n, sinks is not None, "extend"))
                                 if entries is not None and entries[0][0] >= rows:
                                     am = _get_fc().attn_metadata
                                     msl = max((int(getattr(v, "max_seq_len", 0) or 0) for v in am.values()), default=0) if isinstance(am, dict) else 0
-                                    if msl >= 1024:
+                                    if msl >= 2048:
                                         _, _, st_p, ext_ws, _own = entries[0]
                                         return _b12x_prefill(q3=q.view(rows, h_n, 512), swa_k_cache=swa_kv.view(-1, 64 * 584), swa_indices=swa_i2, swa_topk_lengths=swa_lens, workspace=ext_ws, sm_scale=float(kw.get("bmm1_scale", 1.0)), swa_page_size=64, indexed_k_cache=comp_kv.view(-1, 64 * 584), indexed_indices=idx_i2, indexed_topk_lengths=kw.get("extra_sparse_topk_lens"), indexed_page_size=64, attn_sink=sinks, return_lse=False, lse_scale="base2", out=out.view(rows, h_n, 512), prepared=st_p.launch)
                     return orig_smla(**kw)
