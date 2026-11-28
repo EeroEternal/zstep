@@ -42,7 +42,12 @@ SAIL_POLICY_TO_ENV: dict[str, str] = {
     "qkv_fusion_mode": "ZSTEP_SAIL_QKV_FUSION_MODE",
     "engram_indexer_backend": "ZSTEP_SAIL_ENGRAM_INDEXER_BACKEND",
     "lm_head_dtype": "ZSTEP_SAIL_LM_HEAD_DTYPE",
+    "ar_fuse_mhc_post": "ZSTEP_SAIL_AR_FUSE_MHC_POST",
+    "moe_router_mode": "ZSTEP_SAIL_MOE_ROUTER_MODE",
+    "mhc_backend": "ZSTEP_SAIL_MHC_BACKEND",
 }
+
+SAIL_POLICY_METADATA_KEYS: frozenset[str] = frozenset({"version"})
 
 BACKEND_DOCKERFILE: dict[str, str] = {
     "sm120": "deploy/docker/Dockerfile.sm120",
@@ -70,7 +75,9 @@ def policy_to_env_map(
         raise ValueError(f"Policy file {policy_path} must contain a JSON object")
 
     if backend == "sail":
-        unknown = sorted(k for k in raw if k not in SAIL_POLICY_TO_ENV)
+        unknown = sorted(
+            k for k in raw if k not in SAIL_POLICY_TO_ENV and k not in SAIL_POLICY_METADATA_KEYS
+        )
         if unknown:
             raise ValueError(f"Unknown SAIL policy keys: {unknown}")
         for key, env_key in SAIL_POLICY_TO_ENV.items():
