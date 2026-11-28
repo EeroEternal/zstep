@@ -108,6 +108,17 @@ def _slice_piecewise_arg(x: Any, n: int) -> Any:
     return x[:n]
 
 
+def _host_mem_available_gib() -> float:
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return float(line.split()[1]) / (1024.0 * 1024.0)
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
 @dataclass(frozen=True)
 class _SpecVerifyContext:
     num_sample: int
@@ -122,11 +133,22 @@ class _SpecVerifyContext:
 
 
 @dataclass(frozen=True)
+class _FusedSpecRoundContext:
+    num_seqs: int
+    width: int
+    seq_slots_np: np.ndarray
+    pos_starts_np: np.ndarray
+    max_ctx: int
+    seq_max_ctx_np: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
 class _LaunchedStep:
     parity: int
     num_out: int
     sample_slots_out: list[int]
     spec_ctx: _SpecVerifyContext | None = None
+    fused_spec_ctx: _FusedSpecRoundContext | None = None
     pp_send_reqs: list[Any] | None = None
 
 
@@ -605,6 +627,17 @@ class DeepSeekV41StepRunner:
             self._swa_pool = None
         self.dummy_comp_block: int = self.max_seqs + 1
 
+        host_avail_gib = _host_mem_available_gib()
+        engram_gpu_layers = (
+            self.runtime_config.pp_engram_gpu_layers
+            if self.pp_size > 1
+            else (
+                self.runtime_config.engram_gpu_layers
+                if host_avail_gib >= 140.0
+                else 2
+            )
+        )
+        engram_cpu_offload = engram_gpu_layers < 2
         engine_args = EngineArgs(
             model=str(model_dir),
             trust_remote_code=True,
@@ -624,7 +657,10 @@ class DeepSeekV41StepRunner:
             enforce_eager=True,
             enable_prefix_caching=False,
             limit_mm_per_prompt={"image": 0},
-            engram_config=EngramConfig(cpu_offload=(self.pp_size > 1)),
+            engram_config=EngramConfig(
+                cpu_offload=engram_cpu_offload,
+                use_thp=engram_cpu_offload,
+            ),
             speculative_config=(
                 {
                     "method": "dspark",
@@ -668,48 +704,63 @@ class DeepSeekV41StepRunner:
         self.tp_cpu_group: dist.ProcessGroup = tp_group_init.cpu_group
         init_workspace_manager(self.device)
 
-        # In PP>1 mode, keep the first `pp_engram_gpu_layers` Engram layers (e.g. L1,
-        # which has only 1 preceding layer to hide PCIe offload latency) resident on
-        # Stage 0 GPU while offloading later Engram layers (e.g. L14) to CPU.
-        pp_engram_gpu_layers = (
-            self.runtime_config.pp_engram_gpu_layers if self.pp_size > 1 else 0
-        )
+        # Keep the first `engram_gpu_layers` Engram tables (Layer 1, which has only
+        # 1 preceding layer) on GPU HBM while offloading later tables (Layer 14,
+        # 11.80 GiB/GPU on TP=8) to THP-backed pinned host memory (`_prefetch_stream`
+        # overlaps the 18us UVA lookup behind Layers 0..13 inside CUDAGraphs).
         orig_create_embedding = None
         engram_cls = None
-        if pp_engram_gpu_layers > 0:
+        dsv41_model_mod = None
+        orig_drop_ckpt_cache = None
+        if engram_cpu_offload:
             from vllm.models.deepseek_v41.nvidia import engram as dsv41_engram
+            from vllm.models.deepseek_v41.nvidia import model as dsv41_model_mod
 
-            engram_cls = dsv41_engram.Engram
-            orig_create_embedding = engram_cls._create_embedding
+            # Preserve OS page-cache residency of the 475 GiB checkpoint when host RAM
+            # already has >= 220 GiB free beyond page cache (`MemFree >= 350 GiB` on 1 TiB nodes).
+            orig_drop_ckpt_cache = getattr(dsv41_model_mod, "drop_checkpoint_cache", None)
+            if orig_drop_ckpt_cache is not None and host_avail_gib >= 320.0:
+                dsv41_model_mod.drop_checkpoint_cache = lambda *a, **kw: None  # type: ignore[attr-defined]
 
-            def _hybrid_create_embedding(
-                engram_self: Any, layout: Any, layer_hash_index: int
-            ) -> Any:
-                engram_cfg = self.vllm_config.engram_config
-                assert engram_cfg is not None
-                use_cpu_offload = (
-                    engram_cfg.cpu_offload
-                    and layer_hash_index >= pp_engram_gpu_layers
-                )
-                return dsv41_engram.ParallelEngramEmbedding(
-                    layout.num_embeddings[layer_hash_index],
-                    layout.head_dim,
-                    tuple(
-                        size
-                        for order in layout.primes[layer_hash_index]
-                        for size in order
-                    ),
-                    cpu_offload=use_cpu_offload,
-                    dp_shared_memory=bool(engram_cfg.dp_shared_memory),
-                    use_thp=engram_cfg.use_thp,
-                )
+            if engram_gpu_layers >= 0:
+                engram_cls = dsv41_engram.Engram
+                orig_create_embedding = engram_cls._create_embedding
 
-            engram_cls._create_embedding = _hybrid_create_embedding
+                def _hybrid_create_embedding(
+                    engram_self: Any, layout: Any, layer_hash_index: int
+                ) -> Any:
+                    engram_cfg = self.vllm_config.engram_config
+                    assert engram_cfg is not None
+                    use_cpu_offload = (
+                        engram_cfg.cpu_offload
+                        and layer_hash_index >= engram_gpu_layers
+                    )
+                    emb = dsv41_engram.ParallelEngramEmbedding(
+                        layout.num_embeddings[layer_hash_index],
+                        layout.head_dim,
+                        tuple(
+                            size
+                            for order in layout.primes[layer_hash_index]
+                            for size in order
+                        ),
+                        cpu_offload=use_cpu_offload,
+                        dp_shared_memory=bool(engram_cfg.dp_shared_memory),
+                        use_thp=engram_cfg.use_thp if use_cpu_offload else False,
+                    )
+                    if use_cpu_offload:
+                        # Cap background `_prefetch_stream` grid to 8 CTAs (5% of 156 SMs) so UVA
+                        # gathers finish behind Layers 0..13 without stealing SMs from Layer-0 MoE/MegaGate.
+                        emb._num_sms = min(int(emb._num_sms), 16)
+                    return emb
+
+                engram_cls._create_embedding = _hybrid_create_embedding
         try:
             self.model = get_model(vllm_config=self.vllm_config)
         finally:
             if engram_cls is not None and orig_create_embedding is not None:
                 engram_cls._create_embedding = orig_create_embedding
+            if dsv41_model_mod is not None and orig_drop_ckpt_cache is not None:
+                dsv41_model_mod.drop_checkpoint_cache = orig_drop_ckpt_cache  # type: ignore[attr-defined]
         self.model.eval()
         if self.spec_method == "dspark":
             draft_config = self.vllm_config.speculative_config.draft_model_config.hf_config
@@ -2307,6 +2358,19 @@ class DeepSeekV41StepRunner:
 
         need_final_aux = dsv4_core.end_layer in aux_layers_set
         need_final_post = need_hidden or need_final_aux
+        tbo_offloaded_engrams = (
+            [
+                lyr.engram
+                for lyr in dsv4_core.layers[dsv4_core.start_layer : dsv4_core.end_layer]
+                if getattr(lyr, "engram", None) is not None
+                and getattr(lyr.engram, "_prefetch_stream", None) is not None
+            ]
+            if gh_u[0] is not None
+            else []
+        )
+        for eng in tbo_offloaded_engrams:
+            assert gh_u[0] is not None
+            eng.prepare_embeddings(gh_u[0][:, eng.layer_hash_index])
         try:
             for idx in range(dsv4_core.start_layer, dsv4_core.end_layer):
                 layer = dsv4_core.layers[idx]
@@ -2356,14 +2420,21 @@ class DeepSeekV41StepRunner:
                         if capture_prev_aux:
                             _store_aux(idx, u, prev_post.mean(dim=1))
                         assert gh_u[u] is not None
-                        layer.engram.prepare_embeddings(
-                            gh_u[u][:, layer.engram.layer_hash_index]
-                        )
+                        is_offloaded_eng = getattr(layer.engram, "_prefetch_stream", None) is not None
+                        if not is_offloaded_eng:
+                            layer.engram.prepare_embeddings(
+                                gh_u[u][:, layer.engram.layer_hash_index]
+                            )
                         res_u[u] = layer.engram(
                             prev_post,
                             eh_u[u][:, layer.engram.layer_hash_index],
                             em_u[u],
                         )
+                        if is_offloaded_eng and u == 0 and gh_u[1] is not None:
+                            # Kick off u1's UVA prefetch immediately so it hides behind u0's Layer-14 Attn.
+                            layer.engram.prepare_embeddings(
+                                gh_u[1][:, layer.engram.layer_hash_index]
+                            )
                         post_u[u], resmix_u[u], xs[u], pre_u[u] = mhc_pre(
                             res_u[u],
                             layer.hc_attn_fn,
@@ -3583,6 +3654,7 @@ class DeepSeekV41StepRunner:
         total_tokens: int,
         width: int,
         max_seq_len: int,
+        bt_width: int | None = None,
     ) -> bool:
         """Return True when a heterogeneous speculative-verify batch (`1 <= q_len <= width`)
         can be safely padded into the uniform `verify_graphs[v_bucket]` layout without
@@ -3604,10 +3676,11 @@ class DeepSeekV41StepRunner:
         if not bool(np.all(p_min > 0)) or not bool(np.all(seq_lens_np == (p_max + 1))):
             return False
         p_max_pad = p_max + (width - q_lens).astype(np.int64)
-        return bool(
-            np.all(p_max_pad < max_seq_len)
-            and np.all((p_max_pad // 128) == (p_max // 128))
-        )
+        if not bool(np.all(p_max_pad < max_seq_len)):
+            return False
+        if bt_width is not None:
+            return bool(np.all((p_max_pad // 128) < bt_width))
+        return bool(np.all((p_max_pad // 128) == (p_max // 128)))
 
     @staticmethod
     def _pack_ragged_verify_buffers(
@@ -3727,6 +3800,7 @@ class DeepSeekV41StepRunner:
                 total_tokens=total_tokens,
                 width=width,
                 max_seq_len=self.decode_graph_max_seq_len,
+                bt_width=self.bt_width,
             )
         )
         use_verify_graph = (
@@ -3738,6 +3812,7 @@ class DeepSeekV41StepRunner:
         )
         aux_hidden_states: list[torch.Tensor] | None = None
         dspark_ctx_prestored: bool = False
+        fused_spec_ctx: _FusedSpecRoundContext | None = None
         pp_send_reqs: list[Any] | None = None
         self._last_verify_bt_sig = None
         self._last_verify_graph_bucket = None
@@ -3947,7 +4022,6 @@ class DeepSeekV41StepRunner:
             sample_slots_out = [int(slot_np[i]) for i in range(num_seqs)]
             num_out = num_seqs if self.is_last_pp else 0
         elif use_verify_graph:
-            rows = v_bucket * width
             pos_i64 = pos_np.astype(np.int64)
             if is_ragged_verify:
                 seq_slots_np = slot_np[q_start_np[:num_seqs]]
@@ -3957,6 +4031,37 @@ class DeepSeekV41StepRunner:
                 seq_slots_np = slot_np[0:total_tokens:width]
                 p_min = pos_i64[0:total_tokens:width]
                 p_max = pos_i64[width - 1 : total_tokens : width]
+            max_ctx = min(self.max_model_len, pt_np.shape[1] * 128)
+            drafter = self.dspark_drafter
+            seq_max_ctx_np: np.ndarray | None = None
+            can_fuse_spec = False
+            if (
+                self.pp_size == 1
+                and drafter is not None
+                and self.runtime_config.enable_fused_spec_graph
+                and not is_sampling
+                and drafter.has_fused_post_verify_graph(v_bucket)
+            ):
+                p_max_draft = (
+                    p_min + q_lens.astype(np.int64) + self.num_spec_tokens - 1
+                )
+                c_cur = np.maximum(0, p_min // 128)
+                can_fuse_spec = (
+                    bool(np.all(p_min >= 0))
+                    and bool(
+                        np.all(
+                            p_max < min(max_ctx, self.decode_graph_max_seq_len)
+                        )
+                    )
+                    and bool(
+                        np.all(p_max_draft < self.decode_graph_max_seq_len + self.num_spec_tokens)
+                    )
+                    and bool(np.all(c_cur < pt_np.shape[1]))
+                    and bool(np.all(pt_np[seq_slots_np, c_cur] < self.num_kv_pages))
+                )
+            eff_width = width
+            rows = v_bucket * width
+            is_eff_ragged = is_ragged_verify
             c_lo = np.maximum(0, (p_min - 127) // 128)
             c_hi = np.minimum(pt_np.shape[1] - 1, (p_max + self.num_spec_tokens) // 128)
             swa_epoch = self._swa_pool.epoch if self._swa_pool is not None else -1
@@ -3978,10 +4083,14 @@ class DeepSeekV41StepRunner:
                     mla_bt_np[num_seqs:v_bucket] = 0
 
                 if self._swa_pool is not None:
+                    swa_p_max = np.minimum(
+                        p_max + (self.num_spec_tokens if can_fuse_spec else 0),
+                        max_ctx - 1,
+                    )
                     swa_pt, _ = self._swa_pool.map_active_windows(
                         active_pt,
                         p_min,
-                        p_max,
+                        swa_p_max,
                         p_min,
                         active_slots=seq_slots_np,
                     )
@@ -4011,7 +4120,7 @@ class DeepSeekV41StepRunner:
             sl_cpu_np = self.seq_lens_cpu[:v_bucket].numpy()
             sm_cpu_np = self.slot_mapping_cpu[:rows].numpy()
             vb_tok = (pt_np[slot_np, pos_i64 // 128] + 1).astype(np.int64)
-            if is_ragged_verify:
+            if is_eff_ragged:
                 sm_packed = vb_tok * 128 + (pos_i64 % 128)
                 swa_sm_np = (
                     self.swa_slot_mapping_cpu[:rows].numpy()
@@ -4027,7 +4136,7 @@ class DeepSeekV41StepRunner:
                 self._pack_ragged_verify_buffers(
                     num_seqs=num_seqs,
                     v_bucket=v_bucket,
-                    width=width,
+                    width=eff_width,
                     q_start_np=q_start_np,
                     q_lens=q_lens,
                     tok_np=tok_np,
@@ -4050,12 +4159,12 @@ class DeepSeekV41StepRunner:
                 pos_cpu_np[:total_tokens] = pos_i64
                 if rows > total_tokens:
                     pos_cpu_np[total_tokens:rows] = (
-                        np.arange(rows - total_tokens, dtype=np.int64) % width
+                        np.arange(rows - total_tokens, dtype=np.int64) % eff_width
                     )
 
                 sl_cpu_np[:num_seqs] = seq_lens_np
                 if v_bucket > num_seqs:
-                    sl_cpu_np[num_seqs:v_bucket] = width
+                    sl_cpu_np[num_seqs:v_bucket] = eff_width
 
                 sm_cpu_np[:total_tokens] = vb_tok * 128 + (pos_i64 % 128)
                 if rows > total_tokens:
@@ -4112,65 +4221,144 @@ class DeepSeekV41StepRunner:
                     self.swa_slot_mapping_cpu[:rows], non_blocking=True
                 )
 
-            if is_ragged_verify:
-                self._verify_real_rows_gpu[:total_tokens].copy_(
-                    self._verify_real_rows_cpu[:total_tokens], non_blocking=True
+            if can_fuse_spec and drafter is not None:
+                c_cur = p_min // 128
+                c_nxt = np.minimum(pt_np.shape[1] - 1, c_cur + 1)
+                cur_mla = (pt_np[seq_slots_np, c_cur] + 1).astype(np.int64)
+                nxt_raw = pt_np[seq_slots_np, c_nxt]
+                nxt_mla = np.where(
+                    ((c_cur + 1) < pt_np.shape[1]) & (nxt_raw < self.num_kv_pages),
+                    nxt_raw.astype(np.int64) + 1,
+                    0,
                 )
-            self._h2d_done_event.record()
-            if self.pp_size > 1 and not self.is_first_pp:
-                assert (
-                    self._pp_inter_hidden is not None
-                    and self._pp_inter_pre_mix is not None
+                if self._swa_pool is not None:
+                    phys_cur = self._swa_pool.lookup(cur_mla).astype(np.int64)
+                    phys_nxt = np.where(
+                        nxt_mla > 0,
+                        self._swa_pool.lookup(nxt_mla).astype(np.int64),
+                        -1,
+                    )
+                    if not bool(np.all(phys_cur > 0)) or not bool(
+                        np.all((nxt_mla == 0) | (phys_nxt > 0))
+                    ):
+                        can_fuse_spec = False
+                else:
+                    phys_cur = cur_mla
+                    phys_nxt = np.where(nxt_mla > 0, nxt_mla, -1)
+                if can_fuse_spec:
+                    seq_alloc_limit = (c_cur + np.where(phys_nxt > 0, 2, 1)) * 128
+                    seq_max_ctx_np = np.minimum(
+                        min(max_ctx, self.decode_graph_max_seq_len), seq_alloc_limit
+                    ).astype(np.int64)
+                    meta_np = drafter.spec_seq_meta_cpu[:v_bucket].numpy()
+                    meta_np[:num_seqs, 0] = q_lens.astype(np.int64)
+                    meta_np[:num_seqs, 1] = phys_cur
+                    meta_np[:num_seqs, 2] = phys_nxt
+                    meta_np[:num_seqs, 3] = seq_max_ctx_np
+                    if v_bucket > num_seqs:
+                        meta_np[num_seqs:v_bucket] = 0
+                    drafter.spec_seq_meta_gpu[:v_bucket].copy_(
+                        drafter.spec_seq_meta_cpu[:v_bucket], non_blocking=True
+                    )
+
+            if can_fuse_spec and drafter is not None:
+                self._h2d_done_event.record()
+                self.verify_graphs[v_bucket].replay()
+                drafter.post_verify_draft_graphs[v_bucket].replay()
+                active_v_rows = num_seqs * width
+                if self.is_result_rank:
+                    self.out_tokens_cpu[parity, :active_v_rows].copy_(
+                        self.out_tokens_gpu[:active_v_rows], non_blocking=True
+                    )
+                    self.out_logprobs_cpu[parity, :active_v_rows].copy_(
+                        self.out_logprobs_gpu[:active_v_rows], non_blocking=True
+                    )
+                    drafter.spec_acc_lens_cpu[parity, :num_seqs].copy_(
+                        drafter.spec_acc_lens_gpu[:num_seqs], non_blocking=True
+                    )
+                    drafter.draft_out_tokens_pinned[parity, :, :num_seqs].copy_(
+                        drafter.draft_out_tokens_gpu[:, :num_seqs, 0],
+                        non_blocking=True,
+                    )
+                    if (
+                        drafter.has_confidence_head
+                        and drafter.conf_threshold > 0.0
+                        and num_seqs >= 8
+                    ):
+                        drafter.draft_conf_probs_cpu[parity, :num_seqs].copy_(
+                            drafter.draft_conf_probs_gpu[:num_seqs],
+                            non_blocking=True,
+                        )
+                fused_spec_ctx = _FusedSpecRoundContext(
+                    num_seqs=num_seqs,
+                    width=eff_width,
+                    seq_slots_np=seq_slots_np.copy(),
+                    pos_starts_np=p_min.copy(),
+                    max_ctx=max_ctx,
+                    seq_max_ctx_np=seq_max_ctx_np,
                 )
-                self._pp_recv_intermediate(
-                    self._pp_inter_hidden[:rows], self._pp_inter_pre_mix[:rows]
-                )
-            self.verify_graphs[v_bucket].replay()
-            if self.pp_size > 1 and self.is_first_pp:
-                assert (
-                    self._pp_inter_hidden is not None
-                    and self._pp_inter_pre_mix is not None
-                )
-                send_h = self._pp_p2p_hidden[parity][:rows]
-                send_p = self._pp_p2p_pre_mix[parity][:rows]
-                send_h.copy_(self._pp_inter_hidden[:rows])
-                send_p.copy_(self._pp_inter_pre_mix[:rows])
-                pp_send_reqs = self._pp_send_intermediate(send_h, send_p)
                 sample_slots_out = []
                 num_out = 0
             else:
-                raw_aux = self.verify_graph_aux[v_bucket]
                 if is_ragged_verify:
-                    real_rows_gpu = self._verify_real_rows_gpu[:total_tokens]
-                    self._last_verify_graph_bucket = None
-                    aux_hidden_states = (
-                        [a.index_select(0, real_rows_gpu) for a in raw_aux]
-                        if raw_aux is not None
-                        else None
+                    self._verify_real_rows_gpu[:total_tokens].copy_(
+                        self._verify_real_rows_cpu[:total_tokens], non_blocking=True
                     )
-                    self.out_tokens_cpu[parity, :num_sample].copy_(
-                        self.out_tokens_gpu.index_select(0, real_rows_gpu),
-                        non_blocking=True,
+                self._h2d_done_event.record()
+                if self.pp_size > 1 and not self.is_first_pp:
+                    assert (
+                        self._pp_inter_hidden is not None
+                        and self._pp_inter_pre_mix is not None
                     )
-                    self.out_logprobs_cpu[parity, :num_sample].copy_(
-                        self.out_logprobs_gpu.index_select(0, real_rows_gpu),
-                        non_blocking=True,
+                    self._pp_recv_intermediate(
+                        self._pp_inter_hidden[:rows], self._pp_inter_pre_mix[:rows]
                     )
+                self.verify_graphs[v_bucket].replay()
+                if self.pp_size > 1 and self.is_first_pp:
+                    assert (
+                        self._pp_inter_hidden is not None
+                        and self._pp_inter_pre_mix is not None
+                    )
+                    send_h = self._pp_p2p_hidden[parity][:rows]
+                    send_p = self._pp_p2p_pre_mix[parity][:rows]
+                    send_h.copy_(self._pp_inter_hidden[:rows])
+                    send_p.copy_(self._pp_inter_pre_mix[:rows])
+                    pp_send_reqs = self._pp_send_intermediate(send_h, send_p)
+                    sample_slots_out = []
+                    num_out = 0
                 else:
-                    self._last_verify_graph_bucket = v_bucket
-                    aux_hidden_states = (
-                        [a[:total_tokens] for a in raw_aux]
-                        if raw_aux is not None
-                        else None
-                    )
-                    self.out_tokens_cpu[parity, :num_sample].copy_(
-                        self.out_tokens_gpu[:num_sample], non_blocking=True
-                    )
-                    self.out_logprobs_cpu[parity, :num_sample].copy_(
-                        self.out_logprobs_gpu[:num_sample], non_blocking=True
-                    )
-                sample_slots_out = []
-                num_out = num_sample
+                    raw_aux = self.verify_graph_aux[v_bucket]
+                    if is_ragged_verify:
+                        real_rows_gpu = self._verify_real_rows_gpu[:total_tokens]
+                        self._last_verify_graph_bucket = None
+                        aux_hidden_states = (
+                            [a.index_select(0, real_rows_gpu) for a in raw_aux]
+                            if raw_aux is not None
+                            else None
+                        )
+                        self.out_tokens_cpu[parity, :num_sample].copy_(
+                            self.out_tokens_gpu.index_select(0, real_rows_gpu),
+                            non_blocking=True,
+                        )
+                        self.out_logprobs_cpu[parity, :num_sample].copy_(
+                            self.out_logprobs_gpu.index_select(0, real_rows_gpu),
+                            non_blocking=True,
+                        )
+                    else:
+                        self._last_verify_graph_bucket = v_bucket
+                        aux_hidden_states = (
+                            [a[:total_tokens] for a in raw_aux]
+                            if raw_aux is not None
+                            else None
+                        )
+                        self.out_tokens_cpu[parity, :num_sample].copy_(
+                            self.out_tokens_gpu[:num_sample], non_blocking=True
+                        )
+                        self.out_logprobs_cpu[parity, :num_sample].copy_(
+                            self.out_logprobs_gpu[:num_sample], non_blocking=True
+                        )
+                    sample_slots_out = []
+                    num_out = num_sample
         else:
             self._gpu_bt_cache_key = None
             first_pos = pos_np[q_start_np[:num_seqs]]
@@ -4508,7 +4696,7 @@ class DeepSeekV41StepRunner:
                 aux_hidden_states=aux_hidden_states,
                 dspark_ctx_prestored=dspark_ctx_prestored,
             )
-            if (is_spec_step and self.is_last_pp)
+            if (is_spec_step and self.is_last_pp and fused_spec_ctx is None)
             else None
         )
         return _LaunchedStep(
@@ -4516,6 +4704,7 @@ class DeepSeekV41StepRunner:
             num_out=num_out,
             sample_slots_out=sample_slots_out,
             spec_ctx=spec_ctx,
+            fused_spec_ctx=fused_spec_ctx,
             pp_send_reqs=pp_send_reqs,
         )
 
@@ -4529,7 +4718,19 @@ class DeepSeekV41StepRunner:
                 req.wait()
         self.end_events[p].synchronize()
         outputs: list[SeqResult] = []
-        if step.spec_ctx is not None:
+        if step.fused_spec_ctx is not None:
+            if self.is_result_rank and self.dspark_drafter is not None:
+                fctx = step.fused_spec_ctx
+                outputs = self.dspark_drafter.build_fused_seq_results(
+                    parity=p,
+                    num_seqs=fctx.num_seqs,
+                    width=fctx.width,
+                    seq_slots_np=fctx.seq_slots_np,
+                    pos_starts_np=fctx.pos_starts_np,
+                    max_ctx=fctx.max_ctx,
+                    seq_max_ctx_np=fctx.seq_max_ctx_np,
+                )
+        elif step.spec_ctx is not None:
             ctx = step.spec_ctx
             outputs = self._speculative_outputs(
                 parity=p,

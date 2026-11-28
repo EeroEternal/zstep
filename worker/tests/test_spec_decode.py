@@ -378,9 +378,34 @@ def test_ragged_verify_graph_eligibility_and_packing() -> None:
         max_seq_len=131072,
     )
 
-    # Reject when padding crosses a 128-token page boundary (pos=126 with q_len=2 -> 128).
+    # Interior 128-token page boundary crossings are safe when `bt_width` covers `p_max_pad // 128`
+    # (unallocated columns map to the permanent zeroed overflow page `mla_dummy_vb` / `swa_dummy_vb`,
+    # real rows stay causal `<= p_max`, and padded rows carry `slot_mapping = -1`), while crossings
+    # past `bt_width` or without `bt_width` are rejected.
     pos_cross = np.array([100, 101, 102, 103, 125, 126, 300], dtype=np.int32)
     seq_cross = np.array([104, 127, 301], dtype=np.int32)
+    assert DeepSeekV41StepRunner._can_use_ragged_verify_graph(
+        q_start_np=q_start,
+        q_lens=q_lens,
+        pos_np=pos_cross,
+        seq_lens_np=seq_cross,
+        sample_rows_np=sample_rows,
+        total_tokens=7,
+        width=4,
+        max_seq_len=131072,
+        bt_width=4,
+    )
+    assert not DeepSeekV41StepRunner._can_use_ragged_verify_graph(
+        q_start_np=q_start,
+        q_lens=q_lens,
+        pos_np=pos_cross,
+        seq_lens_np=seq_cross,
+        sample_rows_np=sample_rows,
+        total_tokens=7,
+        width=4,
+        max_seq_len=131072,
+        bt_width=2,
+    )
     assert not DeepSeekV41StepRunner._can_use_ragged_verify_graph(
         q_start_np=q_start,
         q_lens=q_lens,

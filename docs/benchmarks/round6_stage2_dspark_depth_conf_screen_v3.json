@@ -1,0 +1,177 @@
+{
+  "base_dspark_k5": {
+    "name": "base_dspark_k5",
+    "elapsed_s": 0.0,
+    "init_wall_ms": 178298.72,
+    "peak_vram_used_mib": 80293,
+    "tiers": {
+      "spec_c1": {
+        "tok_s": 218.98,
+        "ttft_ms": 73.86,
+        "tpot_ms": 4.07,
+        "p99_itl_ms": 9.99,
+        "mean_steps": 365.0
+      },
+      "spec_c2": {
+        "tok_s": 402.47,
+        "ttft_ms": 102.42,
+        "tpot_ms": 4.48,
+        "p99_itl_ms": 49.0,
+        "mean_steps": 488.0
+      },
+      "spec_c4": {
+        "tok_s": 544.66,
+        "ttft_ms": 100.55,
+        "tpot_ms": 6.24,
+        "p99_itl_ms": 125.32,
+        "mean_steps": 360.5
+      },
+      "spec_c8": {
+        "tok_s": 483.45,
+        "ttft_ms": 234.66,
+        "tpot_ms": 12.98,
+        "p99_itl_ms": 167.57,
+        "mean_steps": 168.5
+      },
+      "spec_c16": {
+        "tok_s": 963.23,
+        "ttft_ms": 213.36,
+        "tpot_ms": 12.89,
+        "p99_itl_ms": 200.41,
+        "mean_steps": 306.5
+      }
+    }
+  },
+  "cand_v3_k5": {
+    "name": "cand_v3_k5",
+    "elapsed_s": 252.0,
+    "init_wall_ms": 182350.08,
+    "peak_vram_used_mib": 68281,
+    "tiers": {
+      "spec_c1": {
+        "tok_s": 272.09,
+        "ttft_ms": 73.93,
+        "tpot_ms": 3.12,
+        "p99_itl_ms": 9.89,
+        "mean_steps": 339.0
+      },
+      "spec_c2": {
+        "tok_s": 517.05,
+        "ttft_ms": 102.3,
+        "tpot_ms": 3.35,
+        "p99_itl_ms": 11.7,
+        "mean_steps": 492.5
+      },
+      "spec_c4": {
+        "tok_s": 769.78,
+        "ttft_ms": 101.74,
+        "tpot_ms": 4.28,
+        "p99_itl_ms": 14.74,
+        "mean_steps": 351.5
+      },
+      "spec_c8": {
+        "tok_s": 766.99,
+        "ttft_ms": 114.67,
+        "tpot_ms": 8.5,
+        "p99_itl_ms": 93.91,
+        "mean_steps": 177.5
+      },
+      "spec_c16": {
+        "tok_s": 1256.81,
+        "ttft_ms": 214.79,
+        "tpot_ms": 10.44,
+        "p99_itl_ms": 116.63,
+        "mean_steps": 299.5
+      }
+    },
+    "geomean_gain_vs_base": 0.361022
+  },
+  "cand_v3_k5_conf12": {
+    "name": "cand_v3_k5_conf12",
+    "elapsed_s": 229.9,
+    "init_wall_ms": 159271.71,
+    "peak_vram_used_mib": 68283,
+    "tiers": {
+      "spec_c1": {
+        "tok_s": 253.88,
+        "ttft_ms": 75.36,
+        "tpot_ms": 3.38,
+        "p99_itl_ms": 9.87,
+        "mean_steps": 368.0
+      },
+      "spec_c2": {
+        "tok_s": 509.17,
+        "ttft_ms": 102.62,
+        "tpot_ms": 3.43,
+        "p99_itl_ms": 11.64,
+        "mean_steps": 497.0
+      },
+      "spec_c4": {
+        "tok_s": 705.75,
+        "ttft_ms": 102.96,
+        "tpot_ms": 4.49,
+        "p99_itl_ms": 14.94,
+        "mean_steps": 397.5
+      },
+      "spec_c8": {
+        "tok_s": 798.86,
+        "ttft_ms": 125.58,
+        "tpot_ms": 8.07,
+        "p99_itl_ms": 93.61,
+        "mean_steps": 173.0
+      },
+      "spec_c16": {
+        "tok_s": 1293.4,
+        "ttft_ms": 225.54,
+        "tpot_ms": 10.02,
+        "p99_itl_ms": 202.43,
+        "mean_steps": 302.5
+      }
+    },
+    "geomean_gain_vs_base": 0.333522
+  },
+  "cand_v3_k6": {
+    "name": "cand_v3_k6",
+    "elapsed_s": 229.5,
+    "init_wall_ms": 158266.23,
+    "peak_vram_used_mib": 68295,
+    "tiers": {
+      "spec_c1": {
+        "tok_s": 272.26,
+        "ttft_ms": 74.61,
+        "tpot_ms": 3.11,
+        "p99_itl_ms": 10.07,
+        "mean_steps": 331.0
+      },
+      "spec_c2": {
+        "tok_s": 474.64,
+        "ttft_ms": 103.39,
+        "tpot_ms": 3.61,
+        "p99_itl_ms": 12.44,
+        "mean_steps": 503.5
+      },
+      "spec_c4": {
+        "tok_s": 727.16,
+        "ttft_ms": 102.42,
+        "tpot_ms": 4.63,
+        "p99_itl_ms": 15.76,
+        "mean_steps": 343.5
+      },
+      "spec_c8": {
+        "tok_s": 813.65,
+        "ttft_ms": 116.92,
+        "tpot_ms": 7.66,
+        "p99_itl_ms": 95.38,
+        "mean_steps": 167.0
+      },
+      "spec_c16": {
+        "tok_s": 1228.84,
+        "ttft_ms": 191.31,
+        "tpot_ms": 10.68,
+        "p99_itl_ms": 161.45,
+        "mean_steps": 297.0
+      }
+    },
+    "geomean_gain_vs_base": 0.332641
+  }
+}

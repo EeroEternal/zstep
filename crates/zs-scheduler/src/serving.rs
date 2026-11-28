@@ -3177,8 +3177,10 @@ impl ServingEngine {
             rows.push(seq.last_token);
             rows.extend_from_slice(&seq.pending_draft_tokens[..k_eff]);
             let target_len = start_pos + rows.len();
+            let max_req_len = seq.prompt_tokens.len() + seq.target_output_len;
+            let lookahead_len = (target_len + config.num_speculative_tokens).min(max_req_len);
             seq.ensure_kv_pages_with_cache(
-                target_len,
+                lookahead_len,
                 page_block_tokens,
                 max_pages_per_seq,
                 &self.kv_pool,

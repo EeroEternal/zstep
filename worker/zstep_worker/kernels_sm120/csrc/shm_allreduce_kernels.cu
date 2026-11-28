@@ -4279,6 +4279,115 @@ __global__ void tp8_argmax_gather_shm_kernel(
     }
 }
 
+__global__ void dspark_verify_prep_kernel(
+    const int32_t* __restrict__ out_top2_tokens,
+    const int32_t* __restrict__ verify_token_ids,
+    const int64_t* __restrict__ verify_positions,
+    const int64_t* __restrict__ verify_swa_slots,
+    const int64_t* __restrict__ seq_meta,
+    int32_t* __restrict__ out_acc_lens,
+    int64_t* __restrict__ ctx_slot_mapping,
+    int32_t* __restrict__ draft_tokens,
+    int64_t* __restrict__ draft_positions,
+    int64_t* __restrict__ draft_slot_mapping,
+    int32_t* __restrict__ draft_seq_lens,
+    int b,
+    int width,
+    int k,
+    int32_t noise_token_id) {
+    const int s = static_cast<int>(threadIdx.x + blockIdx.x * blockDim.x);
+    if (s >= b) {
+        return;
+    }
+    const int64_t ql64 = seq_meta[s * 4 + 0];
+    const int64_t phys_cur = seq_meta[s * 4 + 1];
+    const int64_t phys_next = seq_meta[s * 4 + 2];
+    const int64_t max_ctx = seq_meta[s * 4 + 3];
+    const int v_base = s * width;
+    const int d_base = s * k;
+
+    if (ql64 <= 0) {
+        out_acc_lens[s] = 0;
+        for (int j = 0; j < width; ++j) {
+            ctx_slot_mapping[v_base + j] = -1;
+        }
+        draft_tokens[d_base] = 0;
+        for (int j = 1; j < k; ++j) {
+            draft_tokens[d_base + j] = noise_token_id;
+        }
+        for (int j = 0; j < k; ++j) {
+            draft_positions[d_base + j] = j;
+            draft_slot_mapping[d_base + j] = -1;
+        }
+        draft_seq_lens[s] = k;
+        return;
+    }
+
+    const int ql = (ql64 > width) ? width : static_cast<int>(ql64);
+    int acc = 1;
+    for (int j = 1; j < ql; ++j) {
+        const int32_t prev_pred = out_top2_tokens[(v_base + j - 1) * 2 + 0];
+        const int32_t cur_inp = verify_token_ids[v_base + j];
+        if (prev_pred != cur_inp) {
+            break;
+        }
+        acc = j + 1;
+    }
+    out_acc_lens[s] = acc;
+
+    for (int j = 0; j < width; ++j) {
+        const int64_t p_val = verify_positions[v_base + j];
+        if (j < acc && p_val >= 0 && p_val < max_ctx) {
+            ctx_slot_mapping[v_base + j] = verify_swa_slots[v_base + j];
+        } else {
+            ctx_slot_mapping[v_base + j] = -1;
+        }
+    }
+
+    const int32_t anchor = out_top2_tokens[(v_base + acc - 1) * 2 + 0];
+    const int64_t pos_next = verify_positions[v_base + acc - 1] + 1;
+    const int64_t base_col = verify_positions[v_base] >> 7;
+
+    draft_tokens[d_base] = anchor;
+    for (int j = 1; j < k; ++j) {
+        draft_tokens[d_base + j] = noise_token_id;
+    }
+
+    const int64_t alloc_limit = (phys_next > 0)
+        ? ((base_col + 2) * 128)
+        : ((base_col + 1) * 128);
+    const int64_t eff_max_ctx = (max_ctx < alloc_limit) ? max_ctx : alloc_limit;
+
+    if (pos_next >= eff_max_ctx) {
+        for (int j = 0; j < k; ++j) {
+            draft_positions[d_base + j] = j;
+            draft_slot_mapping[d_base + j] = -1;
+        }
+        draft_seq_lens[s] = k;
+        return;
+    }
+
+    const int64_t end_len = pos_next + k;
+    draft_seq_lens[s] = static_cast<int32_t>(
+        (end_len < eff_max_ctx) ? end_len : eff_max_ctx);
+    for (int j = 0; j < k; ++j) {
+        const int64_t q_pos = pos_next + j;
+        const int64_t clamped_pos =
+            (q_pos < eff_max_ctx) ? q_pos : (eff_max_ctx - 1);
+        draft_positions[d_base + j] = (clamped_pos >= 0) ? clamped_pos : j;
+        if (q_pos >= 0 && q_pos < eff_max_ctx) {
+            const int64_t p_col = q_pos >> 7;
+            const int64_t phys_pg = (p_col == base_col)
+                ? phys_cur
+                : ((p_col == base_col + 1) ? phys_next : -1);
+            draft_slot_mapping[d_base + j] =
+                (phys_pg > 0) ? (phys_pg * 128 + (q_pos & 127)) : -1;
+        } else {
+            draft_slot_mapping[d_base + j] = -1;
+        }
+    }
+}
+
 }  // namespace
 
 void launch_local_top2_bf16_cuda(
@@ -4327,5 +4436,43 @@ void launch_tp8_argmax_gather_shm_cuda(
         world_size,
         vocab_per_rank,
         write_all_ranks);
+    ZSTEP_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_dspark_verify_prep_cuda(
+    const int32_t* out_top2_tokens,
+    const int32_t* verify_token_ids,
+    const int64_t* verify_positions,
+    const int64_t* verify_swa_slots,
+    const int64_t* seq_meta,
+    int32_t* out_acc_lens,
+    int64_t* ctx_slot_mapping,
+    int32_t* draft_tokens,
+    int64_t* draft_positions,
+    int64_t* draft_slot_mapping,
+    int32_t* draft_seq_lens,
+    int b,
+    int width,
+    int k,
+    int32_t noise_token_id,
+    std::uintptr_t stream_handle) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    const unsigned int blocks = static_cast<unsigned int>((b + 127) / 128);
+    dspark_verify_prep_kernel<<<blocks, 128, 0, stream>>>(
+        out_top2_tokens,
+        verify_token_ids,
+        verify_positions,
+        verify_swa_slots,
+        seq_meta,
+        out_acc_lens,
+        ctx_slot_mapping,
+        draft_tokens,
+        draft_positions,
+        draft_slot_mapping,
+        draft_seq_lens,
+        b,
+        width,
+        k,
+        noise_token_id);
     ZSTEP_CUDA_CHECK(cudaGetLastError());
 }
