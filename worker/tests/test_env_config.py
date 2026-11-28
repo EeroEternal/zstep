@@ -45,6 +45,9 @@ def test_worker_runtime_config_defaults_and_summary() -> None:
     assert cfg.qwen_enable_fused_gdn is True
     assert cfg.qwen_gdn_decode_mode == "auto"
     assert cfg.enable_driver_batch_memcpy is True
+    assert cfg.enable_vmm_peer_arena is False
+    assert cfg.kv_dram_codec == "none"
+    assert cfg.nvfp4_act_mode == "a4"
     assert cfg.prefill_runahead_depth == 2
     assert cfg.swa_kv_pages == 0
 
@@ -56,6 +59,9 @@ def test_worker_runtime_config_defaults_and_summary() -> None:
     assert "shm_max_ar=auto" in line
     assert "prefill_runahead=2" in line
     assert "driver_batch_memcpy=1" in line
+    assert "kv_codec=none" in line
+    assert "vmm_arena=0" in line
+    assert "nvfp4_act=a4" in line
 
 
 def test_worker_runtime_config_overrides_and_helpers() -> None:
@@ -88,6 +94,9 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
         "ZSTEP_QWEN_ENABLE_FUSED_GDN": "0",
         "ZSTEP_QWEN_GDN_DECODE_MODE": "cluster2",
         "ZSTEP_ENABLE_DRIVER_BATCH_MEMCPY": "0",
+        "ZSTEP_ENABLE_VMM_PEER_ARENA": "1",
+        "ZSTEP_KV_DRAM_CODEC": "rans_gpu",
+        "ZSTEP_NVFP4_ACT_MODE": "A8",
         "ZSTEP_PREFILL_RUNAHEAD_DEPTH": "4",
         "ZSTEP_SWA_KV_PAGES": "2048",
     }
@@ -123,6 +132,9 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
     assert parse_qwen_fused_gdn_enabled(env) is False
     assert parse_qwen_gdn_decode_mode(env) == "cluster2"
     assert cfg.enable_driver_batch_memcpy is False
+    assert cfg.enable_vmm_peer_arena is True
+    assert cfg.kv_dram_codec == "rans_gpu"
+    assert cfg.nvfp4_act_mode == "a8"
     assert cfg.prefill_runahead_depth == 4
     assert cfg.swa_kv_pages == 2048
     assert cfg.prefill_tbo_min_tokens == 6144
@@ -209,6 +221,8 @@ def test_worker_runtime_config_sail_policy_and_env_precedence(tmp_path) -> None:
         ({"ZSTEP_PIPELINE_PARALLEL_SIZE": "3"}, "ZSTEP_PIPELINE_PARALLEL_SIZE"),
         ({"ZSTEP_PP_PREFILL_MICROBATCHES": "0"}, "ZSTEP_PP_PREFILL_MICROBATCHES"),
         ({"ZSTEP_PP_ENGRAM_GPU_LAYERS": "-1"}, "ZSTEP_PP_ENGRAM_GPU_LAYERS"),
+        ({"ZSTEP_KV_DRAM_CODEC": "snappy"}, "ZSTEP_KV_DRAM_CODEC"),
+        ({"ZSTEP_NVFP4_ACT_MODE": "a16"}, "ZSTEP_NVFP4_ACT_MODE"),
     ],
 )
 def test_worker_runtime_config_rejects_invalid_values(

@@ -1,0 +1,278 @@
+{
+  "campaign": "sm120-8x6000d-round8-rans-vmm-nvfp4-dp2tp4-scout",
+  "elapsed_sec": 27.93,
+  "exp1_topology_and_vmm": {
+    "world_size": 8,
+    "topo_text": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tGPU4\tGPU5\tGPU6\tGPU7\tNIC0\tNIC1\tNIC2\tNIC3\tNIC4\tNIC5\tNIC6\tNIC7\tNIC8\tNIC9\tNIC10\tNIC11\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tPXB\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tPXB\tPXB\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\t0-47,96-143\t0\t\tN/A\nGPU1\tPXB\t X \tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tPXB\tPXB\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\t0-47,96-143\t0\t\tN/A\nGPU2\tNODE\tNODE\t X \tPXB\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tPXB\tPXB\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\t0-47,96-143\t0\t\tN/A\nGPU3\tNODE\tNODE\tPXB\t X \tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tPXB\tPXB\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\t0-47,96-143\t0\t\tN/A\nGPU4\tSYS\tSYS\tSYS\tSYS\t X \tPXB\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\tPXB\tPXB\tNODE\tNODE\tNODE\tNODE\t48-95,144-191\t1\t\tN/A\nGPU5\tSYS\tSYS\tSYS\tSYS\tPXB\t X \tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\tPXB\tPXB\tNODE\tNODE\tNODE\tNODE\t48-95,144-191\t1\t\tN/A\nGPU6\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\t X \tPXB\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tPXB\tPXB\tNODE\tNODE\t48-95,144-191\t1\t\tN/A\nGPU7\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tPXB\t X \tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tPXB\tPXB\tNODE\tNODE\t48-95,144-191\t1\t\tN/A\nNIC0\tPXB\tPXB\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\t X \tPIX\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC1\tPXB\tPXB\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tPIX\t X \tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC2\tNODE\tNODE\tPXB\tPXB\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\t X \tPIX\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC3\tNODE\tNODE\tPXB\tPXB\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tPIX\t X \tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC4\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tNODE\t X \tPIX\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC5\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tNODE\tPIX\t X \tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\t\t\t\t\nNIC6\tSYS\tSYS\tSYS\tSYS\tPXB\tPXB\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\t X \tPIX\tNODE\tNODE\tNODE\tNODE\t\t\t\t\nNIC7\tSYS\tSYS\tSYS\tSYS\tPXB\tPXB\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\tPIX\t X \tNODE\tNODE\tNODE\tNODE\t\t\t\t\nNIC8\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tPXB\tPXB\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\t X \tPIX\tNODE\tNODE\t\t\t\t\nNIC9\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tPXB\tPXB\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tPIX\t X \tNODE\tNODE\t\t\t\t\nNIC10\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tNODE\t X \tPIX\t\t\t\t\nNIC11\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\tNODE\tNODE\tNODE\tNODE\tPIX\t X \t\t\t\t\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n\nNIC Legend:\n\n  NIC0: mlx5_0\n  NIC1: mlx5_1\n  NIC2: mlx5_2\n  NIC3: mlx5_3\n  NIC4: mlx5_4\n  NIC5: mlx5_5\n  NIC6: mlx5_6\n  NIC7: mlx5_7\n  NIC8: mlx5_8\n  NIC9: mlx5_9\n  NIC10: mlx5_10\n  NIC11: mlx5_11\n\n",
+    "p2p_matrix": [
+      [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    ],
+    "vmm_audit": {
+      "supported": true,
+      "granularity_bytes": 2097152,
+      "exact_1tib_va_honored": true,
+      "mapped_va_hex": "0x80000000000",
+      "rc_codes": {
+        "create": 0,
+        "export_fd": 0,
+        "import_fd": 0,
+        "reserve": 0,
+        "map": 0,
+        "access_0_1": 0
+      },
+      "gpu2_same_socket_set_access_rc": 0,
+      "gpu4_cross_socket_set_access_rc": 0,
+      "peer_32mib_read_vmm_gbps": 56.05,
+      "peer_32mib_read_legacy_ipc_gbps": 35.1
+    }
+  },
+  "exp2_rans_kv_codec": {
+    "slot_stride_bytes": 82560,
+    "num_pages": 256,
+    "rows_per_page": 128,
+    "dsv41_mla_584": {
+      "raw_page_bytes": 74752,
+      "avg_comp_page_bytes": 64367.6,
+      "unsplit_compression_ratio": 1.1613,
+      "page_split_single_table_ratio": 1.1613,
+      "coalesced_multi_plane_ratio": 1.2361,
+      "plane_ratios": {
+        "fp8_latent": 1.2087,
+        "fp16_scales": 1.3651,
+        "bf16_rope_exp": 2.9049,
+        "bf16_rope_mant": 1.0
+      },
+      "dram_capacity_gain_pct": 23.61,
+      "zero_ulp_byte_mismatches": 0,
+      "decode_err_flag": 0,
+      "gpu_encode_us": 402.9,
+      "gpu_encode_gbps": 47.5,
+      "gpu_decode_us": 234.59,
+      "gpu_decode_gbps": 81.57,
+      "per_page_encode_gbps": 20.51,
+      "per_page_decode_gbps": 35.04,
+      "d2h_raw_dma_us": 334.22,
+      "d2h_rans_plus_dma_us": 1228.99
+    },
+    "latent576": {
+      "raw_page_bytes": 73728,
+      "avg_comp_page_bytes": 63144.0,
+      "unsplit_compression_ratio": 1.1676,
+      "page_split_single_table_ratio": 1.1676,
+      "coalesced_multi_plane_ratio": 1.2344,
+      "plane_ratios": {
+        "fp8_latent": 1.2087,
+        "bf16_rope_exp": 2.9049,
+        "bf16_rope_mant": 1.0
+      },
+      "dram_capacity_gain_pct": 23.44,
+      "zero_ulp_byte_mismatches": 0,
+      "decode_err_flag": 0,
+      "gpu_encode_us": 403.76,
+      "gpu_encode_gbps": 46.75,
+      "gpu_decode_us": 233.3,
+      "gpu_decode_gbps": 80.9,
+      "per_page_encode_gbps": 20.6,
+      "per_page_decode_gbps": 35.0,
+      "d2h_raw_dma_us": 329.58,
+      "d2h_rans_plus_dma_us": 1207.62
+    }
+  },
+  "exp3_nvfp4_and_tp4_moe": {
+    "nvfp4_has_calibrated_input_scale": true,
+    "checkpoint_parity_audit": {
+      "expert_nibbles_bit_identical": true,
+      "expert_dequant_max_abs_diff": 0.0,
+      "engram_mxfp4_mean_cosine_4096rows": 0.993478,
+      "engram_mxfp4_rel_l2_err": 0.120607
+    },
+    "b12x_moe_benchmark": {
+      "tp8_I288": {
+        "raw_I": 288,
+        "eff_I": 320,
+        "lossless_mxfp4_w4a8": {
+          "supported": true,
+          "latency_us": {
+            "M=1": 213.11,
+            "M=2": 202.57,
+            "M=4": 200.97,
+            "M=8": 201.48,
+            "M=16": 1659.42,
+            "M=32": 1658.73,
+            "M=64": 1624.98,
+            "M=128": 1632.57,
+            "M=512": 1644.89,
+            "M=1024": 1649.63,
+            "M=2048": 1666.74,
+            "M=4096": 1905.12
+          }
+        },
+        "nvfp4_w4a8": {
+          "supported": false,
+          "error": "RuntimeError(\"scout_tp8_I288_nvfp4_w4a8/m64 failed to prepare with configuration MoeDecodeConfig(backend='dynamic', route_planner='internal', max_active_clusters=None, dynamic_tile_m=128, dynamic_route_mode='grouped', w4a16_route_mode=None, nvfp4_share_input=False, nvfp4_materialize_intermediate=False, nvfp4_inline_scales=False, w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None) (tuned): \\n\\x1b[91m\\x1b[1merror:\\x1b[0m CUDA_ERROR_ILLEGAL_ADDRESS (error code: 700) \\n \\n\\n\\x1b[0m\\n  \\x1b[94m= note:\\x1b[0m error code 700\\n  \\x1b[94m= note:\\x1b[0m \\n- \\x1b[1mError name: CUDA_ERROR_ILLEGAL_ADDRESS\\n- Error code: 700\\n- CUDA_TOOLKIT_PATH: not set\\n- Target SM ARCH: unknown (unspecified)\\x1b[0m\\n\\n\\x1b[94m\ud83d\udcca GPU Information:\\x1b[0m\\n\\x1b[1m- CUDA devices available: 8 (current: <CUdevice 0>)\\n- Architecture: \\x1b[94mBlackwell\\x1b[0m (\\x1b[92msm_120a\\x1b[0m)\\n- Compatible SM archs: \\x1b[92msm_120a\\x1b[0m\\n- Total Memory: \\x1b[94m83.05 GB\\x1b[0m\\n\\n\")"
+        },
+        "nvfp4_w4a4": {
+          "supported": false,
+          "error": "AcceleratorError(\"CUDA error: an illegal memory access was encountered\\nSearch for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\\n\")"
+        }
+      },
+      "tp4_I576": {
+        "raw_I": 576,
+        "eff_I": 576,
+        "lossless_mxfp4_w4a8": {
+          "supported": false,
+          "error": "AcceleratorError(\"CUDA error: an illegal memory access was encountered\\nSearch for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\\n\")"
+        },
+        "nvfp4_w4a8": {
+          "supported": false,
+          "error": "AcceleratorError(\"CUDA error: an illegal memory access was encountered\\nSearch for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\\n\")"
+        },
+        "nvfp4_w4a4": {
+          "supported": false,
+          "error": "AcceleratorError(\"CUDA error: an illegal memory access was encountered\\nSearch for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\\n\")"
+        }
+      },
+      "tp4_I576_isolated_context": {
+        "raw_I": 576,
+        "eff_I": 576,
+        "lossless_mxfp4_w4a8": {
+          "supported": true,
+          "latency_us": {
+            "M=1": 210.05,
+            "M=8": 208.26,
+            "M=64": 1665.19,
+            "M=512": 1662.54,
+            "M=2048": 1748.72,
+            "M=4096": 2675.88
+          }
+        },
+        "nvfp4_w4a4": {
+          "supported": true,
+          "latency_us": {
+            "M=1": 555.52,
+            "M=8": 1401.86,
+            "M=64": 1566.77,
+            "M=512": 1622.33,
+            "M=2048": 1745.57,
+            "M=4096": 1989.88
+          }
+        },
+        "nvfp4_w4a8": {
+          "supported": false,
+          "error": "CUDA_ERROR_ILLEGAL_ADDRESS (700) inside FlashInfer 0.7.6 b12x m64 dynamic grouped kernel preparation"
+        }
+      }
+    }
+  },
+  "exp4_tp4_island_vs_tp8_collectives": {
+    "tp4_numa0_gpu0_3": {
+      "M=1": 19.26,
+      "M=4": 20.76,
+      "M=16": 31.15,
+      "M=64": 90.1,
+      "M=256": 159.78,
+      "M=1024": 648.63,
+      "M=2048": 1418.57,
+      "M=4096": 2529.64
+    },
+    "tp4_numa1_gpu4_7": {
+      "M=1": 34.91,
+      "M=4": 32.38,
+      "M=16": 33.02,
+      "M=64": 90.19,
+      "M=256": 177.05,
+      "M=1024": 648.91,
+      "M=2048": 1318.82,
+      "M=4096": 2536.12
+    },
+    "tp8_dual_socket_gpu0_7": {
+      "M=1": 43.72,
+      "M=4": 47.51,
+      "M=16": 77.44,
+      "M=64": 115.03,
+      "M=256": 194.45,
+      "M=1024": 714.82,
+      "M=2048": 1453.42,
+      "M=4096": 2974.55
+    }
+  }
+}

@@ -393,6 +393,7 @@ def install_b12x_dsv41_quant_patches() -> bool:
     from vllm.model_executor.layers.quantization.modelopt import (
         CkptCtx,
         ModelOptLinearMethod,
+        ModelOptNvFp4FusedMoE,
     )
     from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -684,6 +685,229 @@ def install_b12x_dsv41_quant_patches() -> bool:
             self._b12x_moe_by_m[m] = entry
             return entry
 
+    class ZstepModelOptNvFp4B12xMoEMethod(ModelOptNvFp4FusedMoE):
+        """SM120 `b12x` unpadded (`I=576` on TP=4) hybrid W4A16/W4A4 ModelOpt NVFP4 MoE method.
+
+        Class name intentionally includes `'ModelOpt'` because `vllm`'s
+        `RoutedExperts.weight_loader` dispatches dual-shard `w13_input_scale`
+        and `uses_weight_scale_2_pattern()` via `'ModelOpt' in quant_method_name`.
+        """
+
+        def __init__(self, quant_config: Any, moe_config: Any):
+            super().__init__(quant_config=quant_config, moe_config=moe_config)
+            self._b12x_enabled: bool = False
+            self._fallback_to_vllm: bool = False
+            self._b12x_eplan: Any = None
+            self._b12x_moe_state: Any = None
+            self._b12x_scratch: tuple[torch.Tensor, ...] | None = None
+            self._b12x_moe_arena: torch.Tensor | None = None
+            self._b12x_moe_by_m: list[Any] = []
+            self._b12x_moe_capi_by_kern: dict[tuple[int, int], Any] = {}
+            self._b12x_dev_idx: int = 0
+
+        @property
+        def is_monolithic(self) -> bool:
+            if not self._fallback_to_vllm:
+                return False
+            return super().is_monolithic
+
+        @property
+        def supports_internal_mk(self) -> bool:
+            if not self._fallback_to_vllm:
+                return False
+            return super().supports_internal_mk
+
+        @property
+        def mk_can_overlap_shared_experts(self) -> bool:
+            if not self._fallback_to_vllm:
+                return False
+            return super().mk_can_overlap_shared_experts
+
+        @property
+        def topk_indices_dtype(self) -> torch.dtype | None:
+            if not self._fallback_to_vllm:
+                return torch.int32
+            return super().topk_indices_dtype
+
+        @property
+        def skip_forward_padding(self) -> bool:
+            if not self._fallback_to_vllm:
+                return False
+            return super().skip_forward_padding
+
+        @property
+        def has_unpadded_output(self) -> bool:
+            if not self._fallback_to_vllm:
+                return False
+            return super().has_unpadded_output
+
+        def maybe_roundup_sizes(
+            self,
+            hidden_size: int,
+            intermediate_size_per_partition: int,
+            act_dtype: torch.dtype,
+            moe_parallel_config: FusedMoEParallelConfig,
+        ) -> tuple[int, int]:
+            if (
+                not self.moe.has_bias
+                and not moe_parallel_config.use_ep
+                and hidden_size % 256 == 0
+                and intermediate_size_per_partition % 32 == 0
+            ):
+                return hidden_size, intermediate_size_per_partition
+            return super().maybe_roundup_sizes(
+                hidden_size,
+                intermediate_size_per_partition,
+                act_dtype,
+                moe_parallel_config,
+            )
+
+        def create_weights(
+            self,
+            layer: RoutedExperts,
+            num_experts: int,
+            hidden_size: int,
+            intermediate_size_per_partition: int,
+            params_dtype: torch.dtype,
+            **extra_weight_attrs: Any,
+        ) -> None:
+            from vllm.model_executor.layers.fused_moe.routed_experts import (
+                FusedMoeWeightScaleSupported,
+            )
+
+            self.num_experts = int(num_experts)
+            self.hidden_size = int(hidden_size)
+            self.intermediate_size = int(intermediate_size_per_partition)
+            super().create_weights(
+                layer,
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                params_dtype,
+                **extra_weight_attrs,
+            )
+            for pname in ("w13_weight_scale", "w2_weight_scale"):
+                p = getattr(layer, pname, None)
+                if p is not None:
+                    p.quant_method = FusedMoeWeightScaleSupported.BLOCK.value
+            for pname in (
+                "w13_weight_scale_2",
+                "w2_weight_scale_2",
+                "w13_input_scale",
+                "w2_input_scale",
+            ):
+                p = getattr(layer, pname, None)
+                if p is not None:
+                    p.quant_method = FusedMoeWeightScaleSupported.TENSOR.value
+
+        def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+            cfg = WorkerRuntimeConfig.from_env()
+            if cfg.nvfp4_act_mode == "a8":
+                raise RuntimeError(
+                    "ZSTEP_NVFP4_ACT_MODE='a8' (`w4a8_nvfp4`) is unsupported on SM120: "
+                    "FlashInfer 0.7.6 `b12x` raises CUDA_ERROR_ILLEGAL_ADDRESS (700) in "
+                    "dynamic m64 grouped preparation. Use ZSTEP_NVFP4_ACT_MODE='a4'."
+                )
+            act_raw = getattr(layer, "activation", "silu")
+            act_val = str(getattr(act_raw, "value", act_raw)).lower()
+            nonlinearity = "silu" if "silu" in act_val else act_val
+            if (
+                self.moe.has_bias
+                or layer.use_ep
+                or self.hidden_size % 256 != 0
+                or self.intermediate_size % 64 != 0
+                or nonlinearity != "silu"
+            ):
+                self._fallback_to_vllm = True
+                super().process_weights_after_loading(layer)
+                return
+
+            device = layer.w13_weight.device
+            swiglu_limit = getattr(layer, "swiglu_limit", None)
+            w13 = layer.w13_weight.data.contiguous()
+            w2 = layer.w2_weight.data.contiguous()
+            s13 = layer.w13_weight_scale.data.contiguous()
+            s2 = layer.w2_weight_scale.data.contiguous()
+            g13 = layer.w13_weight_scale_2.data[:, 0].to(torch.float32).contiguous()
+            g2 = layer.w2_weight_scale_2.data.reshape(-1).to(torch.float32).contiguous()
+            a13_raw = layer.w13_input_scale.data
+            if a13_raw.ndim == 2:
+                a13_raw = a13_raw.max(dim=-1).values
+            a13_recip = (1.0 / a13_raw.reshape(-1).to(torch.float32).clamp_min(1e-12)).contiguous()
+            a2_recip = (
+                1.0 / layer.w2_input_scale.data.reshape(-1).to(torch.float32).clamp_min(1e-12)
+            ).contiguous()
+            if a13_recip.numel() == 1:
+                a13_recip = a13_recip.expand(self.num_experts).contiguous()
+            if a2_recip.numel() == 1:
+                a2_recip = a2_recip.expand(self.num_experts).contiguous()
+
+            # Hybrid W4A16 (M <= 16 decode: avoids 2.6x-6.7x W4A4 small-M slowdown) +
+            # W4A4 NVFP4 Tensor Cores (M > 16 prefill: 1.345x faster at M=4096).
+            wplan = fused_moe.plan_weights(
+                source=fused_moe.PackedSource(
+                    format=fused_moe.PackedSourceFormat("modelopt_nvfp4"),
+                    w13_layout=fused_moe.W13Layout("w31"),
+                ),
+                activation=fused_moe.ActivationSpec(
+                    mode=fused_moe.ActivationMode.A4,
+                    a16_max_tokens=16,
+                    nonlinearity="silu",
+                    io_dtype=torch.bfloat16,
+                    swiglu_limit=float(swiglu_limit)
+                    if swiglu_limit is not None
+                    else None,
+                ),
+                geometry=fused_moe.MoEGeometry(
+                    num_experts=self.num_experts,
+                    hidden_size=self.hidden_size,
+                    intermediate_size=self.intermediate_size,
+                ),
+            )
+            prepared = fused_moe.prepare_weights(
+                plan=wplan,
+                weights=fused_moe.PackedWeights(
+                    w13=w13,
+                    w2=w2,
+                    w13_block_scales=s13,
+                    w2_block_scales=s2,
+                    w13_global_scales=g13,
+                    w2_global_scales=g2,
+                    input_scale=a13_recip,
+                    intermediate_scale=a2_recip,
+                    immutable_input_scales=True,
+                ),
+            )
+            del w13, w2, s13, s2, g13, g2, a13_recip, a2_recip
+            layer._b12x_prepared_experts = prepared
+            self._b12x_enabled = True
+            self.moe_kernel = None
+            self.moe_quant_config = True  # type: ignore[assignment]
+
+            for pname in (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+                "w13_weight_scale_2",
+                "w2_weight_scale_2",
+                "w13_input_scale",
+                "w2_input_scale",
+            ):
+                param = getattr(layer, pname, None)
+                if param is not None:
+                    replace_parameter(
+                        layer,
+                        pname,
+                        torch.empty((0,), dtype=param.dtype, device=device),
+                    )
+            torch.cuda.empty_cache()
+
+        apply = ZstepB12xMxfp4MoEMethod.apply
+        _capture_fast_moe_m = ZstepB12xMxfp4MoEMethod._capture_fast_moe_m
+
+    ZstepB12xNvfp4MoEMethod = ZstepModelOptNvFp4B12xMoEMethod
+
     class ZstepB12xBlock32LinearMethod(ModelOptLinearMethod):
         """SM120 `b12x` `[32, 32] UE8M0` 2D FP8 linear method."""
 
@@ -973,13 +1197,211 @@ def install_b12x_dsv41_quant_patches() -> bool:
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
-            if self.expert_dtype == "fp4" and self.moe_quant_algo != "NVFP4":
+            if self.expert_dtype == "fp4":
+                if self.moe_quant_algo == "NVFP4":
+                    return ZstepB12xNvfp4MoEMethod(
+                        quant_config=self._get_nvfp4_config(),
+                        moe_config=layer.moe_config,
+                    )
                 return ZstepB12xMxfp4MoEMethod(layer.moe_config)
 
         return orig_get_quant_method(self, layer, prefix)
 
     cfg_cls.get_quant_method = _patched_get_quant_method
     cfg_cls._zstep_b12x_patched = True
+    return True
+
+
+def install_mxfp4_engram_patches() -> bool:
+    """Idempotently patch `ParallelEngramEmbedding` to support `engram_embed_quant == 'mxfp4'`."""
+    try:
+        from vllm.config import get_current_vllm_config
+        from vllm.models.deepseek_v41.common import engram as c_engram
+        from vllm.models.deepseek_v41.nvidia import engram as nv_engram
+        from vllm.triton_utils import tl, triton
+    except ImportError:
+        return False
+
+    if getattr(c_engram, "_zstep_mxfp4_engram_patched", False):
+        return True
+    c_engram._zstep_mxfp4_engram_patched = True  # type: ignore[attr-defined]
+
+    @triton.jit(
+        do_not_specialize=[
+            "vocab_start",
+            "vocab_end",
+            "num_rows",
+            "ids_stride_t",
+            "ids_stride_h",
+            "GRID",
+        ]
+    )
+    def _engram_mxfp4_lookup_kernel(
+        weight_u8,
+        scales_u8,
+        ids,
+        out,
+        vocab_start,
+        vocab_end,
+        num_rows,
+        ids_stride_t,
+        ids_stride_h,
+        HEAD_START: tl.constexpr,
+        LOCAL_HEADS: tl.constexpr,
+        TOTAL_HEADS: tl.constexpr,
+        HALF_DIM: tl.constexpr,
+        QUANT_BLOCK: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+        GRID,
+    ):
+        half_cols = tl.arange(0, HALF_DIM)
+        even_cols = half_cols * 2
+        odd_cols = even_cols + 1
+        scale_cols = even_cols // QUANT_BLOCK
+        for base in tl.range(tl.program_id(0) * BLOCK_R, num_rows, GRID * BLOCK_R):
+            rows = base + tl.arange(0, BLOCK_R)
+            valid = rows < num_rows
+            head = HEAD_START + rows % LOCAL_HEADS
+            token = (rows // LOCAL_HEADS).to(tl.int64)
+            index = tl.load(
+                ids + token * ids_stride_t + head * ids_stride_h,
+                mask=valid & (head < TOTAL_HEADS),
+                other=-1,
+            ).to(tl.int64)
+            owned = valid & (head < TOTAL_HEADS) & (index >= vocab_start) & (index < vocab_end)
+            local = tl.where(owned, index - vocab_start, 0)
+            packed = tl.load(
+                weight_u8 + local[:, None] * HALF_DIM + half_cols[None, :],
+                mask=owned[:, None],
+                other=0,
+            ).to(tl.int32)
+            sc_byte = tl.load(
+                scales_u8 + local[:, None] * ((HALF_DIM * 2) // QUANT_BLOCK) + scale_cols[None, :],
+                mask=owned[:, None],
+                other=0,
+            ).to(tl.int32)
+            scale = (sc_byte << 23).to(tl.float32, bitcast=True)
+
+            # Decode OCP FP4 E2M1 nibbles: mag_idx in 0..7 -> {0, 0.5, 1, 1.5, 2, 3, 4, 6}
+            lo = packed & 0xF
+            hi = (packed >> 4) & 0xF
+            lo_m = lo & 0x7
+            hi_m = hi & 0x7
+            lo_abs = tl.where(
+                lo_m <= 3,
+                lo_m.to(tl.float32) * 0.5,
+                tl.where(
+                    lo_m <= 5,
+                    (lo_m - 2).to(tl.float32),
+                    tl.where(lo_m == 6, 4.0, 6.0),
+                ),
+            )
+            hi_abs = tl.where(
+                hi_m <= 3,
+                hi_m.to(tl.float32) * 0.5,
+                tl.where(
+                    hi_m <= 5,
+                    (hi_m - 2).to(tl.float32),
+                    tl.where(hi_m == 6, 4.0, 6.0),
+                ),
+            )
+            lo_val = tl.where((lo & 0x8) != 0, -lo_abs, lo_abs) * scale
+            hi_val = tl.where((hi & 0x8) != 0, -hi_abs, hi_abs) * scale
+
+            out_row_base = out + rows[:, None] * (HALF_DIM * 2)
+            tl.store(out_row_base + even_cols[None, :], lo_val.to(tl.bfloat16), mask=valid[:, None])
+            tl.store(out_row_base + odd_cols[None, :], hi_val.to(tl.bfloat16), mask=valid[:, None])
+
+    def _is_mxfp4_engram_active() -> bool:
+        try:
+            hf_cfg = get_current_vllm_config().model_config.hf_config
+            qcfg = getattr(hf_cfg, "quantization_config", None) or {}
+            return str(qcfg.get("engram_embed_quant", "")).lower() == "mxfp4"
+        except Exception:
+            return False
+
+    orig_base_alloc = c_engram.ParallelEngramEmbedding._allocate_weights
+    orig_base_lookup = c_engram.ParallelEngramEmbedding.lookup
+    orig_nv_alloc = nv_engram.ParallelEngramEmbedding._allocate_weights
+
+    def _patched_base_alloc(self: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        if not _is_mxfp4_engram_active():
+            return orig_base_alloc(self)
+        self._zstep_is_mxfp4 = True
+        return (
+            torch.empty(self.part_num_embeddings, self.dim // 2, dtype=torch.uint8),
+            torch.empty(
+                self.part_num_embeddings, self.dim // self.block_size, dtype=torch.uint8
+            ),
+        )
+
+    def _patched_nv_alloc(self: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        if not _is_mxfp4_engram_active():
+            return orig_nv_alloc(self)
+        self._zstep_is_mxfp4 = True
+        if not self.cpu_offload:
+            return _patched_base_alloc(self)
+        half_dim = self.dim // 2
+        if self.use_thp:
+            weight_bytes = self.part_num_embeddings * half_dim
+            scale_bytes = self.part_num_embeddings * (self.dim // self.block_size)
+            packed = nv_engram._allocate_huge_page_storage(weight_bytes + scale_bytes)
+            if packed is not None:
+                self._packed = packed
+                return (
+                    packed[:weight_bytes].view(torch.uint8).view(-1, half_dim),
+                    packed[weight_bytes:].view(torch.uint8).view(-1, self.dim // self.block_size),
+                )
+        return (
+            torch.empty(
+                self.part_num_embeddings,
+                half_dim,
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=True,
+            ),
+            torch.empty(
+                self.part_num_embeddings,
+                self.dim // self.block_size,
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=True,
+            ),
+        )
+
+    def _patched_base_lookup(
+        self: Any, indices: torch.Tensor, out: torch.Tensor, background: bool = False
+    ) -> None:
+        if not getattr(self, "_zstep_is_mxfp4", False):
+            return orig_base_lookup(self, indices, out, background=background)
+        rows = indices.shape[0] * self.part_n_hash_cols
+        if not rows:
+            return
+        weight, scales = self._storage()
+        tiles = triton.cdiv(rows, 16)
+        grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
+        _engram_mxfp4_lookup_kernel[(grid,)](
+            weight,
+            scales,
+            indices,
+            out,
+            self.vocab_start_idx,
+            self.vocab_end_idx,
+            rows,
+            indices.stride(0),
+            indices.stride(1),
+            HEAD_START=self.head_start,
+            LOCAL_HEADS=self.part_n_hash_cols,
+            TOTAL_HEADS=self.n_hash_cols,
+            HALF_DIM=self.dim // 2,
+            QUANT_BLOCK=self.block_size,
+            BLOCK_R=16,
+            GRID=grid,
+        )
+
+    c_engram.ParallelEngramEmbedding._allocate_weights = _patched_base_alloc
+    c_engram.ParallelEngramEmbedding.lookup = _patched_base_lookup
+    nv_engram.ParallelEngramEmbedding._allocate_weights = _patched_nv_alloc
     return True
 
 

@@ -16,7 +16,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import ctypes
+from dataclasses import dataclass
 import logging
+import os
 from typing import Any
 
 _LOG = logging.getLogger(__name__)
@@ -25,6 +27,55 @@ CUDA_SUCCESS: int = 0
 CUDA_ERROR_NOT_READY: int = 600
 CUDA_ERROR_NOT_SUPPORTED: int = 801
 CU_EVENT_DISABLE_TIMING: int = 0x2
+
+CU_MEM_ALLOC_TYPE_PINNED: int = 1
+CU_MEM_LOCATION_TYPE_DEVICE: int = 1
+CU_MEM_HANDLE_TYPE_NONE: int = 0
+CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR: int = 1
+CU_MEM_ALLOC_GRANULARITY_RECOMMENDED: int = 1
+CU_MEM_ACCESS_FLAGS_PROT_READWRITE: int = 3
+DEFAULT_VMM_BASE_VA: int = 0x0800_0000_0000
+DEFAULT_VMM_RANK_STRIDE: int = 1 << 40
+
+
+class CUmemLocation(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("id", ctypes.c_int),
+    ]
+
+
+class CUmemAllocationProp(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("requestedHandleTypes", ctypes.c_int),
+        ("location", CUmemLocation),
+        ("win32HandleMetaData", ctypes.c_void_p),
+        ("allocFlags", ctypes.c_ubyte * 8),
+        ("_reserved_tail", ctypes.c_ubyte * 32),
+    ]
+
+
+class CUmemAccessDesc(ctypes.Structure):
+    _fields_ = [
+        ("location", CUmemLocation),
+        ("flags", ctypes.c_int),
+    ]
+
+
+@dataclass
+class VmmAllocationHandle:
+    """CUDA 13 Virtual Memory Management fixed-VA allocation and optional POSIX FD."""
+
+    va_ptr: int
+    size_bytes: int
+    granularity_bytes: int
+    alloc_handle: int
+    device_id: int
+    exact_va_honored: bool
+    exported_fd: int = -1
+    peer_device_ids: tuple[int, ...] = ()
+    closed: bool = False
 
 
 class CudaDriverError(RuntimeError):
@@ -56,6 +107,16 @@ class CudaDriverGuard:
         self._cu_event_record: Any = None
         self._cu_event_query: Any = None
         self._cu_stream_wait_event: Any = None
+        self._cu_mem_get_granularity: Any = None
+        self._cu_mem_create: Any = None
+        self._cu_mem_release: Any = None
+        self._cu_mem_addr_reserve: Any = None
+        self._cu_mem_addr_free: Any = None
+        self._cu_mem_map: Any = None
+        self._cu_mem_unmap: Any = None
+        self._cu_mem_set_access: Any = None
+        self._cu_mem_export_fd: Any = None
+        self._cu_mem_import_fd: Any = None
         self._bind_symbols()
 
     def _bind_symbols(self) -> None:
@@ -141,6 +202,102 @@ class CudaDriverGuard:
             stream_wait.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
             stream_wait.restype = ctypes.c_int
             self._cu_stream_wait_event = stream_wait
+
+        # 3. CUDA Virtual Memory Management (VMM) symbols via CDLL (control-plane setup).
+        gran = getattr(self._cdll, "cuMemGetAllocationGranularity", None)
+        if gran is not None:
+            gran.argtypes = [
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(CUmemAllocationProp),
+                ctypes.c_int,
+            ]
+            gran.restype = ctypes.c_int
+            self._cu_mem_get_granularity = gran
+
+        mem_create = getattr(self._cdll, "cuMemCreate", None)
+        if mem_create is not None:
+            mem_create.argtypes = [
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.c_size_t,
+                ctypes.POINTER(CUmemAllocationProp),
+                ctypes.c_ulonglong,
+            ]
+            mem_create.restype = ctypes.c_int
+            self._cu_mem_create = mem_create
+
+        mem_release = getattr(self._cdll, "cuMemRelease", None)
+        if mem_release is not None:
+            mem_release.argtypes = [ctypes.c_uint64]
+            mem_release.restype = ctypes.c_int
+            self._cu_mem_release = mem_release
+
+        addr_res = getattr(self._cdll, "cuMemAddressReserve", None)
+        if addr_res is not None:
+            addr_res.argtypes = [
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.c_uint64,
+                ctypes.c_ulonglong,
+            ]
+            addr_res.restype = ctypes.c_int
+            self._cu_mem_addr_reserve = addr_res
+
+        addr_free = getattr(self._cdll, "cuMemAddressFree", None)
+        if addr_free is not None:
+            addr_free.argtypes = [ctypes.c_uint64, ctypes.c_size_t]
+            addr_free.restype = ctypes.c_int
+            self._cu_mem_addr_free = addr_free
+
+        mem_map = getattr(self._cdll, "cuMemMap", None)
+        if mem_map is not None:
+            mem_map.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.c_uint64,
+                ctypes.c_ulonglong,
+            ]
+            mem_map.restype = ctypes.c_int
+            self._cu_mem_map = mem_map
+
+        mem_unmap = getattr(self._cdll, "cuMemUnmap", None)
+        if mem_unmap is not None:
+            mem_unmap.argtypes = [ctypes.c_uint64, ctypes.c_size_t]
+            mem_unmap.restype = ctypes.c_int
+            self._cu_mem_unmap = mem_unmap
+
+        set_acc = getattr(self._cdll, "cuMemSetAccess", None)
+        if set_acc is not None:
+            set_acc.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_size_t,
+                ctypes.POINTER(CUmemAccessDesc),
+                ctypes.c_size_t,
+            ]
+            set_acc.restype = ctypes.c_int
+            self._cu_mem_set_access = set_acc
+
+        exp_fd = getattr(self._cdll, "cuMemExportToShareableHandle", None)
+        if exp_fd is not None:
+            exp_fd.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_ulonglong,
+            ]
+            exp_fd.restype = ctypes.c_int
+            self._cu_mem_export_fd = exp_fd
+
+        imp_fd = getattr(self._cdll, "cuMemImportFromShareableHandle", None)
+        if imp_fd is not None:
+            imp_fd.argtypes = [
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+            imp_fd.restype = ctypes.c_int
+            self._cu_mem_import_fd = imp_fd
 
     @property
     def batch_memcpy_version(self) -> int:
@@ -296,6 +453,178 @@ class CudaDriverGuard:
                 int(self._cu_memcpy_async(int(dst), int(src), int(nbytes), stream_ptr)),
             )
         return "async_loop"
+
+    @property
+    def has_vmm_ops(self) -> bool:
+        return all(
+            fn is not None
+            for fn in (
+                self._cu_mem_get_granularity,
+                self._cu_mem_create,
+                self._cu_mem_release,
+                self._cu_mem_addr_reserve,
+                self._cu_mem_addr_free,
+                self._cu_mem_map,
+                self._cu_mem_unmap,
+                self._cu_mem_set_access,
+            )
+        )
+
+    def _make_vmm_prop(self, device_id: int, *, export_posix_fd: bool) -> CUmemAllocationProp:
+        prop = CUmemAllocationProp()
+        prop.type = CU_MEM_ALLOC_TYPE_PINNED
+        prop.requestedHandleTypes = (
+            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+            if export_posix_fd
+            else CU_MEM_HANDLE_TYPE_NONE
+        )
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE
+        prop.location.id = int(device_id)
+        return prop
+
+    def vmm_allocation_granularity(
+        self, device_id: int, *, export_posix_fd: bool = False
+    ) -> int:
+        if not self.has_vmm_ops:
+            raise CudaDriverError("cuMemGetAllocationGranularity", CUDA_ERROR_NOT_SUPPORTED)
+        prop = self._make_vmm_prop(device_id, export_posix_fd=export_posix_fd)
+        gran = ctypes.c_size_t(0)
+        _check_cu(
+            "cuMemGetAllocationGranularity",
+            int(
+                self._cu_mem_get_granularity(
+                    ctypes.byref(gran),
+                    ctypes.byref(prop),
+                    CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+                )
+            ),
+        )
+        return int(gran.value)
+
+    def vmm_alloc_and_map_fixed_va(
+        self,
+        *,
+        device_id: int,
+        size_bytes: int,
+        target_va: int = DEFAULT_VMM_BASE_VA,
+        peer_device_ids: Sequence[int] = (),
+        export_posix_fd: bool = False,
+    ) -> VmmAllocationHandle:
+        """Allocate physical HBM via `cuMemCreate` and map at deterministic fixed VA."""
+        if size_bytes <= 0:
+            raise ValueError(f"size_bytes must be > 0 (got {size_bytes})")
+        if not self.has_vmm_ops:
+            raise CudaDriverError("cuMemCreate", CUDA_ERROR_NOT_SUPPORTED)
+
+        gran = self.vmm_allocation_granularity(device_id, export_posix_fd=export_posix_fd)
+        aligned_size = ((int(size_bytes) + gran - 1) // gran) * gran
+        prop = self._make_vmm_prop(device_id, export_posix_fd=export_posix_fd)
+
+        alloc_handle = ctypes.c_uint64(0)
+        _check_cu(
+            "cuMemCreate",
+            int(self._cu_mem_create(ctypes.byref(alloc_handle), aligned_size, ctypes.byref(prop), 0)),
+        )
+        va_ptr = ctypes.c_uint64(0)
+        mapped = False
+        fd_val = -1
+        try:
+            _check_cu(
+                "cuMemAddressReserve",
+                int(
+                    self._cu_mem_addr_reserve(
+                        ctypes.byref(va_ptr),
+                        aligned_size,
+                        gran,
+                        int(target_va),
+                        0,
+                    )
+                ),
+            )
+            _check_cu(
+                "cuMemMap",
+                int(self._cu_mem_map(va_ptr.value, aligned_size, 0, alloc_handle.value, 0)),
+            )
+            mapped = True
+
+            access_devs = [int(device_id)]
+            for pid in peer_device_ids:
+                if int(pid) not in access_devs:
+                    access_devs.append(int(pid))
+            desc_arr = (CUmemAccessDesc * len(access_devs))()
+            for idx, did in enumerate(access_devs):
+                desc_arr[idx].location.type = CU_MEM_LOCATION_TYPE_DEVICE
+                desc_arr[idx].location.id = did
+                desc_arr[idx].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+            _check_cu(
+                "cuMemSetAccess",
+                int(self._cu_mem_set_access(va_ptr.value, aligned_size, desc_arr, len(access_devs))),
+            )
+
+            if export_posix_fd:
+                if self._cu_mem_export_fd is None:
+                    raise CudaDriverError("cuMemExportToShareableHandle", CUDA_ERROR_NOT_SUPPORTED)
+                raw_fd = ctypes.c_int(-1)
+                _check_cu(
+                    "cuMemExportToShareableHandle",
+                    int(
+                        self._cu_mem_export_fd(
+                            ctypes.byref(raw_fd),
+                            alloc_handle.value,
+                            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+                            0,
+                        )
+                    ),
+                )
+                fd_val = int(raw_fd.value)
+        except BaseException:
+            if fd_val >= 0:
+                try:
+                    os.close(fd_val)
+                except OSError:
+                    pass
+            if mapped and va_ptr.value:
+                self._cu_mem_unmap(va_ptr.value, aligned_size)
+            if va_ptr.value:
+                self._cu_mem_addr_free(va_ptr.value, aligned_size)
+            if alloc_handle.value:
+                self._cu_mem_release(alloc_handle.value)
+            raise
+
+        return VmmAllocationHandle(
+            va_ptr=int(va_ptr.value),
+            size_bytes=aligned_size,
+            granularity_bytes=gran,
+            alloc_handle=int(alloc_handle.value),
+            device_id=int(device_id),
+            exact_va_honored=(int(va_ptr.value) == int(target_va)),
+            exported_fd=fd_val,
+            peer_device_ids=tuple(int(p) for p in peer_device_ids),
+        )
+
+    def vmm_free(self, handle: VmmAllocationHandle) -> None:
+        """Unmap, free reserved VA, close exported POSIX FD, and release physical HBM idempotently."""
+        if handle.closed:
+            return
+        handle.closed = True
+        if handle.exported_fd >= 0:
+            try:
+                os.close(handle.exported_fd)
+            except OSError:
+                pass
+            handle.exported_fd = -1
+        if handle.va_ptr and self._cu_mem_unmap is not None:
+            res = int(self._cu_mem_unmap(handle.va_ptr, handle.size_bytes))
+            if res != CUDA_SUCCESS:
+                _LOG.warning("cuMemUnmap(%#x) returned CUresult=%d", handle.va_ptr, res)
+        if handle.va_ptr and self._cu_mem_addr_free is not None:
+            res = int(self._cu_mem_addr_free(handle.va_ptr, handle.size_bytes))
+            if res != CUDA_SUCCESS:
+                _LOG.warning("cuMemAddressFree(%#x) returned CUresult=%d", handle.va_ptr, res)
+        if handle.alloc_handle and self._cu_mem_release is not None:
+            res = int(self._cu_mem_release(handle.alloc_handle))
+            if res != CUDA_SUCCESS:
+                _LOG.warning("cuMemRelease(%#x) returned CUresult=%d", handle.alloc_handle, res)
 
 
 _CACHED_DRIVER: CudaDriverGuard | None = None

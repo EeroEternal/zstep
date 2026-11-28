@@ -371,3 +371,80 @@ def test_host_dram_kv_tier_partial_init_and_sticky_error_close_safety() -> None:
     assert len(destroyed) == 2
     assert tier._cuda_driver is None
 
+
+def test_cuda_driver_guard_vmm_fixed_va_alloc_access_and_idempotent_free() -> None:
+    from zstep_worker.cuda_driver import DEFAULT_VMM_BASE_VA
+
+    libs = _FakeCudaLibs(batch_version=2)
+    vmm_calls: list[tuple[str, tuple]] = []
+
+    def _gran(out_gran, _prop, _option) -> int:
+        out_gran._obj.value = 2 * 1024 * 1024
+        vmm_calls.append(("cuMemGetAllocationGranularity", ()))
+        return CUDA_SUCCESS
+
+    def _create(out_handle, size, _prop, _flags) -> int:
+        out_handle._obj.value = 0xCAFE_1234
+        vmm_calls.append(("cuMemCreate", (int(size),)))
+        return CUDA_SUCCESS
+
+    def _reserve(out_ptr, size, align, addr, _flags) -> int:
+        out_ptr._obj.value = int(addr)
+        vmm_calls.append(("cuMemAddressReserve", (int(size), int(align), int(addr))))
+        return CUDA_SUCCESS
+
+    def _map(ptr, size, _off, handle, _flags) -> int:
+        vmm_calls.append(("cuMemMap", (int(ptr), int(size), int(handle))))
+        return CUDA_SUCCESS
+
+    def _set_access(ptr, size, _descs, count) -> int:
+        vmm_calls.append(("cuMemSetAccess", (int(ptr), int(size), int(count))))
+        return CUDA_SUCCESS
+
+    def _unmap(ptr, size) -> int:
+        vmm_calls.append(("cuMemUnmap", (int(ptr), int(size))))
+        return CUDA_SUCCESS
+
+    def _addr_free(ptr, size) -> int:
+        vmm_calls.append(("cuMemAddressFree", (int(ptr), int(size))))
+        return CUDA_SUCCESS
+
+    def _release(handle) -> int:
+        vmm_calls.append(("cuMemRelease", (int(handle),)))
+        return CUDA_SUCCESS
+
+    libs.cdll.cuMemGetAllocationGranularity = _FakeFunc(_gran)
+    libs.cdll.cuMemCreate = _FakeFunc(_create)
+    libs.cdll.cuMemAddressReserve = _FakeFunc(_reserve)
+    libs.cdll.cuMemMap = _FakeFunc(_map)
+    libs.cdll.cuMemSetAccess = _FakeFunc(_set_access)
+    libs.cdll.cuMemUnmap = _FakeFunc(_unmap)
+    libs.cdll.cuMemAddressFree = _FakeFunc(_addr_free)
+    libs.cdll.cuMemRelease = _FakeFunc(_release)
+
+    guard = CudaDriverGuard(libs.cdll, libs.pydll)
+    assert guard.has_vmm_ops is True
+    h = guard.vmm_alloc_and_map_fixed_va(
+        device_id=0,
+        size_bytes=3 * 1024 * 1024,  # rounds up to 4 MiB (2 MiB granularity)
+        target_va=DEFAULT_VMM_BASE_VA,
+        peer_device_ids=(1, 2, 3),
+    )
+    assert h.va_ptr == DEFAULT_VMM_BASE_VA
+    assert h.exact_va_honored is True
+    assert h.size_bytes == 4 * 1024 * 1024
+    assert h.granularity_bytes == 2 * 1024 * 1024
+    assert h.peer_device_ids == (1, 2, 3)
+
+    guard.vmm_free(h)
+    guard.vmm_free(h)  # idempotent
+    assert [name for name, _ in vmm_calls] == [
+        "cuMemGetAllocationGranularity",
+        "cuMemCreate",
+        "cuMemAddressReserve",
+        "cuMemMap",
+        "cuMemSetAccess",
+        "cuMemUnmap",
+        "cuMemAddressFree",
+        "cuMemRelease",
+    ]

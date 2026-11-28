@@ -13,11 +13,18 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 import logging
+from typing import Any
 
 import numpy as np
 import torch
 
 from zstep_worker.cuda_driver import CudaDriverGuard, load_cuda_driver
+from zstep_worker.env_config import VALID_KV_DRAM_CODECS
+from zstep_worker.kernels_sm120.kv_rans_codec import (
+    decode_lossless_kv_packet,
+    encode_lossless_kv_packet,
+    get_kv_rans_codec_extension,
+)
 from zstep_worker.numa_pin import bind_memory_to_numa_node
 
 _LOG = logging.getLogger(__name__)
@@ -48,16 +55,23 @@ class HostDramKvTier:
         numa_node: int = -1,
         enable_driver_batch_memcpy: bool = True,
         cuda_driver: CudaDriverGuard | None = None,
+        codec: str = "none",
     ) -> None:
         if total_hbm_blocks <= 0:
             raise ValueError(f"total_hbm_blocks must be > 0 (got {total_hbm_blocks})")
         if num_dram_blocks <= 0:
             raise ValueError(f"num_dram_blocks must be > 0 (got {num_dram_blocks})")
+        norm_codec = codec.strip().lower() or "none"
+        if norm_codec not in VALID_KV_DRAM_CODECS:
+            raise ValueError(
+                f"Unsupported HostDramKvTier codec={codec!r}; expected one of {sorted(VALID_KV_DRAM_CODECS)}"
+            )
 
         self.total_hbm_blocks: int = int(total_hbm_blocks)
         self.num_dram_blocks: int = int(num_dram_blocks)
         self.device: torch.device = device
         self.numa_node: int = int(numa_node)
+        self.codec: str = norm_codec
         self._layers: list[_LayerSliceSpec] = []
 
         offset = 0
@@ -122,9 +136,43 @@ class HostDramKvTier:
         self.batch_memcpy_calls: int = 0
         self.batch_memcpy_segments: int = 0
         self.last_batch_mode: str = "torch_copy"
+        self.raw_bytes_offloaded: int = 0
+        self.compressed_bytes_offloaded: int = 0
+        self.crc32_verified_blocks: int = 0
+        self.gpu_rans_chunks_encoded: int = 0
+        self.gpu_rans_chunks_decoded: int = 0
+        self._compressed_packets: list[bytes | None] = (
+            [None] * self.num_dram_blocks if self.codec != "none" else []
+        )
+        self._gpu_rans_slots: list[tuple[list[bytes], list[int], list[int]] | None] = (
+            [None] * self.num_dram_blocks if self.codec == "rans_gpu" else []
+        )
+        self._rans_ext: object | None = None
+        self._rans_gpu_slot_buf: torch.Tensor | None = None
+        self._rans_gpu_chunk_buf: torch.Tensor | None = None
+        self._rans_gpu_split_buf: torch.Tensor | None = None
+        self._rans_gpu_lens: torch.Tensor | None = None
+        self._rans_gpu_crc: torch.Tensor | None = None
+        self._rans_gpu_err: torch.Tensor | None = None
+        if self.codec == "rans_gpu" and pin:
+            ext = get_kv_rans_codec_extension()
+            slot_stride = int(ext.kv_rans_slot_stride())
+            self._rans_ext = ext
+            self._rans_gpu_slot_buf = torch.empty(
+                (slot_stride,), dtype=torch.uint8, device=device
+            )
+            self._rans_gpu_chunk_buf = torch.empty(
+                (74752,), dtype=torch.uint8, device=device
+            )
+            self._rans_gpu_split_buf = torch.empty(
+                (74752,), dtype=torch.uint8, device=device
+            )
+            self._rans_gpu_lens = torch.empty((1,), dtype=torch.int32, device=device)
+            self._rans_gpu_crc = torch.empty((1,), dtype=torch.int32, device=device)
+            self._rans_gpu_err = torch.zeros((1,), dtype=torch.int32, device=device)
         _LOG.info(
             "Initialized HostDramKvTier: blocks=%d, layers=%d, bytes_per_block=%d "
-            "(total=%.2f GiB), pinned=%s, numa_node=%d, numa_bound=%s, driver_batch=%s",
+            "(total=%.2f GiB), pinned=%s, numa_node=%d, numa_bound=%s, driver_batch=%s, codec=%s",
             self.num_dram_blocks,
             len(self._layers),
             self.bytes_per_block,
@@ -133,7 +181,15 @@ class HostDramKvTier:
             self.numa_node,
             self.numa_bound,
             self._cuda_driver.batch_memcpy_version if self._cuda_driver is not None else 0,
+            self.codec,
         )
+
+    @property
+    def compression_ratio(self) -> float:
+        """Measured lossless compression ratio across offloaded KV blocks (`1.0` when `codec='none'`)."""
+        if self.compressed_bytes_offloaded <= 0:
+            return 1.0
+        return self.raw_bytes_offloaded / float(self.compressed_bytes_offloaded)
 
     def close(self) -> None:
         """Destroy any pre-allocated CUDA driver events safely and idempotently."""
@@ -173,6 +229,9 @@ class HostDramKvTier:
         for all `count * num_layers` page copies in a single driver call.
         """
         if count <= 0 or not self._layers:
+            return
+        if self.codec != "none":
+            self._execute_codec_transfers(hbm_page_ids, dram_slot_ids, directions, count)
             return
         if self._copy_stream is not None and self._cuda_driver is not None:
             compute_stream = torch.cuda.current_stream(self.device)
@@ -288,3 +347,190 @@ class HostDramKvTier:
                 self.reload_ops += 1
             else:
                 raise ValueError(f"Unknown KvTransfer direction={direction}")
+
+    def _execute_codec_transfers(
+        self,
+        hbm_page_ids: np.ndarray,
+        dram_slot_ids: np.ndarray,
+        directions: np.ndarray,
+        count: int,
+    ) -> None:
+        """Execute lossless CRC32-authenticated multi-plane KV transfers (`rans_gpu` or `lossless`)."""
+        use_gpu_rans = (
+            self.codec == "rans_gpu"
+            and self._rans_ext is not None
+            and self._copy_stream is not None
+        )
+        if self._copy_stream is not None:
+            compute_stream = torch.cuda.current_stream(self.device)
+            self._copy_stream.wait_stream(compute_stream)
+
+        for i in range(count):
+            hbm_id = int(hbm_page_ids[i])
+            dram_id = int(dram_slot_ids[i])
+            direction = int(directions[i])
+            if not (0 <= hbm_id < self.total_hbm_blocks):
+                raise ValueError(
+                    f"KvTransfer hbm_page_id={hbm_id} out of bounds [0, {self.total_hbm_blocks})"
+                )
+            if not (0 <= dram_id < self.num_dram_blocks):
+                raise ValueError(
+                    f"KvTransfer dram_slot_id={dram_id} out of bounds [0, {self.num_dram_blocks})"
+                )
+            if direction not in (KV_TRANSFER_DIR_D2H, KV_TRANSFER_DIR_H2D):
+                raise ValueError(f"Unknown KvTransfer direction={direction}")
+
+            if use_gpu_rans and all(layer.bytes_per_block <= 74752 for layer in self._layers):
+                self._dispatch_single_gpu_rans(hbm_id, dram_id, direction)
+            else:
+                self._dispatch_single_host_lossless(hbm_id, dram_id, direction)
+
+        if self._copy_stream is not None:
+            compute_stream = torch.cuda.current_stream(self.device)
+            compute_stream.wait_stream(self._copy_stream)
+
+    def _dispatch_single_gpu_rans(self, hbm_id: int, dram_id: int, direction: int) -> None:
+        assert self._rans_ext is not None and self._copy_stream is not None
+        assert self._rans_gpu_slot_buf is not None and self._rans_gpu_chunk_buf is not None
+        assert self._rans_gpu_split_buf is not None and self._rans_gpu_lens is not None
+        assert self._rans_gpu_crc is not None and self._rans_gpu_err is not None
+        ext: Any = self._rans_ext
+        stream_ptr = int(self._copy_stream.cuda_stream)
+
+        with torch.cuda.stream(self._copy_stream):
+            if direction == KV_TRANSFER_DIR_D2H:
+                blobs: list[bytes] = []
+                lens_list: list[int] = []
+                crc_list: list[int] = []
+                total_comp = 0
+                for layer in self._layers:
+                    bpb = layer.bytes_per_block
+                    src_gpu = layer.gpu_flat[hbm_id]
+                    if bpb in (37376, 74752):
+                        rows = bpb // 584
+                        split_view = self._rans_gpu_split_buf[:bpb]
+                        ext.launch_kv_page_split(split_view, src_gpu, rows, 584, 1, 0, stream_ptr)
+                        enc_in = split_view
+                    elif bpb in (36864, 73728):
+                        rows = bpb // 576
+                        split_view = self._rans_gpu_split_buf[:bpb]
+                        ext.launch_kv_page_split(split_view, src_gpu, rows, 576, 1, 0, stream_ptr)
+                        enc_in = split_view
+                    else:
+                        enc_in = src_gpu
+                    ext.launch_kv_rans32_encode(
+                        enc_in,
+                        bpb,
+                        self._rans_gpu_slot_buf,
+                        self._rans_gpu_lens,
+                        self._rans_gpu_crc,
+                        1,
+                        stream_ptr,
+                    )
+                    self._copy_stream.synchronize()
+                    clen = int(self._rans_gpu_lens[0].item())
+                    crc_val = int(self._rans_gpu_crc[0].item())
+                    host_slice = self.dram_arena[dram_id, :clen]
+                    host_slice.copy_(self._rans_gpu_slot_buf[:clen], non_blocking=False)
+                    blobs.append(bytes(host_slice.numpy().tobytes()))
+                    lens_list.append(clen)
+                    crc_list.append(crc_val)
+                    total_comp += clen
+                    self.gpu_rans_chunks_encoded += 1
+                self._gpu_rans_slots[dram_id] = (blobs, lens_list, crc_list)
+                self.raw_bytes_offloaded += self.bytes_per_block
+                self.compressed_bytes_offloaded += total_comp
+                self.offload_ops += 1
+                self.last_batch_mode = "rans_gpu"
+            else:
+                slot_entry = self._gpu_rans_slots[dram_id]
+                if slot_entry is None:
+                    raise ValueError(f"DRAM slot {dram_id} has no encoded rANS payload")
+                blobs, lens_list, crc_list = slot_entry
+                self._rans_gpu_err.zero_()
+                for layer, blob, clen, crc_val in zip(
+                    self._layers, blobs, lens_list, crc_list, strict=True
+                ):
+                    bpb = layer.bytes_per_block
+                    if len(blob) != clen:
+                        raise ValueError("Corrupted rANS slot payload length")
+                    host_slice = self.dram_arena[dram_id, :clen]
+                    host_slice.copy_(torch.frombuffer(bytearray(blob), dtype=torch.uint8))
+                    self._rans_gpu_slot_buf[:clen].copy_(host_slice, non_blocking=False)
+                    self._rans_gpu_lens[0] = clen
+                    self._rans_gpu_crc[0] = crc_val
+                    if bpb in (37376, 74752):
+                        rows, stride = bpb // 584, 584
+                        dec_out = self._rans_gpu_split_buf[:bpb]
+                    elif bpb in (36864, 73728):
+                        rows, stride = bpb // 576, 576
+                        dec_out = self._rans_gpu_split_buf[:bpb]
+                    else:
+                        rows, stride = 0, 0
+                        dec_out = layer.gpu_flat[hbm_id]
+                    ext.launch_kv_rans32_decode(
+                        self._rans_gpu_slot_buf,
+                        self._rans_gpu_lens,
+                        self._rans_gpu_crc,
+                        dec_out,
+                        bpb,
+                        1,
+                        self._rans_gpu_err,
+                        stream_ptr,
+                    )
+                    if stride in (576, 584):
+                        ext.launch_kv_page_split(
+                            layer.gpu_flat[hbm_id], dec_out, rows, stride, 1, 1, stream_ptr
+                        )
+                    self.gpu_rans_chunks_decoded += 1
+                self._copy_stream.synchronize()
+                err_code = int(self._rans_gpu_err[0].item())
+                if err_code != 0:
+                    raise ValueError(
+                        f"GPU rANS KV decode failed CRC32/bounds verification (err_flag={err_code})"
+                    )
+                self.crc32_verified_blocks += 1
+                self.reload_ops += 1
+                self.last_batch_mode = "rans_gpu"
+
+    def _dispatch_single_host_lossless(self, hbm_id: int, dram_id: int, direction: int) -> None:
+        dram_row = self.dram_arena[dram_id]
+        if direction == KV_TRANSFER_DIR_D2H:
+            for layer in self._layers:
+                dst = dram_row[layer.dram_offset : layer.dram_offset + layer.bytes_per_block]
+                dst.copy_(layer.gpu_flat[hbm_id], non_blocking=False)
+            raw_bytes = bytes(dram_row.numpy().tobytes())
+            row_stride = (
+                584
+                if self.bytes_per_block == 128 * 584
+                else (576 if self.bytes_per_block == 128 * 576 else 0)
+            )
+            pkt, stats = encode_lossless_kv_packet(
+                raw_bytes, rows=128 if row_stride else 0, row_stride=row_stride
+            )
+            self._compressed_packets[dram_id] = pkt
+            self.raw_bytes_offloaded += stats.raw_bytes
+            self.compressed_bytes_offloaded += stats.compressed_bytes
+            self.offload_ops += 1
+            self.last_batch_mode = "lossless_zkv1"
+        else:
+            pkt_opt = self._compressed_packets[dram_id]
+            if pkt_opt is None:
+                raise ValueError(f"DRAM slot {dram_id} has no lossless packet stored")
+            row_stride = (
+                584
+                if self.bytes_per_block == 128 * 584
+                else (576 if self.bytes_per_block == 128 * 576 else 0)
+            )
+            restored = decode_lossless_kv_packet(
+                pkt_opt, rows=128 if row_stride else 0, row_stride=row_stride
+            )
+            if len(restored) != self.bytes_per_block:
+                raise ValueError("Restored KV block byte length mismatch")
+            dram_row.copy_(torch.frombuffer(bytearray(restored), dtype=torch.uint8))
+            for layer in self._layers:
+                src = dram_row[layer.dram_offset : layer.dram_offset + layer.bytes_per_block]
+                layer.gpu_flat[hbm_id].copy_(src, non_blocking=False)
+            self.crc32_verified_blocks += 1
+            self.reload_ops += 1
+            self.last_batch_mode = "lossless_zkv1"
