@@ -70,7 +70,7 @@ def get_host_mapped_allreduce_extension():
     if _EXTENSION is None:
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
         _EXTENSION = load_inline(
-            name="zstep_shm_allreduce_sm120_v34_ext",
+            name="zstep_shm_allreduce_sm120_v36_ext",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -93,6 +93,7 @@ def get_host_mapped_allreduce_extension():
                 "launch_ar_mhc_decode",
                 "launch_local_top2_bf16",
                 "launch_tp8_argmax_gather_shm",
+                "launch_dspark_verify_prep",
             ],
             extra_cflags=["-O3"],
             extra_cuda_cflags=[

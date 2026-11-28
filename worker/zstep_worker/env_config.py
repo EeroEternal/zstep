@@ -133,6 +133,8 @@ class WorkerRuntimeConfig:
     prefill_runahead_depth: int = 2
     disable_verify_graphs: bool = False
     disable_draft_graphs: bool = False
+    enable_fused_spec_graph: bool = True
+    dspark_conf_threshold: float = 0.0
 
     # Collectives & PCIe Topology
     p2p_mode: str = "auto"
@@ -162,6 +164,7 @@ class WorkerRuntimeConfig:
     pipeline_parallel_size: int = 1
     pp_prefill_microbatches: int = 4
     pp_engram_gpu_layers: int = 1
+    engram_gpu_layers: int = 1
     b12x_compat_dir: str = ""
     b12x_cache_dir: str | None = None
     b12x_autotune: bool = True
@@ -291,6 +294,21 @@ class WorkerRuntimeConfig:
                 "ZSTEP_PP_ENGRAM_GPU_LAYERS must be >= 0 "
                 f"(got {pp_engram_gpu_layers})"
             )
+        engram_gpu_layers = env_int(
+            "ZSTEP_ENGRAM_GPU_LAYERS", pp_engram_gpu_layers, environ=env
+        )
+        if engram_gpu_layers < 0:
+            raise ValueError(
+                f"ZSTEP_ENGRAM_GPU_LAYERS must be >= 0 (got {engram_gpu_layers})"
+            )
+        dspark_conf_threshold = env_float(
+            "ZSTEP_DSPARK_CONF_THRESHOLD", 0.0, environ=env
+        )
+        if not 0.0 <= dspark_conf_threshold < 1.0:
+            raise ValueError(
+                "ZSTEP_DSPARK_CONF_THRESHOLD must be in [0.0, 1.0) "
+                f"(got {dspark_conf_threshold})"
+            )
 
         raw_cache_dir = env.get("ZSTEP_B12X_CACHE_DIR")
         b12x_cache_dir = (
@@ -315,6 +333,10 @@ class WorkerRuntimeConfig:
             disable_draft_graphs=env_flag(
                 "ZSTEP_DISABLE_DRAFT_GRAPHS", default=False, environ=env
             ),
+            enable_fused_spec_graph=env_flag(
+                "ZSTEP_ENABLE_FUSED_SPEC_GRAPH", default=True, environ=env
+            ),
+            dspark_conf_threshold=dspark_conf_threshold,
             p2p_mode=p2p_mode,
             p2p_min_pxb_bi_gbps=p2p_min_pxb_bi_gbps,
             shm_enable_pxb_p2p=env_flag(
@@ -360,6 +382,7 @@ class WorkerRuntimeConfig:
             pipeline_parallel_size=pipeline_parallel_size,
             pp_prefill_microbatches=pp_prefill_microbatches,
             pp_engram_gpu_layers=pp_engram_gpu_layers,
+            engram_gpu_layers=engram_gpu_layers,
             b12x_compat_dir=env.get("ZSTEP_B12X_COMPAT_DIR", "").strip(),
             b12x_cache_dir=b12x_cache_dir,
             b12x_autotune=env_flag("ZSTEP_B12X_AUTOTUNE", default=True, environ=env),

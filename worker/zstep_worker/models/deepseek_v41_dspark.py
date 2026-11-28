@@ -29,7 +29,10 @@ import torch
 import torch.distributed as dist
 
 from zstep_worker.env_config import WorkerRuntimeConfig
-from zstep_worker.shm_bridge import DECODE_GRAPH_BUCKETS, select_decode_bucket
+from zstep_worker.kernels_sm120.shm_allreduce import (
+    get_host_mapped_allreduce_extension,
+)
+from zstep_worker.shm_bridge import DECODE_GRAPH_BUCKETS, SeqResult, select_decode_bucket
 from zstep_worker.spec_decode import VerifiedSequence
 
 
@@ -112,6 +115,11 @@ class DeepSeekV41DSparkDrafter:
             dtype=self.markov_w1_weight.dtype,
             device=runner.device,
         )
+        self.markov_embeds_buf: torch.Tensor = torch.empty(
+            (max_b, k, self.markov_w1_weight.shape[1]),
+            dtype=self.markov_w1_weight.dtype,
+            device=runner.device,
+        )
         self.step_logits_buf: torch.Tensor = torch.empty(
             (max_b, vpr), dtype=torch.bfloat16, device=runner.device
         )
@@ -124,8 +132,38 @@ class DeepSeekV41DSparkDrafter:
         self.draft_out_tokens_cpu: torch.Tensor = torch.zeros(
             (k, max_b), dtype=torch.int32, pin_memory=True
         )
+        self.draft_out_tokens_pinned: torch.Tensor = torch.zeros(
+            (2, k, max_b), dtype=torch.int32, pin_memory=True
+        )
+        self.draft_seq_lens_gpu: torch.Tensor = torch.zeros(
+            max_b, dtype=torch.int32, device=runner.device
+        )
+        self.has_confidence_head: bool = (
+            getattr(self.model.model, "confidence_head", None) is not None
+        )
+        self.conf_threshold: float = float(runner.runtime_config.dspark_conf_threshold)
+        self.draft_conf_probs_gpu: torch.Tensor = torch.ones(
+            (max_b, k), dtype=torch.float32, device=runner.device
+        )
+        self.draft_conf_probs_cpu: torch.Tensor = torch.ones(
+            (2, max_b, k), dtype=torch.float32, pin_memory=True
+        )
+        self.spec_seq_meta_cpu: torch.Tensor = torch.zeros(
+            (max_b, 4), dtype=torch.int64, pin_memory=True
+        )
+        self.spec_seq_meta_gpu: torch.Tensor = torch.zeros(
+            (max_b, 4), dtype=torch.int64, device=runner.device
+        )
+        self.spec_acc_lens_gpu: torch.Tensor = torch.zeros(
+            max_b, dtype=torch.int32, device=runner.device
+        )
+        self.spec_acc_lens_cpu: torch.Tensor = torch.zeros(
+            (2, max_b), dtype=torch.int32, pin_memory=True
+        )
+        self._ext = get_host_mapped_allreduce_extension()
         self.draft_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.ctx_store_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.post_verify_draft_graphs: dict[int, torch.cuda.CUDAGraph] = {}
 
     def _run_draft_forward_and_markov(self, b: int) -> None:
         runner = self.runner
@@ -140,12 +178,12 @@ class DeepSeekV41DSparkDrafter:
         normed = self.model.model.norm(head_hidden)
         base_logits = runner.model.compute_logits_local(normed).view(b, k, vpr)
         step_logits = self.step_logits_buf[:b]
-        markov_vec = self.markov_vec_buf[:b]
         w2_t = self.markov_w2_shard_t
         local_vals = runner.local_max_vals_buf[:b]
         local_ids = runner.local_max_ids_buf[:b]
         prev_tok = self.draft_tokens_gpu[0:rows:k]
         for step_idx in range(k):
+            markov_vec = self.markov_embeds_buf[:b, step_idx, :]
             torch.index_select(self.markov_w1_weight, 0, prev_tok, out=markov_vec)
             torch.addmm(
                 base_logits[:, step_idx, :],
@@ -163,6 +201,107 @@ class DeepSeekV41DSparkDrafter:
                 all_ranks=True,
             )
             prev_tok = self.draft_out_tokens_gpu[step_idx, :b, 0]
+        if self.has_confidence_head and self.conf_threshold > 0.0:
+            conf = self.model.compute_confidence(
+                head_hidden,
+                self.markov_embeds_buf[:b].reshape(rows, -1),
+            )
+            self.draft_conf_probs_gpu[:b, :k].copy_(conf.view(b, k))
+
+    def launch_gpu_verify_and_prep(self, b: int, width: int) -> None:
+        runner = self.runner
+        v_rows = b * width
+        d_rows = b * self.num_draft_tokens
+        verify_swa = (
+            runner.swa_slot_mapping_gpu[:v_rows]
+            if getattr(runner, "_swa_pool", None) is not None
+            else runner.slot_mapping_gpu[:v_rows]
+        )
+        stream_handle = torch.cuda.current_stream(runner.device).cuda_stream
+        self._ext.launch_dspark_verify_prep(
+            runner.out_tokens_gpu[:v_rows],
+            runner.token_ids_gpu[:v_rows],
+            runner.positions_gpu[:v_rows],
+            verify_swa,
+            self.spec_seq_meta_gpu[:b],
+            self.spec_acc_lens_gpu[:b],
+            self.ctx_slot_mapping_gpu[:v_rows],
+            self.draft_tokens_gpu[:d_rows],
+            self.draft_positions_gpu[:d_rows],
+            self.draft_slot_mapping_gpu[:d_rows],
+            self.draft_seq_lens_gpu[:b],
+            b,
+            width,
+            self.num_draft_tokens,
+            self.noise_token_id,
+            stream_handle,
+        )
+
+    def has_fused_post_verify_graph(self, v_bucket: int) -> bool:
+        return v_bucket in self.post_verify_draft_graphs
+
+    def build_fused_seq_results(
+        self,
+        *,
+        parity: int,
+        num_seqs: int,
+        width: int,
+        seq_slots_np: np.ndarray,
+        pos_starts_np: np.ndarray,
+        max_ctx: int,
+        seq_max_ctx_np: np.ndarray | None = None,
+    ) -> list[SeqResult]:
+        k = self.num_draft_tokens
+        out_tok_np = self.runner._out_tokens_np[parity]
+        out_lp_np = self.runner._out_logprobs_np[parity]
+        acc_np = self.spec_acc_lens_cpu[parity, :num_seqs].numpy()
+        draft_tok_np = self.draft_out_tokens_pinned[parity, :, :num_seqs].numpy()
+        use_conf = (
+            self.has_confidence_head
+            and self.conf_threshold > 0.0
+            and num_seqs >= 8
+        )
+        conf_np = (
+            self.draft_conf_probs_cpu[parity, :num_seqs, :k].numpy()
+            if use_conf
+            else None
+        )
+        outputs: list[SeqResult] = []
+        for s in range(num_seqs):
+            acc = max(1, min(width, int(acc_np[s])))
+            v_base = s * width
+            accepted = [int(out_tok_np[v_base + j, 0]) for j in range(acc)]
+            logprobs = [
+                int(out_lp_np[v_base + j, 0]) & 0xFFFF_FFFF for j in range(acc)
+            ]
+            pos_next = int(pos_starts_np[s]) + acc
+            seq_limit = (
+                int(seq_max_ctx_np[s]) if seq_max_ctx_np is not None else max_ctx
+            )
+            max_k = max(0, min(k, seq_limit - pos_next))
+            if use_conf and conf_np is not None and max_k > 1:
+                keep_k = 1
+                cum_p = float(conf_np[s, 0])
+                for j in range(1, max_k):
+                    cum_p *= float(conf_np[s, j])
+                    if cum_p < self.conf_threshold:
+                        break
+                    keep_k = j + 1
+                max_k = keep_k
+            next_drafts = [int(draft_tok_np[j, s]) for j in range(max_k)]
+            outputs.append(
+                SeqResult(
+                    req_slot=int(seq_slots_np[s]),
+                    accepted_token=accepted[0],
+                    accepted_logprob_bits=logprobs[0],
+                    accepted_tokens=accepted,
+                    accepted_logprobs_bits=logprobs,
+                    next_draft_tokens=next_drafts,
+                    runner_up_token=int(out_tok_np[v_base, 1]),
+                    runner_up_logprob_bits=int(out_lp_np[v_base, 1]) & 0xFFFF_FFFF,
+                )
+            )
+        return outputs
 
     @torch.inference_mode()
     def capture_graphs(
@@ -189,8 +328,8 @@ class DeepSeekV41DSparkDrafter:
                 torch.arange(rows, dtype=torch.int64, device=runner.device) % k
             )
             self.draft_slot_mapping_gpu[:rows].fill_(-1)
-            runner.seq_lens_gpu[:b].fill_(k)
-            runner.seq_lens_gpu[b:].zero_()
+            self.draft_seq_lens_gpu[:b].fill_(k)
+            self.draft_seq_lens_gpu[b:].zero_()
             sl_cpu = torch.full((b,), k, dtype=torch.int32)
 
             with torch.cuda.stream(capture_stream):
@@ -202,7 +341,7 @@ class DeepSeekV41DSparkDrafter:
                         max_seq_len=runner.decode_graph_max_seq_len,
                         qsl_gpu=self.draft_qsl_gpu[: b + 1],
                         qsl_cpu=self.draft_qsl_cpu[: b + 1],
-                        seq_lens_gpu=runner.seq_lens_gpu[:b],
+                        seq_lens_gpu=self.draft_seq_lens_gpu[:b],
                         seq_lens_cpu=sl_cpu,
                         positions_gpu=self.draft_positions_gpu[:rows],
                         slot_mapping_gpu=self.draft_slot_mapping_gpu[:rows],
@@ -229,7 +368,7 @@ class DeepSeekV41DSparkDrafter:
                     max_seq_len=runner.decode_graph_max_seq_len,
                     qsl_gpu=self.draft_qsl_gpu[: b + 1],
                     qsl_cpu=self.draft_qsl_cpu[: b + 1],
-                    seq_lens_gpu=runner.seq_lens_gpu[:b],
+                    seq_lens_gpu=self.draft_seq_lens_gpu[:b],
                     seq_lens_cpu=sl_cpu,
                     positions_gpu=self.draft_positions_gpu[:rows],
                     slot_mapping_gpu=self.draft_slot_mapping_gpu[:rows],
@@ -254,7 +393,7 @@ class DeepSeekV41DSparkDrafter:
                         max_seq_len=runner.decode_graph_max_seq_len,
                         qsl_gpu=self.draft_qsl_gpu[: b + 1],
                         qsl_cpu=self.draft_qsl_cpu[: b + 1],
-                        seq_lens_gpu=runner.seq_lens_gpu[:b],
+                        seq_lens_gpu=self.draft_seq_lens_gpu[:b],
                         seq_lens_cpu=sl_cpu,
                         positions_gpu=self.draft_positions_gpu[:rows],
                         slot_mapping_gpu=self.draft_slot_mapping_gpu[:rows],
@@ -306,9 +445,148 @@ class DeepSeekV41DSparkDrafter:
             dist.barrier(group=getattr(runner, "tp_cpu_group", runner.exchange_group))
             self.ctx_store_graphs[v_bucket] = ctx_g
 
+        # Capture fused post-verify GPU pipeline (`dspark_verify_prep_kernel` ->
+        # `combine_hidden_states + precompute_and_store_context_kv` -> noncausal DSpark
+        # draft + Markov + confidence_head). Queued immediately after `verify_graphs[b]`
+        # on the same CUDA stream without any host synchronization or workspace aliasing.
+        if (
+            runner.pp_size == 1
+            and runner.runtime_config.enable_fused_spec_graph
+            and not runner.runtime_config.disable_verify_graphs
+        ):
+            fused_buckets = [
+                b for b in runner.verify_buckets if b in self.draft_buckets
+            ]
+            for b in fused_buckets:
+                raw_aux = getattr(runner, "verify_graph_aux", {}).get(b)
+                if raw_aux is None:
+                    continue
+                v_rows = b * width
+                d_rows = b * k
+                d_sl_cpu = torch.full((b,), k, dtype=torch.int32)
+                runner.mla_bt_gpu.zero_()
+                runner.swa_bt_gpu.zero_()
+                runner.comp_bt_gpu.fill_(runner.dummy_comp_block)
+                runner.token_ids_gpu[:v_rows].zero_()
+                runner.positions_gpu[:v_rows].copy_(
+                    torch.arange(v_rows, dtype=torch.int64, device=runner.device)
+                    % width
+                )
+                runner.slot_mapping_gpu[:v_rows].fill_(-1)
+                if getattr(runner, "_swa_pool", None) is not None:
+                    runner.swa_slot_mapping_gpu[:v_rows].fill_(-1)
+                self.spec_seq_meta_gpu[:b].zero_()
+                self.ctx_slot_mapping_gpu[:v_rows].fill_(-1)
+                self.draft_tokens_gpu[:d_rows].fill_(self.noise_token_id)
+                self.draft_tokens_gpu[0:d_rows:k].zero_()
+                self.draft_positions_gpu[:d_rows].copy_(
+                    torch.arange(d_rows, dtype=torch.int64, device=runner.device) % k
+                )
+                self.draft_slot_mapping_gpu[:d_rows].fill_(-1)
+                self.draft_seq_lens_gpu[:b].fill_(k)
+
+                with torch.cuda.stream(capture_stream):
+                    for w_idx in range(2):
+                        self.launch_gpu_verify_and_prep(b, width)
+                        mx_w = self.model.combine_hidden_states(
+                            torch.cat(raw_aux, dim=-1)
+                        )
+                        self.model.precompute_and_store_context_kv(
+                            mx_w,
+                            runner.positions_gpu[:v_rows],
+                            [self.ctx_slot_mapping_gpu[:v_rows]]
+                            * self.num_draft_layers,
+                        )
+                        d_meta = runner._build_step_attn_metadata(
+                            num_reqs=b,
+                            num_tokens=d_rows,
+                            max_query_len=k,
+                            max_seq_len=runner.decode_graph_max_seq_len,
+                            qsl_gpu=self.draft_qsl_gpu[: b + 1],
+                            qsl_cpu=self.draft_qsl_cpu[: b + 1],
+                            seq_lens_gpu=self.draft_seq_lens_gpu[:b],
+                            seq_lens_cpu=d_sl_cpu,
+                            positions_gpu=self.draft_positions_gpu[:d_rows],
+                            slot_mapping_gpu=self.draft_slot_mapping_gpu[:d_rows],
+                            is_prefilling_cpu=runner.decode_is_prefilling_cpu[:b],
+                            for_capture=(w_idx == 0),
+                            causal=False,
+                            only_layer_names=self.layer_names,
+                        )
+                        with set_forward_context(
+                            d_meta,
+                            runner.vllm_config,
+                            num_tokens=d_rows,
+                            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                        ):
+                            self._run_draft_forward_and_markov(b)
+                capture_stream.synchronize()
+                dist.barrier(group=runner.exchange_group)
+
+                with torch.cuda.stream(capture_stream):
+                    d_meta_cap = runner._build_step_attn_metadata(
+                        num_reqs=b,
+                        num_tokens=d_rows,
+                        max_query_len=k,
+                        max_seq_len=runner.decode_graph_max_seq_len,
+                        qsl_gpu=self.draft_qsl_gpu[: b + 1],
+                        qsl_cpu=self.draft_qsl_cpu[: b + 1],
+                        seq_lens_gpu=self.draft_seq_lens_gpu[:b],
+                        seq_lens_cpu=d_sl_cpu,
+                        positions_gpu=self.draft_positions_gpu[:d_rows],
+                        slot_mapping_gpu=self.draft_slot_mapping_gpu[:d_rows],
+                        is_prefilling_cpu=runner.decode_is_prefilling_cpu[:b],
+                        for_capture=True,
+                        causal=False,
+                        only_layer_names=self.layer_names,
+                    )
+                capture_stream.synchronize()
+
+                post_g = torch.cuda.CUDAGraph()
+                with set_forward_context(
+                    d_meta_cap,
+                    runner.vllm_config,
+                    num_tokens=d_rows,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                ):
+                    with torch.cuda.graph(
+                        post_g, pool=graph_pool, stream=capture_stream
+                    ):
+                        self.launch_gpu_verify_and_prep(b, width)
+                        mx_c = self.model.combine_hidden_states(
+                            torch.cat(raw_aux, dim=-1)
+                        )
+                        self.model.precompute_and_store_context_kv(
+                            mx_c,
+                            runner.positions_gpu[:v_rows],
+                            [self.ctx_slot_mapping_gpu[:v_rows]]
+                            * self.num_draft_layers,
+                        )
+                        runner._build_step_attn_metadata(
+                            num_reqs=b,
+                            num_tokens=d_rows,
+                            max_query_len=k,
+                            max_seq_len=runner.decode_graph_max_seq_len,
+                            qsl_gpu=self.draft_qsl_gpu[: b + 1],
+                            qsl_cpu=self.draft_qsl_cpu[: b + 1],
+                            seq_lens_gpu=self.draft_seq_lens_gpu[:b],
+                            seq_lens_cpu=d_sl_cpu,
+                            positions_gpu=self.draft_positions_gpu[:d_rows],
+                            slot_mapping_gpu=self.draft_slot_mapping_gpu[:d_rows],
+                            is_prefilling_cpu=runner.decode_is_prefilling_cpu[:b],
+                            for_capture=False,
+                            causal=False,
+                            only_layer_names=self.layer_names,
+                        )
+                        self._run_draft_forward_and_markov(b)
+                capture_stream.synchronize()
+                dist.barrier(group=runner.exchange_group)
+                self.post_verify_draft_graphs[b] = post_g
+
     def close(self) -> None:
         self.draft_graphs.clear()
         self.ctx_store_graphs.clear()
+        self.post_verify_draft_graphs.clear()
 
     def _store_contexts_batched(
         self,
@@ -516,7 +794,8 @@ class DeepSeekV41DSparkDrafter:
             runner.mla_bt_gpu[:eff_b].copy_(runner.mla_bt_cpu[:eff_b], non_blocking=True)
             runner.swa_bt_gpu[:eff_b].copy_(runner.swa_bt_cpu[:eff_b], non_blocking=True)
             runner.comp_bt_gpu[:eff_b].copy_(runner.comp_bt_cpu[:eff_b], non_blocking=True)
-        runner.seq_lens_gpu[:eff_b].copy_(
+        draft_sl_gpu = getattr(self, "draft_seq_lens_gpu", runner.seq_lens_gpu)
+        draft_sl_gpu[:eff_b].copy_(
             runner.seq_lens_cpu[:eff_b], non_blocking=True
         )
         self.draft_tokens_gpu[:rows].copy_(
@@ -539,7 +818,7 @@ class DeepSeekV41DSparkDrafter:
                 max_seq_len=max_s_len,
                 qsl_gpu=self.draft_qsl_gpu[: eff_b + 1],
                 qsl_cpu=self.draft_qsl_cpu[: eff_b + 1],
-                seq_lens_gpu=runner.seq_lens_gpu[:eff_b],
+                seq_lens_gpu=draft_sl_gpu[:eff_b],
                 seq_lens_cpu=runner.seq_lens_cpu[:eff_b],
                 positions_gpu=self.draft_positions_gpu[:rows],
                 slot_mapping_gpu=self.draft_slot_mapping_gpu[:rows],

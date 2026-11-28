@@ -194,6 +194,24 @@ void launch_tp8_argmax_gather_shm_cuda(
     int write_all_ranks,
     std::uintptr_t stream_handle);
 
+void launch_dspark_verify_prep_cuda(
+    const int32_t* out_top2_tokens,
+    const int32_t* verify_token_ids,
+    const int64_t* verify_positions,
+    const int64_t* verify_swa_slots,
+    const int64_t* seq_meta,
+    int32_t* out_acc_lens,
+    int64_t* ctx_slot_mapping,
+    int32_t* draft_tokens,
+    int64_t* draft_positions,
+    int64_t* draft_slot_mapping,
+    int32_t* draft_seq_lens,
+    int b,
+    int width,
+    int k,
+    int32_t noise_token_id,
+    std::uintptr_t stream_handle);
+
 std::uintptr_t register_mapped_host(std::uintptr_t host_address, int64_t bytes) {
     return register_mapped_host_cuda(host_address, bytes);
 }
@@ -918,5 +936,66 @@ void launch_tp8_argmax_gather_shm(
         static_cast<int>(world_size),
         static_cast<int>(vocab_per_rank),
         static_cast<int>(write_all_ranks),
+        stream_handle);
+}
+
+void launch_dspark_verify_prep(
+    torch::Tensor out_top2_tokens,
+    torch::Tensor verify_token_ids,
+    torch::Tensor verify_positions,
+    torch::Tensor verify_swa_slots,
+    torch::Tensor seq_meta,
+    torch::Tensor out_acc_lens,
+    torch::Tensor ctx_slot_mapping,
+    torch::Tensor draft_tokens,
+    torch::Tensor draft_positions,
+    torch::Tensor draft_slot_mapping,
+    torch::Tensor draft_seq_lens,
+    int64_t b,
+    int64_t width,
+    int64_t k,
+    int64_t noise_token_id,
+    std::uintptr_t stream_handle) {
+    const int64_t v_rows = b * width;
+    const int64_t d_rows = b * k;
+    TORCH_CHECK(b > 0 && width >= 2 && k >= 1, "invalid b/width/k");
+    TORCH_CHECK(out_top2_tokens.is_cuda() && out_top2_tokens.is_contiguous() && out_top2_tokens.numel() >= v_rows * 2,
+                "out_top2_tokens must hold v_rows * 2 int32s");
+    TORCH_CHECK(verify_token_ids.is_cuda() && verify_token_ids.is_contiguous() && verify_token_ids.numel() >= v_rows,
+                "verify_token_ids must hold v_rows int32s");
+    TORCH_CHECK(verify_positions.is_cuda() && verify_positions.is_contiguous() && verify_positions.numel() >= v_rows,
+                "verify_positions must hold v_rows int64s");
+    TORCH_CHECK(verify_swa_slots.is_cuda() && verify_swa_slots.is_contiguous() && verify_swa_slots.numel() >= v_rows,
+                "verify_swa_slots must hold v_rows int64s");
+    TORCH_CHECK(seq_meta.is_cuda() && seq_meta.is_contiguous() && seq_meta.numel() >= b * 4,
+                "seq_meta must hold b * 4 int64s");
+    TORCH_CHECK(out_acc_lens.is_cuda() && out_acc_lens.is_contiguous() && out_acc_lens.numel() >= b,
+                "out_acc_lens must hold b int32s");
+    TORCH_CHECK(ctx_slot_mapping.is_cuda() && ctx_slot_mapping.is_contiguous() && ctx_slot_mapping.numel() >= v_rows,
+                "ctx_slot_mapping must hold v_rows int64s");
+    TORCH_CHECK(draft_tokens.is_cuda() && draft_tokens.is_contiguous() && draft_tokens.numel() >= d_rows,
+                "draft_tokens must hold d_rows int32s");
+    TORCH_CHECK(draft_positions.is_cuda() && draft_positions.is_contiguous() && draft_positions.numel() >= d_rows,
+                "draft_positions must hold d_rows int64s");
+    TORCH_CHECK(draft_slot_mapping.is_cuda() && draft_slot_mapping.is_contiguous() && draft_slot_mapping.numel() >= d_rows,
+                "draft_slot_mapping must hold d_rows int64s");
+    TORCH_CHECK(draft_seq_lens.is_cuda() && draft_seq_lens.is_contiguous() && draft_seq_lens.numel() >= b,
+                "draft_seq_lens must hold b int32s");
+    launch_dspark_verify_prep_cuda(
+        out_top2_tokens.data_ptr<int32_t>(),
+        verify_token_ids.data_ptr<int32_t>(),
+        verify_positions.data_ptr<int64_t>(),
+        verify_swa_slots.data_ptr<int64_t>(),
+        seq_meta.data_ptr<int64_t>(),
+        out_acc_lens.data_ptr<int32_t>(),
+        ctx_slot_mapping.data_ptr<int64_t>(),
+        draft_tokens.data_ptr<int32_t>(),
+        draft_positions.data_ptr<int64_t>(),
+        draft_slot_mapping.data_ptr<int64_t>(),
+        draft_seq_lens.data_ptr<int32_t>(),
+        static_cast<int>(b),
+        static_cast<int>(width),
+        static_cast<int>(k),
+        static_cast<int32_t>(noise_token_id),
         stream_handle);
 }

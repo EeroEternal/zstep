@@ -27,8 +27,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use zs_scheduler::{
     BENCHMARK_RANDOM_SEED, BenchmarkProvenance, BenchmarkTierSpec, DEFAULT_HEARTBEAT_TIMEOUT,
-    EngineConfig, GenerationScheduleStats, ServingBenchmarkReport, ServingEngine, StepTop2Logits,
-    TierAggregateStats, WorkerCoordinator, WorkerLaunchConfig,
+    EngineConfig, GenerationScheduleStats, ServingBenchmarkReport, ServingEngine,
+    SpeculativeConfig, SpeculativeMethod, StepTop2Logits, TierAggregateStats, WorkerCoordinator,
+    WorkerLaunchConfig,
 };
 use zs_wire::{MAX_DECODE_GRAPH_SEQS, ShmGeometry};
 
@@ -201,6 +202,10 @@ Run options:\n\
   --repeats N                Interleaved repeat count across all tiers (default: 3)\n\
   --max-prefill-chunk N      Maximum prompt tokens per sequence per prefill step (default: 2048)\n\
   --max-mixed-step-tokens N  Piggyback decode+prefill token cap (default: 3072 on deepseek_v41, 0=off)\n\
+  --speculative-method M     none|ngram|mtp|dspark (or ZSTEP_SPEC_METHOD env)\n\
+  --num-speculative-tokens K Draft tokens per step, 1..=7 (or ZSTEP_NUM_SPEC_TOKENS env)\n\
+  --prompt-lookup-max N      Max ngram prompt-lookup suffix (default: 5)\n\
+  --prompt-lookup-min N      Min ngram prompt-lookup suffix (default: 2)\n\
   --max-seqs N               Sequence capacity (default: 8 synthetic, 128 with --model-dir)\n\
   --max-step-tokens N        Token capacity (default: 192 synthetic, 4096 with --model-dir)\n\
   --max-decoder-rows N       Decoder row capacity (default: 192 synthetic, 4096 with --model-dir)\n\
@@ -238,6 +243,10 @@ struct Arguments {
     repeats: usize,
     max_prefill_chunk: usize,
     max_mixed_step_tokens: Option<usize>,
+    speculative_method: Option<String>,
+    num_speculative_tokens: Option<usize>,
+    prompt_lookup_max: Option<usize>,
+    prompt_lookup_min: Option<usize>,
     max_seqs: Option<u32>,
     max_step_tokens: Option<u32>,
     max_decoder_rows: Option<u32>,
@@ -278,6 +287,10 @@ impl Default for Arguments {
             repeats: 3,
             max_prefill_chunk: 2048,
             max_mixed_step_tokens: None,
+            speculative_method: None,
+            num_speculative_tokens: None,
+            prompt_lookup_max: None,
+            prompt_lookup_min: None,
             max_seqs: None,
             max_step_tokens: None,
             max_decoder_rows: None,
@@ -722,6 +735,22 @@ fn run_engine(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let num_kv_pages = args
         .num_kv_pages
         .unwrap_or(if is_dsv41 { 4_096 } else { 49_152 });
+    let env_spec_method = std::env::var("ZSTEP_SPEC_METHOD").ok();
+    let env_num_spec_tokens = std::env::var("ZSTEP_NUM_SPEC_TOKENS").ok();
+    let speculative = resolve_run_speculative_config(
+        &args,
+        has_model,
+        is_dsv41,
+        max_seqs,
+        max_step_tokens,
+        env_spec_method.as_deref(),
+        env_num_spec_tokens.as_deref(),
+    )?;
+    let spec_verify_width = if speculative.enabled() {
+        (speculative.num_speculative_tokens + 1) as u32
+    } else {
+        6
+    };
 
     let shm_name = args.shm_name.unwrap_or_else(unique_shm_name);
     let config = EngineConfig {
@@ -733,12 +762,12 @@ fn run_engine(args: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             max_decoder_rows,
             max_pages_per_seq,
             page_block_tokens,
-            spec_verify_width: 6,
+            spec_verify_width,
         },
         max_prefill_chunk: args.max_prefill_chunk,
         steps: args.steps,
         token_counts: args.token_counts,
-        speculative: Default::default(),
+        speculative,
         launch: WorkerLaunchConfig {
             python_executable: args.python,
             worker_root: args.worker_root,
@@ -988,6 +1017,16 @@ fn parse_arguments(raw: &[String]) -> Result<Arguments, String> {
             "--max-mixed-step-tokens" => {
                 args.max_mixed_step_tokens = Some(parse_number(option, value)?);
             }
+            "--speculative-method" => args.speculative_method = Some(value.clone()),
+            "--num-speculative-tokens" => {
+                args.num_speculative_tokens = Some(parse_number(option, value)?);
+            }
+            "--prompt-lookup-max" => {
+                args.prompt_lookup_max = Some(parse_number(option, value)?);
+            }
+            "--prompt-lookup-min" => {
+                args.prompt_lookup_min = Some(parse_number(option, value)?);
+            }
             "--max-seqs" => args.max_seqs = Some(parse_number(option, value)?),
             "--max-step-tokens" => args.max_step_tokens = Some(parse_number(option, value)?),
             "--max-decoder-rows" => args.max_decoder_rows = Some(parse_number(option, value)?),
@@ -1040,6 +1079,86 @@ fn parse_number<T: std::str::FromStr>(option: &str, value: &str) -> Result<T, St
     value
         .parse::<T>()
         .map_err(|_| format!("{option} expects a valid integer, got {value}"))
+}
+
+fn resolve_run_speculative_config(
+    args: &Arguments,
+    has_model: bool,
+    is_dsv41: bool,
+    max_seqs: u32,
+    max_step_tokens: u32,
+    env_spec_method: Option<&str>,
+    env_num_spec_tokens: Option<&str>,
+) -> Result<SpeculativeConfig, String> {
+    // `--verify-greedy-json` audits non-speculative target single/batched/chunked mixed-step
+    // Top-2 logit parity unless `--speculative-method` was explicitly requested on the CLI.
+    if !has_model || (args.verify_greedy_json.is_some() && args.speculative_method.is_none()) {
+        return Ok(SpeculativeConfig::default());
+    }
+    let raw_method = args
+        .speculative_method
+        .as_deref()
+        .or_else(|| env_spec_method.map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or("none");
+    let method = match raw_method {
+        "none" => SpeculativeMethod::None,
+        "ngram" => SpeculativeMethod::Ngram,
+        "mtp" => SpeculativeMethod::Mtp,
+        "dspark" => SpeculativeMethod::Dspark,
+        other => return Err(format!("unsupported --speculative-method `{other}`")),
+    };
+    if method == SpeculativeMethod::None && args.num_speculative_tokens.is_some() {
+        return Err(
+            "--num-speculative-tokens requires --speculative-method dspark, mtp, or ngram"
+                .to_owned(),
+        );
+    }
+    if method != SpeculativeMethod::Ngram
+        && (args.prompt_lookup_max.is_some() || args.prompt_lookup_min.is_some())
+    {
+        return Err(
+            "--prompt-lookup-max and --prompt-lookup-min require --speculative-method ngram"
+                .to_owned(),
+        );
+    }
+    if method == SpeculativeMethod::None {
+        return Ok(SpeculativeConfig::default());
+    }
+    let default_k = match method {
+        SpeculativeMethod::None => 0,
+        SpeculativeMethod::Dspark => 5,
+        SpeculativeMethod::Ngram => 3,
+        SpeculativeMethod::Mtp => 1,
+    };
+    let num_speculative_tokens = match args.num_speculative_tokens {
+        Some(explicit) => explicit,
+        None => match env_num_spec_tokens.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => {
+                let parsed = parse_number("ZSTEP_NUM_SPEC_TOKENS", raw)?;
+                if parsed == 0 { default_k } else { parsed }
+            }
+            None => default_k,
+        },
+    };
+    let cfg = SpeculativeConfig {
+        method,
+        num_speculative_tokens,
+        prompt_lookup_max: args.prompt_lookup_max.unwrap_or(5),
+        prompt_lookup_min: args.prompt_lookup_min.unwrap_or(2),
+    };
+    cfg.validate()?;
+    if method == SpeculativeMethod::Dspark && !is_dsv41 {
+        return Err("--speculative-method dspark requires a deepseek_v41 model".to_owned());
+    }
+    if method == SpeculativeMethod::Mtp && is_dsv41 {
+        return Err("--speculative-method mtp requires the Qwen3.5 runner".to_owned());
+    }
+    if max_step_tokens < max_seqs * (cfg.num_speculative_tokens as u32 + 1) {
+        return Err(
+            "--max-step-tokens must be at least max-seqs * (num-speculative-tokens + 1)".to_owned(),
+        );
+    }
+    Ok(cfg)
 }
 
 fn parse_u32_list(option: &str, raw: &str) -> Result<Vec<u32>, String> {
@@ -1311,5 +1430,73 @@ mod tests {
         let mut recomp_report = phase2;
         recomp_report.triton_recompilations = Some(1);
         assert!(validate_greedy_report_gate(&recomp_report, &GreedyGatePolicy::default()).is_err());
+    }
+
+    #[test]
+    fn run_speculative_config_honors_cli_and_env_while_preserving_greedy_gate_isolation() {
+        let bench_args = parse_arguments(&[
+            "--model-dir".to_owned(),
+            "model".to_owned(),
+            "--bench-tiers".to_owned(),
+            "spec_c1:1:8:512:128".to_owned(),
+        ])
+        .expect("valid bench args");
+        let cfg_env = resolve_run_speculative_config(
+            &bench_args,
+            true,
+            true,
+            128,
+            4096,
+            Some("dspark"),
+            Some("5"),
+        )
+        .expect("dspark env config");
+        assert_eq!(cfg_env.method, SpeculativeMethod::Dspark);
+        assert_eq!(cfg_env.num_speculative_tokens, 5);
+
+        let cli_args = parse_arguments(&[
+            "--model-dir".to_owned(),
+            "model".to_owned(),
+            "--speculative-method".to_owned(),
+            "dspark".to_owned(),
+            "--num-speculative-tokens".to_owned(),
+            "7".to_owned(),
+            "--bench-tiers".to_owned(),
+            "spec_c1:1:8:512:128".to_owned(),
+        ])
+        .expect("valid cli spec args");
+        let cfg_cli = resolve_run_speculative_config(
+            &cli_args,
+            true,
+            true,
+            128,
+            4096,
+            Some("dspark"),
+            Some("5"),
+        )
+        .expect("cli overrides env");
+        assert_eq!(cfg_cli.method, SpeculativeMethod::Dspark);
+        assert_eq!(cfg_cli.num_speculative_tokens, 7);
+
+        let greedy_args = parse_arguments(&[
+            "--model-dir".to_owned(),
+            "model".to_owned(),
+            "--verify-greedy-json".to_owned(),
+            "ref.json".to_owned(),
+            "--verify-output-json".to_owned(),
+            "out.json".to_owned(),
+        ])
+        .expect("valid greedy args");
+        let cfg_greedy = resolve_run_speculative_config(
+            &greedy_args,
+            true,
+            true,
+            16,
+            4096,
+            Some("dspark"),
+            Some("5"),
+        )
+        .expect("greedy isolation");
+        assert_eq!(cfg_greedy.method, SpeculativeMethod::None);
     }
 }
