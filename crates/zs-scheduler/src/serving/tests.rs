@@ -1796,3 +1796,16 @@ fn pp_1f1b_cohorts_ready_requires_four_prompt_complete_sequences_with_headroom()
     ];
     assert!(!pp_1f1b_cohorts_ready(&near_eos, 2, 128, false));
 }
+
+#[test]
+fn adaptive_pure_prefill_chunk_bursts_only_without_active_decodes_and_preserves_small_caps() {
+    assert_eq!(effective_prefill_chunk_cap(0, 1, 2048, 8192), 8192);
+    assert_eq!(effective_prefill_chunk_cap(0, 1, 2048, 4096), 4096);
+    assert_eq!(effective_prefill_chunk_cap(0, 2, 2048, 4096), 2048);
+    assert_eq!(effective_prefill_chunk_cap(1, 1, 2048, 8192), 2048);
+    assert_eq!(effective_prefill_chunk_cap(0, 1, 24, 8192), 24);
+    assert_eq!(
+        effective_prefill_chunk_cap(0, 1, usize::MAX, 8192),
+        usize::MAX
+    );
+}
