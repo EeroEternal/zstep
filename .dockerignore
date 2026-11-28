@@ -1,0 +1,10 @@
+.git
+target
+**/__pycache__
+**/*.pyc
+.venv
+worker/.venv
+.pytest_cache
+.ruff_cache
+results
+*.sqlite3

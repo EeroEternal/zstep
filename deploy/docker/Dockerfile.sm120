@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1.7
+# Production Docker image for zstep on NVIDIA SM120 (RTX 5090 / RTX 6000D)
+# Compatible with Nebula (`nebula-node --zstep-docker-image <image>`).
+#
+# Build:
+#   docker build -f deploy/docker/Dockerfile.sm120 -t zstep:sm120 .
+
+ARG RUST_IMAGE=rust:1.85-bookworm
+ARG BASE_IMAGE=vllm/vllm-openai:v0.31.0
+ARG APPLY_SM120_OVERLAY=1
+
+FROM ${RUST_IMAGE} AS rust-builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release -p zs-server && \
+    strip target/release/zs-server
+
+FROM ${BASE_IMAGE} AS runtime
+ARG APPLY_SM120_OVERLAY
+
+COPY --from=rust-builder /src/target/release/zs-server /usr/local/bin/zs-server
+COPY worker /opt/zstep/worker
+COPY scripts/prepare_sm120_overlay.sh /opt/zstep/scripts/prepare_sm120_overlay.sh
+
+# Install zstep_worker into the container Python environment without pulling
+# conflicting torch/cuda wheels; runtime CUDA/PyTorch/Triton come from BASE_IMAGE.
+RUN pip install --no-cache-dir --no-deps --no-build-isolation /opt/zstep/worker
+
+# Bake the deterministic FlashInfer SM120 overlay directly into site-packages
+# when present in the build context so Nebula containers require zero bind mounts.
+RUN if [ "${APPLY_SM120_OVERLAY}" = "1" ] && [ -f /opt/zstep/worker/third_party/flashinfer_sm120_overlay_d0cbb476.tar.xz ]; then \
+      /opt/zstep/scripts/prepare_sm120_overlay.sh /tmp/fi-overlay && \
+      cp -a /tmp/fi-overlay/flashinfer/. /usr/local/lib/python3.12/dist-packages/flashinfer/ && \
+      cp -a /tmp/fi-overlay/flashinfer/experimental/b12x/_compat/b12x /usr/local/lib/python3.12/dist-packages/b12x && \
+      cp -a /tmp/fi-overlay/flashinfer/experimental/b12x/_compat/_flashinfer_filelock.py /usr/local/lib/python3.12/dist-packages/_flashinfer_filelock.py && \
+      rm -rf /tmp/fi-overlay; \
+    fi
+
+# Nebula-aligned cache and runtime defaults (all overridable via `docker run -e`).
+ENV ZSTEP_BACKEND=cuda \
+    ZSTEP_WORKER_ROOT=/opt/zstep/worker \
+    ZSTEP_ENABLE_B12X=1 \
+    ZSTEP_REQUIRE_B12X=1 \
+    ZSTEP_REQUIRE_SM120_EXP=1 \
+    B12X_W4A8_TINY_DECODE=0 \
+    HF_HOME=/model/.cache/huggingface \
+    XDG_CACHE_HOME=/model/.cache \
+    TRITON_CACHE_DIR=/model/.cache/triton \
+    TORCHINDUCTOR_CACHE_DIR=/model/.cache/torchinductor \
+    TORCH_EXTENSIONS_DIR=/model/.cache/torch_extensions \
+    FLASHINFER_WORKSPACE_BASE=/model/.cache/flashinfer
+
+WORKDIR /opt/zstep
+ENTRYPOINT ["zs-server"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "8000"]
