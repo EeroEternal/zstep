@@ -24,6 +24,10 @@ VALID_QWEN_GDN_DECODE_MODES: tuple[str, ...] = (
     "split_2op",
     "split_3op",
 )
+VALID_SAIL_BACKENDS: frozenset[str] = frozenset({"auto", "sail", "sm120"})
+VALID_SAIL_SPARSE_ATTN_BACKENDS: frozenset[str] = frozenset(
+    {"auto", "flash_mla", "triton_tp8", "hggc_tp8"}
+)
 DEFAULT_MIN_PXB_BI_GBPS: float = 25.0
 
 
@@ -173,6 +177,22 @@ class WorkerRuntimeConfig:
     qwen_enable_fused_gdn: bool = True
     qwen_gdn_decode_mode: str = "auto"
 
+    # T-Head PPU-ZW810E / SAIL backend & Evolith-approved policy knobs
+    backend: str = "auto"
+    sail_policy_path: str = ""
+    sail_ar_blocks: int = 8
+    sail_ar_threads: int = 256
+    sail_ar_oneshot_max_bytes: int = 131072
+    sail_ar_pccl_min_bytes: int = 67108864
+    sail_moe_gemv_max_rows: int = 16
+    sail_moe_gemv_threads: int = 256
+    sail_moe_block_m: int = 32
+    sail_moe_num_warps: int = 4
+    sail_sparse_attn_backend: str = "auto"
+    sail_mhc_split_k: int = 1
+    sail_mhc_fused_max_rows: int = 16
+    sail_observe_path: str = ""
+
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> WorkerRuntimeConfig:
         env = os.environ if environ is None else environ
@@ -317,6 +337,98 @@ class WorkerRuntimeConfig:
             else None
         )
 
+        backend = env.get("ZSTEP_BACKEND", "auto").strip().lower() or "auto"
+        if backend not in VALID_SAIL_BACKENDS:
+            raise ValueError(
+                f"Unsupported ZSTEP_BACKEND={backend!r}; "
+                f"expected one of {sorted(VALID_SAIL_BACKENDS)}"
+            )
+        sail_policy_path = env.get("ZSTEP_SAIL_POLICY_PATH", "").strip()
+        policy_defaults: dict[str, object] = {}
+        if sail_policy_path:
+            import json
+            from pathlib import Path
+
+            raw_policy = json.loads(
+                Path(sail_policy_path).read_text(encoding="utf-8")
+            )
+            if not isinstance(raw_policy, dict):
+                raise ValueError("ZSTEP_SAIL_POLICY_PATH must contain a JSON object")
+            policy_defaults = raw_policy
+
+        def _sail_int(env_key: str, policy_key: str, fallback: int) -> int:
+            if env.get(env_key, "").strip():
+                return env_int(env_key, fallback, environ=env)
+            if policy_key in policy_defaults:
+                val = policy_defaults[policy_key]
+                if isinstance(val, bool) or not isinstance(val, int):
+                    raise ValueError(f"Policy field {policy_key!r} must be an integer")
+                return val
+            return fallback
+
+        def _sail_str(env_key: str, policy_key: str, fallback: str) -> str:
+            raw_val = env.get(env_key, "").strip()
+            if raw_val:
+                return raw_val
+            if policy_key in policy_defaults:
+                val = policy_defaults[policy_key]
+                if not isinstance(val, str):
+                    raise ValueError(f"Policy field {policy_key!r} must be a string")
+                return val.strip() or fallback
+            return fallback
+
+        sail_ar_blocks = _sail_int("ZSTEP_SAIL_AR_BLOCKS", "ar_blocks", 8)
+        if not 1 <= sail_ar_blocks <= 64:
+            raise ValueError(f"sail_ar_blocks must be in 1..=64 (got {sail_ar_blocks})")
+        sail_ar_threads = _sail_int("ZSTEP_SAIL_AR_THREADS", "ar_threads", 256)
+        if sail_ar_threads not in (64, 128, 256, 512):
+            raise ValueError(
+                f"sail_ar_threads must be 64, 128, 256, or 512 (got {sail_ar_threads})"
+            )
+        sail_ar_oneshot_max_bytes = _sail_int(
+            "ZSTEP_SAIL_AR_ONESHOT_MAX_BYTES", "ar_oneshot_max_bytes", 131072
+        )
+        if sail_ar_oneshot_max_bytes < 0:
+            raise ValueError("sail_ar_oneshot_max_bytes must be >= 0")
+        sail_ar_pccl_min_bytes = _sail_int(
+            "ZSTEP_SAIL_AR_PCCL_MIN_BYTES", "ar_pccl_min_bytes", 67108864
+        )
+        if sail_ar_pccl_min_bytes < 0:
+            raise ValueError("sail_ar_pccl_min_bytes must be >= 0")
+        sail_moe_gemv_max_rows = _sail_int(
+            "ZSTEP_SAIL_MOE_GEMV_MAX_ROWS", "moe_gemv_max_rows", 16
+        )
+        if not 0 <= sail_moe_gemv_max_rows <= 256:
+            raise ValueError("sail_moe_gemv_max_rows must be in 0..=256")
+        sail_moe_gemv_threads = _sail_int(
+            "ZSTEP_SAIL_MOE_GEMV_THREADS", "moe_gemv_threads", 256
+        )
+        if sail_moe_gemv_threads not in (128, 256, 512):
+            raise ValueError("sail_moe_gemv_threads must be 128, 256, or 512")
+        sail_moe_block_m = _sail_int("ZSTEP_SAIL_MOE_BLOCK_M", "moe_block_m", 32)
+        if sail_moe_block_m not in (16, 32, 64):
+            raise ValueError("sail_moe_block_m must be 16, 32, or 64")
+        sail_moe_num_warps = _sail_int("ZSTEP_SAIL_MOE_NUM_WARPS", "moe_num_warps", 4)
+        if sail_moe_num_warps not in (2, 4, 8):
+            raise ValueError("sail_moe_num_warps must be 2, 4, or 8")
+        sail_sparse_attn_backend = _sail_str(
+            "ZSTEP_SAIL_SPARSE_ATTN_BACKEND", "sparse_attn_backend", "auto"
+        ).lower()
+        if sail_sparse_attn_backend not in VALID_SAIL_SPARSE_ATTN_BACKENDS:
+            raise ValueError(
+                f"Unsupported ZSTEP_SAIL_SPARSE_ATTN_BACKEND={sail_sparse_attn_backend!r}; "
+                f"expected one of {sorted(VALID_SAIL_SPARSE_ATTN_BACKENDS)}"
+            )
+        sail_mhc_split_k = _sail_int("ZSTEP_SAIL_MHC_SPLIT_K", "mhc_split_k", 1)
+        if sail_mhc_split_k not in (1, 2, 4, 8, 16):
+            raise ValueError("sail_mhc_split_k must be 1, 2, 4, 8, or 16")
+        sail_mhc_fused_max_rows = _sail_int(
+            "ZSTEP_SAIL_MHC_FUSED_MAX_ROWS", "mhc_fused_max_rows", 16
+        )
+        if not 0 <= sail_mhc_fused_max_rows <= 4096:
+            raise ValueError("sail_mhc_fused_max_rows must be in 0..=4096")
+        sail_observe_path = env.get("ZSTEP_SAIL_OBSERVE_PATH", "").strip()
+
         return cls(
             spec_method=spec_method,
             num_spec_tokens=num_spec_tokens,
@@ -388,6 +500,20 @@ class WorkerRuntimeConfig:
             b12x_autotune=env_flag("ZSTEP_B12X_AUTOTUNE", default=True, environ=env),
             qwen_enable_fused_gdn=parse_qwen_fused_gdn_enabled(env),
             qwen_gdn_decode_mode=parse_qwen_gdn_decode_mode(env),
+            backend=backend,
+            sail_policy_path=sail_policy_path,
+            sail_ar_blocks=sail_ar_blocks,
+            sail_ar_threads=sail_ar_threads,
+            sail_ar_oneshot_max_bytes=sail_ar_oneshot_max_bytes,
+            sail_ar_pccl_min_bytes=sail_ar_pccl_min_bytes,
+            sail_moe_gemv_max_rows=sail_moe_gemv_max_rows,
+            sail_moe_gemv_threads=sail_moe_gemv_threads,
+            sail_moe_block_m=sail_moe_block_m,
+            sail_moe_num_warps=sail_moe_num_warps,
+            sail_sparse_attn_backend=sail_sparse_attn_backend,
+            sail_mhc_split_k=sail_mhc_split_k,
+            sail_mhc_fused_max_rows=sail_mhc_fused_max_rows,
+            sail_observe_path=sail_observe_path,
         )
 
     def effective_shm_max_ar_numel(self, default_numel: int) -> int:
@@ -415,5 +541,11 @@ class WorkerRuntimeConfig:
             f"verify_graphs={int(not self.disable_verify_graphs)} "
             f"draft_graphs={int(not self.disable_draft_graphs)} "
             f"prefill_runahead={self.prefill_runahead_depth} "
-            f"driver_batch_memcpy={int(self.enable_driver_batch_memcpy)}"
+            f"driver_batch_memcpy={int(self.enable_driver_batch_memcpy)} "
+            f"sail={self.backend}(ar={self.sail_ar_blocks}x{self.sail_ar_threads},"
+            f"os={self.sail_ar_oneshot_max_bytes},pccl={self.sail_ar_pccl_min_bytes},"
+            f"moe_gemv<={self.sail_moe_gemv_max_rows}@{self.sail_moe_gemv_threads},"
+            f"bm={self.sail_moe_block_m}w{self.sail_moe_num_warps},"
+            f"attn={self.sail_sparse_attn_backend},"
+            f"mhc={self.sail_mhc_split_k}r{self.sail_mhc_fused_max_rows})"
         )

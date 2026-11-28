@@ -147,6 +147,33 @@ def test_worker_runtime_config_overrides_and_helpers() -> None:
     assert tbo_cfg.pp_engram_gpu_layers == 1
 
 
+def test_worker_runtime_config_sail_policy_and_env_precedence(tmp_path) -> None:
+    policy_file = tmp_path / "approved-sail-policy.json"
+    policy_file.write_text(
+        '{"ar_blocks": 16, "ar_threads": 128, "moe_gemv_max_rows": 32, '
+        '"sparse_attn_backend": "hggc_tp8"}',
+        encoding="utf-8",
+    )
+    cfg = WorkerRuntimeConfig.from_env(
+        {
+            "ZSTEP_BACKEND": "sail",
+            "ZSTEP_SAIL_POLICY_PATH": str(policy_file),
+            "ZSTEP_SAIL_AR_BLOCKS": "24",
+        }
+    )
+    assert cfg.backend == "sail"
+    assert cfg.sail_ar_blocks == 24
+    assert cfg.sail_ar_threads == 128
+    assert cfg.sail_moe_gemv_max_rows == 32
+    assert cfg.sail_sparse_attn_backend == "hggc_tp8"
+    assert cfg.sail_mhc_split_k == 1
+    assert cfg.sail_mhc_fused_max_rows == 16
+    assert (
+        "sail=sail(ar=24x128,os=131072,pccl=67108864,moe_gemv<=32@256,bm=32w4,attn=hggc_tp8,mhc=1r16)"
+        in cfg.format_log_line()
+    )
+
+
 @pytest.mark.parametrize(
     ("env", "match"),
     [

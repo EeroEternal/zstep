@@ -1,0 +1,13 @@
+{
+  "ar_blocks": 64,
+  "ar_threads": 512,
+  "ar_oneshot_max_bytes": 131072,
+  "ar_pccl_min_bytes": 67108864,
+  "moe_gemv_max_rows": 32,
+  "moe_gemv_threads": 256,
+  "moe_block_m": 16,
+  "moe_num_warps": 4,
+  "sparse_attn_backend": "triton_tp8",
+  "mhc_split_k": 8,
+  "mhc_fused_max_rows": 4096
+}

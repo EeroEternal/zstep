@@ -29,6 +29,7 @@ CSRC_DIR = WORKER_PKG / "kernels_sm120" / "csrc"
 
 HOTPATH_MODEL_FILES: tuple[str, ...] = (
     "models/deepseek_v41.py",
+    "models/deepseek_v41_sail.py",
     "models/qwen35_moe.py",
     "sampler.py",
     "spec_decode.py",
@@ -324,15 +325,17 @@ def _check_balanced_delimiters(src: str, label: str) -> None:
 
 
 def test_sm120_csrc_sources_have_balanced_delimiters_and_bound_entrypoints() -> None:
+    sail_csrc_dir = WORKER_PKG / "kernels_sail" / "csrc"
     specs = (
-        ("kernels_sm120/shm_allreduce.py", "shm_allreduce.cpp", "shm_allreduce_kernels.cu"),
-        ("kernels_sm120/qwen35_ops.py", "qwen35_ops.cpp", "qwen35_ops_kernels.cu"),
+        ("kernels_sm120/shm_allreduce.py", CSRC_DIR / "shm_allreduce.cpp", CSRC_DIR / "shm_allreduce_kernels.cu"),
+        ("kernels_sm120/qwen35_ops.py", CSRC_DIR / "qwen35_ops.cpp", CSRC_DIR / "qwen35_ops_kernels.cu"),
+        ("kernels_sail/ppu_collectives.py", sail_csrc_dir / "sail_ops.cpp", sail_csrc_dir / "sail_ops_kernels.cu"),
     )
-    decl_re = re.compile(r"\bvoid\s+(launch_[A-Za-z0-9_]+_cuda)\s*\(")
-    for py_rel, cpp_name, cu_name in specs:
+    decl_re = re.compile(r"\b(?:void|int64_t|std::uintptr_t|torch::Tensor)\s+([A-Za-z0-9_]+_cuda)\s*\(")
+    for py_rel, cpp_path, cu_path in specs:
         py_path = WORKER_PKG / py_rel
-        cpp_path = CSRC_DIR / cpp_name
-        cu_path = CSRC_DIR / cu_name
+        cpp_name = cpp_path.name
+        cu_name = cu_path.name
         assert cpp_path.is_file(), f"Missing {cpp_path}"
         assert cu_path.is_file(), f"Missing {cu_path}"
         cpp_src = cpp_path.read_text(encoding="utf-8")
@@ -348,9 +351,9 @@ def test_sm120_csrc_sources_have_balanced_delimiters_and_bound_entrypoints() -> 
             )
 
         forward_cuda_fns = set(decl_re.findall(cpp_src))
-        assert forward_cuda_fns, f"No `launch_*_cuda` declarations found in {cpp_name}"
+        assert forward_cuda_fns, f"No `*_cuda` declarations found in {cpp_name}"
         for cuda_fn in sorted(forward_cuda_fns):
-            assert re.search(rf"\bvoid\s+{re.escape(cuda_fn)}\s*\(", cu_src), (
+            assert re.search(rf"\b{re.escape(cuda_fn)}\s*\(", cu_src), (
                 f"Forward-declared `{cuda_fn}` in {cpp_name} missing from {cu_name}"
             )
 
