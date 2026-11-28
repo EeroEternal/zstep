@@ -1129,7 +1129,6 @@ class DeepSeekV41SailDSparkDrafter:
                 if raw_mx is None or v_bucket not in self.draft_buckets:
                     continue
                 v_rows = v_bucket * width
-                d_rows = v_bucket * k
                 if (
                     v_rows > self.ctx_swa_slots_gpu.shape[0]
                     or v_bucket > self.spec_seq_meta_gpu.shape[0]
